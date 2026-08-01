@@ -170,6 +170,49 @@ sudo llmctl bench --concurrency 25 --requests 50 --max-tokens 512
 
 The output includes aggregate tokens/s, p50/p95 effective tokens/s per request, and request latency. For targets such as “25 average concurrent requests at 40 tokens/s,” test short text, long prompts, reasoning, tool calls, and six-image requests separately. A 256K context is the maximum window for one request; it does not mean that 25 requests can all use 256K simultaneously.
 
+## Automated Testing, Advice, and Optimization
+
+Test the current configuration and generate advice without writing configuration or restarting services:
+
+```bash
+sudo llmctl optimize analyze --profile balanced
+```
+
+After consent, test candidates and apply the selected result automatically:
+
+```bash
+sudo llmctl optimize run --profile balanced
+```
+
+Available objectives:
+
+- `latency`: prioritize p95 TTFT and ITL.
+- `balanced`: the default; combine aggregate throughput, p95 TTFT, and ITL.
+- `throughput`: prioritize aggregate output tokens/s while retaining tail-latency constraints.
+
+The flow first runs capability smoke tests and a current-configuration baseline. It then collects streaming TTFT, ITL, E2E, aggregate output tokens/s, GPU utilization/VRAM/temperature, CPU/memory/swap, plus each vLLM worker's peak KV-cache use, queueing, preemptions, and prefix-cache hits. Every proposed parameter is shown with its rationale, possible cost, and the boundaries this test cannot prove. Missing critical GPU, host, or vLLM metrics—and excessive CPU, memory, or swap pressure—prevent upward-scaling candidates.
+
+No configuration is written and no service is restarted before the user enters `y`. After consent, LLMCtl stores a complete `cluster.env` backup under `/var/lib/llm-cluster/optimization/backups` and tests at most two conservative candidates. A candidate must have no request failures, must not increase KV-cache preemptions, and normally must improve the selected objective's composite score by at least 5%. Every trial restarts active workers, so the API is briefly unavailable. Final acceptance covers text, reasoning, tool calling, and, when supported, OCR/six-image input. Startup failure, smoke-test failure, Ctrl+C, or a termination signal restores the original configuration.
+
+Quick mode reduces requests and candidate count. It is useful for screening but produces weaker evidence:
+
+```bash
+sudo llmctl optimize analyze --profile throughput --quick
+sudo llmctl optimize run --profile throughput --quick
+```
+
+Inspect the report or explicitly restore the pre-optimization configuration:
+
+```bash
+sudo llmctl optimize report
+sudo llmctl optimize report --json
+sudo llmctl optimize restore latest
+# Or use the RUN_ID from the report
+sudo llmctl optimize restore 20260801T120000Z
+```
+
+The automatic workload is reproducible synthetic text, not a representation of real prompts, long contexts, output lengths, image ratios, or tool-call distribution. It never changes the model, TP, context limit, routing semantics, quantization format, or driver automatically. Replay production-like samples before rollout. Use `--yes` only in an unattended maintenance window after reviewing candidate and downtime implications.
+
 ## Model Search and Reconfiguration
 
 ```bash
@@ -182,6 +225,8 @@ sudo llmctl models current
 The installer performs a read-only preflight before model search. It covers OS/architecture, CPU/cores/threads, memory/swap, GPUs/VRAM/driver/compute capability, current and maximum PCIe links, GPU/NUMA/NVLink topology, and model-filesystem capacity. PCIe/topology information is a capability snapshot, not an active NCCL bandwidth test.
 
 The catalog excludes platform-specific conversions such as Apple MLX weights. `mlx-community/*` targets MLX on Apple Silicon and cannot be used as NVIDIA CUDA/vLLM weights. Selecting a candidate expands its VRAM budget, TP links, host memory, disk, startup parallelism, and itemized recommendation reasons. You can then confirm, return to the candidate list, or search again.
+
+The ModelScope downloader is pinned in an isolated virtual environment, and its actual command is `/opt/llm-cluster/hub-venv/bin/ms`. Before downloading large weights, the installer validates `ms download --help`. A `.partial` directory is the resumable download target and should not be removed after a download error.
 
 If the selected model already exists locally, the installer skips its download and does not copy weights only when the Hub, model ID, revision, configuration architecture, complete weight set, and size all match. A retained `/data/ornith/models` root can be detected automatically. Similar model names from different sources or IDs are never mixed.
 

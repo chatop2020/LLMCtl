@@ -25,6 +25,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
+- Use `llmctl optimize` to collect streaming TTFT/ITL/E2E, aggregate throughput, GPU/VRAM/temperature, CPU/memory/swap, and vLLM KV-cache/queue/preemption/prefix-cache metrics. It explains every candidate's rationale, tradeoffs, and boundaries before consent, then backs up configuration, restarts and tests candidates, selects the objective-specific winner, runs full smoke acceptance, and rolls back on failure or interruption.
 
 ## Important Boundaries
 
@@ -39,7 +40,9 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `install-llm-cluster.sh` | Initial installation or model/topology reselection |
 | `llmctl.sh` | Installed as the global `/usr/local/sbin/llmctl` command |
 | `lib/model_catalog.py` | Hub search, capability detection, VRAM estimation, and deployment planning |
+| `lib/runtime_optimizer.py` | Streaming benchmarks, GPU/vLLM metrics, conservative candidates, and objective scoring |
 | `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
+| `tests/test_runtime_optimizer.py` | Tuning advice, scoring, metrics parsing, and streaming-latency tests |
 | `README.md` / `README_EN.md` | Chinese and English project overview |
 | `USAGE.md` / `USAGE_EN.md` | Chinese and English operations, API, and troubleshooting manual |
 
@@ -69,7 +72,7 @@ sudo llmctl admin set-password
 Copy the entire directory to the server, enter it, and run:
 
 ```bash
-chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py
 sudo bash install-llm-cluster.sh
 ```
 

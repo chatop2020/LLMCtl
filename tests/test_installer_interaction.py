@@ -30,12 +30,16 @@ class InstallerInteractionTests(unittest.TestCase):
             "make_active_workers() {", 1
         )[0]
         self.assertIn(
-            'MODELSCOPE_DOWNLOADER="${venv}/bin/ms-hub"', download
+            'MODELSCOPE_DOWNLOADER="${venv}/bin/ms"', download
         )
         self.assertNotIn("printf '%s\\n'", download)
         self.assertIn("ensure_modelscope_downloader", model_download)
         self.assertIn('"${MODELSCOPE_DOWNLOADER}" download', model_download)
         self.assertNotIn("$(ensure_modelscope_downloader)", model_download)
+        self.assertNotIn("ms-hub", download)
+        self.assertIn('download --help >/dev/null', download)
+        self.assertIn('importlib.metadata.version("modelscope-hub") == "0.1.8"', download)
+        self.assertIn("--force-reinstall", download)
 
     def test_interactive_modelscope_search_accepts_default_auto_task(self):
         completed = subprocess.run(

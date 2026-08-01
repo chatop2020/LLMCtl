@@ -25,6 +25,7 @@
 - systemd 开机自启；Worker 可分批并行加载，SSH 断开不影响后台启动。
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
+- `llmctl optimize` 可采集流式 TTFT/ITL/E2E、聚合吞吐、GPU/显存/温度、CPU/内存/Swap 和 vLLM KV Cache/排队/抢占/前缀缓存指标；先解释候选原因、代价和边界，经用户确认后才备份配置、逐项重启试验、自动择优、完整冒烟，并在失败或中断时回滚。
 
 ## 重要边界
 
@@ -39,7 +40,9 @@
 | `install-llm-cluster.sh` | 首次安装或重新选择模型/拓扑 |
 | `llmctl.sh` | 安装为全局命令 `/usr/local/sbin/llmctl` |
 | `lib/model_catalog.py` | Hub 搜索、能力识别、显存估算和部署计划 |
+| `lib/runtime_optimizer.py` | 流式基准、GPU/vLLM 指标采集、保守候选生成与目标评分 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
+| `tests/test_runtime_optimizer.py` | 调优建议、评分、指标解析与流式时延测试 |
 | `README.md` / `README_EN.md` | 中英文项目说明 |
 | `USAGE.md` / `USAGE_EN.md` | 中英文日常使用、API 和故障排查手册 |
 
@@ -69,7 +72,7 @@ sudo llmctl admin set-password
 把整个目录复制到服务器，进入目录后运行：
 
 ```bash
-chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py
 sudo bash install-llm-cluster.sh
 ```
 

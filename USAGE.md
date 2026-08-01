@@ -170,6 +170,49 @@ sudo llmctl bench --concurrency 25 --requests 50 --max-tokens 512
 
 输出包括聚合 token/s、单请求有效 token/s p50/p95 和请求耗时。对“25 平均并发、40 token/s”这类目标，至少分别测试短文本、长 prompt、思考、工具调用和 6 图请求。256K 是单请求最大窗口，不等于 25 个请求都能同时使用 256K。
 
+## 自动测试、建议与调优
+
+只测试当前配置并获得建议，不写配置或重启：
+
+```bash
+sudo llmctl optimize analyze --profile balanced
+```
+
+经确认后自动试验并应用：
+
+```bash
+sudo llmctl optimize run --profile balanced
+```
+
+可选目标：
+
+- `latency`：优先 p95 TTFT 与 ITL。
+- `balanced`：默认，综合聚合吞吐、p95 TTFT 和 ITL。
+- `throughput`：优先聚合输出 token/s，同时保留尾延迟约束。
+
+流程先执行能力冒烟和当前配置基线，再采集流式 TTFT、ITL、E2E、聚合输出 token/s、GPU 利用率/显存/温度、CPU/内存/Swap，以及每个 vLLM Worker 的 KV Cache 峰值、排队、抢占和前缀缓存命中。随后逐项展示候选参数、推荐原因、可能代价和不可由本测试证明的边界。关键 GPU、主机或 vLLM 指标缺失，以及 CPU/内存/Swap 压力过高时，流程不会生成向上扩容候选。
+
+在用户输入 `y` 前不会写配置或重启。确认后，LLMCtl 会把完整 `cluster.env` 备份到 `/var/lib/llm-cluster/optimization/backups`，最多测试两个保守候选。候选必须没有请求失败、不能增加 KV Cache 抢占，并且针对所选目标的综合得分通常至少提高 5% 才会保留。每次候选试验都需要重启激活 Worker，因此 API 会短暂不可用。最后还会运行包含文本、思考、工具调用及模型支持时 OCR/6 图的完整冒烟测试；启动、冒烟、Ctrl+C 或信号中断都会触发原配置恢复。
+
+快速模式减少请求量和候选数，适合初筛但证据较弱：
+
+```bash
+sudo llmctl optimize analyze --profile throughput --quick
+sudo llmctl optimize run --profile throughput --quick
+```
+
+查看报告或显式恢复调优前配置：
+
+```bash
+sudo llmctl optimize report
+sudo llmctl optimize report --json
+sudo llmctl optimize restore latest
+# 或使用报告中的 RUN_ID
+sudo llmctl optimize restore 20260801T120000Z
+```
+
+自动负载是可复现的合成文本，不代表真实 prompt、长上下文、输出长度、图片比例或工具调用分布。它不会自动改变模型、TP、上下文上限、路由语义、量化格式或驱动；上线前仍需用业务样本复测。`--yes` 只适合已经阅读候选和停机影响的无人值守维护窗口。
+
 ## 模型搜索与重配
 
 ```bash
@@ -182,6 +225,8 @@ sudo llmctl models current
 安装向导会先做只读体检，再搜索模型。体检包括操作系统/架构、CPU/核/线程、内存/Swap、GPU/显存/驱动/计算能力、PCIe 当前与最大链路、GPU/NUMA/NVLink 拓扑和模型盘空间。PCIe/拓扑是能力快照，不是主动 NCCL 带宽测试。
 
 目录会排除 Apple MLX 等平台专用转换权重；`mlx-community/*` 面向 MLX/Apple Silicon，不能作为 NVIDIA CUDA/vLLM 权重。选择候选后会展开显存预算、TP 链路、主机内存、磁盘、启动并行度和逐项推荐理由。此时可确认、返回候选列表或重新搜索。
+
+ModelScope 下载器固定安装在独立虚拟环境，实际命令为 `/opt/llm-cluster/hub-venv/bin/ms`。安装器会在下载大权重前验证 `ms download --help`；`.partial` 目录用于断点续传，下载错误时不要手工删除。
 
 若所选模型已存在，只有 Hub、模型 ID、revision、配置架构、完整权重和体积全部匹配时才跳过下载，且不会复制权重。保留的 `/data/ornith/models` 可被自动识别；不同来源或模型 ID 即使名称相似也不会混用。
 

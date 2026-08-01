@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.0.3"
+readonly INSTALLER_VERSION="2.1.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -91,6 +91,7 @@ INTERFACE_LANGUAGE_EXPLICIT=0
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MANAGER_SOURCE="${SCRIPT_DIR}/llmctl.sh"
 CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
+OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -807,6 +808,7 @@ check_discovery_host() {
   [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04* ]] || die "$(l10n "仅支持 Ubuntu 24.04；检测到 ${PRETTY_NAME:-unknown}" "Only Ubuntu 24.04 is supported; detected ${PRETTY_NAME:-unknown}")"
   [[ -r "${MANAGER_SOURCE}" ]] || die "$(l10n 'llmctl.sh 必须与安装脚本放在同一目录' 'llmctl.sh must be in the same directory as the installer')"
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
+  [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -831,6 +833,7 @@ check_host() {
   [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04* ]] || die "$(l10n "仅支持 Ubuntu 24.04；检测到 ${PRETTY_NAME:-unknown}" "Only Ubuntu 24.04 is supported; detected ${PRETTY_NAME:-unknown}")"
   [[ -x "${MANAGER_SOURCE}" ]] || [[ -r "${MANAGER_SOURCE}" ]] || die "$(l10n 'llmctl.sh 必须与安装脚本放在同一目录' 'llmctl.sh must be in the same directory as the installer')"
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
+  [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -963,7 +966,7 @@ install_packages() {
   log "$(l10n '安装 Ubuntu 基础依赖与 Docker...' 'Installing Ubuntu prerequisites and Docker...')"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl gnupg jq openssl file tar python3 python3-venv
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg jq openssl file tar python3 python3-venv util-linux
   if ! command -v docker >/dev/null 2>&1; then
     apt-get install -y --no-install-recommends docker.io
   fi
@@ -986,7 +989,7 @@ install_packages() {
 
 verify_container_runtime() {
   local tool_name
-  for tool_name in curl jq openssl file base64 sha256sum timeout; do
+  for tool_name in curl jq openssl file base64 sha256sum timeout flock; do
     command -v "${tool_name}" >/dev/null 2>&1 || die "$(l10n "缺少运行依赖：${tool_name}" "Missing runtime dependency: ${tool_name}")"
   done
   command -v docker >/dev/null 2>&1 || die "$(l10n 'Docker 未安装' 'Docker is not installed')"
@@ -1026,14 +1029,23 @@ print(arch)
 }
 
 ensure_modelscope_downloader() {
-  local venv="/opt/llm-cluster/hub-venv"
-  MODELSCOPE_DOWNLOADER="${venv}/bin/ms-hub"
-  if [[ ! -x "${venv}/bin/ms-hub" ]]; then
+  local venv="/opt/llm-cluster/hub-venv" package_ok=0
+  MODELSCOPE_DOWNLOADER="${venv}/bin/ms"
+  if [[ -x "${venv}/bin/python" ]] && "${venv}/bin/python" -c \
+    'import importlib.metadata; raise SystemExit(0 if importlib.metadata.version("modelscope-hub") == "0.1.8" else 1)' 2>/dev/null; then
+    package_ok=1
+  fi
+  if [[ ! -x "${MODELSCOPE_DOWNLOADER}" || ${package_ok} -eq 0 ]]; then
     log "$(l10n '在独立维护环境安装 ModelScope 下载器 modelscope-hub==0.1.8...' 'Installing modelscope-hub==0.1.8 in an isolated maintenance environment...')"
     python3 -m venv "${venv}" || die "$(l10n "无法创建 ${venv}；请安装 python3-venv" "Could not create ${venv}; install python3-venv")"
-    "${venv}/bin/pip" install --disable-pip-version-check "modelscope-hub==0.1.8" || die "$(l10n 'ModelScope 下载器安装失败' 'ModelScope downloader installation failed')"
+    "${venv}/bin/pip" install --disable-pip-version-check --upgrade --force-reinstall "modelscope-hub==0.1.8" || die "$(l10n 'ModelScope 下载器安装失败' 'ModelScope downloader installation failed')"
   fi
   [[ -x "${MODELSCOPE_DOWNLOADER}" ]] || die "$(l10n "ModelScope 下载器不可执行：${MODELSCOPE_DOWNLOADER}" "ModelScope downloader is not executable: ${MODELSCOPE_DOWNLOADER}")"
+  "${venv}/bin/python" -c \
+    'import importlib.metadata; raise SystemExit(0 if importlib.metadata.version("modelscope-hub") == "0.1.8" else 1)' || \
+    die "$(l10n 'ModelScope 下载器版本核验失败' 'ModelScope downloader version verification failed')"
+  "${MODELSCOPE_DOWNLOADER}" download --help >/dev/null || \
+    die "$(l10n 'ModelScope 下载器缺少 download 子命令或参数不兼容' 'The ModelScope downloader lacks a compatible download subcommand')"
 }
 
 validate_downloaded_model() {
@@ -1269,6 +1281,7 @@ install_manager() {
   install -m 755 "${MANAGER_SOURCE}" /usr/local/sbin/llmctl
   install -d -m 755 /usr/local/lib/llm-cluster
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
+  install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
 }
 
 write_systemd_units() {
