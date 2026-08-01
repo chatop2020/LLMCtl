@@ -1,5 +1,7 @@
 # llmctl 使用手册
 
+**语言：** 中文 | [English](USAGE_EN.md)
+
 ## 安装后的第一组命令
 
 ```bash

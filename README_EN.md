@@ -1,0 +1,187 @@
+# LLMCtl: General-Purpose Multi-GPU vLLM Cluster Deployer
+
+**Language:** [中文](README.md) | English
+
+[![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)
+
+LLMCtl searches Hugging Face or ModelScope for models on a bare-metal Ubuntu 24.04 host, conservatively filters them according to the local NVIDIA GPUs and VRAM, plans the deployment topology, and automatically deploys multiple vLLM workers, LiteLLM load balancing, and a web administration UI.
+
+The project does not use Conda or modify the NVIDIA driver. Inference dependencies are contained in pinned Docker image versions. A LAN proxy may be used temporarily during installation; runtime is fully offline by default and does not update automatically.
+
+> This is a prerelease intended for validation on real multi-GPU hosts. The
+> [GitHub repository](https://github.com/chatop2020/LLMCtl) is the source of truth, and automated tests run for every push and pull request.
+
+## Key Features
+
+- Search Hugging Face and ModelScope together or search either source independently.
+- Only display models that pass all of these gates: generative task, complete weights, an architecture supported by vLLM 0.22.1, and capacity for at least an 8K context window on the local host.
+- Automatically recommend tensor parallelism (TP), instance count, context length, and `max-num-seqs` based on weight size, runtime reserve, KV cache, minimum per-GPU VRAM, and GPU count.
+- Recheck the architecture with `ModelRegistry` inside the pinned vLLM container before download, then verify configuration, weight presence, and size after download.
+- Enable image/OCR input, OpenAI tool calling, reasoning parsing, and per-request reasoning disable controls only when the model capability matches.
+- Map one GPU or one TP group to each worker. LiteLLM uses `least-busy` routing based on unfinished requests and enforces a per-worker concurrency limit.
+- Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
+- Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
+- Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
+
+## Important Boundaries
+
+“Installable according to the catalog” is a conservative preflight result, not an absolute runtime guarantee. Custom model code, tokenizers, quantization kernels, model repository contents, and vLLM itself may still have runtime compatibility issues. Installation therefore includes three real acceptance gates: architecture verification in the pinned image, full model loading, and capability-aware API smoke tests. Failure at any gate stops the installation and disables autostart.
+
+Tool calling, reasoning, and OCR cannot be guaranteed merely because a model name suggests those capabilities. The scripts enable parameters only for recognized parser protocols. An unknown model may still be deployed as a regular text or image model, but LLMCtl does not claim capabilities it cannot verify.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `install-llm-cluster.sh` | Initial installation or model/topology reselection |
+| `llmctl.sh` | Installed as the global `/usr/local/sbin/llmctl` command |
+| `lib/model_catalog.py` | Hub search, capability detection, VRAM estimation, and deployment planning |
+| `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
+| `README.md` / `README_EN.md` | Chinese and English project overview |
+| `USAGE.md` / `USAGE_EN.md` | Chinese and English operations, API, and troubleshooting manual |
+
+## Defaults
+
+| Setting | Default |
+|---|---|
+| Model directory | `/data/llm-cluster/models` |
+| vLLM image | `vllm/vllm-openai:v0.22.1` |
+| LiteLLM image | `ghcr.io/berriai/litellm:v1.94.0` |
+| PostgreSQL | `postgres:16-alpine` |
+| API | `http://SERVER_IP:8000/v1` |
+| Web UI | `http://SERVER_IP:8000/ui` |
+| Administrator username | `admin` |
+| Initial shared password | `llm-admin` |
+| Routing strategy | `least-busy` |
+| GPU memory utilization | `0.92` |
+
+The initial web password intentionally remains a public shared default. It is not secure and must be changed immediately after installation:
+
+```bash
+sudo llmctl admin set-password
+```
+
+## Quick Start
+
+Copy the entire directory to the server, enter it, and run:
+
+```bash
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py
+sudo bash install-llm-cluster.sh
+```
+
+The interactive workflow asks you to:
+
+1. Search Hugging Face, ModelScope, both sources, or enter a model directly.
+2. Enter a search term and task type (text, vision, or auto).
+3. Select from models deployable on the local host.
+4. Select the model directory, defaulting to `/data/llm-cluster/models`.
+5. Accept or override the recommended TP, sequences per instance, active instance count, and startup parallelism.
+6. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
+
+Typical unattended ModelScope installation:
+
+```bash
+sudo bash install-llm-cluster.sh \
+  --yes \
+  --model-source modelscope \
+  --catalog-query Qwen3 \
+  --catalog-task text \
+  --model-root /data/llm-cluster/models
+```
+
+Specify an exact Hugging Face model. If no revision is supplied, LLMCtl resolves and pins the current commit SHA:
+
+```bash
+sudo bash install-llm-cluster.sh \
+  --yes \
+  --model-source huggingface \
+  --model-id Qwen/Qwen3-8B \
+  --proxy http://10.1.0.6:7890
+```
+
+Use the retained Ornith-compatible profile:
+
+```bash
+sudo bash install-llm-cluster.sh --yes --model-source validated \
+  --proxy http://10.1.0.6:7890
+```
+
+Reselecting a model recalculates TP, context length, and capability parameters while retaining downloaded models and the LiteLLM database:
+
+```bash
+sudo bash install-llm-cluster.sh --force-reconfigure
+```
+
+The general-purpose installer never overwrites a legacy `/etc/ornith` cluster automatically. If old services are detected, installation stops with instructions so that two worker sets cannot compete for the same GPUs and ports 8100–8107. An existing Ornith deployment can keep running. Do not migrate it until its configuration, models, and LiteLLM database have been backed up.
+
+Do not use `llmctl download` to switch directly to a different model. Different models may require different TP and parsers. The manager rejects this unsafe switch; use the installer's `--force-reconfigure` workflow instead.
+
+## Networking and Proxies
+
+A proxy is used only for installation, model downloads, or explicit maintenance commands. Before installation finishes, the script:
+
+1. Clears proxy variables from the current process.
+2. Removes Docker's temporary proxy drop-in.
+3. Restarts Docker so the temporary proxy is no longer effective.
+4. Starts vLLM with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
+
+Save a maintenance proxy:
+
+```bash
+sudo llmctl proxy set 10.1.0.6 7890 http
+sudo llmctl proxy test
+sudo llmctl proxy show
+sudo llmctl proxy clear
+```
+
+Private or gated Hugging Face models require `HF_TOKEN` when the installer runs, and you must accept the model license first. Private ModelScope models use `MODELSCOPE_API_TOKEN`. Tokens are not written to the cluster configuration.
+
+## Model Catalog Commands
+
+After installation, you can still inspect the hardware and browse candidate models:
+
+```bash
+sudo llmctl models hardware
+sudo llmctl models search Qwen3 --source all --task auto --limit 10
+sudo llmctl models search OCR --source modelscope --task vision
+sudo llmctl models inspect huggingface Qwen/Qwen3-8B
+sudo llmctl models current
+```
+
+A catalog plan such as `TP1×8 ctx=32768 seq=7` means eight independent workers with up to seven vLLM scheduling sequences per worker. It does not guarantee that every request can simultaneously occupy a 32K or 256K context. Longer requests and additional images increase KV cache pressure and reduce sustainable concurrency.
+
+For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
+
+## Service and Data Locations
+
+| Path or service | Contents |
+|---|---|
+| `/etc/llm-cluster/cluster.env` | Non-secret model, topology, and capability configuration |
+| `/etc/llm-cluster/secrets.env` | API key, database credentials, and web administration credentials (mode 0600) |
+| `/etc/llm-cluster/workers/*.env` | Worker-to-GPU mappings |
+| `/usr/local/lib/llm-cluster/model_catalog.py` | Installed model catalog helper |
+| `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
+| `/data/llm-cluster/models` | Default model root |
+| `llm-cluster.service` | Top-level oneshot service |
+| `llm-worker@N.service` | vLLM worker |
+| `llm-router.service` | LiteLLM API and UI |
+| `llm-database.service` | LiteLLM PostgreSQL database |
+
+## Security Notes
+
+- The API listens on `0.0.0.0:8000` by default and should be restricted to a trusted LAN with the host firewall. PostgreSQL listens only on `127.0.0.1`.
+- Model revisions are recorded in the manifest. Hugging Face defaults to a pinned commit; ModelScope defaults to `master`. For reproducible deployments, explicitly provide a tag or commit hash.
+- `--trust-remote-code` is enabled only when the model configuration declares `auto_map`. This still executes repository code, so select only reviewed models at pinned revisions.
+- External image domains are denied by default. OCR examples use base64 `data:` URLs to reduce SSRF exposure.
+- The scripts never upgrade images automatically. `llmctl update` pulls and validates images only when an administrator runs it explicitly.
+
+## Development Validation
+
+```bash
+bash -n install-llm-cluster.sh llmctl.sh
+python3 -m py_compile lib/model_catalog.py
+python3 -m unittest discover -s tests -v
+```
+
+Before a real release, also perform a complete installation on the target server, run `llmctl smoke --full`, and execute `llmctl bench` with the actual request distribution. Targets such as 40 tokens/s, 25 concurrent requests, or a 256K context cannot be promised from VRAM estimates alone. They must be benchmarked with the actual model, input lengths, image counts, and output lengths.

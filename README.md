@@ -1,5 +1,7 @@
 # LLMCtl：通用 vLLM 多 GPU 集群部署器
 
+**语言：** 中文 | [English](README_EN.md)
+
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)
 
 在 Ubuntu 24.04 裸机上，从 Hugging Face 或 ModelScope 搜索模型，按本机 NVIDIA GPU/显存保守筛选并规划拓扑，然后自动部署多个 vLLM Worker、LiteLLM 负载均衡和 Web 管理后台。
@@ -35,7 +37,8 @@
 | `llmctl.sh` | 安装为全局命令 `/usr/local/sbin/llmctl` |
 | `lib/model_catalog.py` | Hub 搜索、能力识别、显存估算和部署计划 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
-| `USAGE.md` | 日常使用、API 和故障排查手册 |
+| `README.md` / `README_EN.md` | 中英文项目说明 |
+| `USAGE.md` / `USAGE_EN.md` | 中英文日常使用、API 和故障排查手册 |
 
 ## 默认值
 

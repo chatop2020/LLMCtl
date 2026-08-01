@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.0.0"
+readonly INSTALLER_VERSION="2.0.1"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -93,10 +93,25 @@ CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
 CATALOG_RESULTS=""
+UNEXPECTED_ERROR_REPORTED=0
 
 log()  { printf '[install-llm] %s\n' "$*"; }
 warn() { printf '[install-llm] WARNING: %s\n' "$*" >&2; }
-die()  { printf '[install-llm] ERROR: %s\n' "$*" >&2; exit 1; }
+die()  {
+  UNEXPECTED_ERROR_REPORTED=1
+  printf '[install-llm] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+report_unexpected_error() {
+  local status="${1:-1}" line="${2:-unknown}"
+  (( UNEXPECTED_ERROR_REPORTED == 0 )) || return 0
+  UNEXPECTED_ERROR_REPORTED=1
+  printf '[install-llm] ERROR: 安装器在第 %s 行意外失败（退出码 %s）；已停止，未继续执行后续安装步骤。\n' \
+    "${line}" "${status}" >&2
+}
+
+trap 'report_unexpected_error "$?" "${LINENO}"' ERR
 
 usage() {
   cat <<'EOF'
@@ -261,12 +276,6 @@ EOF
   apply_catalog_selection "${CATALOG_RESULTS}" "${index:-1}"
 }
 
-catalog_args() {
-  local -n _args=$1
-  _args=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
-  (( MAX_LEN_EXPLICIT )) && _args+=(--max-model-len "${MAX_MODEL_LEN}")
-}
-
 run_catalog_with_retry() {
   local -a command=("$@")
   if python3 "${CATALOG_SOURCE}" "${command[@]}"; then return 0; fi
@@ -278,8 +287,10 @@ run_catalog_with_retry() {
 
 search_catalog() {
   local source="${1:-all}" query="${CATALOG_QUERY}" task="${CATALOG_TASK}"
-  local -a plan_args=()
-  catalog_args plan_args
+  local -a plan_args=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
+  if (( MAX_LEN_EXPLICIT )); then
+    plan_args+=(--max-model-len "${MAX_MODEL_LEN}")
+  fi
   [[ "${task}" =~ ^(auto|text|vision)$ ]] || die "catalog-task 只能是 auto、text 或 vision"
   CATALOG_RESULTS=$(mktemp /tmp/llm-catalog.XXXXXX.json)
   log "读取 ${source} 模型目录并按本机 GPU/显存规划，请稍候..."
@@ -321,8 +332,10 @@ apply_catalog_selection() {
 
 inspect_and_plan_model() {
   local assignments
-  local -a plan_args=()
-  catalog_args plan_args
+  local -a plan_args=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
+  if (( MAX_LEN_EXPLICIT )); then
+    plan_args+=(--max-model-len "${MAX_MODEL_LEN}")
+  fi
   assignments=$(mktemp /tmp/llm-plan.XXXXXX.env)
   if ! run_catalog_with_retry inspect "${MODEL_HUB}" "${MODEL_ID}" ${MODEL_REVISION:+"${MODEL_REVISION}"} \
     --shell "${plan_args[@]}" >"${assignments}"; then
