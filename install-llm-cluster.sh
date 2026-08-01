@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.1.0"
+readonly INSTALLER_VERSION="2.1.1"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -1587,7 +1587,7 @@ EOF
     if ! /usr/local/sbin/llmctl health || ! /usr/local/sbin/llmctl smoke --full; then
       systemctl disable llm-cluster.service 2>/dev/null || true
       /usr/local/sbin/llmctl shutdown --timeout 180 || true
-      die "$(l10n '部署验收失败；服务已停止且取消自启，请检查 llmctl logs' 'Deployment acceptance checks failed; services were stopped and boot activation disabled. Inspect llmctl logs.')"
+      die "$(l10n '部署验收失败；服务已停止且取消自启。请运行 llmctl logs、llmctl logs worker 0，并查看错误中给出的诊断 JSON' 'Deployment acceptance checks failed; services were stopped and boot activation disabled. Run llmctl logs, llmctl logs worker 0, and inspect the diagnostic JSON named in the error.')"
     fi
   fi
   print_summary

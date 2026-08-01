@@ -40,6 +40,8 @@ sudo llmctl logs worker 0 -f
 nvidia-smi
 ```
 
+`sudo llmctl logs` aggregates the router, database, and all active workers by default. Use `llmctl logs router`, `llmctl logs database`, or `llmctl logs worker 0` to narrow the view. When a capability smoke test fails, the response summary reports `finish_reason` and field lengths; the complete fixed-test response is stored root-only under `/var/lib/llm-cluster/diagnostics/smoke` to distinguish length truncation, protocol parsing, and an incorrect model answer.
+
 If the top-level unit shows `active (exited)` or `Finished llm-cluster.service`, that is the expected `oneshot + RemainAfterExit` state. The actual inference processes run in `llm-worker@N.service` units.
 
 ## Worker Management

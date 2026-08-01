@@ -5,9 +5,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.1.0"
+readonly CTL_VERSION="2.1.1"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
-readonly STATE_DIR="/var/lib/llm-cluster"
+readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
 readonly RETAINED_SECRETS="${STATE_DIR}/retained-secrets.env"
 readonly CLUSTER_ENV="${CONFIG_DIR}/cluster.env"
@@ -18,6 +18,7 @@ readonly DOCKER_PROXY_DROPIN="/etc/systemd/system/docker.service.d/90-llm-cluste
 readonly CATALOG_HELPER="${LLM_CATALOG_HELPER:-/usr/local/lib/llm-cluster/model_catalog.py}"
 readonly OPTIMIZER_HELPER="${LLM_OPTIMIZER_HELPER:-/usr/local/lib/llm-cluster/runtime_optimizer.py}"
 readonly OPTIMIZATION_DIR="${STATE_DIR}/optimization"
+readonly SMOKE_DIAGNOSTIC_DIR="${STATE_DIR}/diagnostics/smoke"
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
@@ -174,6 +175,7 @@ usage() {
   llmctl database <start|stop|restart|status>  管理 LiteLLM PostgreSQL
   llmctl timezone show|set [时区]              查看或设置系统时区（默认 Asia/Shanghai）
 
+  llmctl logs [all] [-f]                      全部组件日志（默认）
   llmctl logs worker <ID> [-f]                Worker 日志
   llmctl logs router [-f]                     LiteLLM 日志
   llmctl logs database [-f]                   PostgreSQL 日志
@@ -892,8 +894,19 @@ cmd_database() {
 
 cmd_logs() {
   load_config
-  local target="${1:-}" id follow=""
+  local target="${1:-all}" id follow=""
+  local -a journal_args=()
+  if [[ "${target}" == -f ]]; then target=all; follow=-f; fi
   case "${target}" in
+    all)
+      [[ "${2:-}" == "-f" ]] && follow="-f"
+      journal_args=(journalctl -u llm-router.service -u llm-database.service)
+      IFS=',' read -r -a log_worker_ids <<<"${ACTIVE_WORKERS}"
+      for id in "${log_worker_ids[@]}"; do journal_args+=(-u "$(worker_unit "${id}")"); done
+      [[ -z "${follow}" ]] || journal_args+=("${follow}")
+      journal_args+=(-n 400 --no-pager)
+      "${journal_args[@]}"
+      ;;
     worker)
       id="${2:?请指定 Worker ID}"
       csv_normalize "${id}" >/dev/null
@@ -908,7 +921,7 @@ cmd_logs() {
       [[ "${2:-}" == "-f" ]] && follow="-f"
       journalctl -u llm-database.service ${follow} -n 200 --no-pager
       ;;
-    *) die "用法：llmctl logs worker <ID> [-f] | logs router [-f] | logs database [-f]" ;;
+    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f]" ;;
   esac
 }
 
@@ -918,6 +931,42 @@ api_post() {
     -H "Authorization: Bearer ${key}" \
     -H 'Content-Type: application/json' \
     --data-binary "@${payload}" "${url}"
+}
+
+smoke_response_summary() {
+  local response="${1:-}"
+  [[ -n "${response}" ]] || response='{}'
+  jq -c '{finish_reason:(.choices[0].finish_reason // null),
+          stop_reason:(.choices[0].stop_reason // null),
+          content_chars:((.choices[0].message.content // "") | length),
+          reasoning_chars:((.choices[0].message.reasoning_content // .choices[0].message.reasoning // "") | length),
+          tool_calls:((.choices[0].message.tool_calls // []) | length),
+          error:(.error.message // null)}' <<<"${response}" 2>/dev/null || printf '%s' '{"invalid_json":true}'
+}
+
+smoke_save_response() {
+  local stage="${1:?}" response="${2:-}" timestamp destination tmp
+  [[ -n "${response}" ]] || response='{}'
+  [[ "${stage}" =~ ^[a-z0-9-]+$ ]] || stage=unknown
+  install -d -m 700 "${SMOKE_DIAGNOSTIC_DIR}"
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  destination="${SMOKE_DIAGNOSTIC_DIR}/${timestamp}-${stage}.json"
+  tmp=$(mktemp "${SMOKE_DIAGNOSTIC_DIR}/.response.XXXXXX")
+  if ! jq . <<<"${response}" >"${tmp}" 2>/dev/null; then
+    jq -n --arg raw "${response}" '{invalid_json:true,raw:$raw}' >"${tmp}"
+  fi
+  chmod 600 "${tmp}"
+  mv -f "${tmp}" "${destination}"
+  ln -sfn "$(basename "${destination}")" "${SMOKE_DIAGNOSTIC_DIR}/latest-${stage}.json"
+  printf '%s\n' "${destination}"
+}
+
+smoke_fail_response() {
+  local stage="${1:?}" reason="${2:?}" response="${3:-}" diagnostic summary
+  [[ -n "${response}" ]] || response='{}'
+  diagnostic=$(smoke_save_response "${stage}" "${response}")
+  summary=$(smoke_response_summary "${response}")
+  die "${reason}；响应摘要=${summary}；完整响应=${diagnostic}"
 }
 
 make_ocr_fixture() {
@@ -950,7 +999,7 @@ ocr_request_file() {
   base64 -w 0 "${image_file}" >"${b64_file}"
   jq -n --rawfile b64 "${b64_file}" --arg mime "${mime}" --arg prompt "${prompt}" --arg model "${SERVED_MODEL_NAME}" '
     {model:$model, max_tokens:512, temperature:0,
-     reasoning_effort:"none",
+     reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false},
      messages:[{role:"user",content:[
        {type:"image_url",image_url:{url:("data:"+$mime+";base64,"+$b64)}},
        {type:"text",text:$prompt}
@@ -959,7 +1008,8 @@ ocr_request_file() {
 }
 
 smoke_endpoint() {
-  local base_url="${1:?}" key="${2:?}" full="${3:-0}" tmp response content reasoning tool tmp_dir ocr_json six_images_json
+  local base_url="${1:?}" key="${2:?}" full="${3:-0}" tmp response content reasoning tool finish_reason
+  local tmp_dir ocr_json six_images_json reasoning_limit diagnostic
   tmp=$(mktemp)
   trap 'rm -f "${tmp:-}" "${ocr_json:-}" "${six_images_json:-}"; [[ -z "${tmp_dir:-}" ]] || rm -rf "${tmp_dir}"' RETURN
 
@@ -968,29 +1018,44 @@ smoke_endpoint() {
     {model:$model,max_tokens:64,temperature:0,messages:[{role:"user",content:"只输出 LLM_OK，不要输出其他内容。"}]} +
     (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${tmp}"
   response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "文本冒烟测试请求失败"
+  jq -e '.choices[0].message | type == "object"' <<<"${response}" >/dev/null 2>&1 || smoke_fail_response text "文本测试响应结构无效" "${response}"
   content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
-  [[ "${content}" == *LLM_OK* ]] || die "文本语义测试失败，模型可能输出异常：${content:0:200}"
+  [[ "${content}" == *LLM_OK* ]] || smoke_fail_response text "文本语义测试失败，模型未返回 LLM_OK" "${response}"
   reasoning=$(jq -r '.choices[0].message.reasoning_content // .choices[0].message.reasoning // ""' <<<"${response}")
-  (( SUPPORTS_THINKING_TOGGLE == 0 )) || [[ -z "${reasoning}" ]] || die "请求级思考开关未关闭 reasoning 输出"
+  (( SUPPORTS_THINKING_TOGGLE == 0 )) || [[ -z "${reasoning}" ]] || smoke_fail_response text-toggle "请求级思考开关未关闭 reasoning 输出" "${response}"
   log "文本生成$([[ ${SUPPORTS_THINKING_TOGGLE} -eq 1 ]] && printf '与请求级思考关闭' || true)：PASS"
 
   if (( SUPPORTS_REASONING == 1 )); then
     log "开始思考解析冒烟测试..."
-    jq -n --arg model "${SERVED_MODEL_NAME}" '{model:$model,max_tokens:256,temperature:0,messages:[{role:"user",content:"请认真计算 17×19，并给出答案。"}]}' >"${tmp}"
-    response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "思考测试请求失败"
+    for reasoning_limit in 2048 4096; do
+      jq -n --arg model "${SERVED_MODEL_NAME}" --argjson max_tokens "${reasoning_limit}" \
+        '{model:$model,max_tokens:$max_tokens,temperature:0.6,top_p:0.95,top_k:20,
+          messages:[{role:"user",content:"请简短思考并计算 17×19，随后给出包含计算结果的最终答案。"}]}' >"${tmp}"
+      response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "思考测试请求失败"
+      jq -e '.choices[0].message | type == "object"' <<<"${response}" >/dev/null 2>&1 || smoke_fail_response reasoning "思考测试响应结构无效" "${response}"
+      finish_reason=$(jq -r '.choices[0].finish_reason // ""' <<<"${response}")
+      if [[ "${finish_reason}" != length ]]; then break; fi
+      diagnostic=$(smoke_save_response "reasoning-truncated-${reasoning_limit}" "${response}")
+      warn "思考测试在 ${reasoning_limit} token 达到长度上限；响应已保存至 ${diagnostic}。$([[ ${reasoning_limit} -eq 2048 ]] && printf ' 将以 4096 token 重试一次。' || true)"
+    done
     content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
     reasoning=$(jq -r '.choices[0].message.reasoning_content // .choices[0].message.reasoning // ""' <<<"${response}")
-    [[ "${content}" == *323* ]] || die "思考测试答案异常：${content:0:200}"
-    [[ -n "${reasoning}" ]] || die "未检测到独立 reasoning_content/reasoning 字段"
+    [[ "${finish_reason}" != length ]] || smoke_fail_response reasoning "思考生成在 4096 token 后仍因长度截断，不能证明完整推理能力" "${response}"
+    [[ -n "${reasoning}" ]] || smoke_fail_response reasoning "未检测到独立 reasoning_content/reasoning 字段" "${response}"
+    [[ -n "${content}" ]] || smoke_fail_response reasoning "思考已解析，但没有独立的最终答案 content" "${response}"
+    [[ "${content}" == *323* ]] || smoke_fail_response reasoning "最终答案未包含正确结果 323" "${response}"
     log "默认思考并独立解析：PASS"
   fi
 
   if (( SUPPORTS_TOOL_CALLING == 1 )); then
     log "开始 OpenAI 工具调用冒烟测试..."
-    jq -n --arg model "${SERVED_MODEL_NAME}" '{model:$model,max_tokens:256,temperature:0,messages:[{role:"user",content:"必须调用 get_weather 查询 Paris。"}],tools:[{type:"function",function:{name:"get_weather",description:"查询城市天气",parameters:{type:"object",properties:{city:{type:"string"}},required:["city"]}}}],tool_choice:"required"}' >"${tmp}"
+    jq -n --arg model "${SERVED_MODEL_NAME}" '{model:$model,max_tokens:512,temperature:0,
+      reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false},
+      messages:[{role:"user",content:"必须调用 get_weather 查询 Paris。"}],
+      tools:[{type:"function",function:{name:"get_weather",description:"查询城市天气",parameters:{type:"object",properties:{city:{type:"string"}},required:["city"]}}}],tool_choice:"required"}' >"${tmp}"
     response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "工具调用测试请求失败"
     tool=$(jq -r '.choices[0].message.tool_calls[0].function.name // ""' <<<"${response}")
-    [[ "${tool}" == get_weather ]] || die "工具调用解析失败：$(jq -c '.choices[0].message' <<<"${response}" | head -c 300)"
+    [[ "${tool}" == get_weather ]] || smoke_fail_response tool-calling "工具调用未解析为 get_weather" "${response}"
     log "OpenAI 工具调用：PASS"
   fi
 
@@ -1003,10 +1068,10 @@ smoke_endpoint() {
     response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${ocr_json}") || die "图片输入测试请求失败"
     content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
     if (( SUPPORTS_OCR == 1 )); then
-      [[ "${content}" == *7319* ]] || die "OCR 语义测试失败：${content:0:200}"
+      [[ "${content}" == *7319* ]] || smoke_fail_response ocr "OCR 语义测试未识别出 7319" "${response}"
       log "视觉/OCR：PASS"
     else
-      [[ -n "${content}" ]] || die "图片输入测试返回空内容"
+      [[ -n "${content}" ]] || smoke_fail_response image "图片输入测试返回空内容" "${response}"
       log "图片输入：PASS（模型未标记为 OCR 优化，不强制识别准确率）"
     fi
     local data_url
@@ -1020,7 +1085,7 @@ smoke_endpoint() {
        (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${six_images_json}"
     response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${six_images_json}") || die "单请求 6 图测试失败"
     content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
-    [[ -n "${content}" ]] || die "单请求 6 图返回空内容"
+    [[ -n "${content}" ]] || smoke_fail_response six-images "单请求 6 图返回空内容" "${response}"
     log "单请求 6 张图片：PASS"
   elif [[ "${full}" == 1 ]]; then
     log "当前模型不支持图片输入，跳过 OCR/6 图测试。"
@@ -1104,6 +1169,7 @@ def one(index):
         "max_tokens": max_tokens,
         "temperature": 0.7,
         "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
         "messages": [{"role": "user", "content":
             "连续写一篇关于分布式系统的技术短文，内容尽量充实，在达到输出上限前不要提前结束。"}],
     }
@@ -1197,7 +1263,7 @@ optimizer_choose_workload() {
 }
 
 optimizer_preflight() {
-  [[ -r "${OPTIMIZER_HELPER}" ]] || die "$(ctl_l10n "缺少 ${OPTIMIZER_HELPER}；请使用完整 2.1.0 安装包重新安装 llmctl" "Missing ${OPTIMIZER_HELPER}; reinstall llmctl from the complete 2.1.0 package")"
+  [[ -r "${OPTIMIZER_HELPER}" ]] || die "$(ctl_l10n "缺少 ${OPTIMIZER_HELPER}；请使用完整且同版本的安装包重新安装 llmctl" "Missing ${OPTIMIZER_HELPER}; reinstall llmctl from a complete matching-version package")"
   command -v python3 >/dev/null 2>&1 || die "python3 missing"
   command -v jq >/dev/null 2>&1 || die "jq missing"
   command -v flock >/dev/null 2>&1 || die "flock missing"

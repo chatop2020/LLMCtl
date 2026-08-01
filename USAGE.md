@@ -40,6 +40,8 @@ sudo llmctl logs worker 0 -f
 nvidia-smi
 ```
 
+`sudo llmctl logs` 默认汇总 Router、数据库和全部激活 Worker；也可使用 `llmctl logs router`、`llmctl logs database` 或 `llmctl logs worker 0` 精确查看。能力冒烟失败时，响应摘要会显示 `finish_reason` 与各字段长度，完整固定测试响应保存在 root-only 的 `/var/lib/llm-cluster/diagnostics/smoke`，用于区分长度截断、协议解析和模型答案错误。
+
 若总控显示 `active (exited)` 或 `Finished llm-cluster.service`，这是正常的 `oneshot + RemainAfterExit` 状态；真正的推理进程位于 `llm-worker@N.service`。
 
 ## Worker 管理

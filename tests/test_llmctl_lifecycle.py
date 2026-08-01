@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -30,6 +31,81 @@ def run_bash(body: str) -> str:
 
 
 class LlmctlLifecycleTests(unittest.TestCase):
+    def test_default_logs_aggregate_router_database_and_active_workers(self):
+        output = run_bash(
+            r"""
+            load_config() { ACTIVE_WORKERS=0,1; }
+            journalctl() { printf '%s\n' "$*"; }
+            cmd_logs
+            """
+        )
+        arguments = output.splitlines()
+        self.assertIn("llm-router.service", arguments)
+        self.assertIn("llm-database.service", arguments)
+        self.assertIn("llm-worker@0.service", arguments)
+        self.assertIn("llm-worker@1.service", arguments)
+
+    def test_reasoning_smoke_uses_model_sampling_and_requires_separate_answer(self):
+        output = run_bash(
+            r"""
+            SERVED_MODEL_NAME=test-model
+            SUPPORTS_THINKING_TOGGLE=1
+            SUPPORTS_REASONING=1
+            SUPPORTS_TOOL_CALLING=0
+            SUPPORTS_IMAGE_INPUT=0
+            api_post() {
+              if jq -e '.reasoning_effort == "none"' "$3" >/dev/null; then
+                printf '%s\n' '{"choices":[{"finish_reason":"stop","message":{"content":"LLM_OK","reasoning":null}}]}'
+              else
+                jq -e '.max_tokens == 2048 and .temperature == 0.6 and .top_p == 0.95 and .top_k == 20' "$3" >/dev/null
+                printf '%s\n' '{"choices":[{"finish_reason":"stop","message":{"content":"323","reasoning":"17 times 19"}}]}'
+              fi
+            }
+            smoke_endpoint http://127.0.0.1:1 key 0
+            """
+        )
+        self.assertIn("默认思考并独立解析：PASS", output)
+
+    def test_truncated_reasoning_retries_and_writes_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                SERVED_MODEL_NAME=test-model
+                SUPPORTS_THINKING_TOGGLE=1
+                SUPPORTS_REASONING=1
+                SUPPORTS_TOOL_CALLING=0
+                SUPPORTS_IMAGE_INPUT=0
+                api_post() {{
+                  if jq -e '.reasoning_effort == "none"' "$3" >/dev/null; then
+                    printf '%s\\n' '{{"choices":[{{"finish_reason":"stop","message":{{"content":"LLM_OK","reasoning":null}}}}]}}'
+                  else
+                    printf '%s\\n' '{{"choices":[{{"finish_reason":"length","message":{{"content":null,"reasoning":"17 times 19 is 323"}}}}]}}'
+                  fi
+                }}
+                smoke_endpoint http://127.0.0.1:1 key 0
+                """
+            )
+            environment = os.environ.copy()
+            environment["LLM_CLUSTER_STATE_DIR"] = directory
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=False,
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            diagnostics = list((pathlib.Path(directory) / "diagnostics" / "smoke").glob("*.json"))
+            diagnostic_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in diagnostics]
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("2048 token", completed.stderr)
+        self.assertIn("4096 token", completed.stderr)
+        self.assertIn('"finish_reason":"length"', completed.stderr)
+        self.assertGreaterEqual(len(diagnostics), 3)
+        self.assertTrue(all("choices" in payload for payload in diagnostic_payloads))
+
     def test_optimizer_workload_is_bounded_by_active_scheduling_slots(self):
         output = run_bash(
             r"""

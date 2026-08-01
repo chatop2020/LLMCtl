@@ -23,6 +23,18 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("SUPPORTS_TOOL_CALLING == 1", MANAGER)
         self.assertIn("SUPPORTS_REASONING == 1", MANAGER)
 
+    def test_smoke_diagnostics_and_default_aggregate_logs_are_operational(self):
+        smoke = MANAGER.split("smoke_endpoint() {", 1)[1].split("cmd_smoke() {", 1)[0]
+        logs = MANAGER.split("cmd_logs() {", 1)[1].split("api_post() {", 1)[0]
+        self.assertIn("for reasoning_limit in 2048 4096", smoke)
+        self.assertIn("temperature:0.6,top_p:0.95,top_k:20", smoke)
+        self.assertIn("finish_reason", smoke)
+        self.assertIn("smoke_fail_response", smoke)
+        self.assertIn('local target="${1:-all}"', logs)
+        self.assertIn("llm-router.service", logs)
+        self.assertIn("llm-database.service", logs)
+        self.assertNotIn("请检查 llmctl logs'", INSTALLER)
+
     def test_catalog_metadata_is_persisted(self):
         for key in (
             "MODEL_HUB",
