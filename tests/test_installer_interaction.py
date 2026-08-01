@@ -21,6 +21,22 @@ def installer_script(body: str) -> str:
 
 
 class InstallerInteractionTests(unittest.TestCase):
+    def test_modelscope_downloader_path_is_not_captured_with_install_logs(self):
+        installer = INSTALLER.read_text(encoding="utf-8")
+        download = installer.split("ensure_modelscope_downloader() {", 1)[1].split(
+            "validate_downloaded_model() {", 1
+        )[0]
+        model_download = installer.split("download_model() {", 1)[1].split(
+            "make_active_workers() {", 1
+        )[0]
+        self.assertIn(
+            'MODELSCOPE_DOWNLOADER="${venv}/bin/ms-hub"', download
+        )
+        self.assertNotIn("printf '%s\\n'", download)
+        self.assertIn("ensure_modelscope_downloader", model_download)
+        self.assertIn('"${MODELSCOPE_DOWNLOADER}" download', model_download)
+        self.assertNotIn("$(ensure_modelscope_downloader)", model_download)
+
     def test_interactive_modelscope_search_accepts_default_auto_task(self):
         completed = subprocess.run(
             [

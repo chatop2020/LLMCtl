@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.0.2"
+readonly CTL_VERSION="2.0.3"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="/var/lib/llm-cluster"
 readonly CACHE_DIR="${STATE_DIR}/cache"

@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.0.2"
+readonly INSTALLER_VERSION="2.0.3"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -96,6 +96,7 @@ CATALOG_TASK="auto"
 CATALOG_LIMIT=10
 CATALOG_RESULTS=""
 HOST_PROFILE_JSON=""
+MODELSCOPE_DOWNLOADER=""
 UNEXPECTED_ERROR_REPORTED=0
 
 log()  { printf '[install-llm] %s\n' "$*"; }
@@ -1026,12 +1027,13 @@ print(arch)
 
 ensure_modelscope_downloader() {
   local venv="/opt/llm-cluster/hub-venv"
+  MODELSCOPE_DOWNLOADER="${venv}/bin/ms-hub"
   if [[ ! -x "${venv}/bin/ms-hub" ]]; then
-    log "$(l10n '在独立维护环境安装 ModelScope 下载器 modelscope-hub==0.1.8...' 'Installing modelscope-hub==0.1.8 in an isolated maintenance environment...')" >&2
+    log "$(l10n '在独立维护环境安装 ModelScope 下载器 modelscope-hub==0.1.8...' 'Installing modelscope-hub==0.1.8 in an isolated maintenance environment...')"
     python3 -m venv "${venv}" || die "$(l10n "无法创建 ${venv}；请安装 python3-venv" "Could not create ${venv}; install python3-venv")"
     "${venv}/bin/pip" install --disable-pip-version-check "modelscope-hub==0.1.8" || die "$(l10n 'ModelScope 下载器安装失败' 'ModelScope downloader installation failed')"
   fi
-  printf '%s\n' "${venv}/bin/ms-hub"
+  [[ -x "${MODELSCOPE_DOWNLOADER}" ]] || die "$(l10n "ModelScope 下载器不可执行：${MODELSCOPE_DOWNLOADER}" "ModelScope downloader is not executable: ${MODELSCOPE_DOWNLOADER}")"
 }
 
 validate_downloaded_model() {
@@ -1111,9 +1113,8 @@ snapshot_download(
 )
 ' || die "$(l10n "Hugging Face 下载失败；${partial} 已保留，下次可续传" "Hugging Face download failed; ${partial} was retained for a later resume")"
     else
-      local ms_hub
-      ms_hub=$(ensure_modelscope_downloader)
-      "${ms_hub}" download "${MODEL_ID}" --revision "${MODEL_REVISION}" \
+      ensure_modelscope_downloader
+      "${MODELSCOPE_DOWNLOADER}" download "${MODEL_ID}" --revision "${MODEL_REVISION}" \
         --local-dir "${partial}" --max-workers 8 || \
         die "$(l10n "ModelScope 下载失败；${partial} 已保留，下次可续传" "ModelScope download failed; ${partial} was retained for a later resume")"
     fi
