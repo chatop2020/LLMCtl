@@ -375,6 +375,50 @@ class LlmctlLifecycleTests(unittest.TestCase):
         )
         self.assertIn("shutdown --timeout 180", install_acceptance)
 
+    def test_omniroute_password_rotation_updates_portal_then_gateway(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = pathlib.Path(directory)
+            secrets_file = config_dir / "secrets.env"
+            secrets_file.write_text(
+                "UI_PASSWORD=OldPassword123\nACCOUNT_ADMIN_PASSWORD=OldPassword123\n",
+                encoding="utf-8",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_CONFIG_DIR={config_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                require_root() {{ :; }}
+                load_config() {{
+                  GATEWAY_KIND=omniroute
+                  UI_PASSWORD=OldPassword123
+                  ACCOUNT_ADMIN_PASSWORD=OldPassword123
+                  ACCOUNT_DB_PATH={directory!s}/account-portal.db
+                }}
+                account_helper() {{ printf 'portal <%s>\n' "$ACCOUNT_ADMIN_PASSWORD"; }}
+                gateway_helper() {{
+                  printf 'gateway <%s>\n' "$LLMCTL_NEW_PASSWORD"
+                  printf 'UI_PASSWORD=%s\nACCOUNT_ADMIN_PASSWORD=%s\n' \
+                    "$LLMCTL_NEW_PASSWORD" "$LLMCTL_NEW_PASSWORD" >"$SECRETS_ENV"
+                }}
+                router_local_base_url() {{ printf 'http://127.0.0.1:8000\n'; }}
+                systemctl() {{ printf 'systemctl <%s> <%s>\n' "$1" "$2"; }}
+                wait_account_portal() {{ printf 'portal-ready\n'; }}
+                cmd_admin set-password NewPassword456
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        lines = completed.stdout.splitlines()
+        self.assertLess(lines.index("portal <NewPassword456>"), lines.index("gateway <NewPassword456>"))
+        self.assertIn("systemctl <restart> <llm-account.service>", lines)
+        self.assertIn("portal-ready", lines)
+
 
 if __name__ == "__main__":
     unittest.main()

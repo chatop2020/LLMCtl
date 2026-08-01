@@ -19,7 +19,7 @@ sudo llmctl admin set-password
 sudo llmctl timezone set Asia/Shanghai
 ```
 
-Web 管理界面地址由接入层决定：New API 和 Bifrost 为 `http://服务器IP:8000/`，LiteLLM 为 `http://服务器IP:8000/ui`。管理员用户名默认 `admin`，初始通用密码 `llm-admin`。凭据写在 root-only 的 `/etc/llm-cluster/secrets.env`，也可用 `sudo llmctl admin show` 查看。首次登录后请修改。
+Web 管理界面地址由接入层决定：New API、Bifrost 和 OmniRoute 为 `http://服务器IP:8000/`，LiteLLM 为 `http://服务器IP:8000/ui`。管理员用户名默认 `admin`。OmniRoute 未显式传入密码时生成强随机密码；其他接入层初始密码为 `llm-admin`。凭据写在 root-only 的 `/etc/llm-cluster/secrets.env`，也可用 `sudo llmctl admin show` 查看。
 
 全新安装时选择接入层；默认 New API，也可显式指定：
 
@@ -27,9 +27,10 @@ Web 管理界面地址由接入层决定：New API 和 Bifrost 为 `http://服�
 sudo bash install-llm-cluster.sh --gateway newapi
 sudo bash install-llm-cluster.sh --gateway litellm
 sudo bash install-llm-cluster.sh --gateway bifrost
+sudo bash install-llm-cluster.sh --gateway omniroute
 ```
 
-安装器只拉取所选接入层。若精确镜像已经存在于本机，直接复用；模型身份、revision、架构、完整性和大小全部匹配时也跳过权重下载。三种接入层统一使用 root-only 的 `GATEWAY_API_KEY`，且不做在线迁移。
+安装器只拉取所选接入层。若精确镜像已经存在于本机，直接复用；模型身份、revision、架构、完整性和大小全部匹配时也跳过权重下载。四种接入层统一维护 root-only 的 `GATEWAY_API_KEY`，且不做在线迁移。
 
 ## SSH 断开或安装窗口看起来不动
 
@@ -103,7 +104,7 @@ sudo llmctl router restart
 sudo llmctl database status
 ```
 
-`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 还会自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限。
+`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限；OmniRoute 自动创建每 Worker 一个 Provider 节点及一个等权 Combo，并同步模型元信息和维护 key。
 
 这些路由都不会直接读取单个请求将占用的 GPU 显存、KV Cache 或图片大小。长上下文和多图请求仍可能造成瞬时不均；用真实业务分布运行 `llmctl bench` 和 `llmctl optimize analyze` 后再调优。
 
@@ -117,7 +118,51 @@ sudo llmctl admin set-username NEW_ADMIN
 sudo llmctl admin set-password
 ```
 
-New API 的调用令牌由其数据库生成，所以 `key rotate` 不接受自定义值；LiteLLM 和 Bifrost 可选传入新值，Bifrost 值必须以 `sk-bf-` 开头。
+New API 和 OmniRoute 的维护调用令牌由各自数据库生成，所以 `key rotate` 不接受自定义值；LiteLLM 和 Bifrost 可选传入新值，Bifrost 值必须以 `sk-bf-` 开头。OmniRoute 普通用户自己的 key 应在账户门户内轮换，不受这个管理员命令影响。
+
+### OmniRoute 企业账户门户
+
+OmniRoute 自身没有 SMTP 注册流程。LLMCtl 因此在它前面部署独立的 `llm-account.service`，调用 OmniRoute 的管理接口创建用户 key 和 token 限额。两者使用同一状态目录但绝不混表：
+
+```text
+/var/lib/llm-cluster/omniroute/gateway/storage.sqlite
+/var/lib/llm-cluster/omniroute/portal/account-portal.db
+```
+
+第一项完全归 OmniRoute 管理，第二项只存门户用户、验证状态、额度策略、会话和门户审计。门户数据库不保存明文 API key；用户验证邮箱后只显示一次新 key，之后只能轮换。OmniRoute 继续记录实际请求和 token 用量，因此“账户操作审计”和“推理调用审计”分别在两个界面查看。
+
+默认关闭公开注册。启用时必须配置精确邮箱域名白名单、公开门户地址和外部 SMTP。例如：
+
+```bash
+sudo bash install-llm-cluster.sh \
+  --gateway omniroute \
+  --registration enabled \
+  --allowed-email-domains example.com,subsidiary.example.com \
+  --account-public-url https://llm.example.com \
+  --account-api-public-url https://llm-api.example.com \
+  --account-admin-email llm-admin@example.com \
+  --account-default-quota 1000000 \
+  --account-quota-reset monthly \
+  --smtp-host smtp.example.com \
+  --smtp-port 587 \
+  --smtp-security starttls \
+  --smtp-username llm@example.com \
+  --smtp-password APP_PASSWORD \
+  --smtp-from llm@example.com
+```
+
+白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查。门户管理员可在设置页关闭/开启注册、调整白名单和新用户默认额度，也可为已有用户修改额度、重置周期或停用账户。支持 `daily`、`weekly`、`monthly` 周期，额度由 OmniRoute token-limit 执行和重置。
+
+```bash
+sudo llmctl account status
+sudo llmctl account url
+sudo llmctl account restart
+sudo llmctl logs account -f
+```
+
+门户默认是 `http://服务器IP:8001/`。用户登录后可查看当前用量和重置时间；模型页实时读取 OmniRoute `/v1/models`，显示并可复制模型 ID、具体 `/v1` 地址和可直接执行的 `curl` 示例。OCR/视觉/工具等标签来自安装时已核验的模型能力元数据，不改变 vLLM 的实际能力。
+
+生产环境应把端口 8001 和 8000 放在 HTTPS 反向代理之后；`--account-public-url` 与 `--account-api-public-url` 要填写用户真正访问的无路径 origin。SMTP 密码和管理 key 只存在 root-only 的 `secrets.env`，不要写入命令历史；无人值守部署更适合通过受限环境或临时参数文件注入。
 
 ## OpenAI 兼容 API
 
@@ -282,7 +327,7 @@ sudo llmctl offline export /data/offline/llm-bundle
 sudo llmctl offline import /data/offline/llm-bundle
 ```
 
-离线包包含当前选择的接入层类型与镜像；不能把 New API 离线包直接导入 LiteLLM/Bifrost 规划。
+离线包包含当前选择的接入层类型与镜像；不能在 New API、LiteLLM、Bifrost、OmniRoute 规划之间混用。OmniRoute 包不需要 PostgreSQL 镜像。
 
 ## 日志
 
@@ -299,10 +344,11 @@ journalctl -u llm-cluster.service -n 300 --no-pager
 - Worker 显存停止增长且日志长期无变化：查看是否在编译 CUDA Graph、CPU 内存/磁盘是否饱和，以及服务是否仍 active。
 - Worker 退出：日志末尾通常会给出 OOM、架构、量化内核或模型代码错误。
 - 接入层不健康但 Worker 健康：检查 `llm-router` 和 `llm-database` 日志。New API 自动配置失败时，Router 日志之后还会在 `llm-cluster.service` 日志中显示具体的 setup/login/channel/token 错误。
+- OmniRoute 健康但门户不可用：运行 `llmctl account status`、`llmctl logs account`。邮件收不到时重点检查 SMTP 主机、TLS 模式、发件地址和垃圾邮件策略；门户不会绕过邮箱验证直接发 key。
 
 ## 卸载
 
-默认保留模型、接入层 PostgreSQL/本地状态卷和 root-only 恢复凭据：
+默认保留模型、接入层 PostgreSQL/SQLite 本地状态和 root-only 恢复凭据：
 
 ```bash
 sudo llmctl uninstall
@@ -316,4 +362,6 @@ sudo llmctl uninstall
 sudo llmctl uninstall --purge-model --purge-images --purge-database
 ```
 
-`--purge-model` 只有在模型目录存在安装器标记时才允许执行；`--purge-database` 会永久删除 Web UI 数据、虚拟 key、New API/Bifrost 本地状态和管理记录。只想保留现有权重时不要使用 `--purge-model`。
+`--purge-model` 只有在模型目录存在安装器标记时才允许执行；`--purge-database` 会永久删除 Web UI 数据、虚拟 key、New API/Bifrost 状态，以及 OmniRoute 的两个独立 SQLite 文件和账户审计。只想保留现有权重时不要使用 `--purge-model`。
+
+备份 OmniRoute 时应同时备份 `gateway/storage.sqlite` 和 `portal/account-portal.db`。最简单且一致的方式是短暂停止门户和网关，复制两个文件后再启动；只备份其中一个可能导致门户用户与 OmniRoute key/限额无法对应。

@@ -21,8 +21,13 @@ def installer_script(body: str) -> str:
 
 
 class InstallerInteractionTests(unittest.TestCase):
-    def test_gateway_selection_defaults_to_newapi_and_supports_all_three_choices(self):
-        for answer, expected in (("\n", "newapi"), ("2\n", "litellm"), ("3\n", "bifrost")):
+    def test_gateway_selection_defaults_to_newapi_and_supports_all_four_choices(self):
+        for answer, expected in (
+            ("\n", "newapi"),
+            ("2\n", "litellm"),
+            ("3\n", "bifrost"),
+            ("4\n", "omniroute"),
+        ):
             with self.subTest(answer=answer):
                 completed = subprocess.run(
                     [
@@ -38,6 +43,30 @@ class InstallerInteractionTests(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn(f"gateway={expected}", completed.stdout)
+
+    def test_omniroute_generates_strong_password_and_defaults_registration_closed(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    "GATEWAY_KIND=omniroute; ASSUME_YES=1; configure_omniroute_portal_interactively; "
+                    "printf 'password=%s registration=%s\\n' \"$UI_PASSWORD\" \"$ACCOUNT_REGISTRATION_ENABLED\""
+                ),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        values = completed.stdout.strip().split()
+        password = values[0].split("=", 1)[1]
+        self.assertGreaterEqual(len(password), 12)
+        self.assertIn("registration=0", completed.stdout)
+
+    def test_account_public_origin_validation_accepts_normal_hosts_and_rejects_paths(self):
+        installer = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn('^https?://[][A-Za-z0-9.:-]+$', installer)
+        self.assertNotIn('^https?://[A-Za-z0-9.:[\\]-]+$', installer)
 
     def test_gateway_selection_uses_english_copy_after_language_choice(self):
         completed = subprocess.run(

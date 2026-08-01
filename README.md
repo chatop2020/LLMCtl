@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)
 
-在 Ubuntu 24.04 裸机上，从 Hugging Face 或 ModelScope 搜索模型，按本机 NVIDIA GPU/显存保守筛选并规划拓扑，然后自动部署多个 vLLM Worker，以及 New API、LiteLLM、Bifrost 三选一的接入层。默认推荐 New API。
+在 Ubuntu 24.04 裸机上，从 Hugging Face 或 ModelScope 搜索模型，按本机 NVIDIA GPU/显存保守筛选并规划拓扑，然后自动部署多个 vLLM Worker，以及 New API、LiteLLM、Bifrost、OmniRoute 四选一的接入层。默认推荐 New API；需要公司内部注册、独立 API key、周期额度和模型门户时可选择 OmniRoute。
 
 项目不使用 Conda，也不改 NVIDIA 驱动。推理依赖位于固定版本的 Docker 镜像中；安装时可以临时使用局域网代理，运行期默认完全离线且不会自动更新。
 
@@ -22,6 +22,7 @@
 - 下载前在固定 vLLM 容器的 `ModelRegistry` 中再次核验架构；下载后校验配置、权重存在性和体积。
 - 模型能力匹配时才启用图片/OCR、OpenAI 工具调用、思考解析和请求级思考关闭。
 - 一个 GPU 或一个 TP 分组对应一个 Worker；安装器为所选接入层自动生成全部 Worker、鉴权和数据库配置，并通过统一的 `:8000/v1` 提供服务。
+- OmniRoute 模式额外部署轻量账户门户：支持邮箱验证、精确企业邮箱后缀白名单、注册开关、用户独立 API key、周期 token 额度/自动重置、用量、门户审计和实时模型目录。
 - systemd 开机自启；Worker 可分批并行加载，SSH 断开不影响后台启动。
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
@@ -41,7 +42,8 @@
 | `llmctl.sh` | 安装为全局命令 `/usr/local/sbin/llmctl` |
 | `lib/model_catalog.py` | Hub 搜索、能力识别、显存估算和部署计划 |
 | `lib/runtime_optimizer.py` | 流式基准、GPU/vLLM 指标采集、保守候选生成与目标评分 |
-| `lib/gateway_config.py` | 三种接入层的无密钥配置生成与 New API 状态同步 |
+| `lib/gateway_config.py` | 四种接入层的无密钥配置生成及 New API/OmniRoute 状态同步 |
+| `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、额度和模型目录 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
 | `tests/test_runtime_optimizer.py` | 调优建议、评分、指标解析与流式时延测试 |
 | `README.md` / `README_EN.md` | 中英文项目说明 |
@@ -57,15 +59,17 @@
 | New API 镜像 | `calciumion/new-api:v1.0.0-rc.22` |
 | LiteLLM 镜像 | `ghcr.io/berriai/litellm:v1.94.0` |
 | Bifrost 镜像 | `maximhq/bifrost:v1.6.7` |
+| OmniRoute 镜像 | `diegosouzapw/omniroute:3.8.50` |
 | PostgreSQL | `postgres:16-alpine` |
 | API | `http://服务器IP:8000/v1` |
-| Web UI | New API/Bifrost：`http://服务器IP:8000/`；LiteLLM：`/ui` |
+| Web UI | New API/Bifrost/OmniRoute：`http://服务器IP:8000/`；LiteLLM：`/ui` |
+| OmniRoute 账户门户 | `http://服务器IP:8001/` |
 | 管理员用户名 | `admin` |
-| 初始通用密码 | `llm-admin` |
+| 初始密码 | 默认 `llm-admin`；OmniRoute 未指定时生成强随机值 |
 | 路由 | 8 个健康 Worker 等权分发并故障切换；LiteLLM 使用 `least-busy` |
 | GPU 显存利用率 | `0.92` |
 
-初始 Web 密码按你的要求保留为可公开的通用密码。它不是安全密码，安装后应立即运行：
+New API、LiteLLM 和 Bifrost 的初始 Web 密码按你的要求保留为通用值。它不是安全密码，安装后应立即运行；OmniRoute 默认已生成强随机密码，也建议妥善轮换：
 
 ```bash
 sudo llmctl admin set-password
@@ -73,29 +77,30 @@ sudo llmctl admin set-password
 
 ### 接入层选择
 
-安装向导在下载镜像前提供三个选项；无人值守时用 `--gateway`：
+安装向导在下载镜像前提供四个选项；无人值守时用 `--gateway`：
 
 | 接入层 | 适用场景 | 自动配置内容 |
 |---|---|---|
 | New API（默认） | 中文管理体验、渠道/令牌/用量管理 | 初始化管理员；为每个健康 Worker 创建等权渠道；创建 root-only 调用令牌 |
 | LiteLLM | 更广的供应商兼容与成熟代理配置 | 生成模型列表、`least-busy` 路由、主密钥和 PostgreSQL |
 | Bifrost | 高效转发、可观测与虚拟密钥治理 | 生成 8 个 vLLM key、等权路由、虚拟密钥、管理认证和 PostgreSQL 日志存储 |
+| OmniRoute | 本地 SQLite 网关及公司账户门户 | 创建 8 个 Provider 节点和一个等权 Combo；部署独立门户数据库、邮箱注册、用户 key、周期额度、用量与模型目录 |
 
-三者都使用 `llm-router.service`、`llm-database.service`、端口 `8000` 和 OpenAI 兼容 `/v1`，统一调用密钥保存在 root-only 的 `GATEWAY_API_KEY`。本版不做在线迁移；切换接入层应在没有旧服务配置的全新安装中选择。本地模型和已存在的精确 Docker 镜像会分别经核验后复用，不会重新下载。New API 当前锁定的是 RC 版本并采用 AGPL-3.0，Bifrost 为 Apache-2.0；部署前应按你的分发和修改方式审查许可证。
+四者都使用 `llm-router.service`、端口 `8000` 和 OpenAI 兼容 `/v1`，统一维护密钥保存在 root-only 的 `GATEWAY_API_KEY`。New API、LiteLLM、Bifrost 使用 `llm-database.service` 的 PostgreSQL；OmniRoute 使用自己的 SQLite，不启动 PostgreSQL，并额外启动 `llm-account.service`。本版不做在线迁移；切换接入层时应使用没有旧服务配置的全新安装。本地模型和已存在的精确 Docker 镜像会分别核验后复用。部署前还应按使用方式审查各上游项目许可证。
 
 ## 快速开始
 
 把整个目录复制到服务器，进入目录后运行：
 
 ```bash
-chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py lib/account_portal.py
 sudo bash install-llm-cluster.sh
 ```
 
 交互流程会依次询问：
 
 1. 选择中文或 English；默认中文，后续安装向导和模型目录使用所选语言。
-2. 选择 New API（默认）、LiteLLM 或 Bifrost。
+2. 选择 New API（默认）、LiteLLM、Bifrost 或 OmniRoute；OmniRoute 会继续询问企业注册、邮箱域名和 SMTP 设置。
 3. 只读显示本机 OS、CPU、内存、GPU/驱动、PCIe/拓扑/NUMA 与磁盘体检。
 4. 搜索 Hugging Face、ModelScope、两者，或直接输入模型；再输入关键词和用途。
 5. 从通过门禁的候选中选择。输入 `0`/`b` 返回，`q` 退出。
@@ -205,16 +210,20 @@ sudo llmctl models current
 | `/etc/llm-cluster/workers/*.env` | Worker 与 GPU 映射 |
 | `/usr/local/lib/llm-cluster/model_catalog.py` | 已安装目录助手 |
 | `/usr/local/lib/llm-cluster/gateway_config.py` | 接入层配置与 New API 同步助手 |
+| `/usr/local/lib/llm-cluster/account_portal.py` | OmniRoute 企业账户门户 |
 | `/var/lib/llm-cluster/cache` | 可再生成的 vLLM 缓存 |
+| `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute 自身 SQLite 数据库 |
+| `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | 账户门户独立 SQLite 数据库 |
 | `/data/llm-cluster/models` | 默认模型根目录 |
 | `llm-cluster.service` | 总控 oneshot 服务 |
 | `llm-worker@N.service` | vLLM Worker |
-| `llm-router.service` | 所选 New API/LiteLLM/Bifrost API/UI |
-| `llm-database.service` | 接入层 PostgreSQL |
+| `llm-router.service` | 所选 New API/LiteLLM/Bifrost/OmniRoute API/UI |
+| `llm-database.service` | 非 OmniRoute 接入层 PostgreSQL |
+| `llm-account.service` | 仅 OmniRoute 模式的企业账户门户 |
 
 ## 安全说明
 
-- API 默认监听 `0.0.0.0:8000`，应使用主机防火墙限制到可信局域网；PostgreSQL 只监听 `127.0.0.1`。
+- API 默认监听 `0.0.0.0:8000`；OmniRoute 账户门户默认监听 `0.0.0.0:8001`。生产环境应使用防火墙限制来源，并在反向代理上启用 HTTPS；PostgreSQL 只监听 `127.0.0.1`。
 - 模型 revision 会写入清单。Hugging Face 默认固定 commit；ModelScope 默认 `master`，若要求可复现部署，请显式提供 tag 或 commit hash。
 - 只有模型配置声明 `auto_map` 时才启用 `--trust-remote-code`。这仍意味着会执行仓库代码，只选择经过审核且固定 revision 的模型。
 - 外部图片域名默认不放行；OCR 示例使用 `data:` base64，降低 SSRF 风险。

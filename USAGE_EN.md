@@ -19,7 +19,7 @@ Change the server timezone from UTC to China Standard Time:
 sudo llmctl timezone set Asia/Shanghai
 ```
 
-The web administration URL depends on the gateway: New API and Bifrost use `http://SERVER_IP:8000/`; LiteLLM uses `http://SERVER_IP:8000/ui`. The administrator username defaults to `admin`, and the initial shared password is `llm-admin`. Credentials are stored in the root-only `/etc/llm-cluster/secrets.env` file and can also be displayed with `sudo llmctl admin show`. Change the password after the first login.
+The web administration URL depends on the gateway: New API, Bifrost, and OmniRoute use `http://SERVER_IP:8000/`; LiteLLM uses `http://SERVER_IP:8000/ui`. The administrator username defaults to `admin`. OmniRoute generates a strong random password when none is provided; the other gateways initially use `llm-admin`. Credentials are stored in root-only `/etc/llm-cluster/secrets.env` and can be displayed with `sudo llmctl admin show`.
 
 Choose the gateway during a clean install. New API is the default, or select one explicitly:
 
@@ -27,9 +27,10 @@ Choose the gateway during a clean install. New API is the default, or select one
 sudo bash install-llm-cluster.sh --gateway newapi
 sudo bash install-llm-cluster.sh --gateway litellm
 sudo bash install-llm-cluster.sh --gateway bifrost
+sudo bash install-llm-cluster.sh --gateway omniroute
 ```
 
-The installer pulls only the selected gateway. An exact local image is reused without a pull. Model download is also skipped when identity, revision, architecture, completeness, and size all match. All three use the root-only `GATEWAY_API_KEY`, and there is no online migration between them.
+The installer pulls only the selected gateway. An exact local image is reused without a pull. Model download is also skipped when identity, revision, architecture, completeness, and size all match. All four maintain the root-only `GATEWAY_API_KEY`, and there is no online migration between them.
 
 ## SSH Disconnected or the Installation Window Appears Stuck
 
@@ -103,7 +104,7 @@ sudo llmctl router restart
 sudo llmctl database status
 ```
 
-`llmctl router restart` rediscovers healthy workers, renders the selected gateway configuration, restarts it, waits for process health, and only then verifies authenticated `/v1/models`. New API also initializes the administrator, creates an equal-weight channel per healthy worker, and creates a managed token. Bifrost generates equal-weight vLLM keys, a virtual key, and PostgreSQL log storage. LiteLLM uses `least-busy` plus a per-worker concurrency limit.
+`llmctl router restart` rediscovers healthy workers, renders the selected gateway configuration, restarts it, waits for process health, and only then verifies authenticated `/v1/models`. New API initializes the administrator, creates an equal-weight channel per healthy worker, and creates a managed token. Bifrost generates equal-weight vLLM keys, a virtual key, and PostgreSQL log storage. LiteLLM uses `least-busy` plus a per-worker concurrency limit. OmniRoute creates one provider node per worker and an equal-weight Combo, then synchronizes model metadata and the maintenance key.
 
 None of these routers directly knows how much GPU memory, KV cache, or image processing a particular request will consume. Long-context and multi-image requests may still create transient imbalance. Run `llmctl bench` and `llmctl optimize analyze` with a realistic workload before tuning.
 
@@ -117,7 +118,51 @@ sudo llmctl admin set-username NEW_ADMIN
 sudo llmctl admin set-password
 ```
 
-New API creates its API tokens in its database, so `key rotate` does not accept a caller-supplied value. LiteLLM and Bifrost accept an optional value; a Bifrost key must start with `sk-bf-`.
+New API and OmniRoute create maintenance tokens in their databases, so `key rotate` does not accept a caller-supplied value. LiteLLM and Bifrost accept an optional value; a Bifrost key must start with `sk-bf-`. OmniRoute users rotate their personal keys in the account portal; the administrator command does not replace those keys.
+
+### OmniRoute company account portal
+
+OmniRoute does not provide an SMTP registration flow. LLMCtl therefore deploys a separate `llm-account.service`, which uses OmniRoute's management API to create user keys and token limits. They share a state directory but never a database file:
+
+```text
+/var/lib/llm-cluster/omniroute/gateway/storage.sqlite
+/var/lib/llm-cluster/omniroute/portal/account-portal.db
+```
+
+The first file is owned entirely by OmniRoute. The second stores portal users, verification state, quota policy, sessions, and portal audit events. The portal never stores a plaintext API key: a newly issued key is displayed once after email verification, and later it can only be rotated. OmniRoute remains the source for inference calls and token usage, so portal account audit and inference-call audit are viewed separately.
+
+Public registration is disabled by default. Enabling it requires an exact email-domain allowlist, the public portal origin, and external SMTP:
+
+```bash
+sudo bash install-llm-cluster.sh \
+  --gateway omniroute \
+  --registration enabled \
+  --allowed-email-domains example.com,subsidiary.example.com \
+  --account-public-url https://llm.example.com \
+  --account-api-public-url https://llm-api.example.com \
+  --account-admin-email llm-admin@example.com \
+  --account-default-quota 1000000 \
+  --account-quota-reset monthly \
+  --smtp-host smtp.example.com \
+  --smtp-port 587 \
+  --smtp-security starttls \
+  --smtp-username llm@example.com \
+  --smtp-password APP_PASSWORD \
+  --smtp-from llm@example.com
+```
+
+The allowlist matches the complete part after `@`; allowing `example.com` does not allow `evil-example.com` or `dept.example.com`. It is checked both at registration and verification. In the administrator UI, registration can be enabled or disabled, the allowlist and new-user default can be changed, and existing users can receive a new quota/reset period or be disabled. Supported periods are `daily`, `weekly`, and `monthly`; enforcement and reset are handled by OmniRoute token limits.
+
+```bash
+sudo llmctl account status
+sudo llmctl account url
+sudo llmctl account restart
+sudo llmctl logs account -f
+```
+
+The portal defaults to `http://SERVER_IP:8001/`. After login, users can view usage and reset time. Its model page reads OmniRoute `/v1/models` live and provides copyable model IDs, the concrete `/v1` endpoint, and a runnable `curl` example. OCR, vision, and tool tags come from model capabilities verified during installation; they do not change vLLM behavior.
+
+In production, place ports 8001 and 8000 behind an HTTPS reverse proxy. `--account-public-url` and `--account-api-public-url` must be the path-free origins users actually reach. SMTP credentials and the management key live only in root-only `secrets.env`; avoid placing passwords in shell history and use a protected environment or temporary argument source for unattended deployment.
 
 ## OpenAI-Compatible API
 
@@ -282,7 +327,7 @@ sudo llmctl offline export /data/offline/llm-bundle
 sudo llmctl offline import /data/offline/llm-bundle
 ```
 
-An offline bundle records the selected gateway kind and image. A New API bundle cannot be imported into a LiteLLM or Bifrost plan.
+An offline bundle records the selected gateway kind and image. Bundles cannot be mixed between New API, LiteLLM, Bifrost, and OmniRoute plans. An OmniRoute bundle does not require the PostgreSQL image.
 
 ## Logs
 
@@ -299,10 +344,11 @@ Common interpretations:
 - If worker GPU memory stops growing and logs remain unchanged for a long time, check whether CUDA Graph compilation is in progress, whether CPU memory or disk is saturated, and whether the service is still active.
 - If a worker exits, the final log lines usually identify an out-of-memory error, architecture mismatch, quantization-kernel problem, or model-code error.
 - If the gateway is unhealthy while workers are healthy, inspect the `llm-router` and `llm-database` logs. For New API reconciliation failures, the `llm-cluster.service` log also reports the exact setup, login, channel, or token error after the router log.
+- If OmniRoute is healthy but the portal is not, run `llmctl account status` and `llmctl logs account`. For missing mail, check the SMTP host, TLS mode, sender, and spam policy; the portal never bypasses verification to issue a key.
 
 ## Uninstall
 
-By default, uninstall retains the models, gateway PostgreSQL/local-state volumes, and root-only recovery credentials:
+By default, uninstall retains the models, gateway PostgreSQL/SQLite state, and root-only recovery credentials:
 
 ```bash
 sudo llmctl uninstall
@@ -316,4 +362,6 @@ Optional permanent deletion:
 sudo llmctl uninstall --purge-model --purge-images --purge-database
 ```
 
-`--purge-model` is allowed only when the model directory contains the installer's marker. `--purge-database` permanently deletes web UI data, virtual keys, New API/Bifrost local state, and administration records. Do not use `--purge-model` when the existing weights must be retained.
+`--purge-model` is allowed only when the model directory contains the installer's marker. `--purge-database` permanently deletes web UI data, virtual keys, New API/Bifrost state, and both independent OmniRoute SQLite files including account audit. Do not use `--purge-model` when existing weights must be retained.
+
+Back up both `gateway/storage.sqlite` and `portal/account-portal.db` for OmniRoute. The simplest consistent method is to stop the portal and gateway briefly, copy both files, then restart them. Backing up only one can leave portal users unmatched with OmniRoute keys and limits.

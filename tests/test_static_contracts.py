@@ -8,6 +8,7 @@ INSTALLER = (ROOT / "install-llm-cluster.sh").read_text(encoding="utf-8")
 MANAGER = (ROOT / "llmctl.sh").read_text(encoding="utf-8")
 OPTIMIZER = (ROOT / "lib" / "runtime_optimizer.py").read_text(encoding="utf-8")
 GATEWAY = (ROOT / "lib" / "gateway_config.py").read_text(encoding="utf-8")
+ACCOUNT = (ROOT / "lib" / "account_portal.py").read_text(encoding="utf-8")
 
 
 class StaticDeploymentContracts(unittest.TestCase):
@@ -22,7 +23,9 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn('newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}"', MANAGER)
         self.assertIn('litellm) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${LITELLM_IMAGE}}"', MANAGER)
         self.assertIn('bifrost) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${BIFROST_IMAGE}}"', MANAGER)
+        self.assertIn('omniroute) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${OMNIROUTE_IMAGE}}"', MANAGER)
         self.assertIn("reconcile-newapi", MANAGER)
+        self.assertIn("reconcile-omniroute", MANAGER)
         self.assertIn("wait_gateway_process", MANAGER)
         self.assertIn("GATEWAY_API_KEY", MANAGER)
 
@@ -30,6 +33,7 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)
         self.assertIn("ghcr.io/berriai/litellm:v1.94.0", INSTALLER)
         self.assertIn("maximhq/bifrost:v1.6.7", INSTALLER)
+        self.assertIn("diegosouzapw/omniroute:3.8.50", INSTALLER)
         pull = INSTALLER.split("pull_images() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('selected_gateway_image=$(gateway_image)', pull)
         self.assertIn('ensure_image "${selected_gateway_image}"', pull)
@@ -119,8 +123,26 @@ class StaticDeploymentContracts(unittest.TestCase):
             for term in ("New API", "LiteLLM", "Bifrost", "--gateway", "GATEWAY_API_KEY"):
                 self.assertIn(term, chinese)
                 self.assertIn(term, english)
+            self.assertIn("OmniRoute", chinese)
+            self.assertIn("OmniRoute", english)
             self.assertIn("不做在线迁移", chinese)
             self.assertIn("no online migration", english.lower())
+
+    def test_omniroute_account_portal_has_isolated_sqlite_and_company_registration_controls(self):
+        self.assertIn("account-portal.db", INSTALLER)
+        self.assertIn("storage.sqlite", MANAGER)
+        self.assertIn("User=llm-account", INSTALLER)
+        self.assertIn('install -d -m 751 -o root -g llm-account "${STATE_DIR}/omniroute"', INSTALLER)
+        self.assertIn("UMask=0077", INSTALLER)
+        self.assertIn("ACCOUNT_ALLOWED_EMAIL_DOMAINS", ACCOUNT)
+        self.assertIn("registration_enabled", ACCOUNT)
+        self.assertIn("verification_tokens", ACCOUNT)
+        self.assertIn("SMTP_HOST", ACCOUNT)
+        self.assertIn("/api/usage/token-limits", ACCOUNT)
+        self.assertIn("/v1/models", ACCOUNT)
+        self.assertIn("curl", ACCOUNT)
+        self.assertIn("audit_events", ACCOUNT)
+        self.assertIn("API key plaintext is returned once", ACCOUNT)
 
 
 if __name__ == "__main__":

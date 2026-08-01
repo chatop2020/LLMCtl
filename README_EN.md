@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)
 
-LLMCtl searches Hugging Face or ModelScope for models on a bare-metal Ubuntu 24.04 host, conservatively filters them according to the local NVIDIA GPUs and VRAM, plans the deployment topology, and automatically deploys multiple vLLM workers plus one of three gateways: New API, LiteLLM, or Bifrost. New API is the default recommendation.
+LLMCtl searches Hugging Face or ModelScope for models on a bare-metal Ubuntu 24.04 host, conservatively filters them according to the local NVIDIA GPUs and VRAM, plans the deployment topology, and automatically deploys multiple vLLM workers plus one of four gateways: New API, LiteLLM, Bifrost, or OmniRoute. New API is the default recommendation; OmniRoute is intended for installations that need company self-registration, personal API keys, recurring quotas, and a model portal.
 
 The project does not use Conda or modify the NVIDIA driver. Inference dependencies are contained in pinned Docker image versions. A LAN proxy may be used temporarily during installation; runtime is fully offline by default and does not update automatically.
 
@@ -22,6 +22,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - Recheck the architecture with `ModelRegistry` inside the pinned vLLM container before download, then verify configuration, weight presence, and size after download.
 - Enable image/OCR input, OpenAI tool calling, reasoning parsing, and per-request reasoning disable controls only when the model capability matches.
 - Map one GPU or one TP group to each worker. The installer configures all workers, authentication, and database state for the selected gateway and exposes a consistent `:8000/v1` endpoint.
+- In OmniRoute mode, deploy a lightweight account portal with email verification, an exact corporate-domain allowlist, registration controls, personal API keys, recurring token quotas, usage, portal audit events, and a live model catalog.
 - Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
@@ -41,7 +42,8 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `llmctl.sh` | Installed as the global `/usr/local/sbin/llmctl` command |
 | `lib/model_catalog.py` | Hub search, capability detection, VRAM estimation, and deployment planning |
 | `lib/runtime_optimizer.py` | Streaming benchmarks, GPU/vLLM metrics, conservative candidates, and objective scoring |
-| `lib/gateway_config.py` | Secret-free configuration generation for all gateways and New API reconciliation |
+| `lib/gateway_config.py` | Secret-free configuration for all four gateways and New API/OmniRoute reconciliation |
+| `lib/account_portal.py` | OmniRoute company account portal, verification, quotas, and model catalog |
 | `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
 | `tests/test_runtime_optimizer.py` | Tuning advice, scoring, metrics parsing, and streaming-latency tests |
 | `README.md` / `README_EN.md` | Chinese and English project overview |
@@ -57,15 +59,17 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | New API image | `calciumion/new-api:v1.0.0-rc.22` |
 | LiteLLM image | `ghcr.io/berriai/litellm:v1.94.0` |
 | Bifrost image | `maximhq/bifrost:v1.6.7` |
+| OmniRoute image | `diegosouzapw/omniroute:3.8.50` |
 | PostgreSQL | `postgres:16-alpine` |
 | API | `http://SERVER_IP:8000/v1` |
-| Web UI | New API/Bifrost: `http://SERVER_IP:8000/`; LiteLLM: `/ui` |
+| Web UI | New API/Bifrost/OmniRoute: `http://SERVER_IP:8000/`; LiteLLM: `/ui` |
+| OmniRoute account portal | `http://SERVER_IP:8001/` |
 | Administrator username | `admin` |
-| Initial shared password | `llm-admin` |
+| Initial password | `llm-admin` by default; OmniRoute generates a strong random value when omitted |
 | Routing | Equal-weight healthy workers with failover; LiteLLM uses `least-busy` |
 | GPU memory utilization | `0.92` |
 
-The initial web password intentionally remains a public shared default. It is not secure and must be changed immediately after installation:
+The initial shared password for New API, LiteLLM, and Bifrost is intentionally simple as requested. Change it immediately. OmniRoute generates a strong random password by default, which should still be managed and rotated carefully:
 
 ```bash
 sudo llmctl admin set-password
@@ -73,29 +77,30 @@ sudo llmctl admin set-password
 
 ### Gateway Selection
 
-The wizard offers three choices before image download. For unattended installs, use `--gateway`:
+The wizard offers four choices before image download. For unattended installs, use `--gateway`:
 
 | Gateway | Best fit | Fully automated configuration |
 |---|---|---|
 | New API (default) | Friendly Chinese administration, channels, keys, and usage | Initializes the administrator, creates one equal-weight channel per healthy worker, and creates a root-only API token |
 | LiteLLM | Broad provider compatibility and established proxy configuration | Generates the model list, `least-busy` routing, master key, and PostgreSQL settings |
 | Bifrost | Efficient forwarding, observability, and virtual-key governance | Generates eight vLLM keys, equal-weight routing, a virtual key, admin authentication, and PostgreSQL log storage |
+| OmniRoute | Local SQLite gateway plus a company account portal | Creates eight provider nodes and one equal-weight Combo; deploys a separate portal database, email registration, personal keys, recurring quotas, usage, and a model catalog |
 
-All three use `llm-router.service`, `llm-database.service`, port `8000`, and an OpenAI-compatible `/v1`; the shared root-only API-key variable is `GATEWAY_API_KEY`. There is no online migration: select a gateway during a clean install after old service configuration has been removed. Existing model files and exact local Docker images are independently verified and reused instead of downloaded again. The pinned New API version is currently an RC and is AGPL-3.0; Bifrost is Apache-2.0. Review license obligations for your distribution and modification model.
+All four use `llm-router.service`, port `8000`, and an OpenAI-compatible `/v1`; the root-only maintenance key is stored in `GATEWAY_API_KEY`. New API, LiteLLM, and Bifrost use PostgreSQL through `llm-database.service`. OmniRoute uses its own SQLite database, does not start PostgreSQL, and adds `llm-account.service`. There is no online migration between gateway types: select one during a clean install after old service configuration has been removed. Existing model files and exact local Docker images are verified and reused. Review the upstream licenses for your distribution and modification model.
 
 ## Quick Start
 
 Copy the entire directory to the server, enter it, and run:
 
 ```bash
-chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py lib/account_portal.py
 sudo bash install-llm-cluster.sh
 ```
 
 The interactive workflow asks you to:
 
 1. Select 中文 or English. Chinese is the default; subsequent installer and catalog interaction uses the selection.
-2. Select New API (default), LiteLLM, or Bifrost.
+2. Select New API (default), LiteLLM, Bifrost, or OmniRoute. OmniRoute then asks about company registration, email domains, and SMTP.
 3. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
 4. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
 5. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
@@ -205,16 +210,20 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `/etc/llm-cluster/workers/*.env` | Worker-to-GPU mappings |
 | `/usr/local/lib/llm-cluster/model_catalog.py` | Installed model catalog helper |
 | `/usr/local/lib/llm-cluster/gateway_config.py` | Gateway configuration and New API reconciliation helper |
+| `/usr/local/lib/llm-cluster/account_portal.py` | OmniRoute company account portal |
 | `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
+| `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute's SQLite database |
+| `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | Separate account-portal SQLite database |
 | `/data/llm-cluster/models` | Default model root |
 | `llm-cluster.service` | Top-level oneshot service |
 | `llm-worker@N.service` | vLLM worker |
-| `llm-router.service` | Selected New API, LiteLLM, or Bifrost API and UI |
-| `llm-database.service` | Gateway PostgreSQL database |
+| `llm-router.service` | Selected New API, LiteLLM, Bifrost, or OmniRoute API and UI |
+| `llm-database.service` | PostgreSQL for non-OmniRoute gateways |
+| `llm-account.service` | Company account portal in OmniRoute mode only |
 
 ## Security Notes
 
-- The API listens on `0.0.0.0:8000` by default and should be restricted to a trusted LAN with the host firewall. PostgreSQL listens only on `127.0.0.1`.
+- The API listens on `0.0.0.0:8000`; the OmniRoute account portal defaults to `0.0.0.0:8001`. Restrict both with the host firewall and terminate HTTPS at a reverse proxy in production. PostgreSQL listens only on `127.0.0.1`.
 - Model revisions are recorded in the manifest. Hugging Face defaults to a pinned commit; ModelScope defaults to `master`. For reproducible deployments, explicitly provide a tag or commit hash.
 - `--trust-remote-code` is enabled only when the model configuration declares `auto_map`. This still executes repository code, so select only reviewed models at pinned revisions.
 - External image domains are denied by default. OCR examples use base64 `data:` URLs to reduce SSRF exposure.

@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.2.1"
+readonly INSTALLER_VERSION="2.3.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -45,6 +45,7 @@ VLLM_IMAGE="vllm/vllm-openai:v0.22.1"
 LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.94.0"
 NEWAPI_IMAGE="calciumion/new-api:v1.0.0-rc.22"
 BIFROST_IMAGE="maximhq/bifrost:v1.6.7"
+OMNIROUTE_IMAGE="diegosouzapw/omniroute:3.8.50"
 POSTGRES_IMAGE="postgres:16-alpine"
 GATEWAY_KIND="newapi"
 TP_SIZE=1
@@ -63,6 +64,22 @@ WORKER_BASE_PORT=8100
 API_BIND="0.0.0.0"
 API_PORT=8000
 GATEWAY_DB_PORT=15432
+ACCOUNT_BIND="0.0.0.0"
+ACCOUNT_PORT=8001
+ACCOUNT_PUBLIC_URL=""
+ACCOUNT_API_PUBLIC_URL=""
+ACCOUNT_REGISTRATION_ENABLED=0
+ACCOUNT_ALLOWED_EMAIL_DOMAINS=""
+ACCOUNT_DEFAULT_QUOTA_TOKENS=1000000
+ACCOUNT_QUOTA_RESET="monthly"
+ACCOUNT_QUOTA_RESET_TIME="00:00"
+ACCOUNT_ADMIN_EMAIL="admin@llmctl.local"
+SMTP_HOST=""
+SMTP_PORT=587
+SMTP_SECURITY="starttls"
+SMTP_USERNAME=""
+SMTP_PASSWORD=""
+SMTP_FROM=""
 UI_USERNAME="admin"
 UI_PASSWORD="llm-admin"
 START_TIMEOUT=1800
@@ -92,11 +109,13 @@ UI_PASSWORD_EXPLICIT=0
 INTERFACE_LANGUAGE="zh"
 INTERFACE_LANGUAGE_EXPLICIT=0
 GATEWAY_EXPLICIT=0
+REGISTRATION_EXPLICIT=0
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MANAGER_SOURCE="${SCRIPT_DIR}/llmctl.sh"
 CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
+ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -155,11 +174,24 @@ Common unattended options:
   --api-bind IP                  Default 0.0.0.0
   --api-port PORT                Default 8000
   --worker-base-port PORT        Default 8100
-  --gateway newapi|litellm|bifrost
+  --gateway newapi|litellm|bifrost|omniroute
                                   API gateway; default and recommendation: newapi
   --ui-username USER             Gateway Web administrator; default admin
-  --ui-password PASSWORD         Initial gateway password; default llm-admin
+  --ui-password PASSWORD         Initial gateway password; default llm-admin;
+                                  OmniRoute generates a strong random value when omitted
   --database-port PORT           Gateway PostgreSQL port; default 15432
+  --account-port PORT            OmniRoute account portal port; default 8001
+  --account-public-url URL       Public portal URL used in verification email
+  --account-api-public-url URL   Public OmniRoute URL shown in API examples
+  --registration enabled|disabled
+  --allowed-email-domains LIST   Exact comma-separated company email domains
+  --account-default-quota N      Default recurring token quota; default 1000000
+  --account-quota-reset daily|weekly|monthly
+  --account-quota-reset-time HH:MM
+  --account-admin-email EMAIL    Initial portal administrator login
+  --smtp-host HOST --smtp-port PORT
+  --smtp-security starttls|ssl|plain
+  --smtp-username USER --smtp-password PASSWORD --smtp-from EMAIL
   --proxy URL                    Used only during installation/downloads
   --save-proxy                   Save for future llmctl download/update operations
   --no-start                     Install and register services without starting them
@@ -170,6 +202,7 @@ Common unattended options:
   --newapi-image IMAGE           Override the pinned New API image
   --litellm-image IMAGE          Override the pinned LiteLLM image
   --bifrost-image IMAGE          Override the pinned Bifrost image
+  --omniroute-image IMAGE        Override the pinned OmniRoute image
   --postgres-image IMAGE         Override the PostgreSQL 16 image
 
 Example:
@@ -214,11 +247,24 @@ EOF
   --api-bind IP                   默认 0.0.0.0
   --api-port PORT                 默认 8000
   --worker-base-port PORT         默认 8100
-  --gateway newapi|litellm|bifrost
+  --gateway newapi|litellm|bifrost|omniroute
                                    API 接入层，默认并推荐 newapi
   --ui-username USER              接入层 Web 管理员，默认 admin
-  --ui-password PASSWORD          接入层初始密码，默认 llm-admin
+  --ui-password PASSWORD          接入层初始密码，默认 llm-admin；OmniRoute 未指定时
+                                  自动生成强随机密码
   --database-port PORT            接入层 PostgreSQL 本机端口，默认 15432
+  --account-port PORT             OmniRoute 账户门户端口，默认 8001
+  --account-public-url URL        验证邮件中的门户公开地址
+  --account-api-public-url URL    调用示例中显示的 OmniRoute 公开地址
+  --registration enabled|disabled 是否开放注册
+  --allowed-email-domains LIST    允许注册的公司邮箱后缀，逗号分隔且精确匹配
+  --account-default-quota N       默认周期 Token 额度，默认 1000000
+  --account-quota-reset daily|weekly|monthly
+  --account-quota-reset-time HH:MM
+  --account-admin-email EMAIL     门户初始管理员登录邮箱
+  --smtp-host HOST --smtp-port PORT
+  --smtp-security starttls|ssl|plain
+  --smtp-username USER --smtp-password PASSWORD --smtp-from EMAIL
   --proxy URL                     仅安装/下载阶段使用的代理
   --save-proxy                    保存供以后 llmctl download/update 使用
   --no-start                      安装并注册服务，但不立即启动
@@ -229,6 +275,7 @@ EOF
   --newapi-image IMAGE            覆盖锁定的 New API 镜像
   --litellm-image IMAGE           覆盖锁定的 LiteLLM 镜像
   --bifrost-image IMAGE           覆盖锁定的 Bifrost 镜像
+  --omniroute-image IMAGE         覆盖锁定的 OmniRoute 镜像
   --postgres-image IMAGE          覆盖 PostgreSQL 16 镜像
 
 示例：
@@ -293,6 +340,24 @@ parse_args() {
       --ui-username) need_value "$@"; UI_USERNAME="$2"; UI_USERNAME_EXPLICIT=1; shift 2 ;;
       --ui-password) need_value "$@"; UI_PASSWORD="$2"; UI_PASSWORD_EXPLICIT=1; shift 2 ;;
       --database-port) need_value "$@"; GATEWAY_DB_PORT="$2"; shift 2 ;;
+      --account-port) need_value "$@"; ACCOUNT_PORT="$2"; shift 2 ;;
+      --account-public-url) need_value "$@"; ACCOUNT_PUBLIC_URL="$2"; shift 2 ;;
+      --account-api-public-url) need_value "$@"; ACCOUNT_API_PUBLIC_URL="$2"; shift 2 ;;
+      --registration)
+        need_value "$@"; REGISTRATION_EXPLICIT=1
+        case "$2" in enabled) ACCOUNT_REGISTRATION_ENABLED=1 ;; disabled) ACCOUNT_REGISTRATION_ENABLED=0 ;; *) die "$(l10n '--registration 只能是 enabled 或 disabled' '--registration must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --allowed-email-domains) need_value "$@"; ACCOUNT_ALLOWED_EMAIL_DOMAINS="$2"; shift 2 ;;
+      --account-default-quota) need_value "$@"; ACCOUNT_DEFAULT_QUOTA_TOKENS="$2"; shift 2 ;;
+      --account-quota-reset) need_value "$@"; ACCOUNT_QUOTA_RESET="$2"; shift 2 ;;
+      --account-quota-reset-time) need_value "$@"; ACCOUNT_QUOTA_RESET_TIME="$2"; shift 2 ;;
+      --account-admin-email) need_value "$@"; ACCOUNT_ADMIN_EMAIL="$2"; shift 2 ;;
+      --smtp-host) need_value "$@"; SMTP_HOST="$2"; shift 2 ;;
+      --smtp-port) need_value "$@"; SMTP_PORT="$2"; shift 2 ;;
+      --smtp-security) need_value "$@"; SMTP_SECURITY="$2"; shift 2 ;;
+      --smtp-username) need_value "$@"; SMTP_USERNAME="$2"; shift 2 ;;
+      --smtp-password) need_value "$@"; SMTP_PASSWORD="$2"; shift 2 ;;
+      --smtp-from) need_value "$@"; SMTP_FROM="$2"; shift 2 ;;
       --proxy) need_value "$@"; PROXY_URL="$2"; shift 2 ;;
       --save-proxy) SAVE_PROXY=1; shift ;;
       --no-start) NO_START=1; shift ;;
@@ -303,6 +368,7 @@ parse_args() {
       --newapi-image) need_value "$@"; NEWAPI_IMAGE="$2"; shift 2 ;;
       --litellm-image) need_value "$@"; LITELLM_IMAGE="$2"; shift 2 ;;
       --bifrost-image) need_value "$@"; BIFROST_IMAGE="$2"; shift 2 ;;
+      --omniroute-image) need_value "$@"; OMNIROUTE_IMAGE="$2"; shift 2 ;;
       --postgres-image) need_value "$@"; POSTGRES_IMAGE="$2"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
       --version) printf '%s\n' "${INSTALLER_VERSION}"; exit 0 ;;
@@ -340,6 +406,7 @@ gateway_display_name() {
     newapi) printf 'New API' ;;
     litellm) printf 'LiteLLM' ;;
     bifrost) printf 'Bifrost' ;;
+    omniroute) printf 'OmniRoute' ;;
     *) printf '%s' "${1:-unknown}" ;;
   esac
 }
@@ -349,6 +416,7 @@ gateway_image() {
     newapi) printf '%s\n' "${NEWAPI_IMAGE}" ;;
     litellm) printf '%s\n' "${LITELLM_IMAGE}" ;;
     bifrost) printf '%s\n' "${BIFROST_IMAGE}" ;;
+    omniroute) printf '%s\n' "${OMNIROUTE_IMAGE}" ;;
     *) return 1 ;;
   esac
 }
@@ -357,11 +425,18 @@ gateway_ui_path() {
   [[ "${GATEWAY_KIND}" == litellm ]] && printf '/ui' || printf '/'
 }
 
+account_portal_url() {
+  local host="${API_BIND}"
+  [[ "${host}" == 0.0.0.0 || "${host}" == :: ]] && host='<server-IP>'
+  [[ -n "${ACCOUNT_PUBLIC_URL}" ]] && printf '%s\n' "${ACCOUNT_PUBLIC_URL}" || printf 'http://%s:%s\n' "${host}" "${ACCOUNT_PORT}"
+}
+
 gateway_routing_summary() {
   case "${GATEWAY_KIND}" in
     newapi) printf '%s' "$(l10n '同优先级渠道按权重随机，失败时切换渠道' 'weighted channels at equal priority with channel failover')" ;;
     litellm) printf 'LiteLLM %s' "${ROUTING_STRATEGY}" ;;
     bifrost) printf '%s' "$(l10n 'vLLM keys 等权轮转并自动回退' 'equally weighted vLLM keys with automatic fallback')" ;;
+    omniroute) printf '%s' "$(l10n 'Combo 对健康 Worker 做无会话粘性的 round-robin，并自动回退' 'non-sticky round-robin Combo across healthy workers with automatic fallback')" ;;
   esac
 }
 
@@ -376,6 +451,7 @@ Choose an API gateway:
   1) New API (recommended/default) — Chinese-friendly admin UI, channels, keys and usage
   2) LiteLLM — broad provider compatibility and the legacy LLMCtl integration
   3) Bifrost — efficient gateway with per-worker weighted routing and observability
+  4) OmniRoute — routing/observability plus LLMCtl company account portal
   0) Cancel installation
 EOF
     else
@@ -385,6 +461,7 @@ EOF
   1) New API（推荐/默认）— 中文管理界面友好，提供渠道、令牌和用量管理
   2) LiteLLM — 供应商兼容面广，也是 LLMCtl 原有接入层
   3) Bifrost — 高效网关，支持按 Worker 加权路由与可观测性
+  4) OmniRoute — 路由与可观测性，并配套 LLMCtl 公司账户门户
   0) 退出安装
 EOF
     fi
@@ -393,10 +470,39 @@ EOF
       1|newapi) GATEWAY_KIND=newapi; return 0 ;;
       2|litellm) GATEWAY_KIND=litellm; return 0 ;;
       3|bifrost) GATEWAY_KIND=bifrost; return 0 ;;
+      4|omniroute) GATEWAY_KIND=omniroute; return 0 ;;
       0|q|Q) log "$(l10n '已取消，尚未执行安装。' 'Cancelled before installation started.')"; exit 0 ;;
       *) warn "$(l10n '接入层选择无效，请重新选择。' 'Invalid gateway choice; choose again.')" ;;
     esac
   done
+}
+
+configure_omniroute_portal_interactively() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
+  if (( ! UI_PASSWORD_EXPLICIT )); then
+    command -v openssl >/dev/null 2>&1 || die "$(l10n 'OmniRoute 需要 openssl 生成初始强密码' 'OmniRoute requires openssl to generate its initial strong password')"
+    UI_PASSWORD="llm-$(openssl rand -hex 10)"
+  fi
+  (( ASSUME_YES || NON_INTERACTIVE || REGISTRATION_EXPLICIT )) && return 0
+  local answer suggested_ip smtp_password
+  read -r -p "$(l10n '是否立即开放公司邮箱注册？[y/N] ' 'Enable company-email registration now? [y/N] ')" answer
+  [[ "${answer}" =~ ^[Yy]$ ]] || { ACCOUNT_REGISTRATION_ENABLED=0; return 0; }
+  ACCOUNT_REGISTRATION_ENABLED=1
+  read -r -p "$(l10n '允许的邮箱后缀（逗号分隔，如 example.com）: ' 'Allowed email domains (comma-separated, e.g. example.com): ')" ACCOUNT_ALLOWED_EMAIL_DOMAINS
+  suggested_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  read -r -p "$(l10n "门户公开地址 [http://${suggested_ip:-服务器IP}:${ACCOUNT_PORT}]: " "Portal public URL [http://${suggested_ip:-server-IP}:${ACCOUNT_PORT}]: ")" ACCOUNT_PUBLIC_URL
+  ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-http://${suggested_ip:-127.0.0.1}:${ACCOUNT_PORT}}"
+  read -r -p "$(l10n 'SMTP 主机: ' 'SMTP host: ')" SMTP_HOST
+  read -r -p "$(l10n 'SMTP 端口 [587]: ' 'SMTP port [587]: ')" answer; SMTP_PORT="${answer:-587}"
+  read -r -p "$(l10n 'SMTP 安全协议 starttls/ssl/plain [starttls]: ' 'SMTP security starttls/ssl/plain [starttls]: ')" answer; SMTP_SECURITY="${answer:-starttls}"
+  read -r -p "$(l10n 'SMTP 用户名（本地无认证 SMTP 可留空）: ' 'SMTP username (blank for an unauthenticated local relay): ')" SMTP_USERNAME
+  if [[ -n "${SMTP_USERNAME}" ]]; then
+    read -r -s -p "$(l10n 'SMTP 密码: ' 'SMTP password: ')" smtp_password; printf '\n' >&2
+    SMTP_PASSWORD="${smtp_password}"
+  fi
+  read -r -p "$(l10n '发件邮箱: ' 'From email: ')" SMTP_FROM
+  read -r -p "$(l10n "每用户默认周期 Token 额度 [${ACCOUNT_DEFAULT_QUOTA_TOKENS}]: " "Default recurring token quota [${ACCOUNT_DEFAULT_QUOTA_TOKENS}]: ")" answer
+  ACCOUNT_DEFAULT_QUOTA_TOKENS="${answer:-${ACCOUNT_DEFAULT_QUOTA_TOKENS}}"
 }
 
 ask() {
@@ -870,19 +976,44 @@ validate_scalar_config() {
   (( API_PORT < WORKER_BASE_PORT || API_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'API 端口与 Worker 端口范围冲突' 'The API port conflicts with the worker port range')"
   (( GATEWAY_DB_PORT != API_PORT )) || die "$(l10n 'database-port 不能与 API 端口相同' 'database-port cannot equal the API port')"
   (( GATEWAY_DB_PORT < WORKER_BASE_PORT || GATEWAY_DB_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'database-port 与 Worker 端口范围冲突' 'database-port conflicts with the worker port range')"
-  [[ "${GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost)$ ]] || die "$(l10n 'gateway 只能是 newapi、litellm 或 bifrost' 'gateway must be newapi, litellm, or bifrost')"
-  if [[ "${GATEWAY_KIND}" == newapi && "${API_BIND}" != 0.0.0.0 && "${API_BIND}" != :: ]]; then
-    die "$(l10n 'New API 镜像不能单独指定监听 IP；请使用默认 --api-bind 0.0.0.0，并通过防火墙限制访问' 'The New API image cannot bind a specific IP; use the default --api-bind 0.0.0.0 and restrict access with the firewall')"
+  [[ "${GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost|omniroute)$ ]] || die "$(l10n 'gateway 只能是 newapi、litellm、bifrost 或 omniroute' 'gateway must be newapi, litellm, bifrost, or omniroute')"
+  if [[ "${GATEWAY_KIND}" =~ ^(newapi|omniroute)$ && "${API_BIND}" != 0.0.0.0 && "${API_BIND}" != :: ]]; then
+    die "$(l10n '所选镜像不能单独指定监听 IP；请使用默认 --api-bind 0.0.0.0，并通过防火墙限制访问' 'The selected image cannot bind a specific IP; use the default --api-bind 0.0.0.0 and restrict access with the firewall')"
   fi
   [[ "${UI_USERNAME}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "$(l10n 'ui-username 只允许字母、数字、点、下划线、@ 和连字符' 'ui-username may contain only letters, digits, dots, underscores, @, and hyphens')"
   [[ "${GATEWAY_KIND}" != newapi || ${#UI_USERNAME} -le 12 ]] || die "$(l10n 'New API 管理员用户名不能超过 12 个字符' 'The New API administrator username cannot exceed 12 characters')"
   [[ "${UI_PASSWORD}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "$(l10n 'ui-password 需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符' 'ui-password must be 8-128 characters using letters, digits, dots, underscores, @, and hyphens')"
   [[ "${GATEWAY_KIND}" != newapi || ${#UI_PASSWORD} -le 20 ]] || die "$(l10n 'New API 管理员密码不能超过 20 个字符' 'The New API administrator password cannot exceed 20 characters')"
+  [[ "${GATEWAY_KIND}" != omniroute || ${#UI_PASSWORD} -ge 12 ]] || die "$(l10n 'OmniRoute/账户门户管理员密码至少 12 位' 'The OmniRoute/account portal administrator password must be at least 12 characters')"
   [[ "${VLLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'vLLM 镜像名格式无效' 'Invalid vLLM image name')"
   [[ "${NEWAPI_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'New API 镜像名格式无效' 'Invalid New API image name')"
   [[ "${LITELLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'LiteLLM 镜像名格式无效' 'Invalid LiteLLM image name')"
   [[ "${BIFROST_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'Bifrost 镜像名格式无效' 'Invalid Bifrost image name')"
+  [[ "${OMNIROUTE_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'OmniRoute 镜像名格式无效' 'Invalid OmniRoute image name')"
   [[ "${POSTGRES_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'PostgreSQL 镜像名格式无效' 'Invalid PostgreSQL image name')"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    [[ "${ACCOUNT_BIND}" =~ ^[0-9a-fA-F:.]+$ ]] || die "$(l10n 'account-bind 只能是 IP 地址' 'account-bind must be an IP address')"
+    [[ "${ACCOUNT_PORT}" =~ ^[0-9]+$ ]] && (( ACCOUNT_PORT >= 1024 && ACCOUNT_PORT <= 65535 )) || die "$(l10n 'account-port 范围 1024-65535' 'account-port must be between 1024 and 65535')"
+    (( ACCOUNT_PORT != API_PORT )) || die "$(l10n 'account-port 不能与 API 端口相同' 'account-port cannot equal the API port')"
+    (( ACCOUNT_PORT < WORKER_BASE_PORT || ACCOUNT_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'account-port 与 Worker 端口范围冲突' 'account-port conflicts with the worker port range')"
+    [[ "${ACCOUNT_REGISTRATION_ENABLED}" =~ ^[01]$ ]] || die "ACCOUNT_REGISTRATION_ENABLED must be 0 or 1"
+    [[ "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" =~ ^[0-9]+$ ]] && (( ACCOUNT_DEFAULT_QUOTA_TOKENS >= 1 && ACCOUNT_DEFAULT_QUOTA_TOKENS <= 1000000000000 )) || die "$(l10n '默认 Token 额度无效' 'Invalid default token quota')"
+    [[ "${ACCOUNT_QUOTA_RESET}" =~ ^(daily|weekly|monthly)$ ]] || die "$(l10n '额度重置周期无效' 'Invalid quota reset interval')"
+    [[ "${ACCOUNT_QUOTA_RESET_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$(l10n '额度重置时间必须是 HH:MM' 'Quota reset time must be HH:MM')"
+    [[ "${ACCOUNT_ADMIN_EMAIL}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || die "$(l10n '门户管理员邮箱格式无效' 'Invalid portal administrator email')"
+    [[ -z "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" || "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || die "$(l10n '邮箱后缀只能是逗号分隔的域名' 'Email domains must be comma-separated domain names')"
+    [[ -z "${ACCOUNT_PUBLIC_URL}" || "${ACCOUNT_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+$ ]] || die "$(l10n 'account-public-url 必须是无路径的 http(s) URL' 'account-public-url must be an http(s) URL without a path')"
+    [[ -z "${ACCOUNT_API_PUBLIC_URL}" || "${ACCOUNT_API_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+$ ]] || die "$(l10n 'account-api-public-url 必须是无路径的 http(s) URL' 'account-api-public-url must be an http(s) URL without a path')"
+    [[ -z "${SMTP_HOST}" || "${SMTP_HOST}" =~ ^[A-Za-z0-9.:-]+$ ]] || die "$(l10n 'SMTP 主机格式无效' 'Invalid SMTP host')"
+    [[ "${SMTP_PORT}" =~ ^[0-9]+$ ]] && (( SMTP_PORT >= 1 && SMTP_PORT <= 65535 )) || die "$(l10n 'SMTP 端口无效' 'Invalid SMTP port')"
+    [[ "${SMTP_SECURITY}" =~ ^(starttls|ssl|plain)$ ]] || die "$(l10n 'SMTP 安全协议无效' 'Invalid SMTP security mode')"
+    [[ -z "${SMTP_USERNAME}" || "${SMTP_USERNAME}" =~ ^[A-Za-z0-9._@%+=:-]+$ ]] || die "$(l10n 'SMTP 用户名含不支持的字符' 'SMTP username contains unsupported characters')"
+    [[ -z "${SMTP_PASSWORD}" || "${SMTP_PASSWORD}" =~ ^[A-Za-z0-9._@%+=:,/~-]+$ ]] || die "$(l10n 'SMTP 密码含不支持的字符；请使用应用专用密码' 'SMTP password contains unsupported characters; use an app password')"
+    [[ -z "${SMTP_FROM}" || "${SMTP_FROM}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || die "$(l10n '发件邮箱格式无效' 'Invalid SMTP from address')"
+    if (( ACCOUNT_REGISTRATION_ENABLED )); then
+      [[ -n "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" && -n "${ACCOUNT_PUBLIC_URL}" && -n "${SMTP_HOST}" && -n "${SMTP_FROM}" ]] || die "$(l10n '开放注册必须配置允许的邮箱后缀、门户公开 URL、SMTP 主机和发件邮箱' 'Enabling registration requires allowed domains, portal public URL, SMTP host, and from address')"
+    fi
+  fi
   if [[ -n "${PROXY_URL}" ]]; then
     [[ "${PROXY_URL}" =~ ^https?://[A-Za-z0-9._:-]+$ ]] || die "$(l10n '代理格式应为 http://IP:PORT 或 https://IP:PORT' 'Proxy must be formatted as http://IP:PORT or https://IP:PORT')"
   fi
@@ -898,6 +1029,7 @@ check_discovery_host() {
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
+  [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -924,6 +1056,7 @@ check_host() {
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
+  [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -966,7 +1099,8 @@ check_host() {
 check_ports_available() {
   command -v ss >/dev/null 2>&1 || { warn "$(l10n '缺少 ss，跳过端口占用预检。' 'ss is unavailable; skipping the port-occupancy preflight.')"; return 0; }
   local port id
-  local -a ports=("${API_PORT}" "${GATEWAY_DB_PORT}")
+  local -a ports=("${API_PORT}")
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then ports+=("${ACCOUNT_PORT}"); else ports+=("${GATEWAY_DB_PORT}"); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do ports+=("$((WORKER_BASE_PORT + id))"); done
   for port in "${ports[@]}"; do
     if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
@@ -1102,7 +1236,7 @@ pull_images() {
   selected_gateway_image=$(gateway_image) || die "$(l10n '无法解析接入层镜像' 'Could not resolve the gateway image')"
   ensure_image "${VLLM_IMAGE}" vLLM
   ensure_image "${selected_gateway_image}" "$(gateway_display_name)"
-  ensure_image "${POSTGRES_IMAGE}" PostgreSQL
+  [[ "${GATEWAY_KIND}" == omniroute ]] || ensure_image "${POSTGRES_IMAGE}" PostgreSQL
 }
 
 verify_gpu_in_container() {
@@ -1288,6 +1422,7 @@ GATEWAY_IMAGE=$(gateway_image)
 NEWAPI_IMAGE=${NEWAPI_IMAGE}
 LITELLM_IMAGE=${LITELLM_IMAGE}
 BIFROST_IMAGE=${BIFROST_IMAGE}
+OMNIROUTE_IMAGE=${OMNIROUTE_IMAGE}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
 PHYSICAL_GPU_COUNT=${PHYSICAL_GPU_COUNT}
 TP_SIZE=${TP_SIZE}
@@ -1297,6 +1432,17 @@ WORKER_BASE_PORT=${WORKER_BASE_PORT}
 API_BIND=${API_BIND}
 API_PORT=${API_PORT}
 GATEWAY_DB_PORT=${GATEWAY_DB_PORT}
+ACCOUNT_BIND=${ACCOUNT_BIND}
+ACCOUNT_PORT=${ACCOUNT_PORT}
+ACCOUNT_PUBLIC_URL=${ACCOUNT_PUBLIC_URL}
+ACCOUNT_API_PUBLIC_URL=${ACCOUNT_API_PUBLIC_URL}
+ACCOUNT_REGISTRATION_ENABLED=${ACCOUNT_REGISTRATION_ENABLED}
+ACCOUNT_ALLOWED_EMAIL_DOMAINS=${ACCOUNT_ALLOWED_EMAIL_DOMAINS}
+ACCOUNT_DEFAULT_QUOTA_TOKENS=${ACCOUNT_DEFAULT_QUOTA_TOKENS}
+ACCOUNT_QUOTA_RESET=${ACCOUNT_QUOTA_RESET}
+ACCOUNT_QUOTA_RESET_TIME=${ACCOUNT_QUOTA_RESET_TIME}
+ACCOUNT_ADMIN_EMAIL=${ACCOUNT_ADMIN_EMAIL}
+ACCOUNT_DB_PATH=${STATE_DIR}/omniroute/portal/account-portal.db
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 ESTIMATED_MAX_NUM_SEQS=${ESTIMATED_MAX_NUM_SEQS}
@@ -1314,11 +1460,12 @@ EOF
   local requested_ui_username="${UI_USERNAME}" requested_ui_password="${UI_PASSWORD}"
   local existing_gateway_key="" existing_backend_key="" existing_salt_key=""
   local existing_session_secret="" existing_encryption_key=""
+  local existing_omni_jwt="" existing_omni_api_secret="" existing_omni_storage_key=""
   local existing_ui_username="" existing_ui_password="" existing_postgres_password=""
   local secrets_source=""
   if [[ -r "${SECRETS_ENV}" ]]; then
     secrets_source="${SECRETS_ENV}"
-  elif [[ -r "${RETAINED_SECRETS}" ]] && docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; then
+  elif [[ -r "${RETAINED_SECRETS}" ]] && { [[ "${GATEWAY_KIND}" == omniroute && -d "${STATE_DIR}/omniroute/gateway" ]] || docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; }; then
     secrets_source="${RETAINED_SECRETS}"
     log "$(l10n '检测到保留的接入层数据库和恢复凭据，将继续使用原管理数据。' 'Found a retained gateway database and recovery credentials; reusing the existing administration data.')"
   fi
@@ -1330,6 +1477,9 @@ EOF
     existing_salt_key="${LITELLM_SALT_KEY:-}"
     existing_session_secret="${NEWAPI_SESSION_SECRET:-}"
     existing_encryption_key="${BIFROST_ENCRYPTION_KEY:-}"
+    existing_omni_jwt="${OMNIROUTE_JWT_SECRET:-}"
+    existing_omni_api_secret="${OMNIROUTE_API_KEY_SECRET:-}"
+    existing_omni_storage_key="${OMNIROUTE_STORAGE_ENCRYPTION_KEY:-}"
     existing_ui_username="${UI_USERNAME:-}"
     existing_ui_password="${UI_PASSWORD:-}"
     existing_postgres_password="${POSTGRES_PASSWORD:-}"
@@ -1357,9 +1507,19 @@ LITELLM_SALT_KEY=${existing_salt_key:-sk-salt-$(openssl rand -hex 32)}
 NEWAPI_SESSION_SECRET=${session_secret}
 SESSION_SECRET=${session_secret}
 BIFROST_ENCRYPTION_KEY=${existing_encryption_key:-$(openssl rand -hex 32)}
+OMNIROUTE_JWT_SECRET=${existing_omni_jwt:-$(openssl rand -hex 64)}
+OMNIROUTE_API_KEY_SECRET=${existing_omni_api_secret:-$(openssl rand -hex 32)}
+OMNIROUTE_STORAGE_ENCRYPTION_KEY=${existing_omni_storage_key:-$(openssl rand -hex 32)}
 GATEWAY_STATE_KIND=${GATEWAY_KIND}
 UI_USERNAME=${final_ui_username}
 UI_PASSWORD=${final_ui_password}
+ACCOUNT_ADMIN_PASSWORD=${final_ui_password}
+SMTP_HOST=${SMTP_HOST}
+SMTP_PORT=${SMTP_PORT}
+SMTP_SECURITY=${SMTP_SECURITY}
+SMTP_USERNAME=${SMTP_USERNAME}
+SMTP_PASSWORD=${SMTP_PASSWORD}
+SMTP_FROM=${SMTP_FROM}
 POSTGRES_USER=${postgres_user}
 POSTGRES_PASSWORD=${postgres_password}
 POSTGRES_DB=${postgres_db}
@@ -1404,6 +1564,29 @@ install_manager() {
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
+  install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    getent group llm-account >/dev/null 2>&1 || groupadd --system llm-account
+    id -u llm-account >/dev/null 2>&1 || useradd --system --gid llm-account --home-dir /nonexistent --shell /usr/sbin/nologin llm-account
+    # The portal user needs to traverse the shared parent, but it cannot read
+    # or enter the gateway sibling directory owned by container UID 1000.
+    install -d -m 751 -o root -g llm-account "${STATE_DIR}/omniroute"
+    install -d -m 770 -o 1000 -g 1000 "${STATE_DIR}/omniroute/gateway"
+    install -d -m 750 -o llm-account -g llm-account "${STATE_DIR}/omniroute/portal"
+  fi
+}
+
+validate_account_portal_configuration() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  source "${CLUSTER_ENV}"
+  # shellcheck disable=SC1090
+  source "${SECRETS_ENV}"
+  set +a
+  /usr/local/lib/llm-cluster/account_portal.py check-config >/dev/null || \
+    die "$(l10n '账户门户配置自检失败；尚未写入 systemd 单元' 'Account portal configuration validation failed before systemd units were written')"
+  log "$(l10n '账户门户配置与独立 SQLite 路径自检通过。' 'Account portal configuration and isolated SQLite path validated.')"
 }
 
 write_systemd_units() {
@@ -1433,7 +1616,9 @@ TimeoutStopSec=120
 WantedBy=llm-cluster.service
 EOF
 
-  cat >/etc/systemd/system/llm-database.service <<'EOF'
+  if [[ "${GATEWAY_KIND}" != omniroute ]]; then
+    rm -f /etc/systemd/system/llm-account.service
+    cat >/etc/systemd/system/llm-database.service <<'EOF'
 [Unit]
 Description=PostgreSQL database for the LLMCtl API gateway
 After=docker.service network-online.target
@@ -1460,7 +1645,7 @@ NoNewPrivileges=true
 WantedBy=llm-cluster.service
 EOF
 
-  cat >/etc/systemd/system/llm-router.service <<'EOF'
+    cat >/etc/systemd/system/llm-router.service <<'EOF'
 [Unit]
 Description=Selected API gateway for the local vLLM cluster
 After=docker.service network-online.target llm-database.service
@@ -1486,7 +1671,7 @@ NoNewPrivileges=true
 WantedBy=llm-cluster.service
 EOF
 
-  cat >/etc/systemd/system/llm-cluster.service <<'EOF'
+    cat >/etc/systemd/system/llm-cluster.service <<'EOF'
 [Unit]
 Description=Hardware-aware local LLM inference cluster
 After=docker.service network-online.target llm-database.service
@@ -1504,7 +1689,87 @@ TimeoutStopSec=900
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 644 /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-cluster.service
+  else
+    rm -f /etc/systemd/system/llm-database.service
+    cat >/etc/systemd/system/llm-router.service <<'EOF'
+[Unit]
+Description=OmniRoute API gateway for the local vLLM cluster
+After=docker.service network-online.target
+Requires=docker.service
+PartOf=llm-cluster.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/llm-cluster/cluster.env
+EnvironmentFile=/etc/llm-cluster/secrets.env
+ExecStartPre=-/usr/bin/docker rm -f llm-router
+ExecStart=/usr/local/sbin/llmctl _gateway-start
+ExecStop=-/usr/bin/docker stop --time 30 llm-router
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=60
+NoNewPrivileges=true
+
+[Install]
+WantedBy=llm-cluster.service
+EOF
+
+    cat >/etc/systemd/system/llm-account.service <<'EOF'
+[Unit]
+Description=LLMCtl company account portal for OmniRoute
+After=network-online.target llm-router.service
+Requires=llm-router.service
+PartOf=llm-cluster.service llm-router.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=llm-account
+Group=llm-account
+UMask=0077
+EnvironmentFile=/etc/llm-cluster/cluster.env
+EnvironmentFile=/etc/llm-cluster/secrets.env
+ExecStart=/usr/local/lib/llm-cluster/account_portal.py serve
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llm-cluster/omniroute/portal
+
+[Install]
+WantedBy=llm-cluster.service
+EOF
+
+    cat >/etc/systemd/system/llm-cluster.service <<'EOF'
+[Unit]
+Description=Hardware-aware local LLM inference cluster
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/llmctl _boot-start
+ExecStop=/usr/local/sbin/llmctl _boot-stop
+TimeoutStartSec=infinity
+TimeoutStopSec=900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+  chmod 644 /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-cluster.service
+  [[ ! -e /etc/systemd/system/llm-database.service ]] || chmod 644 /etc/systemd/system/llm-database.service
+  [[ ! -e /etc/systemd/system/llm-account.service ]] || chmod 644 /etc/systemd/system/llm-account.service
   systemctl daemon-reload
 }
 
@@ -1561,6 +1826,7 @@ API:               http://${host_for_url}:${API_PORT}/v1
 Web UI:            http://${host_for_url}:${API_PORT}$(gateway_ui_path)
 Administrator:     ${UI_USERNAME}
 Initial password:  ${UI_PASSWORD}
+$([[ "${GATEWAY_KIND}" == omniroute ]] && printf 'Account portal:    %s\nPortal admin:      %s\nRegistration:      %s; domains=%s\n' "$(account_portal_url)" "${ACCOUNT_ADMIN_EMAIL}" "$([[ ${ACCOUNT_REGISTRATION_ENABLED} -eq 1 ]] && printf enabled || printf disabled)" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-not configured}")
 Served model:      ${SERVED_MODEL_NAME}
 API key:           ${GATEWAY_API_KEY}
 
@@ -1580,7 +1846,7 @@ If reasoning can be disabled, add "reasoning_effort":"none" to Chat Completions 
 Vision requests use messages[].content.image_url; data:base64 is allowed by default to limit SSRF exposure.
 
 Note: ${INSTANCE_COUNT}×${MAX_NUM_SEQS} is a scheduling-slot count, not ${INSTANCE_COUNT}×${MAX_NUM_SEQS} simultaneous 256K requests.
-Gateway routing uses configured worker health/weights; none of the three gateways reads live GPU VRAM/KV-cache pressure.
+Gateway routing uses configured worker health/weights; none of the four gateways reads live GPU VRAM/KV-cache pressure.
 Change the shared initial Web UI password immediately with llmctl admin set-password.
 EOF
     return
@@ -1606,6 +1872,7 @@ API：        http://${host_for_url}:${API_PORT}/v1
 Web UI：     http://${host_for_url}:${API_PORT}$(gateway_ui_path)
 管理员：     ${UI_USERNAME}
 初始密码：   ${UI_PASSWORD}
+$([[ "${GATEWAY_KIND}" == omniroute ]] && printf '账户门户：   %s\n门户管理员： %s\n注册策略：   %s；邮箱后缀=%s\n' "$(account_portal_url)" "${ACCOUNT_ADMIN_EMAIL}" "$([[ ${ACCOUNT_REGISTRATION_ENABLED} -eq 1 ]] && printf 已启用 || printf 已关闭)" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-未配置}")
 模型名：     ${SERVED_MODEL_NAME}
 API key：    ${GATEWAY_API_KEY}
 
@@ -1625,7 +1892,7 @@ API key：    ${GATEWAY_API_KEY}
 图片模型使用 messages[].content.image_url；默认只接受 data:base64，避免外部 URL SSRF。
 
 注意：${INSTANCE_COUNT}×${MAX_NUM_SEQS} 是调度槽，不表示所有请求都能同时使用 256K。
-三种接入层均按已配置的健康 Worker/权重路由，不读取实时 GPU 显存或 KV Cache 压力。
+四种接入层均按已配置的健康 Worker/权重路由，不读取实时 GPU 显存或 KV Cache 压力。
 Web UI 使用通用初始密码；首次登录后请立即通过 llmctl admin set-password 修改。
 EOF
 }
@@ -1636,11 +1903,10 @@ preflight_existing_install() {
   if [[ -r "${LEGACY_CONFIG_DIR}/cluster.env" && ! -r "${CLUSTER_ENV}" ]]; then
     die "$(l10n "检测到旧版 Ornith 集群 ${LEGACY_CONFIG_DIR}。为避免两套服务抢占 GPU/端口，本版拒绝并行覆盖且不执行在线迁移；请先卸载旧服务并保留模型，再执行全新安装。" "A legacy Ornith cluster was found at ${LEGACY_CONFIG_DIR}. To prevent GPU and port conflicts, this installer neither overwrites it nor performs an online migration; remove the old services, retain the model files, and then perform a clean install.")"
   fi
-  if [[ -r "${RETAINED_SECRETS}" ]] && command -v docker >/dev/null 2>&1 && \
-     docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; then
+  if [[ -r "${RETAINED_SECRETS}" ]] && { [[ -d "${STATE_DIR}/omniroute/gateway" ]] || { command -v docker >/dev/null 2>&1 && docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; }; }; then
     retained_kind=$(awk -F= '$1 == "GATEWAY_STATE_KIND" {print $2; exit}' "${RETAINED_SECRETS}")
     if [[ -n "${retained_kind}" && "${retained_kind}" != "${GATEWAY_KIND}" ]]; then
-      die "$(l10n "检测到 ${retained_kind} 的保留管理数据；本版不在接入层之间迁移。请改选 ${retained_kind}，或确认不再需要管理数据后删除 llm-cluster-gateway-postgres 与 llm-cluster-gateway-data 卷。模型目录不受影响。" "Retained ${retained_kind} administration state was found. This release does not migrate between gateways. Select ${retained_kind}, or, after confirming that the administration state is no longer needed, delete the llm-cluster-gateway-postgres and llm-cluster-gateway-data volumes. Model files are unaffected.")"
+      die "$(l10n "检测到 ${retained_kind} 的保留管理数据；本版不在接入层之间迁移。请改选 ${retained_kind}，或确认不再需要管理数据后删除对应的 PostgreSQL 卷/OmniRoute SQLite 状态和 retained-secrets.env。模型目录不受影响。" "Retained ${retained_kind} administration state was found. This release does not migrate between gateways. Select ${retained_kind}, or, after confirming that the administration state is no longer needed, delete the corresponding PostgreSQL volumes/OmniRoute SQLite state and retained-secrets.env. Model files are unaffected.")"
     fi
   fi
   [[ -e "${CLUSTER_ENV}" ]] || return 0
@@ -1659,6 +1925,7 @@ main() {
   parse_args "$@"
   select_language_interactively
   select_gateway_interactively
+  configure_omniroute_portal_interactively
   preflight_existing_install
   check_discovery_host
   select_model_interactively
@@ -1722,6 +1989,7 @@ EOF
 
   write_configuration
   install_manager
+  validate_account_portal_configuration
   prepare_worker_cache
   write_systemd_units
 

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.2.1"
+readonly CTL_VERSION="2.3.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -17,6 +17,10 @@ readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm.yaml"
 readonly BIFROST_DIR="${CONFIG_DIR}/bifrost"
 readonly BIFROST_CONFIG="${BIFROST_DIR}/config.json"
 readonly NEWAPI_PLAN="${CONFIG_DIR}/newapi-plan.json"
+readonly OMNIROUTE_PLAN="${CONFIG_DIR}/omniroute-plan.json"
+readonly OMNIROUTE_SQLITE="${STATE_DIR}/omniroute/gateway/storage.sqlite"
+readonly ACCOUNT_SQLITE="${STATE_DIR}/omniroute/portal/account-portal.db"
+readonly ACCOUNT_HELPER="${LLM_ACCOUNT_HELPER:-/usr/local/lib/llm-cluster/account_portal.py}"
 readonly DOCKER_PROXY_DROPIN="/etc/systemd/system/docker.service.d/90-llm-cluster-temporary-proxy.conf"
 readonly CATALOG_HELPER="${LLM_CATALOG_HELPER:-/usr/local/lib/llm-cluster/model_catalog.py}"
 readonly OPTIMIZER_HELPER="${LLM_OPTIMIZER_HELPER:-/usr/local/lib/llm-cluster/runtime_optimizer.py}"
@@ -74,16 +78,35 @@ load_config() {
   LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.94.0}"
   NEWAPI_IMAGE="${NEWAPI_IMAGE:-calciumion/new-api:v1.0.0-rc.22}"
   BIFROST_IMAGE="${BIFROST_IMAGE:-maximhq/bifrost:v1.6.7}"
+  OMNIROUTE_IMAGE="${OMNIROUTE_IMAGE:-diegosouzapw/omniroute:3.8.50}"
   case "${GATEWAY_KIND}" in
     newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}" ;;
     litellm) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${LITELLM_IMAGE}}" ;;
     bifrost) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${BIFROST_IMAGE}}" ;;
-    *) die "GATEWAY_KIND 必须是 newapi、litellm 或 bifrost" ;;
+    omniroute) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${OMNIROUTE_IMAGE}}" ;;
+    *) die "GATEWAY_KIND 必须是 newapi、litellm、bifrost 或 omniroute" ;;
   esac
   GATEWAY_DB_PORT="${GATEWAY_DB_PORT:-${LITELLM_DB_PORT:-15432}}"
   GATEWAY_API_KEY="${GATEWAY_API_KEY:-${LITELLM_MASTER_KEY:-}}"
   LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-${GATEWAY_API_KEY}}"
   DATABASE_URL="${DATABASE_URL:-${SQL_DSN:-}}"
+  ACCOUNT_PORT="${ACCOUNT_PORT:-8001}"
+  ACCOUNT_BIND="${ACCOUNT_BIND:-0.0.0.0}"
+  ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-}"
+  ACCOUNT_API_PUBLIC_URL="${ACCOUNT_API_PUBLIC_URL:-}"
+  ACCOUNT_ADMIN_EMAIL="${ACCOUNT_ADMIN_EMAIL:-admin@llmctl.local}"
+  ACCOUNT_DB_PATH="${ACCOUNT_DB_PATH:-${ACCOUNT_SQLITE}}"
+  ACCOUNT_REGISTRATION_ENABLED="${ACCOUNT_REGISTRATION_ENABLED:-0}"
+  ACCOUNT_ALLOWED_EMAIL_DOMAINS="${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-}"
+  ACCOUNT_DEFAULT_QUOTA_TOKENS="${ACCOUNT_DEFAULT_QUOTA_TOKENS:-1000000}"
+  ACCOUNT_QUOTA_RESET="${ACCOUNT_QUOTA_RESET:-monthly}"
+  ACCOUNT_QUOTA_RESET_TIME="${ACCOUNT_QUOTA_RESET_TIME:-00:00}"
+  SMTP_HOST="${SMTP_HOST:-}"
+  SMTP_PORT="${SMTP_PORT:-587}"
+  SMTP_SECURITY="${SMTP_SECURITY:-starttls}"
+  SMTP_USERNAME="${SMTP_USERNAME:-}"
+  SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+  SMTP_FROM="${SMTP_FROM:-}"
 
   : "${PHYSICAL_GPU_COUNT:?PHYSICAL_GPU_COUNT missing}"
   : "${TP_SIZE:?TP_SIZE missing}"
@@ -115,6 +138,13 @@ load_config() {
   : "${POSTGRES_DB:?POSTGRES_DB missing}"
   : "${DATABASE_URL:?DATABASE_URL missing}"
   [[ -x "${GATEWAY_HELPER}" ]] || die "网关配置助手不可执行：${GATEWAY_HELPER}"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    [[ -x "${ACCOUNT_HELPER}" ]] || die "账户门户不可执行：${ACCOUNT_HELPER}"
+    : "${OMNIROUTE_JWT_SECRET:?OMNIROUTE_JWT_SECRET missing}"
+    : "${OMNIROUTE_API_KEY_SECRET:?OMNIROUTE_API_KEY_SECRET missing}"
+    : "${OMNIROUTE_STORAGE_ENCRYPTION_KEY:?OMNIROUTE_STORAGE_ENCRYPTION_KEY missing}"
+    : "${ACCOUNT_ADMIN_PASSWORD:?ACCOUNT_ADMIN_PASSWORD missing}"
+  fi
   [[ "${STARTUP_PARALLELISM}" =~ ^[0-9]+$ ]] && (( STARTUP_PARALLELISM >= 1 && STARTUP_PARALLELISM <= INSTANCE_COUNT )) || die "STARTUP_PARALLELISM 必须在 1-${INSTANCE_COUNT}"
 }
 
@@ -149,6 +179,22 @@ cmd_gateway_start() {
         -e APP_DIR=/app/data -e "APP_HOST=${API_BIND}" -e "APP_PORT=${API_PORT}" \
         -v llm-cluster-gateway-data:/app/data \
         -v "${BIFROST_CONFIG}:/app/data/config.json:ro" \
+        "${GATEWAY_IMAGE}"
+      ;;
+    omniroute)
+      [[ "${API_BIND}" == 0.0.0.0 || "${API_BIND}" == :: ]] || \
+        die "OmniRoute 当前仅支持 api-bind=0.0.0.0 或 ::；请通过防火墙限制入口"
+      install -d -m 770 -o 1000 -g 1000 "${STATE_DIR}/omniroute/gateway"
+      exec /usr/bin/docker run --rm --name llm-router --network host \
+        --env-file "${SECRETS_ENV}" \
+        -e "PORT=${API_PORT}" -e "DASHBOARD_PORT=${API_PORT}" -e "API_PORT=${API_PORT}" \
+        -e "INITIAL_PASSWORD=${UI_PASSWORD}" -e "JWT_SECRET=${OMNIROUTE_JWT_SECRET}" \
+        -e "API_KEY_SECRET=${OMNIROUTE_API_KEY_SECRET}" \
+        -e "STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}" \
+        -e STORAGE_ENCRYPTION_KEY_VERSION=v1 -e REQUIRE_API_KEY=true \
+        -e AUTH_COOKIE_SECURE=false -e OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS=true \
+        -e ALLOW_MULTI_CONNECTIONS_PER_COMPAT_NODE=true \
+        -v "${STATE_DIR}/omniroute/gateway:/app/data" \
         "${GATEWAY_IMAGE}"
       ;;
   esac
@@ -226,14 +272,16 @@ usage() {
   llmctl deactivate <0,1,...|all>             移出负载均衡 + stop + disable
   llmctl scale <1-N>                          持久调整集群为前 N 个实例
   llmctl autostart <enable|disable|status>     管理整个集群的开机自启
-  llmctl router <start|stop|restart|status>    管理所选接入层（New API/LiteLLM/Bifrost）
+  llmctl router <start|stop|restart|status>    管理所选接入层（含 OmniRoute）
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
+  llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
   llmctl timezone show|set [时区]              查看或设置系统时区（默认 Asia/Shanghai）
 
   llmctl logs [all] [-f]                      全部组件日志（默认）
   llmctl logs worker <ID> [-f]                Worker 日志
   llmctl logs router [-f]                     所选接入层日志
   llmctl logs database [-f]                   PostgreSQL 日志
+  llmctl logs account [-f]                    OmniRoute 账户门户日志
   llmctl smoke [--worker ID] [--full]         文本/思考/工具；--full 另测 OCR/单请求6图
   llmctl ocr <图片文件> [提示词]               通过集群入口执行 OCR
   llmctl bench [--concurrency N] [--requests N] [--max-tokens N]
@@ -512,6 +560,7 @@ gateway_display_name() {
     newapi) printf 'New API\n' ;;
     litellm) printf 'LiteLLM\n' ;;
     bifrost) printf 'Bifrost\n' ;;
+    omniroute) printf 'OmniRoute\n' ;;
   esac
 }
 
@@ -520,6 +569,7 @@ gateway_config_path() {
     newapi) printf '%s\n' "${NEWAPI_PLAN}" ;;
     litellm) printf '%s\n' "${LITELLM_CONFIG}" ;;
     bifrost) printf '%s\n' "${BIFROST_CONFIG}" ;;
+    omniroute) printf '%s\n' "${OMNIROUTE_PLAN}" ;;
   esac
 }
 
@@ -531,7 +581,19 @@ gateway_helper() {
   export SERVED_MODEL_NAME WORKER_BASE_PORT MAX_NUM_SEQS MAX_MODEL_LEN ROUTING_STRATEGY
   export GATEWAY_DB_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD BACKEND_API_KEY
   export GATEWAY_API_KEY BIFROST_ENCRYPTION_KEY UI_USERNAME UI_PASSWORD DATABASE_URL
+  export SUPPORTS_IMAGE_INPUT SUPPORTS_OCR OMNIROUTE_JWT_SECRET OMNIROUTE_API_KEY_SECRET
+  export OMNIROUTE_STORAGE_ENCRYPTION_KEY ACCOUNT_PORT ACCOUNT_BIND
   "${GATEWAY_HELPER}" "$@"
+}
+
+account_helper() {
+  export ACCOUNT_BIND ACCOUNT_PORT ACCOUNT_PUBLIC_URL ACCOUNT_API_PUBLIC_URL
+  export ACCOUNT_ADMIN_EMAIL ACCOUNT_ADMIN_PASSWORD ACCOUNT_DB_PATH
+  export ACCOUNT_REGISTRATION_ENABLED ACCOUNT_ALLOWED_EMAIL_DOMAINS
+  export ACCOUNT_DEFAULT_QUOTA_TOKENS ACCOUNT_QUOTA_RESET ACCOUNT_QUOTA_RESET_TIME
+  export SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USERNAME SMTP_PASSWORD SMTP_FROM
+  export GATEWAY_API_KEY API_PORT SUPPORTS_OCR
+  "${ACCOUNT_HELPER}" "$@"
 }
 
 render_router_config() {
@@ -542,7 +604,11 @@ render_router_config() {
   gateway_helper render --gateway "${GATEWAY_KIND}" --worker-ids "${worker_ids}" --output "${output}"
   chown root:root "${output}"
   chmod 640 "${output}"
-  log "$(gateway_display_name) 配置已生成，健康后端：${worker_ids}；策略：${ROUTING_STRATEGY}。"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    log "OmniRoute 期望状态已生成，健康后端：${worker_ids}；策略：round-robin（关闭会话粘性）。"
+  else
+    log "$(gateway_display_name) 配置已生成，健康后端：${worker_ids}；策略：${ROUTING_STRATEGY}。"
+  fi
 }
 
 gateway_process_health() {
@@ -552,6 +618,7 @@ gateway_process_health() {
     newapi) curl --noproxy '*' -fsS --max-time 3 "${base_url}/api/status" >/dev/null 2>&1 ;;
     litellm) curl --noproxy '*' -fsS --max-time 3 "${base_url}/health/liveliness" >/dev/null 2>&1 ;;
     bifrost) curl --noproxy '*' -fsS --max-time 3 "${base_url}/health" >/dev/null 2>&1 ;;
+    omniroute) curl --noproxy '*' -fsS --max-time 3 "${base_url}/api/health/ping" >/dev/null 2>&1 ;;
   esac
 }
 
@@ -572,18 +639,27 @@ wait_gateway_process() {
 
 reconcile_gateway() {
   local worker_ids="${1:?}"
-  [[ "${GATEWAY_KIND}" == newapi ]] || return 0
   export GATEWAY_LOCAL_URL
   GATEWAY_LOCAL_URL=$(router_local_base_url)
-  log "自动初始化 New API，并同步 ${worker_ids} 个健康 Worker、管理员和调用密钥..."
-  gateway_helper reconcile-newapi --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
-  # The helper may create New API's first managed token.
+  case "${GATEWAY_KIND}" in
+    newapi)
+      log "自动初始化 New API，并同步 ${worker_ids} 个健康 Worker、管理员和调用密钥..."
+      gateway_helper reconcile-newapi --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
+      ;;
+    omniroute)
+      log "自动初始化 OmniRoute，并同步 ${worker_ids} 个健康 Worker、模型、Combo 和管理密钥..."
+      gateway_helper reconcile-omniroute --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
+      ;;
+    *) return 0 ;;
+  esac
+  # Reconciliation can atomically replace the managed gateway key.
   # shellcheck disable=SC1090
   source "${SECRETS_ENV}"
-  log "New API 自动配置完成。"
+  log "$(gateway_display_name) 自动配置完成。"
 }
 
 ensure_database_ready() {
+  [[ "${GATEWAY_KIND}" != omniroute ]] || return 0
   local started now
   systemctl start llm-database.service
   started=$(date +%s)
@@ -609,6 +685,10 @@ refresh_router() {
   wait_gateway_process
   reconcile_gateway "${ids}"
   wait_router
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    systemctl restart llm-account.service
+    wait_account_portal
+  fi
 }
 
 reload_gateway_api_key() {
@@ -648,7 +728,38 @@ router_local_base_url() {
 }
 
 database_health() {
+  [[ "${GATEWAY_KIND}" != omniroute ]] || return 0
   docker exec llm-database pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1
+}
+
+account_portal_health() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
+  curl --noproxy '*' -fsS --max-time 5 "$(account_local_base_url)/ready" >/dev/null 2>&1
+}
+
+account_local_base_url() {
+  case "${ACCOUNT_BIND}" in
+    0.0.0.0) printf 'http://127.0.0.1:%s\n' "${ACCOUNT_PORT}" ;;
+    ::) printf 'http://[::1]:%s\n' "${ACCOUNT_PORT}" ;;
+    *:*) printf 'http://[%s]:%s\n' "${ACCOUNT_BIND}" "${ACCOUNT_PORT}" ;;
+    *) printf 'http://%s:%s\n' "${ACCOUNT_BIND}" "${ACCOUNT_PORT}" ;;
+  esac
+}
+
+wait_account_portal() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
+  local started now
+  started=$(date +%s)
+  until account_portal_health; do
+    systemctl is-active --quiet llm-account.service || {
+      journalctl -u llm-account.service -n 100 --no-pager >&2 || true
+      die "账户门户启动失败；请查看 llmctl logs account"
+    }
+    now=$(date +%s)
+    (( now - started < 60 )) || die "账户门户启动超时"
+    sleep 2
+  done
+  log "账户门户已就绪：$(account_local_base_url)"
 }
 
 wait_router() {
@@ -786,8 +897,13 @@ cmd_status() {
   printf '开机激活 Worker: %s\n' "${ACTIVE_WORKERS}"
   router_state=$(systemctl is-active llm-router.service 2>/dev/null || true)
   printf '%s: %s (%s)\n' "$(gateway_display_name)" "${router_state:-unknown}" "$([[ -n "${router_state}" ]] && router_health && printf healthy || printf unhealthy)"
-  database_state=$(systemctl is-active llm-database.service 2>/dev/null || true)
-  printf 'PostgreSQL: %s (%s，仅监听 127.0.0.1:%s)\n' "${database_state:-unknown}" "$([[ -n "${database_state}" ]] && database_health && printf healthy || printf unhealthy)" "${GATEWAY_DB_PORT}"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf 'SQLite: OmniRoute=%s；账户门户=%s（隔离文件，无数据库服务实例）\n' "${OMNIROUTE_SQLITE}" "${ACCOUNT_DB_PATH}"
+    printf '账户门户: %s (%s)  http://%s:%s\n' "$(systemctl is-active llm-account.service 2>/dev/null || true)" "$(account_portal_health && printf healthy || printf unhealthy)" "${ACCOUNT_BIND}" "${ACCOUNT_PORT}"
+  else
+    database_state=$(systemctl is-active llm-database.service 2>/dev/null || true)
+    printf 'PostgreSQL: %s (%s，仅监听 127.0.0.1:%s)\n' "${database_state:-unknown}" "$([[ -n "${database_state}" ]] && database_health && printf healthy || printf unhealthy)" "${GATEWAY_DB_PORT}"
+  fi
   printf '\n%-8s %-10s %-7s %-9s %-9s %-12s %-18s\n' INSTANCE GPUS PORT BOOT SYSTEMD HEALTH VRAM
   IFS=',' read -r -a id_list <<<"${ids}"
   for id in "${id_list[@]}"; do
@@ -813,7 +929,10 @@ cmd_status() {
 cmd_health() {
   load_config
   local id failures=0 running_count=0
-  if database_health; then log "PostgreSQL: healthy"; else warn "PostgreSQL: unhealthy"; failures=$((failures + 1)); fi
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    log "SQLite 数据库：隔离文件，无独立数据库实例"
+    if account_portal_health; then log "账户门户: healthy"; else warn "账户门户: unhealthy"; failures=$((failures + 1)); fi
+  elif database_health; then log "PostgreSQL: healthy"; else warn "PostgreSQL: unhealthy"; failures=$((failures + 1)); fi
   if router_health; then log "$(gateway_display_name): healthy"; else warn "$(gateway_display_name): unhealthy"; failures=$((failures + 1)); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
     if worker_is_active "${id}"; then
@@ -831,16 +950,22 @@ cmd_health() {
 cmd_startup() {
   load_config
   local action="${1:-status}" timeout interval=10 started now elapsed cluster_state pending_mode
-  local database_ready gateway_ready database_state gateway_state
+  local database_ready gateway_ready portal_ready database_state gateway_state portal_state dependency_text
   case "${action}" in
     status)
       cluster_state=$(systemctl show llm-cluster.service -p ActiveState --value 2>/dev/null || printf unknown)
       [[ "${cluster_state}" == activating ]] && pending_mode=1 || pending_mode=0
       collect_worker_progress "${ACTIVE_WORKERS}" "${pending_mode}"
       log_worker_progress 0 "启动快照（cluster=${cluster_state}）"
-      printf 'database=%s router=%s\n' \
-        "$(database_health && printf healthy || printf unavailable)" \
-        "$(router_health && printf healthy || printf unavailable)"
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        printf 'sqlite=embedded router=%s account=%s\n' \
+          "$(router_health && printf healthy || printf unavailable)" \
+          "$(account_portal_health && printf healthy || printf unavailable)"
+      else
+        printf 'database=%s router=%s\n' \
+          "$(database_health && printf healthy || printf unavailable)" \
+          "$(router_health && printf healthy || printf unavailable)"
+      fi
       ;;
     watch)
       timeout=$((START_TIMEOUT * ((INSTANCE_COUNT + STARTUP_PARALLELISM - 1) / STARTUP_PARALLELISM) + 300))
@@ -864,14 +989,29 @@ cmd_startup() {
         collect_worker_progress "${ACTIVE_WORKERS}" "${pending_mode}"
         database_ready=0
         gateway_ready=0
+        portal_ready=1
         database_state=unavailable
         gateway_state=unavailable
+        portal_state=not-applicable
         if database_health; then database_ready=1; database_state=healthy; fi
         if router_health; then gateway_ready=1; gateway_state=healthy; fi
+        if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+          database_state=embedded
+          portal_ready=0
+          portal_state=unavailable
+          if account_portal_health; then portal_ready=1; portal_state=healthy; fi
+          dependency_text="；Dependencies=[SQLite:${database_state},$(gateway_display_name):${gateway_state},AccountPortal:${portal_state}]"
+        else
+          dependency_text="；Dependencies=[PostgreSQL:${database_state},$(gateway_display_name):${gateway_state}]"
+        fi
         log_worker_progress "${elapsed}" "集群启动中（cluster=${cluster_state}）" \
-          "；Dependencies=[PostgreSQL:${database_state},$(gateway_display_name):${gateway_state}]"
-        if (( PROGRESS_HEALTHY == PROGRESS_TOTAL && database_ready == 1 && gateway_ready == 1 )); then
-          log "集群已就绪：PostgreSQL、${PROGRESS_TOTAL} 个 Worker 和 $(gateway_display_name) 全部健康。"
+          "${dependency_text}"
+        if (( PROGRESS_HEALTHY == PROGRESS_TOTAL && database_ready == 1 && gateway_ready == 1 && portal_ready == 1 )); then
+          if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+            log "集群已就绪：${PROGRESS_TOTAL} 个 Worker、OmniRoute 和账户门户全部健康。"
+          else
+            log "集群已就绪：PostgreSQL、${PROGRESS_TOTAL} 个 Worker 和 $(gateway_display_name) 全部健康。"
+          fi
           return 0
         fi
         if [[ "${cluster_state}" == failed ]] || (( PROGRESS_FAILED > 0 )); then
@@ -994,6 +1134,7 @@ cmd_router() {
 
 cmd_database() {
   require_root; load_config
+  [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 模式使用两个隔离的 SQLite 文件，没有 PostgreSQL 服务；请使用 llmctl account。"
   case "${1:-status}" in
     start)
       systemctl start llm-database.service
@@ -1014,6 +1155,22 @@ cmd_database() {
   esac
 }
 
+cmd_account() {
+  require_root; load_config
+  [[ "${GATEWAY_KIND}" == omniroute ]] || die "账户门户只在 OmniRoute 模式启用。"
+  case "${1:-status}" in
+    start) systemctl start llm-account.service; wait_account_portal ;;
+    restart) systemctl restart llm-account.service; wait_account_portal ;;
+    stop) systemctl stop llm-account.service ;;
+    status) systemctl status llm-account.service --no-pager || true ;;
+    url)
+      printf 'PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-$(account_local_base_url)}"
+      printf 'OMNIROUTE_URL=%s\n' "${ACCOUNT_API_PUBLIC_URL:-$(router_local_base_url)}"
+      ;;
+    *) die "account 子命令必须是 start|stop|restart|status|url" ;;
+  esac
+}
+
 cmd_logs() {
   load_config
   local target="${1:-all}" id follow=""
@@ -1022,7 +1179,8 @@ cmd_logs() {
   case "${target}" in
     all)
       [[ "${2:-}" == "-f" ]] && follow="-f"
-      journal_args=(journalctl -u llm-router.service -u llm-database.service)
+      journal_args=(journalctl -u llm-router.service)
+      if [[ "${GATEWAY_KIND:-litellm}" == omniroute ]]; then journal_args+=(-u llm-account.service); else journal_args+=(-u llm-database.service); fi
       IFS=',' read -r -a log_worker_ids <<<"${ACTIVE_WORKERS}"
       for id in "${log_worker_ids[@]}"; do journal_args+=(-u "$(worker_unit "${id}")"); done
       [[ -z "${follow}" ]] || journal_args+=("${follow}")
@@ -1040,10 +1198,16 @@ cmd_logs() {
       journalctl -u llm-router.service ${follow} -n 200 --no-pager
       ;;
     database)
+      [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 模式没有 PostgreSQL 服务"
       [[ "${2:-}" == "-f" ]] && follow="-f"
       journalctl -u llm-database.service ${follow} -n 200 --no-pager
       ;;
-    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f]" ;;
+    account)
+      [[ "${GATEWAY_KIND}" == omniroute ]] || die "账户门户只在 OmniRoute 模式启用"
+      [[ "${2:-}" == "-f" ]] && follow="-f"
+      journalctl -u llm-account.service ${follow} -n 200 --no-pager
+      ;;
+    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f] | logs account [-f]" ;;
   esac
 }
 
@@ -1805,7 +1969,7 @@ cmd_tune() {
       printf 'gpu-memory-utilization=%s\n' "${GPU_MEMORY_UTILIZATION}"
       printf 'max-num-seqs=%s\n' "${MAX_NUM_SEQS}"
       printf 'max-num-batched-tokens=%s\n' "${MAX_NUM_BATCHED_TOKENS}"
-      printf 'routing-strategy=%s\n' "${ROUTING_STRATEGY}"
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then printf 'routing-strategy=round-robin (OmniRoute managed Combo)\n'; else printf 'routing-strategy=%s\n' "${ROUTING_STRATEGY}"; fi
       printf 'startup-parallelism=%s\n' "${STARTUP_PARALLELISM}"
       printf 'api-bind=%s\napi-port=%s\n' "${API_BIND}" "${API_PORT}"
       printf 'mm-limit=%s\n' "${MM_LIMIT}"
@@ -1831,6 +1995,7 @@ cmd_tune() {
           value="'$(jq -cn --argjson n "${value}" '{image:$n,video:0}')'"
           env_key=MM_LIMIT ;;
         routing-strategy)
+          [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 模式固定使用低开销 round-robin；本命令不修改 Combo 策略"
           case "${value}" in least-busy|simple-shuffle|latency-based-routing|usage-based-routing-v2) ;; *) die "不支持的路由策略" ;; esac
           env_key=ROUTING_STRATEGY; restart_workers=0; apply_router=1 ;;
         api-bind)
@@ -1880,6 +2045,19 @@ cmd_key() {
         log "New API 入口密钥已轮换。用 llmctl key show 查看。"
         return 0
       fi
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        [[ -z "${new_key}" ]] || die "OmniRoute 管理密钥由其数据库生成；请使用不带自定义 KEY 的 llmctl key rotate"
+        export GATEWAY_LOCAL_URL
+        GATEWAY_LOCAL_URL=$(router_local_base_url)
+        gateway_helper rotate-omniroute-key --secrets-file "${SECRETS_ENV}"
+        # Reload the new management key before restarting the dependent portal.
+        # shellcheck disable=SC1090
+        source "${SECRETS_ENV}"
+        systemctl restart llm-account.service
+        wait_account_portal
+        log "OmniRoute 管理密钥已轮换；用户个人 Key 不受影响。"
+        return 0
+      fi
       if [[ -z "${new_key}" ]]; then
         [[ "${GATEWAY_KIND}" == bifrost ]] && new_key="sk-bf-$(openssl rand -hex 32)" || new_key="sk-$(openssl rand -hex 32)"
       fi
@@ -1906,11 +2084,16 @@ cmd_admin() {
       printf 'GATEWAY_UI_URL=http://%s:%s%s\n' "${ui_host}" "${API_PORT}" "$(gateway_ui_path)"
       printf 'GATEWAY_UI_USERNAME=%s\n' "${UI_USERNAME}"
       printf 'GATEWAY_UI_PASSWORD=%s\n' "${UI_PASSWORD}"
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        printf 'ACCOUNT_PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-http://${ui_host}:${ACCOUNT_PORT}}"
+        printf 'ACCOUNT_PORTAL_ADMIN=%s\n' "${ACCOUNT_ADMIN_EMAIL}"
+      fi
       warn "这是管理员凭据；请勿复制到日志、工单或代码仓库。"
       ;;
     set-username)
       local new_username="${2:?请指定新用户名}"
       [[ "${new_username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "用户名只允许字母、数字、点、下划线、@ 和连字符"
+      [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 管理界面只使用密码；账户门户管理员使用邮箱登录，不能通过 set-username 修改。"
       if [[ "${GATEWAY_KIND}" == newapi ]]; then
         (( ${#new_username} <= 12 )) || die "New API 管理员用户名最多 12 位"
         export GATEWAY_LOCAL_URL LLMCTL_NEW_USERNAME="${new_username}"
@@ -1934,10 +2117,27 @@ cmd_admin() {
       fi
       [[ "${new_password}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "密码需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符"
       [[ "${GATEWAY_KIND}" != newapi || ${#new_password} -le 20 ]] || die "New API 管理员密码不能超过 20 位"
+      [[ "${GATEWAY_KIND}" != omniroute || ${#new_password} -ge 12 ]] || die "OmniRoute/账户门户共享管理员密码至少 12 位"
       if [[ "${GATEWAY_KIND}" == newapi ]]; then
         export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${new_password}"
         GATEWAY_LOCAL_URL=$(router_local_base_url)
         gateway_helper newapi-admin set-password --secrets-file "${SECRETS_ENV}"
+      elif [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        local old_password="${UI_PASSWORD}"
+        export ACCOUNT_ADMIN_PASSWORD="${new_password}"
+        account_helper reset-admin-password || die "账户门户管理员密码更新失败；OmniRoute 密码未修改"
+        export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${new_password}"
+        GATEWAY_LOCAL_URL=$(router_local_base_url)
+        if ! gateway_helper omniroute-admin set-password --secrets-file "${SECRETS_ENV}"; then
+          export ACCOUNT_ADMIN_PASSWORD="${old_password}"
+          account_helper reset-admin-password || warn "账户门户管理员密码回滚失败，请立即检查"
+          die "OmniRoute 管理员密码更新失败；账户门户密码已回滚"
+        fi
+        # The gateway helper atomically persisted both shared credentials.
+        # shellcheck disable=SC1090
+        source "${SECRETS_ENV}"
+        systemctl restart llm-account.service
+        wait_account_portal
       else
         set_env_value "${SECRETS_ENV}" UI_PASSWORD "${new_password}"
         refresh_router
@@ -2213,6 +2413,9 @@ cmd_update() {
       --bifrost-image)
         [[ "${GATEWAY_KIND}" == bifrost ]] || die "当前网关不是 Bifrost；请使用 --gateway-image"
         new_gateway="${2:?缺少镜像}"; shift 2 ;;
+      --omniroute-image)
+        [[ "${GATEWAY_KIND}" == omniroute ]] || die "当前网关不是 OmniRoute；请使用 --gateway-image"
+        new_gateway="${2:?缺少镜像}"; shift 2 ;;
       --postgres-image) new_postgres="${2:?缺少镜像}"; shift 2 ;;
       *) die "未知 update 参数：$1" ;;
     esac
@@ -2230,8 +2433,14 @@ cmd_update() {
   fi
   trap 'clear_temporary_proxy; (( was_cluster_active == 0 )) || systemctl start llm-cluster.service 2>/dev/null || true' EXIT
   setup_docker_proxy
-  if ! docker pull "${new_vllm}" || ! docker pull "${new_gateway}" || ! docker pull "${new_postgres}" || \
-     ! image_supports_architecture "${new_vllm}" "${MODEL_ARCHITECTURE}"; then
+  local image_validation_failed=0
+  docker pull "${new_vllm}" || image_validation_failed=1
+  docker pull "${new_gateway}" || image_validation_failed=1
+  if [[ "${GATEWAY_KIND}" != omniroute ]]; then
+    docker pull "${new_postgres}" || image_validation_failed=1
+  fi
+  image_supports_architecture "${new_vllm}" "${MODEL_ARCHITECTURE}" || image_validation_failed=1
+  if (( image_validation_failed )); then
     clear_temporary_proxy
     trap - EXIT
     (( was_cluster_active == 0 )) || systemctl start llm-cluster.service 2>/dev/null || true
@@ -2245,6 +2454,7 @@ cmd_update() {
     newapi) set_env_value "${CLUSTER_ENV}" NEWAPI_IMAGE "${new_gateway}" ;;
     litellm) set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${new_gateway}" ;;
     bifrost) set_env_value "${CLUSTER_ENV}" BIFROST_IMAGE "${new_gateway}" ;;
+    omniroute) set_env_value "${CLUSTER_ENV}" OMNIROUTE_IMAGE "${new_gateway}" ;;
   esac
   set_env_value "${CLUSTER_ENV}" POSTGRES_IMAGE "${new_postgres}"
   if (( stopped_for_proxy )); then
@@ -2257,6 +2467,7 @@ cmd_update() {
         newapi) set_env_value "${CLUSTER_ENV}" NEWAPI_IMAGE "${NEWAPI_IMAGE}" ;;
         litellm) set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${LITELLM_IMAGE}" ;;
         bifrost) set_env_value "${CLUSTER_ENV}" BIFROST_IMAGE "${BIFROST_IMAGE}" ;;
+        omniroute) set_env_value "${CLUSTER_ENV}" OMNIROUTE_IMAGE "${OMNIROUTE_IMAGE}" ;;
       esac
       set_env_value "${CLUSTER_ENV}" POSTGRES_IMAGE "${POSTGRES_IMAGE}"
       systemctl reset-failed >/dev/null 2>&1 || true
@@ -2295,7 +2506,7 @@ read_bundle_env() {
     esac
   done <"${file}"
   [[ "${IMPORT_VLLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线 vLLM 镜像名无效"
-  [[ "${IMPORT_GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost)$ ]] || die "离线 GATEWAY_KIND 无效"
+  [[ "${IMPORT_GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost|omniroute)$ ]] || die "离线 GATEWAY_KIND 无效"
   [[ "${IMPORT_GATEWAY_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线网关镜像名无效"
   [[ "${IMPORT_GATEWAY_KIND}" == "${GATEWAY_KIND}" ]] || die "离线包网关与当前安装规划不一致"
   [[ "${IMPORT_POSTGRES_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线 PostgreSQL 镜像名无效"
@@ -2321,8 +2532,10 @@ cmd_offline() {
       docker save -o "${dir}/vllm-image.tar" "${VLLM_IMAGE}"
       log "导出 $(gateway_display_name) 镜像..."
       docker save -o "${dir}/gateway-image.tar" "${GATEWAY_IMAGE}"
-      log "导出 PostgreSQL 镜像..."
-      docker save -o "${dir}/postgres-image.tar" "${POSTGRES_IMAGE}"
+      if [[ "${GATEWAY_KIND}" != omniroute ]]; then
+        log "导出 PostgreSQL 镜像..."
+        docker save -o "${dir}/postgres-image.tar" "${POSTGRES_IMAGE}"
+      fi
       log "导出当前模型（未压缩以加快恢复）..."
       tar -C "${MODEL_ROOT}" -cf "${dir}/model.tar" "${current_name}" current.manifest
       cat >"${dir}/bundle.env" <<EOF
@@ -2337,22 +2550,30 @@ MODEL_ARCHITECTURE=${MODEL_ARCHITECTURE}
 MODEL_DIR_NAME=${current_name}
 EXPORTED_AT=$(date -u +%FT%TZ)
 EOF
-      (cd "${dir}" && sha256sum vllm-image.tar gateway-image.tar postgres-image.tar model.tar >SHA256SUMS)
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        (cd "${dir}" && sha256sum vllm-image.tar gateway-image.tar model.tar >SHA256SUMS)
+      else
+        (cd "${dir}" && sha256sum vllm-image.tar gateway-image.tar postgres-image.tar model.tar >SHA256SUMS)
+      fi
       log "离线包已导出到 ${dir}"
       ;;
     import)
       [[ -r "${dir}/bundle.env" && -r "${dir}/SHA256SUMS" ]] || die "离线包清单不完整"
-      awk 'NF==2 && length($1)==64 && $1 !~ /[^0-9a-f]/ && ($2=="vllm-image.tar" || $2=="gateway-image.tar" || $2=="postgres-image.tar" || $2=="model.tar") && !seen[$2]++ {ok++} END{exit !(ok==4)}' "${dir}/SHA256SUMS" || die "SHA256SUMS 格式或文件名不安全"
+      read_bundle_env "${dir}/bundle.env"
+      if [[ "${IMPORT_GATEWAY_KIND}" == omniroute ]]; then
+        awk 'NF==2 && length($1)==64 && $1 !~ /[^0-9a-f]/ && ($2=="vllm-image.tar" || $2=="gateway-image.tar" || $2=="model.tar") && !seen[$2]++ {ok++} END{exit !(ok==3)}' "${dir}/SHA256SUMS" || die "SHA256SUMS 格式或文件名不安全"
+      else
+        awk 'NF==2 && length($1)==64 && $1 !~ /[^0-9a-f]/ && ($2=="vllm-image.tar" || $2=="gateway-image.tar" || $2=="postgres-image.tar" || $2=="model.tar") && !seen[$2]++ {ok++} END{exit !(ok==4)}' "${dir}/SHA256SUMS" || die "SHA256SUMS 格式或文件名不安全"
+      fi
       (cd "${dir}" && sha256sum -c SHA256SUMS) || die "离线包校验失败"
       safe_tar_listing "${dir}/model.tar"
-      read_bundle_env "${dir}/bundle.env"
       [[ "${IMPORT_MODEL_HUB}:${IMPORT_MODEL_ID}@${IMPORT_MODEL_REVISION}:${IMPORT_MODEL_ARCHITECTURE}" == \
          "${MODEL_HUB}:${MODEL_ID}@${MODEL_REVISION}:${MODEL_ARCHITECTURE}" ]] || \
         die "离线包模型与当前硬件规划不一致；请用安装器选择该模型并生成匹配配置后再导入"
       tar -tf "${dir}/model.tar" | awk -v root="${IMPORT_MODEL_DIR_NAME}/" '$0 != "current.manifest" && index($0,root) != 1 {bad=1} END{exit bad}' || die "离线模型包路径与清单不一致"
       docker load -i "${dir}/vllm-image.tar"
       docker load -i "${dir}/gateway-image.tar"
-      docker load -i "${dir}/postgres-image.tar"
+      [[ "${IMPORT_GATEWAY_KIND}" == omniroute ]] || docker load -i "${dir}/postgres-image.tar"
       image_supports_architecture "${IMPORT_VLLM_IMAGE}" "${MODEL_ARCHITECTURE}" || die "离线 vLLM 镜像不支持 ${MODEL_ARCHITECTURE}"
       install -d -m 755 "${MODEL_ROOT}"
       tar -C "${MODEL_ROOT}" -xf "${dir}/model.tar"
@@ -2363,6 +2584,7 @@ EOF
         newapi) set_env_value "${CLUSTER_ENV}" NEWAPI_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
         litellm) set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
         bifrost) set_env_value "${CLUSTER_ENV}" BIFROST_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
+        omniroute) set_env_value "${CLUSTER_ENV}" OMNIROUTE_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
       esac
       set_env_value "${CLUSTER_ENV}" POSTGRES_IMAGE "${IMPORT_POSTGRES_IMAGE}"
       log "离线包导入完成；运行 llmctl restart all 生效。"
@@ -2395,7 +2617,7 @@ cmd_uninstall() {
   stop_managed_services_with_progress 180 || \
     die "LLM 服务未能在限定时间内安全停止；配置尚未删除，请根据上方单位/容器状态检查"
   log "卸载 3/4：删除 systemd 单元和可再生成数据；配置保留到最后一步。"
-  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-worker@.service
+  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
   clear_temporary_proxy
@@ -2408,7 +2630,11 @@ cmd_uninstall() {
   remove_tree_with_progress "${CACHE_DIR}" "可再生成编译缓存" 5
   if (( purge_images )); then
     log "删除锁定的 LLM 容器镜像。"
-    docker image rm "${VLLM_IMAGE}" "${GATEWAY_IMAGE}" "${POSTGRES_IMAGE}" 2>/dev/null || true
+    if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+      docker image rm "${VLLM_IMAGE}" "${GATEWAY_IMAGE}" 2>/dev/null || true
+    else
+      docker image rm "${VLLM_IMAGE}" "${GATEWAY_IMAGE}" "${POSTGRES_IMAGE}" 2>/dev/null || true
+    fi
   fi
   if (( purge_database )); then
     if docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; then
@@ -2419,9 +2645,17 @@ cmd_uninstall() {
     fi
     docker volume rm llm-cluster-gateway-data >/dev/null 2>&1 || true
     log "接入层本地状态卷 llm-cluster-gateway-data 已清理（如存在）。"
+    if [[ -d "${STATE_DIR}/omniroute" ]]; then
+      remove_tree_with_progress "${STATE_DIR}/omniroute" "OmniRoute 与账户门户 SQLite 数据" 5
+    fi
+    if getent passwd llm-account 2>/dev/null | awk -F: '$6=="/nonexistent" && $7=="/usr/sbin/nologin" {found=1} END{exit !found}'; then
+      userdel llm-account 2>/dev/null || true
+      groupdel llm-account 2>/dev/null || true
+      log "账户门户专用系统用户 llm-account 已清理。"
+    fi
     rm -f "${RETAINED_SECRETS}"
   else
-    log "接入层 PostgreSQL/本地状态卷和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装相同接入层时可继续使用。"
+    log "接入层 PostgreSQL/SQLite 状态和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装相同接入层时可继续使用。"
   fi
   if (( purge_model )); then
     local normalized_root="${MODEL_ROOT%/}"
@@ -2468,7 +2702,8 @@ remove_tree_with_progress() {
 }
 
 managed_container_names() {
-  local id out="llm-router,llm-database"
+  local id out="llm-router"
+  [[ "${GATEWAY_KIND}" == omniroute ]] || out+=",llm-database"
   for ((id = 0; id < INSTANCE_COUNT; id++)); do out+=",llm-worker-${id}"; done
   printf '%s\n' "${out}"
 }
@@ -2486,7 +2721,8 @@ running_managed_containers() {
 
 active_managed_units() {
   local unit state out=""
-  local -a units=(llm-cluster.service llm-router.service llm-database.service)
+  local -a units=(llm-cluster.service llm-router.service)
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
   for unit in "${units[@]}"; do
@@ -2515,7 +2751,8 @@ wait_managed_services_stopped() {
 
 force_stop_managed_services() {
   local names name
-  local -a units=(llm-cluster.service llm-router.service llm-database.service)
+  local -a units=(llm-cluster.service llm-router.service)
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
   systemctl kill --kill-whom=all --signal=SIGKILL "${units[@]}" 2>/dev/null || true
@@ -2529,7 +2766,8 @@ force_stop_managed_services() {
 
 stop_managed_services_with_progress() {
   local timeout="${1:-180}" id
-  local -a units=(llm-cluster.service llm-router.service llm-database.service)
+  local -a units=(llm-cluster.service llm-router.service)
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
   systemctl stop --no-block "${units[@]}" 2>/dev/null || true
   if wait_managed_services_stopped "${timeout}"; then
@@ -2544,9 +2782,13 @@ stop_managed_services_with_progress() {
 cmd_boot_start() {
   require_root; load_config
   local startup_failed=0 healthy
-  log "启动 PostgreSQL 管理数据库..."
-  ensure_database_ready
-  log "数据库已就绪；按每批 ${STARTUP_PARALLELISM} 个启动 Worker：${ACTIVE_WORKERS}。"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    log "OmniRoute 与账户门户使用两个隔离的 SQLite 数据库；无需启动数据库实例。"
+  else
+    log "启动 PostgreSQL 管理数据库..."
+    ensure_database_ready
+  fi
+  log "按每批 ${STARTUP_PARALLELISM} 个启动 Worker：${ACTIVE_WORKERS}。"
   start_worker_ids_batched "${ACTIVE_WORKERS}" || startup_failed=1
   healthy=$(healthy_worker_ids)
   [[ -n "${healthy}" ]] || die "没有 Worker 成功启动"
@@ -2556,6 +2798,11 @@ cmd_boot_start() {
   wait_gateway_process
   reconcile_gateway "${healthy}"
   wait_router
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    log "启动公司账户门户..."
+    systemctl start llm-account.service
+    wait_account_portal
+  fi
   (( startup_failed == 0 )) || warn "至少一个 Worker 启动失败；健康 Worker 已继续提供服务。"
 }
 
@@ -2565,7 +2812,7 @@ cmd_boot_stop() {
   # their stop jobs to the same transaction and runs them concurrently. Calling
   # `systemctl stop` recursively from this ExecStop can wait on its own parent
   # transaction and was the cause of the legacy uninstall appearing hung.
-  log "systemd 已并发停止 Router、数据库和 ${INSTANCE_COUNT} 个 Worker。"
+  log "systemd 已并发停止 Router、可选数据库/账户门户和 ${INSTANCE_COUNT} 个 Worker。"
 }
 
 main() {
@@ -2589,6 +2836,7 @@ main() {
     autostart) cmd_autostart "$@" ;;
     router) cmd_router "$@" ;;
     database) cmd_database "$@" ;;
+    account) cmd_account "$@" ;;
     logs) cmd_logs "$@" ;;
     smoke) cmd_smoke "$@" ;;
     ocr) cmd_ocr "$@" ;;

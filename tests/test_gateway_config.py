@@ -31,6 +31,7 @@ BASE_ENV = {
     "BIFROST_ENCRYPTION_KEY": "encryption-secret",
     "UI_USERNAME": "admin",
     "UI_PASSWORD": "admin-pass",
+    "SUPPORTS_IMAGE_INPUT": "1",
 }
 
 
@@ -81,6 +82,74 @@ class FakeNewAPIClient:
         raise AssertionError((method, path, payload))
 
 
+class FakeOmniRouteClient:
+    def __init__(self):
+        self.calls = []
+        self.nodes = [
+            {"id": "node-0", "name": "LLMCtl worker 0"},
+            {"id": "node-stale", "name": "LLMCtl worker 7"},
+        ]
+        self.connections = [
+            {"id": "conn-0", "provider": "node-0"},
+            {"id": "conn-duplicate", "provider": "node-0"},
+            {"id": "conn-stale", "provider": "node-stale"},
+        ]
+        self.models = {"node-0": [{"id": "local-model"}], "node-stale": []}
+        self.combo = {
+            "id": "combo-1",
+            "name": "local-model",
+            "description": gateway.OMNIROUTE_DESCRIPTION,
+        }
+
+    def login(self):
+        self.calls.append(("LOGIN", "", None))
+
+    def management_key_works(self, key):
+        return key == BASE_ENV["GATEWAY_API_KEY"]
+
+    def request(self, method, path, payload=None, bearer=""):
+        self.calls.append((method, path, payload))
+        if (method, path) == ("GET", "/api/provider-nodes?limit=1000"):
+            return {"nodes": list(self.nodes)}
+        if (method, path) == ("GET", "/api/providers?limit=1000"):
+            return {"connections": list(self.connections)}
+        if method == "PUT" and path.startswith("/api/provider-nodes/"):
+            node_id = path.rsplit("/", 1)[1]
+            return {"node": {"id": node_id, **payload}}
+        if (method, path) == ("POST", "/api/provider-nodes"):
+            node = {"id": "node-1", **payload}
+            self.nodes.append(node)
+            return {"node": node}
+        if method == "PUT" and path.startswith("/api/providers/"):
+            connection_id = path.rsplit("/", 1)[1]
+            current = next(item for item in self.connections if item["id"] == connection_id)
+            current.update(payload)
+            return {"connection": dict(current)}
+        if (method, path) == ("POST", "/api/providers"):
+            connection = {"id": "conn-1", **payload}
+            self.connections.append(connection)
+            return {"connection": connection}
+        if method == "GET" and path.startswith("/api/provider-models?"):
+            provider = path.split("provider=", 1)[1]
+            return {"models": list(self.models.get(provider, []))}
+        if method in {"POST", "PUT"} and path == "/api/provider-models":
+            return {"model": payload}
+        if (method, path) == ("GET", "/api/combos?limit=1000"):
+            return {"combos": [dict(self.combo)]}
+        if (method, path) == ("PUT", "/api/combos/combo-1"):
+            self.combo.update(payload)
+            return dict(self.combo)
+        if method == "DELETE" and path.startswith("/api/providers/"):
+            connection_id = path.rsplit("/", 1)[1]
+            self.connections = [item for item in self.connections if item["id"] != connection_id]
+            return {"success": True}
+        if method == "DELETE" and path.startswith("/api/provider-nodes/"):
+            node_id = path.rsplit("/", 1)[1]
+            self.nodes = [item for item in self.nodes if item["id"] != node_id]
+            return {"success": True}
+        raise AssertionError((method, path, payload))
+
+
 class GatewayConfigTests(unittest.TestCase):
     def test_render_litellm_has_one_backend_per_worker_and_no_plaintext_secret(self):
         with mock.patch.dict(os.environ, BASE_ENV, clear=True):
@@ -115,6 +184,43 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertEqual(plan["retry_times"], 1)
         self.assertEqual(plan["channels"][1]["base_url"], "http://127.0.0.1:8107")
         self.assertNotIn("key", json.dumps(plan).lower())
+
+    def test_render_omniroute_plan_has_isolated_worker_targets_without_secrets(self):
+        with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+            plan = json.loads(gateway.omniroute_plan([0, 7]))
+        self.assertEqual(plan["gateway"], "omniroute")
+        self.assertEqual(plan["strategy"], "round-robin")
+        self.assertTrue(plan["supports_vision"])
+        self.assertEqual(plan["workers"][1]["base_url"], "http://127.0.0.1:8107/v1")
+        self.assertNotIn("sk-backend-secret", json.dumps(plan))
+
+    def test_omniroute_reconcile_commits_combo_before_removing_stale_resources(self):
+        client = FakeOmniRouteClient()
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = pathlib.Path(directory) / "secrets.env"
+            secrets.write_text("GATEWAY_API_KEY=sk-bf-public-secret\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+                gateway.reconcile_omniroute(client, [0, 1], secrets)
+        combo_position = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[0:2] == ("PUT", "/api/combos/combo-1")
+        )
+        cleanup_positions = [
+            index
+            for index, call in enumerate(client.calls)
+            if call[0] == "DELETE"
+        ]
+        self.assertTrue(cleanup_positions)
+        self.assertLess(combo_position, min(cleanup_positions))
+        self.assertEqual({item["id"] for item in client.nodes}, {"node-0", "node-1"})
+        self.assertEqual({item["id"] for item in client.connections}, {"conn-0", "conn-1", "conn-stale"})
+        update_connection = next(
+            call for call in client.calls if call[0:2] == ("PUT", "/api/providers/conn-0")
+        )
+        self.assertEqual(update_connection[2]["apiKey"], "sk-backend-secret")
+        self.assertEqual(client.combo["strategy"], "round-robin")
+        self.assertTrue(client.combo["config"]["disableSessionStickiness"])
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

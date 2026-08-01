@@ -9,18 +9,23 @@ configuration refers to environment variables rather than embedding them.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
+import http.cookiejar
 import json
 import os
 import pathlib
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Iterable
 
 
 MANAGED_TAG = "llmctl-managed"
 MANAGED_TOKEN = "llmctl-default"
+OMNIROUTE_MANAGED_KEY = "llmctl-management"
+OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually."
 
 
 def required_env(name: str) -> str:
@@ -224,6 +229,29 @@ def newapi_plan(worker_ids: Iterable[int]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
+def omniroute_plan(worker_ids: Iterable[int]) -> str:
+    """Persist the desired OmniRoute graph without embedding credentials."""
+    model = required_env("SERVED_MODEL_NAME")
+    base_port = int(required_env("WORKER_BASE_PORT"))
+    data = {
+        "gateway": "omniroute",
+        "managed_tag": MANAGED_TAG,
+        "model": model,
+        "strategy": "round-robin",
+        "supports_vision": os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1",
+        "workers": [
+            {
+                "id": worker_id,
+                "node_name": f"LLMCtl worker {worker_id}",
+                "prefix": f"llmctl-w{worker_id}",
+                "base_url": f"http://127.0.0.1:{base_port + worker_id}/v1",
+            }
+            for worker_id in worker_ids
+        ],
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
 class NewAPIClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
@@ -296,6 +324,299 @@ class NewAPIClient:
         if not isinstance(token, str) or not token:
             raise RuntimeError("New API login did not return an access token")
         self.access_token = token
+
+
+class OmniRouteClient:
+    """Minimal dashboard/API client with cookie isolation and no proxy use."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.cookies = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(self.cookies)
+        )
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        bearer: str = "",
+    ) -> dict[str, Any]:
+        data = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with self.opener.open(request, timeout=30) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:800]
+            raise RuntimeError(
+                f"OmniRoute {method} {path} returned HTTP {error.code}: {detail}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"OmniRoute {method} {path} failed: {error.reason}") from error
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"OmniRoute {method} {path} returned invalid JSON") from error
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"OmniRoute {method} {path} returned a non-object response")
+        return parsed
+
+    def login(self) -> None:
+        self.request("POST", "/api/auth/login", {"password": required_env("UI_PASSWORD")})
+        if not any(cookie.name == "auth_token" for cookie in self.cookies):
+            raise RuntimeError("OmniRoute login did not establish a dashboard session")
+
+    def management_key_works(self, key: str) -> bool:
+        if not key:
+            return False
+        probe = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(
+            f"{self.base_url}/api/keys?limit=1",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {key}"},
+        )
+        try:
+            with probe.open(request, timeout=10) as response:
+                return response.status == 200
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            return False
+
+
+def response_list(response: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
+    for key in keys:
+        value = response.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def ensure_omniroute_management_key(
+    client: OmniRouteClient, secrets_file: pathlib.Path, rotate: bool = False
+) -> str:
+    current = os.environ.get("GATEWAY_API_KEY", "")
+    if not rotate and client.management_key_works(current):
+        return current
+    existing = response_list(client.request("GET", "/api/keys?limit=1000"), "keys")
+    created = client.request(
+        "POST", "/api/keys", {"name": OMNIROUTE_MANAGED_KEY, "scopes": ["manage"]}
+    )
+    key_id, raw_key = str(created.get("id", "")), str(created.get("key", ""))
+    if not key_id or len(raw_key) < 16 or not client.management_key_works(raw_key):
+        if key_id:
+            with contextlib.suppress(RuntimeError):
+                client.request("DELETE", f"/api/keys/{urllib.parse.quote(key_id, safe='')}")
+        raise RuntimeError("OmniRoute did not create a working LLMCtl management key")
+    update_env_file(
+        secrets_file,
+        {
+            "GATEWAY_API_KEY": raw_key,
+            "LITELLM_MASTER_KEY": raw_key,
+            "OMNIROUTE_MANAGED_KEY_ID": key_id,
+        },
+    )
+    for item in existing:
+        stale_id = str(item.get("id", ""))
+        if item.get("name") == OMNIROUTE_MANAGED_KEY and stale_id and stale_id != key_id:
+            with contextlib.suppress(RuntimeError):
+                client.request("DELETE", f"/api/keys/{urllib.parse.quote(stale_id, safe='')}")
+    return raw_key
+
+
+def reconcile_omniroute(
+    client: OmniRouteClient, worker_ids: list[int], secrets_file: pathlib.Path
+) -> None:
+    """Reconcile compatible nodes, connections, model metadata, and routing combo."""
+    client.login()
+    ensure_omniroute_management_key(client, secrets_file)
+    model = required_env("SERVED_MODEL_NAME")
+    base_port = int(required_env("WORKER_BASE_PORT"))
+    backend_key = required_env("BACKEND_API_KEY")
+    supports_vision = os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
+
+    nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
+    connections = response_list(client.request("GET", "/api/providers?limit=1000"), "connections")
+    desired_node_ids: set[str] = set()
+    stale_connection_ids: set[str] = set()
+    combo_models: list[dict[str, Any]] = []
+    for worker_id in worker_ids:
+        name = f"LLMCtl worker {worker_id}"
+        prefix = f"llmctl-w{worker_id}"
+        base_url = f"http://127.0.0.1:{base_port + worker_id}/v1"
+        matches = [node for node in nodes if node.get("name") == name]
+        node: dict[str, Any]
+        if matches:
+            node = client.request(
+                "PUT",
+                f"/api/provider-nodes/{urllib.parse.quote(str(matches[0]['id']), safe='')}",
+                {
+                    "name": name,
+                    "prefix": prefix,
+                    "apiType": "chat",
+                    "baseUrl": base_url,
+                    "chatPath": "/chat/completions",
+                    "modelsPath": "/models",
+                },
+            ).get("node", matches[0])
+        else:
+            response = client.request(
+                "POST",
+                "/api/provider-nodes",
+                {
+                    "name": name,
+                    "prefix": prefix,
+                    "apiType": "chat",
+                    "type": "openai-compatible",
+                    "baseUrl": base_url,
+                    "chatPath": "/chat/completions",
+                    "modelsPath": "/models",
+                },
+            )
+            node = response.get("node", {})
+        node_id = str(node.get("id", ""))
+        if not node_id:
+            raise RuntimeError(f"OmniRoute did not return the provider node for worker {worker_id}")
+        desired_node_ids.add(node_id)
+
+        connection_matches = [item for item in connections if item.get("provider") == node_id]
+        if connection_matches:
+            connection_id = str(connection_matches[0].get("id", ""))
+            if not connection_id:
+                raise RuntimeError(
+                    f"OmniRoute returned an invalid connection for worker {worker_id}"
+                )
+            response = client.request(
+                "PUT",
+                f"/api/providers/{urllib.parse.quote(connection_id, safe='')}",
+                {
+                    "name": name,
+                    "apiKey": backend_key,
+                    "priority": 1,
+                    "defaultModel": model,
+                    "isActive": True,
+                    "testStatus": "success",
+                },
+            )
+            connection = response.get("connection", connection_matches[0])
+            for duplicate in connection_matches[1:]:
+                duplicate_id = str(duplicate.get("id", ""))
+                if duplicate_id:
+                    stale_connection_ids.add(duplicate_id)
+        else:
+            response = client.request(
+                "POST",
+                "/api/providers",
+                {
+                    "provider": node_id,
+                    "apiKey": backend_key,
+                    "name": name,
+                    "priority": 1,
+                    "testStatus": "success",
+                    "defaultModel": model,
+                },
+            )
+            connection = response.get("connection", {})
+        connection_id = str(connection.get("id", ""))
+        if not connection_id:
+            raise RuntimeError(f"OmniRoute did not return the connection for worker {worker_id}")
+
+        models = response_list(
+            client.request(
+                "GET", f"/api/provider-models?provider={urllib.parse.quote(node_id, safe='')}"
+            ),
+            "models",
+        )
+        existing_model = next(
+            (item for item in models if item.get("id") == model or item.get("modelId") == model),
+            None,
+        )
+        model_payload: dict[str, Any] = {
+            "provider": node_id,
+            "modelId": model,
+            "modelName": model,
+            "source": MANAGED_TAG,
+            "apiFormat": "chat-completions",
+            "supportedEndpoints": ["chat"],
+            "targetFormat": "openai",
+            "max_input_tokens": int(required_env("MAX_MODEL_LEN")),
+            "max_output_tokens": int(required_env("MAX_MODEL_LEN")),
+            "contextWindowOverride": int(required_env("MAX_MODEL_LEN")),
+            "supportsVision": supports_vision,
+        }
+        if existing_model:
+            # Reconcile mutable capability/context metadata as the selected
+            # model plan changes; a stale manual row must not outlive it.
+            client.request("PUT", "/api/provider-models", model_payload)
+        else:
+            client.request(
+                "POST",
+                "/api/provider-models",
+                model_payload,
+            )
+        combo_models.append(
+            {
+                "kind": "model",
+                "provider": node_id,
+                "model": model,
+                "connectionId": connection_id,
+                "label": name,
+            }
+        )
+
+    combos = response_list(client.request("GET", "/api/combos?limit=1000"), "combos")
+    existing_combo = next((item for item in combos if item.get("name") == model), None)
+    combo_payload: dict[str, Any] = {
+        "name": model,
+        "description": OMNIROUTE_DESCRIPTION,
+        "models": combo_models,
+        "strategy": "round-robin",
+        "config": {
+            "disableSessionStickiness": True,
+            "healthCheckEnabled": True,
+            "maxRetries": 1,
+            "failoverBeforeRetry": True,
+        },
+        "context_length": int(required_env("MAX_MODEL_LEN")),
+    }
+    if existing_combo:
+        if existing_combo.get("description") != OMNIROUTE_DESCRIPTION:
+            raise RuntimeError(
+                f"OmniRoute combo '{model}' already exists and is not managed by LLMCtl"
+            )
+        combo_id = str(existing_combo.get("id", ""))
+        client.request(
+            "PUT", f"/api/combos/{urllib.parse.quote(combo_id, safe='')}", combo_payload
+        )
+    else:
+        client.request("POST", "/api/combos", combo_payload)
+
+    # Remove only LLMCtl-owned duplicates after the replacement combo is
+    # committed.  This ordering preserves the last known-good route if any
+    # earlier reconciliation step fails.
+    for connection_id in sorted(stale_connection_ids):
+        client.request(
+            "DELETE", f"/api/providers/{urllib.parse.quote(connection_id, safe='')}"
+        )
+    for node in nodes:
+        node_id = str(node.get("id", ""))
+        if (
+            str(node.get("name", "")).startswith("LLMCtl worker ")
+            and node_id
+            and node_id not in desired_node_ids
+        ):
+            client.request(
+                "DELETE", f"/api/provider-nodes/{urllib.parse.quote(node_id, safe='')}"
+            )
 
 
 def response_items(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -433,6 +754,8 @@ def command_render(args: argparse.Namespace) -> None:
         content = litellm_config(workers)
     elif args.gateway == "bifrost":
         content = bifrost_config(workers)
+    elif args.gateway == "omniroute":
+        content = omniroute_plan(workers)
     else:
         content = newapi_plan(workers)
     atomic_write(output, content)
@@ -441,6 +764,40 @@ def command_render(args: argparse.Namespace) -> None:
 def command_reconcile_newapi(args: argparse.Namespace) -> None:
     reconcile_newapi(
         newapi_client(), parse_worker_ids(args.worker_ids), pathlib.Path(args.secrets_file)
+    )
+
+
+def command_reconcile_omniroute(args: argparse.Namespace) -> None:
+    reconcile_omniroute(
+        OmniRouteClient(required_env("GATEWAY_LOCAL_URL")),
+        parse_worker_ids(args.worker_ids),
+        pathlib.Path(args.secrets_file),
+    )
+
+
+def command_rotate_omniroute(args: argparse.Namespace) -> None:
+    client = OmniRouteClient(required_env("GATEWAY_LOCAL_URL"))
+    client.login()
+    ensure_omniroute_management_key(client, pathlib.Path(args.secrets_file), rotate=True)
+
+
+def command_omniroute_admin(args: argparse.Namespace) -> None:
+    client = OmniRouteClient(required_env("GATEWAY_LOCAL_URL"))
+    client.login()
+    if args.action != "set-password":
+        raise RuntimeError("OmniRoute dashboard authentication does not use a username")
+    new_password = required_env("LLMCTL_NEW_PASSWORD")
+    client.request(
+        "PATCH",
+        "/api/settings",
+        {
+            "currentPassword": required_env("UI_PASSWORD"),
+            "newPassword": new_password,
+        },
+    )
+    update_env_file(
+        pathlib.Path(args.secrets_file),
+        {"UI_PASSWORD": new_password, "ACCOUNT_ADMIN_PASSWORD": new_password},
     )
 
 
@@ -480,7 +837,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     render = subparsers.add_parser("render")
-    render.add_argument("--gateway", choices=("newapi", "litellm", "bifrost"), required=True)
+    render.add_argument(
+        "--gateway", choices=("newapi", "litellm", "bifrost", "omniroute"), required=True
+    )
     render.add_argument("--worker-ids", required=True)
     render.add_argument("--output", required=True)
     render.set_defaults(handler=command_render)
@@ -489,6 +848,20 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--worker-ids", required=True)
     reconcile.add_argument("--secrets-file", required=True)
     reconcile.set_defaults(handler=command_reconcile_newapi)
+
+    reconcile_omni = subparsers.add_parser("reconcile-omniroute")
+    reconcile_omni.add_argument("--worker-ids", required=True)
+    reconcile_omni.add_argument("--secrets-file", required=True)
+    reconcile_omni.set_defaults(handler=command_reconcile_omniroute)
+
+    rotate_omni = subparsers.add_parser("rotate-omniroute-key")
+    rotate_omni.add_argument("--secrets-file", required=True)
+    rotate_omni.set_defaults(handler=command_rotate_omniroute)
+
+    omni_admin = subparsers.add_parser("omniroute-admin")
+    omni_admin.add_argument("action", choices=("set-password",))
+    omni_admin.add_argument("--secrets-file", required=True)
+    omni_admin.set_defaults(handler=command_omniroute_admin)
 
     rotate = subparsers.add_parser("rotate-newapi-token")
     rotate.add_argument("--secrets-file", required=True)
