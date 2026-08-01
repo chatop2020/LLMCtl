@@ -73,6 +73,35 @@ class InstallerInteractionTests(unittest.TestCase):
         self.assertIn("summary <2>", completed.stdout)
         self.assertIn("selected <2>", completed.stdout)
 
+    def test_direct_or_validated_plan_can_return_before_installation(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    MODEL_HUB=huggingface
+                    MODEL_ID=example/Test
+                    MODEL_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                    run_catalog_with_retry() { printf '{}\n'; }
+                    show_catalog_selection_summary() { printf 'detailed-plan\n'; }
+                    if plan_single_model_interactively; then
+                      printf 'unexpected-accept\n'
+                    else
+                      printf 'returned-before-install\n'
+                    fi
+                    """
+                ),
+            ],
+            input="b\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("detailed-plan", completed.stdout)
+        self.assertIn("returned-before-install", completed.stdout)
+        self.assertNotIn("unexpected-accept", completed.stdout)
+
     def test_model_selection_can_return_to_discovery(self):
         completed = subprocess.run(
             [
@@ -83,6 +112,7 @@ class InstallerInteractionTests(unittest.TestCase):
                     search_catalog() { CATALOG_RESULTS=/tmp/test-catalog.json; }
                     catalog_result_count() { printf '1\n'; }
                     discard_catalog_results() { CATALOG_RESULTS=''; }
+                    plan_single_model_interactively() { return 0; }
                     select_model_interactively
                     printf 'source=%s\n' "$MODEL_SOURCE"
                     """
@@ -103,6 +133,7 @@ class InstallerInteractionTests(unittest.TestCase):
                 installer_script(
                     r"""
                     select_language_interactively
+                    plan_single_model_interactively() { return 0; }
                     select_model_interactively
                     printf 'language=%s source=%s\n' "$INTERFACE_LANGUAGE" "$MODEL_SOURCE"
                     """

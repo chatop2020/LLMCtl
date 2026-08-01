@@ -79,7 +79,7 @@ The interactive workflow asks you to:
 2. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
 3. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
 4. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
-5. Review the detailed plan, itemized recommendation reasons, and warnings. Press `Y` to accept, `b` for the list, `s` to search again, or `q` to quit.
+5. Review the detailed plan, itemized recommendation reasons, and warnings. Catalog candidates, validated profiles, and manually entered models all require confirmation. Press `Y` to accept, `b` to go back, `s` to search again, or `q` to quit.
 6. Select the model directory and review TP, sequences per replica, active replicas, and the host-planned startup parallelism.
 7. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
 

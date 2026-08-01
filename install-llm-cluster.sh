@@ -370,7 +370,13 @@ EOF
       1) MODEL_SOURCE=catalog; hub=all ;;
       2) MODEL_SOURCE=catalog; hub=modelscope ;;
       3) MODEL_SOURCE=catalog; hub=huggingface ;;
-      4) MODEL_SOURCE=validated; return 0 ;;
+      4)
+        MODEL_SOURCE=validated
+        MODEL_HUB=huggingface
+        MODEL_ID="${VALIDATED_MODEL_ID}"
+        MODEL_REVISION="${VALIDATED_MODEL_REVISION}"
+        if plan_single_model_interactively; then return 0; else continue; fi
+        ;;
       5)
       read -r -p "$(l10n '来源 huggingface/modelscope [modelscope]（b 返回）: ' 'Source huggingface/modelscope [modelscope] (b to go back): ')" hub
       hub="${hub:-modelscope}"
@@ -386,7 +392,7 @@ EOF
       MODEL_HUB="${hub}"
       MODEL_ID_EXPLICIT=1
       [[ -z "${MODEL_REVISION}" ]] || MODEL_REVISION_EXPLICIT=1
-      return 0
+      if plan_single_model_interactively; then return 0; else continue; fi
       ;;
       *) warn "$(l10n "无效模型选择：${choice}，请重新选择。" "Invalid model choice: ${choice}; choose again.")"; continue ;;
     esac
@@ -443,6 +449,47 @@ EOF
         esac
       done
     done
+  done
+}
+
+plan_single_model_interactively() {
+  local result choice
+  local -a plan_args=(
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+    --model-root "${MODEL_ROOT}"
+  )
+  [[ -z "${HOST_PROFILE_JSON}" ]] || plan_args+=(--hardware-json "${HOST_PROFILE_JSON}")
+  (( MAX_LEN_EXPLICIT == 0 )) || plan_args+=(--max-model-len "${MAX_MODEL_LEN}")
+  result=$(mktemp /tmp/llm-inspect.XXXXXX.json)
+  if ! run_catalog_with_retry inspect "${MODEL_HUB}" "${MODEL_ID}" ${MODEL_REVISION:+"${MODEL_REVISION}"} \
+    --json "${plan_args[@]}" >"${result}"; then
+    rm -f -- "${result}"
+    warn "$(l10n '该模型未通过元数据、vLLM 架构或本机硬件门禁；已返回模型发现。' 'This model did not pass metadata, vLLM architecture, or host hardware gates; returning to model discovery.')"
+    return 1
+  fi
+  show_catalog_selection_summary "${result}" 1 || {
+    rm -f -- "${result}"
+    return 1
+  }
+  while true; do
+    read -r -p "$(l10n '确认此模型与计划？[Y] 接受 / b 返回 / q 退出: ' 'Confirm this model and plan? [Y] accept / b back / q quit: ')" choice
+    case "${choice:-Y}" in
+      y|Y|yes|YES)
+        apply_catalog_selection "${result}" 1
+        return 0
+        ;;
+      b|B|back|BACK|n|N|no|NO)
+        rm -f -- "${result}"
+        printf '%s\n' "$(l10n '已返回模型发现方式。' 'Returned to model discovery.')" >&2
+        return 1
+        ;;
+      q|Q|quit|QUIT)
+        rm -f -- "${result}"
+        log "$(l10n '已取消，尚未执行安装。' 'Cancelled before installation started.')"
+        exit 0
+        ;;
+      *) warn "$(l10n '请输入 Y、b 或 q。' 'Enter Y, b, or q.')" ;;
+    esac
   done
 }
 
@@ -555,14 +602,14 @@ apply_model_source_defaults() {
       MODEL_HUB=huggingface
       MODEL_ID="${VALIDATED_MODEL_ID}"
       MODEL_REVISION="${VALIDATED_MODEL_REVISION}"
-      inspect_and_plan_model
+      (( MODEL_PLAN_APPLIED )) || inspect_and_plan_model
       ;;
     official)
       MODEL_HUB=huggingface
       MODEL_ID="${OFFICIAL_MODEL_ID}"
       MODEL_REVISION="${OFFICIAL_MODEL_REVISION}"
       (( ASSUME_YES || NON_INTERACTIVE )) && warn "$(l10n '已选择存在公开兼容性报告的 official FP8 仓库。' 'Selected the official FP8 repository, which has a public compatibility report.')"
-      inspect_and_plan_model
+      (( MODEL_PLAN_APPLIED )) || inspect_and_plan_model
       ;;
     catalog)
       if (( ! MODEL_PLAN_APPLIED )); then
@@ -578,8 +625,10 @@ apply_model_source_defaults() {
         apply_catalog_selection "${CATALOG_RESULTS}" 1
         return 0
       fi
-      (( MODEL_REVISION_EXPLICIT )) || MODEL_REVISION=""
-      inspect_and_plan_model
+      if (( ! MODEL_PLAN_APPLIED )); then
+        (( MODEL_REVISION_EXPLICIT )) || MODEL_REVISION=""
+        inspect_and_plan_model
+      fi
       ;;
     *) die "$(l10n '--model-source 只能是 catalog、validated、official、huggingface 或 modelscope' '--model-source must be catalog, validated, official, huggingface, or modelscope')" ;;
   esac

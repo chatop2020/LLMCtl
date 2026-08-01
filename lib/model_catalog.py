@@ -1296,6 +1296,10 @@ def main() -> int:
         if args.command == "select":
             with open(args.input, "r", encoding="utf-8") as handle:
                 models = json.load(handle)
+            if isinstance(models, dict):
+                models = [models]
+            if not isinstance(models, list):
+                raise CatalogError(tr("选择文件必须包含模型对象或列表", "Selection input must contain a model object or list"))
             if not 1 <= args.index <= len(models):
                 raise CatalogError(tr(f"选择范围必须是 1-{len(models)}", f"Selection must be between 1 and {len(models)}"))
             model = models[args.index - 1]
