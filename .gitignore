@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+*.dump
+*.tar
+*.tar.gz
+.env
+.venv/
+__pycache__/
+*.py[cod]
+secrets.env
+proxy.env
+offline-bundle/
+work/
