@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.2.0"
+readonly CTL_VERSION="2.2.1"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -454,8 +454,8 @@ collect_worker_progress() {
 }
 
 log_worker_progress() {
-  local elapsed="${1:?}" prefix="${2:-启动中}"
-  log "${prefix} ${elapsed}s：healthy=${PROGRESS_HEALTHY}/${PROGRESS_TOTAL}，loading=${PROGRESS_LOADING}，pending=${PROGRESS_PENDING}，failed=${PROGRESS_FAILED}；Worker=[${PROGRESS_STATES}]；VRAM=[$(gpu_memory_snapshot)]"
+  local elapsed="${1:?}" prefix="${2:-启动中}" dependency_status="${3:-}"
+  log "${prefix} ${elapsed}s：healthy=${PROGRESS_HEALTHY}/${PROGRESS_TOTAL}，loading=${PROGRESS_LOADING}，pending=${PROGRESS_PENDING}，failed=${PROGRESS_FAILED}；Worker=[${PROGRESS_STATES}]；VRAM=[$(gpu_memory_snapshot)]${dependency_status}"
 }
 
 show_failed_worker_logs() {
@@ -611,8 +611,27 @@ refresh_router() {
   wait_router
 }
 
+reload_gateway_api_key() {
+  local key value current="" legacy=""
+  [[ -r "${SECRETS_ENV}" ]] || return 1
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      GATEWAY_API_KEY) current="${value}"; break ;;
+      LITELLM_MASTER_KEY) legacy="${value}" ;;
+    esac
+  done <"${SECRETS_ENV}"
+  current="${current:-${legacy}}"
+  [[ -n "${current}" ]] || return 1
+  GATEWAY_API_KEY="${current}"
+  LITELLM_MASTER_KEY="${current}"
+}
+
 router_health() {
   local base_url
+  # New API creates its managed token after the startup watcher has begun.
+  # Reload the atomically replaced root-only secrets file for every readiness
+  # probe so long-running observers and concurrent key rotations converge.
+  reload_gateway_api_key || return 1
   base_url=$(router_local_base_url)
   curl --noproxy '*' -fsS --max-time 3 \
     -H "Authorization: Bearer ${GATEWAY_API_KEY}" \
@@ -812,6 +831,7 @@ cmd_health() {
 cmd_startup() {
   load_config
   local action="${1:-status}" timeout interval=10 started now elapsed cluster_state pending_mode
+  local database_ready gateway_ready database_state gateway_state
   case "${action}" in
     status)
       cluster_state=$(systemctl show llm-cluster.service -p ActiveState --value 2>/dev/null || printf unknown)
@@ -842,8 +862,15 @@ cmd_startup() {
         cluster_state=$(systemctl show llm-cluster.service -p ActiveState --value 2>/dev/null || printf unknown)
         [[ "${cluster_state}" == activating || ${elapsed} -lt 10 ]] && pending_mode=1 || pending_mode=0
         collect_worker_progress "${ACTIVE_WORKERS}" "${pending_mode}"
-        log_worker_progress "${elapsed}" "集群启动中（cluster=${cluster_state}）"
-        if (( PROGRESS_HEALTHY == PROGRESS_TOTAL )) && database_health && router_health; then
+        database_ready=0
+        gateway_ready=0
+        database_state=unavailable
+        gateway_state=unavailable
+        if database_health; then database_ready=1; database_state=healthy; fi
+        if router_health; then gateway_ready=1; gateway_state=healthy; fi
+        log_worker_progress "${elapsed}" "集群启动中（cluster=${cluster_state}）" \
+          "；Dependencies=[PostgreSQL:${database_state},$(gateway_display_name):${gateway_state}]"
+        if (( PROGRESS_HEALTHY == PROGRESS_TOTAL && database_ready == 1 && gateway_ready == 1 )); then
           log "集群已就绪：PostgreSQL、${PROGRESS_TOTAL} 个 Worker 和 $(gateway_display_name) 全部健康。"
           return 0
         fi

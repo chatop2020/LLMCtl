@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.2.0"
+readonly INSTALLER_VERSION="2.2.1"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -1522,6 +1522,18 @@ start_cluster_with_progress() {
   /usr/local/sbin/llmctl startup watch --timeout "${timeout}" --interval 10
 }
 
+start_cluster_with_fresh_health_fallback() {
+  if start_cluster_with_progress; then
+    return 0
+  fi
+  warn "$(l10n '启动观察器已中断；在关停服务前使用新进程复核真实集群健康状态。' 'The startup observer ended; rechecking actual cluster health in a fresh process before stopping services.')"
+  if /usr/local/sbin/llmctl health; then
+    log "$(l10n '真实集群健康检查通过；忽略观察器故障并继续部署验收。' 'Actual cluster health passed; ignoring the observer failure and continuing deployment acceptance.')"
+    return 0
+  fi
+  return 1
+}
+
 print_summary() {
   # shellcheck disable=SC1090
   source "${SECRETS_ENV}"
@@ -1717,7 +1729,7 @@ EOF
   if (( NO_START )); then
     log "$(l10n '按 --no-start 未启动；稍后运行 sudo systemctl start llm-cluster。' 'Services were not started because of --no-start; run sudo systemctl start llm-cluster later.')"
   else
-    if ! start_cluster_with_progress; then
+    if ! start_cluster_with_fresh_health_fallback; then
       systemctl disable llm-cluster.service 2>/dev/null || true
       /usr/local/sbin/llmctl shutdown --timeout 180 || true
       die "$(l10n '集群启动失败；已取消开机自启，请查看 journalctl -u llm-cluster' 'Cluster startup failed and boot activation was disabled; inspect journalctl -u llm-cluster')"

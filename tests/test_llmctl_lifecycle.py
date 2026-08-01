@@ -218,6 +218,82 @@ class LlmctlLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(output.strip(), "1|1|1|0|0:healthy,1:loading,2:pending")
 
+    def test_router_health_reloads_newapi_token_created_after_watcher_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = pathlib.Path(directory) / "config"
+            config_dir.mkdir()
+            (config_dir / "secrets.env").write_text(
+                "GATEWAY_API_KEY=sk-new-managed-token\n", encoding="utf-8"
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_CONFIG_DIR={config_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                GATEWAY_API_KEY=sk-stale-bootstrap-token
+                LITELLM_MASTER_KEY=sk-stale-bootstrap-token
+                API_BIND=0.0.0.0
+                API_PORT=8000
+                curl() {{
+                  local argument found=0
+                  for argument in "$@"; do
+                    [[ "${{argument}}" == "Authorization: Bearer sk-new-managed-token" ]] && found=1
+                  done
+                  (( found == 1 ))
+                }}
+                router_health
+                printf '%s|%s\n' "$GATEWAY_API_KEY" "$LITELLM_MASTER_KEY"
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(
+            completed.stdout.strip(),
+            "sk-new-managed-token|sk-new-managed-token",
+        )
+
+    def test_startup_watch_reports_database_and_gateway_dependencies(self):
+        manager = MANAGER.read_text(encoding="utf-8")
+        startup = manager.split("cmd_startup() {", 1)[1].split("api_post() {", 1)[0]
+        watch = startup.split("watch)", 1)[1]
+        self.assertIn("Dependencies=[PostgreSQL:${database_state}", startup)
+        self.assertLess(watch.index("if router_health"), watch.index("log_worker_progress"))
+        self.assertIn("gateway_ready == 1", watch)
+
+    def test_gateway_key_reload_keeps_legacy_litellm_config_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = pathlib.Path(directory) / "config"
+            config_dir.mkdir()
+            (config_dir / "secrets.env").write_text(
+                "LITELLM_MASTER_KEY=sk-legacy-master\n", encoding="utf-8"
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_CONFIG_DIR={config_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                GATEWAY_API_KEY=stale
+                LITELLM_MASTER_KEY=stale
+                reload_gateway_api_key
+                printf '%s|%s\n' "$GATEWAY_API_KEY" "$LITELLM_MASTER_KEY"
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(
+            completed.stdout.strip(), "sk-legacy-master|sk-legacy-master"
+        )
+
     def test_worker_batch_is_submitted_non_blocking_then_observed_as_a_group(self):
         output = run_bash(
             r"""
@@ -282,6 +358,22 @@ class LlmctlLifecycleTests(unittest.TestCase):
         start = installer.split("start_cluster_with_progress() {", 1)[1].split("\n}", 1)[0]
         self.assertIn("systemctl start --no-block llm-cluster.service", start)
         self.assertIn("llmctl startup watch", start)
+
+    def test_installer_rechecks_real_health_before_shutdown_after_watcher_failure(self):
+        installer = (ROOT / "install-llm-cluster.sh").read_text(encoding="utf-8")
+        fallback = installer.split(
+            "start_cluster_with_fresh_health_fallback() {", 1
+        )[1].split("\n}", 1)[0]
+        install_acceptance = installer.split(
+            "if ! start_cluster_with_fresh_health_fallback; then", 1
+        )[1].split("fi", 1)[0]
+        self.assertIn("start_cluster_with_progress", fallback)
+        self.assertIn("/usr/local/sbin/llmctl health", fallback)
+        self.assertLess(
+            installer.index("start_cluster_with_fresh_health_fallback() {"),
+            installer.index("if ! start_cluster_with_fresh_health_fallback; then"),
+        )
+        self.assertIn("shutdown --timeout 180", install_acceptance)
 
 
 if __name__ == "__main__":
