@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.0.1"
+readonly CTL_VERSION="2.0.2"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="/var/lib/llm-cluster"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -1358,7 +1358,12 @@ EOF
 
 run_catalog_maintenance() {
   [[ -x "${CATALOG_HELPER}" ]] || die "缺少模型目录助手 ${CATALOG_HELPER}"
-  local -a command=("$@")
+  local language="${LLMCTL_LANG:-}"
+  if [[ -z "${language}" && -r "${CLUSTER_ENV}" ]]; then
+    language=$(awk -F= '$1=="INTERFACE_LANGUAGE"{print $2; exit}' "${CLUSTER_ENV}")
+  fi
+  [[ "${language}" == en || "${language}" == zh ]] || language=zh
+  local -a command=(--lang "${language}" "$@")
   if python3 "${CATALOG_HELPER}" "${command[@]}"; then return 0; fi
   warn "目录查询未成功；尝试维护代理后重试。"
   prompt_proxy_if_needed

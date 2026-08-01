@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import pathlib
 import subprocess
+import tempfile
 import textwrap
 import unittest
 
@@ -31,6 +32,8 @@ class InstallerInteractionTests(unittest.TestCase):
                       printf 'search <%s> <%s> <%s>\n' "$1" "$CATALOG_QUERY" "$CATALOG_TASK"
                       CATALOG_RESULTS=/tmp/test-catalog.json
                     }
+                    catalog_result_count() { printf '1\n'; }
+                    show_catalog_selection_summary() { printf 'summary <%s> <%s>\n' "$1" "$2"; }
                     apply_catalog_selection() {
                       printf 'select <%s> <%s>\n' "$1" "$2"
                     }
@@ -38,13 +41,80 @@ class InstallerInteractionTests(unittest.TestCase):
                     """
                 ),
             ],
-            input="2\nornith\n\n1\n",
+            input="2\nornith\n\n1\ny\n",
             text=True,
             capture_output=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("search <modelscope> <ornith> <auto>", completed.stdout)
         self.assertIn("select </tmp/test-catalog.json> <1>", completed.stdout)
+
+    def test_model_confirmation_can_return_to_candidate_list(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    search_catalog() { CATALOG_RESULTS=/tmp/test-catalog.json; }
+                    catalog_result_count() { printf '2\n'; }
+                    show_catalog_selection_summary() { printf 'summary <%s>\n' "$2"; }
+                    apply_catalog_selection() { printf 'selected <%s>\n' "$2"; }
+                    select_model_interactively
+                    """
+                ),
+            ],
+            input="2\nornith\n\n1\nb\n2\ny\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("summary <1>", completed.stdout)
+        self.assertIn("summary <2>", completed.stdout)
+        self.assertIn("selected <2>", completed.stdout)
+
+    def test_model_selection_can_return_to_discovery(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    search_catalog() { CATALOG_RESULTS=/tmp/test-catalog.json; }
+                    catalog_result_count() { printf '1\n'; }
+                    discard_catalog_results() { CATALOG_RESULTS=''; }
+                    select_model_interactively
+                    printf 'source=%s\n' "$MODEL_SOURCE"
+                    """
+                ),
+            ],
+            input="2\nornith\n\n0\n4\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("source=validated", completed.stdout)
+
+    def test_english_language_selects_english_model_menu(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    select_language_interactively
+                    select_model_interactively
+                    printf 'language=%s source=%s\n' "$INTERFACE_LANGUAGE" "$MODEL_SOURCE"
+                    """
+                ),
+            ],
+            input="2\n4\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Choose how to discover a model", completed.stderr)
+        self.assertIn("language=en source=validated", completed.stdout)
 
     def test_catalog_search_with_default_context_returns_successfully(self):
         completed = subprocess.run(
@@ -111,6 +181,63 @@ class InstallerInteractionTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("安装器在第", completed.stderr)
         self.assertIn("意外失败", completed.stderr)
+
+    def test_english_help_works_even_when_lang_follows_help(self):
+        completed = subprocess.run(
+            ["bash", str(INSTALLER), "--help", "--lang", "en"],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Universal vLLM cluster installer", completed.stdout)
+        self.assertNotIn("通用 vLLM 集群自动安装器", completed.stdout)
+
+    def test_exact_local_model_is_reusable_but_mismatched_identity_is_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            revision = "a" * 40
+            target = root / "legacy-ornith-weights"
+            target.mkdir()
+            (target / "config.json").write_text(
+                '{"architectures":["Qwen3ForCausalLM"]}', encoding="utf-8"
+            )
+            (target / "model.safetensors").write_bytes(b"weight")
+            (root / "current.manifest").write_text(
+                "\n".join(
+                    (
+                        "MODEL_ID=example/Test",
+                        f"MODEL_REVISION={revision}",
+                        "MODEL_HUB=huggingface",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "current").symlink_to(target.name)
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    installer_script(
+                        f"""
+                        MODEL_ROOT={root!s}
+                        MODEL_ID=example/Test
+                        MODEL_REVISION={revision}
+                        MODEL_HUB=huggingface
+                        MODEL_ARCHITECTURE=Qwen3ForCausalLM
+                        MODEL_WEIGHT_BYTES=1
+                        reusable_model_at_root "$MODEL_ROOT" && printf 'exact=yes\n'
+                        MODEL_ID=example/Other
+                        if reusable_model_at_root "$MODEL_ROOT"; then printf 'mismatch=yes\n'; else printf 'mismatch=no\n'; fi
+                        """
+                    ),
+                ],
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("exact=yes", completed.stdout)
+        self.assertIn("mismatch=no", completed.stdout)
 
 
 if __name__ == "__main__":

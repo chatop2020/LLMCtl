@@ -79,7 +79,7 @@ sudo llmctl tune set startup-parallelism 8
 sudo llmctl restart all
 ```
 
-Loading eight workers concurrently is faster, but it increases peak CPU, system memory, and disk-read demand. During startup, every worker loads its own model copy; weights are not shared between GPUs.
+Loading eight workers concurrently is faster, but it increases peak CPU, system memory, and disk-read demand. The installer derives its default from host CPU threads, available memory, model size, and replica count; watch memory and disk activity after increasing it manually. During startup, every worker loads its own model copy; weights are not shared between GPUs.
 
 Startup requests are submitted concurrently in batches, and LLMCtl continuously reports aggregated progress for the entire batch instead of silently waiting for each worker in sequence. When `systemctl start llm-cluster.service` is invoked directly, the systemd client does not forward service logs. Open another terminal or reconnect through SSH and run `sudo llmctl startup watch`.
 
@@ -178,6 +178,12 @@ sudo llmctl models search Qwen --source all --task auto
 sudo llmctl models inspect modelscope Qwen/Qwen3-8B
 sudo llmctl models current
 ```
+
+The installer performs a read-only preflight before model search. It covers OS/architecture, CPU/cores/threads, memory/swap, GPUs/VRAM/driver/compute capability, current and maximum PCIe links, GPU/NUMA/NVLink topology, and model-filesystem capacity. PCIe/topology information is a capability snapshot, not an active NCCL bandwidth test.
+
+The catalog excludes platform-specific conversions such as Apple MLX weights. `mlx-community/*` targets MLX on Apple Silicon and cannot be used as NVIDIA CUDA/vLLM weights. Selecting a candidate expands its VRAM budget, TP links, host memory, disk, startup parallelism, and itemized recommendation reasons. You can then confirm, return to the candidate list, or search again.
+
+If the selected model already exists locally, the installer skips its download and does not copy weights only when the Hub, model ID, revision, configuration architecture, complete weight set, and size all match. A retained `/data/ornith/models` root can be detected automatically. Similar model names from different sources or IDs are never mixed.
 
 To switch to a different model, return to the project directory and rerun the installer:
 

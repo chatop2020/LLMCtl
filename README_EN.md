@@ -14,8 +14,11 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 ## Key Features
 
 - Search Hugging Face and ModelScope together or search either source independently.
-- Only display models that pass all of these gates: generative task, complete weights, an architecture supported by vLLM 0.22.1, and capacity for at least an 8K context window on the local host.
-- Automatically recommend tensor parallelism (TP), instance count, context length, and `max-num-seqs` based on weight size, runtime reserve, KV cache, minimum per-GPU VRAM, and GPU count.
+- Run a read-only host preflight before recommendations: OS/architecture, CPU/cores/threads, memory/swap, NVIDIA GPUs/VRAM/driver/compute capability, current and maximum PCIe links, GPU/NUMA/NVLink topology, and model-filesystem capacity.
+- Only display models that pass all of these gates: generative task, complete weights, non-platform-specific format, an architecture supported by vLLM 0.22.1, and capacity for at least an 8K context window on the local host.
+- Explicitly reject Apple MLX conversions such as `mlx-community/*`. They target MLX on Apple Silicon and are not NVIDIA CUDA/vLLM weights. Native Ornith FP8/AWQ/GPTQ variants remain eligible.
+- Automatically recommend TP, instance count, context length, `max-num-seqs`, and startup parallelism from weight size, runtime reserve, KV cache, minimum per-GPU VRAM, GPU count, CPU, available memory, PCIe/topology, and disk capacity.
+- After candidate selection, show VRAM, topology, host-memory and disk budgets, itemized recommendation reasons, and warnings. The user can confirm, return to the list, search again, or quit.
 - Recheck the architecture with `ModelRegistry` inside the pinned vLLM container before download, then verify configuration, weight presence, and size after download.
 - Enable image/OCR input, OpenAI tool calling, reasoning parsing, and per-request reasoning disable controls only when the model capability matches.
 - Map one GPU or one TP group to each worker. LiteLLM uses `least-busy` routing based on unfinished requests and enforces a per-worker concurrency limit.
@@ -72,12 +75,19 @@ sudo bash install-llm-cluster.sh
 
 The interactive workflow asks you to:
 
-1. Search Hugging Face, ModelScope, both sources, or enter a model directly.
-2. Enter a search term and task type (text, vision, or auto).
-3. Select from models deployable on the local host.
-4. Select the model directory, defaulting to `/data/llm-cluster/models`.
-5. Accept or override the recommended TP, sequences per instance, active instance count, and startup parallelism.
-6. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
+1. Select 中文 or English. Chinese is the default; subsequent installer and catalog interaction uses the selection.
+2. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
+3. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
+4. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
+5. Review the detailed plan, itemized recommendation reasons, and warnings. Press `Y` to accept, `b` for the list, `s` to search again, or `q` to quit.
+6. Select the model directory and review TP, sequences per replica, active replicas, and the host-planned startup parallelism.
+7. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
+
+The wizard language can also be selected directly:
+
+```bash
+sudo bash install-llm-cluster.sh --lang en
+```
 
 Typical unattended ModelScope installation:
 
@@ -105,6 +115,19 @@ Use the retained Ornith-compatible profile:
 ```bash
 sudo bash install-llm-cluster.sh --yes --model-source validated \
   --proxy http://10.1.0.6:7890
+```
+
+### Reusing Existing Weights and Skipping Downloads
+
+If a retained 36 GiB Ornith model is stored under `/data/ornith/models`, select the validated `protoLabsAI/Ornith-1.0-35B-FP8` profile. LLMCtl checks its legacy manifest and actual files. On an exact match, that directory becomes the default and the installer reports that the download and weight copy are skipped. The 36 GiB directory does not need to be moved.
+
+Reuse requires matching Hub, model ID, revision, `config.json` architecture, complete weight files, and a conservative size floor. Legacy Ornith manifests without a Hub field receive a narrow compatibility exception only for the pinned Hugging Face Ornith identities. Similar names or sizes are not identity: the ModelScope `deepreinforce-ai/Ornith-1.0-35B-FP8` cannot impersonate the Hugging Face `protoLabsAI/Ornith-1.0-35B-FP8`. A mismatch is never mixed in place; LLMCtl downloads the selected version normally.
+
+For unattended reuse, select the retained root explicitly and add `--skip-download`. This option does not bypass the checks above:
+
+```bash
+sudo bash install-llm-cluster.sh --yes --model-source validated \
+  --model-root /data/ornith/models --skip-download
 ```
 
 Reselecting a model recalculates TP, context length, and capability parameters while retaining downloaded models and the LiteLLM database:
@@ -149,7 +172,7 @@ sudo llmctl models inspect huggingface Qwen/Qwen3-8B
 sudo llmctl models current
 ```
 
-A catalog plan such as `TP1×8 ctx=32768 seq=7` means eight independent workers with up to seven vLLM scheduling sequences per worker. It does not guarantee that every request can simultaneously occupy a 32K or 256K context. Longer requests and additional images increase KV cache pressure and reduce sustainable concurrency.
+A catalog plan such as `TP1×8 ctx=32768 seq=7 start=8` means eight independent workers, up to seven vLLM scheduling sequences per worker, and a recommendation to load up to eight workers concurrently. It does not guarantee that every request can simultaneously occupy a 32K or 256K context. Longer requests and additional images increase KV cache pressure and reduce sustainable concurrency. PCIe/topology data is a capability snapshot, not an NCCL bandwidth test; use workload benchmarks for real performance.
 
 For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 

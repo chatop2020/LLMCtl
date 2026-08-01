@@ -33,6 +33,8 @@ class StaticDeploymentContracts(unittest.TestCase):
             "TRUST_REMOTE_CODE",
         ):
             self.assertIn(f"{key}=${{{key}}}", INSTALLER)
+        self.assertIn("INTERFACE_LANGUAGE=${INTERFACE_LANGUAGE}", INSTALLER)
+        self.assertIn('local -a command=(--lang "${language}" "$@")', MANAGER)
 
     def test_proxy_is_not_in_worker_unit(self):
         unit = INSTALLER.split("Description=vLLM model worker instance %i", 1)[1].split("EOF", 1)[0]

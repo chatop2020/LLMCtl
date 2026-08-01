@@ -14,8 +14,11 @@
 ## 主要能力
 
 - 同时搜索 Hugging Face 和 ModelScope，也可只搜索其中一个。
-- 只显示通过以下门禁的模型：生成式任务、完整权重、vLLM 0.22.1 架构清单、本机至少 8K 上下文可容纳。
-- 按权重、运行时预留、KV Cache、最低单卡显存和 GPU 数自动推荐 TP、实例数、上下文与 `max-num-seqs`。
+- 推荐前执行只读本机体检：操作系统/架构、CPU/核/线程、内存/Swap、NVIDIA GPU/显存/驱动/计算能力、PCIe 当前与最大链路、GPU/NUMA/NVLink 拓扑及模型盘空间。
+- 只显示通过以下门禁的模型：生成式任务、完整权重、非平台专用转换格式、vLLM 0.22.1 架构清单、本机至少 8K 上下文可容纳。
+- 明确排除 `mlx-community/*` 等 Apple MLX 转换权重；它们面向 MLX/Apple Silicon，不是 NVIDIA CUDA/vLLM 权重。原生 Ornith FP8/AWQ/GPTQ 等版本不受影响。
+- 按权重、运行时预留、KV Cache、最低单卡显存、GPU 数、CPU、可用内存、PCIe/拓扑和磁盘自动推荐 TP、实例数、上下文、`max-num-seqs` 与启动并行度。
+- 选择候选后显示显存预算、拓扑链路、主机内存/磁盘预算、逐项推荐原因和风险提示；可确认、返回列表、重新搜索或退出。
 - 下载前在固定 vLLM 容器的 `ModelRegistry` 中再次核验架构；下载后校验配置、权重存在性和体积。
 - 模型能力匹配时才启用图片/OCR、OpenAI 工具调用、思考解析和请求级思考关闭。
 - 一个 GPU 或一个 TP 分组对应一个 Worker；LiteLLM 使用 `least-busy` 按未完成请求数路由，并设置每 Worker 的并发上限。
@@ -72,12 +75,19 @@ sudo bash install-llm-cluster.sh
 
 交互流程会依次询问：
 
-1. 搜索 Hugging Face、ModelScope、两者，或直接输入模型。
-2. 搜索关键词和用途（文本/视觉/自动）。
-3. 从本机可部署模型中选择。
-4. 模型目录，默认 `/data/llm-cluster/models`。
-5. 是否接受推荐 TP、每实例序列数、激活实例数和并行启动数。
-6. 需要国际资源时才询问代理 IP 和端口；代理可选择保存供维护使用。
+1. 选择中文或 English；默认中文，后续安装向导和模型目录使用所选语言。
+2. 只读显示本机 OS、CPU、内存、GPU/驱动、PCIe/拓扑/NUMA 与磁盘体检。
+3. 搜索 Hugging Face、ModelScope、两者，或直接输入模型；再输入关键词和用途。
+4. 从通过门禁的候选中选择。输入 `0`/`b` 返回，`q` 退出。
+5. 阅读模型详细计划、逐项推荐原因和风险；`Y` 确认、`b` 返回列表、`s` 重新搜索、`q` 退出。
+6. 选择模型目录，确认 TP、每实例序列数、激活实例数和按本机资源规划的并行启动数。
+7. 需要国际资源时才询问代理 IP 和端口；代理可选择保存供维护使用。
+
+也可用参数直接选择安装向导语言：
+
+```bash
+sudo bash install-llm-cluster.sh --lang en
+```
 
 典型的 ModelScope 无人值守安装：
 
@@ -105,6 +115,19 @@ sudo bash install-llm-cluster.sh \
 ```bash
 sudo bash install-llm-cluster.sh --yes --model-source validated \
   --proxy http://10.1.0.6:7890
+```
+
+### 复用已有模型、跳过下载
+
+如果之前保留的 36G Ornith 位于 `/data/ornith/models`，选择已验证的 `protoLabsAI/Ornith-1.0-35B-FP8` 配置后，安装器会检查旧清单和实际文件；完全匹配时自动把该目录作为默认值，随后显示“跳过下载且不复制权重”。无需手工搬运 36G 文件。
+
+复用必须同时满足：Hub、模型 ID、revision、`config.json` 架构、完整权重文件和保守体积下限。旧 Ornith 清单没有 Hub 字段时，只对已固定的 Hugging Face Ornith 身份作有限兼容。名字或文件大小相似不算匹配；例如 ModelScope 的 `deepreinforce-ai/Ornith-1.0-35B-FP8` 不能直接冒充 Hugging Face 的 `protoLabsAI/Ornith-1.0-35B-FP8`。不匹配时安装器拒绝混用，再正常下载所选版本。
+
+无人值守复用也可以显式指定原目录并加 `--skip-download`；该参数不会绕过上述核验：
+
+```bash
+sudo bash install-llm-cluster.sh --yes --model-source validated \
+  --model-root /data/ornith/models --skip-download
 ```
 
 重新选择模型会重新计算 TP/上下文/能力参数，并保留已下载模型与 LiteLLM 数据库：
@@ -149,7 +172,7 @@ sudo llmctl models inspect huggingface Qwen/Qwen3-8B
 sudo llmctl models current
 ```
 
-目录结果中的计划例如 `TP1×8 ctx=32768 seq=7`，表示 8 个独立 Worker、每个 Worker 最多 7 个 vLLM 调度序列；这不是“每个请求都能同时占满 32K/256K”的保证。请求越长、图片越多，KV Cache 压力越高，实际可持续并发越低。
+目录结果中的计划例如 `TP1×8 ctx=32768 seq=7 start=8`，表示 8 个独立 Worker、每个 Worker 最多 7 个 vLLM 调度序列，并建议最多同时加载 8 个 Worker；这不是“每个请求都能同时占满 32K/256K”的保证。请求越长、图片越多，KV Cache 压力越高，实际可持续并发越低。PCIe/拓扑体检是能力快照，不是 NCCL 带宽测试，真实性能仍以业务压测为准。
 
 更多日常命令和 API 示例见 [USAGE.md](USAGE.md)。
 

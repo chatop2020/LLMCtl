@@ -79,7 +79,7 @@ sudo llmctl tune set startup-parallelism 8
 sudo llmctl restart all
 ```
 
-8 个并行加载启动更快，但 CPU、系统内存和磁盘读取峰值更高。启动期间每个 Worker 分别加载一份模型；这不是 GPU 间权重共享。
+8 个并行加载启动更快，但 CPU、系统内存和磁盘读取峰值更高。安装器会根据本机 CPU 线程、可用内存、模型大小和实例数给出默认值；手工调高后应观察内存与磁盘。启动期间每个 Worker 分别加载一份模型；这不是 GPU 间权重共享。
 
 启动命令按批次并发发起，并持续输出整个批次的聚合进度，不会再逐个 Worker 静默等待。直接执行 `systemctl start llm-cluster.service` 时，systemd 客户端本身不会转发服务日志；请另开窗口或 SSH 重连后运行 `sudo llmctl startup watch`。
 
@@ -178,6 +178,12 @@ sudo llmctl models search Qwen --source all --task auto
 sudo llmctl models inspect modelscope Qwen/Qwen3-8B
 sudo llmctl models current
 ```
+
+安装向导会先做只读体检，再搜索模型。体检包括操作系统/架构、CPU/核/线程、内存/Swap、GPU/显存/驱动/计算能力、PCIe 当前与最大链路、GPU/NUMA/NVLink 拓扑和模型盘空间。PCIe/拓扑是能力快照，不是主动 NCCL 带宽测试。
+
+目录会排除 Apple MLX 等平台专用转换权重；`mlx-community/*` 面向 MLX/Apple Silicon，不能作为 NVIDIA CUDA/vLLM 权重。选择候选后会展开显存预算、TP 链路、主机内存、磁盘、启动并行度和逐项推荐理由。此时可确认、返回候选列表或重新搜索。
+
+若所选模型已存在，只有 Hub、模型 ID、revision、配置架构、完整权重和体积全部匹配时才跳过下载，且不会复制权重。保留的 `/data/ornith/models` 可被自动识别；不同来源或模型 ID 即使名称相似也不会混用。
 
 切换到不同模型：回到项目目录，重新运行安装器。
 
