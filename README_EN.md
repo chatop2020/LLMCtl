@@ -9,7 +9,7 @@ LLMCtl searches Hugging Face or ModelScope for models on a bare-metal Ubuntu 24.
 The project does not use Conda or modify the NVIDIA driver. Inference dependencies are contained in pinned Docker image versions. A LAN proxy may be used temporarily during installation; runtime is fully offline by default and does not update automatically.
 
 > This is a prerelease intended for validation on real multi-GPU hosts. The
-> [GitHub repository](https://github.com/chatop2020/LLMCtl) is the source of truth, and automated tests run for every push and pull request.
+> [GitHub repository](https://github.com/chatop2020/LLMCtl) is the source of truth. Tests run locally by default, and the same checks can be started manually from GitHub Actions when needed.
 
 ## Key Features
 

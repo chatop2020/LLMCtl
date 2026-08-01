@@ -9,7 +9,7 @@
 项目不使用 Conda，也不改 NVIDIA 驱动。推理依赖位于固定版本的 Docker 镜像中；安装时可以临时使用局域网代理，运行期默认完全离线且不会自动更新。
 
 > 当前为面向真实多 GPU 主机验收的预发布版本。代码由
-> [GitHub 仓库](https://github.com/chatop2020/LLMCtl)统一管理；每次提交和拉取请求都会运行自动测试。
+> [GitHub 仓库](https://github.com/chatop2020/LLMCtl)统一管理；测试默认在本地执行，需要时可从 GitHub Actions 手动运行同一套检查。
 
 ## 主要能力
 
