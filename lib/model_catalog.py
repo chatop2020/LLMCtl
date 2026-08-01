@@ -26,7 +26,7 @@ import urllib.request
 from typing import Any, Iterable
 
 
-CATALOG_VERSION = "2.1.1"
+CATALOG_VERSION = "2.2.0"
 VLLM_COMPAT_VERSION = "0.22.1"
 GIB = 1024**3
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")

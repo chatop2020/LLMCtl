@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)
 
-LLMCtl searches Hugging Face or ModelScope for models on a bare-metal Ubuntu 24.04 host, conservatively filters them according to the local NVIDIA GPUs and VRAM, plans the deployment topology, and automatically deploys multiple vLLM workers, LiteLLM load balancing, and a web administration UI.
+LLMCtl searches Hugging Face or ModelScope for models on a bare-metal Ubuntu 24.04 host, conservatively filters them according to the local NVIDIA GPUs and VRAM, plans the deployment topology, and automatically deploys multiple vLLM workers plus one of three gateways: New API, LiteLLM, or Bifrost. New API is the default recommendation.
 
 The project does not use Conda or modify the NVIDIA driver. Inference dependencies are contained in pinned Docker image versions. A LAN proxy may be used temporarily during installation; runtime is fully offline by default and does not update automatically.
 
@@ -21,7 +21,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - After candidate selection, show VRAM, topology, host-memory and disk budgets, itemized recommendation reasons, and warnings. The user can confirm, return to the list, search again, or quit.
 - Recheck the architecture with `ModelRegistry` inside the pinned vLLM container before download, then verify configuration, weight presence, and size after download.
 - Enable image/OCR input, OpenAI tool calling, reasoning parsing, and per-request reasoning disable controls only when the model capability matches.
-- Map one GPU or one TP group to each worker. LiteLLM uses `least-busy` routing based on unfinished requests and enforces a per-worker concurrency limit.
+- Map one GPU or one TP group to each worker. The installer configures all workers, authentication, and database state for the selected gateway and exposes a consistent `:8000/v1` endpoint.
 - Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
@@ -41,6 +41,7 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `llmctl.sh` | Installed as the global `/usr/local/sbin/llmctl` command |
 | `lib/model_catalog.py` | Hub search, capability detection, VRAM estimation, and deployment planning |
 | `lib/runtime_optimizer.py` | Streaming benchmarks, GPU/vLLM metrics, conservative candidates, and objective scoring |
+| `lib/gateway_config.py` | Secret-free configuration generation for all gateways and New API reconciliation |
 | `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
 | `tests/test_runtime_optimizer.py` | Tuning advice, scoring, metrics parsing, and streaming-latency tests |
 | `README.md` / `README_EN.md` | Chinese and English project overview |
@@ -52,13 +53,16 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 |---|---|
 | Model directory | `/data/llm-cluster/models` |
 | vLLM image | `vllm/vllm-openai:v0.22.1` |
+| Gateway | New API (recommended) |
+| New API image | `calciumion/new-api:v1.0.0-rc.22` |
 | LiteLLM image | `ghcr.io/berriai/litellm:v1.94.0` |
+| Bifrost image | `maximhq/bifrost:v1.6.7` |
 | PostgreSQL | `postgres:16-alpine` |
 | API | `http://SERVER_IP:8000/v1` |
-| Web UI | `http://SERVER_IP:8000/ui` |
+| Web UI | New API/Bifrost: `http://SERVER_IP:8000/`; LiteLLM: `/ui` |
 | Administrator username | `admin` |
 | Initial shared password | `llm-admin` |
-| Routing strategy | `least-busy` |
+| Routing | Equal-weight healthy workers with failover; LiteLLM uses `least-busy` |
 | GPU memory utilization | `0.92` |
 
 The initial web password intentionally remains a public shared default. It is not secure and must be changed immediately after installation:
@@ -67,24 +71,37 @@ The initial web password intentionally remains a public shared default. It is no
 sudo llmctl admin set-password
 ```
 
+### Gateway Selection
+
+The wizard offers three choices before image download. For unattended installs, use `--gateway`:
+
+| Gateway | Best fit | Fully automated configuration |
+|---|---|---|
+| New API (default) | Friendly Chinese administration, channels, keys, and usage | Initializes the administrator, creates one equal-weight channel per healthy worker, and creates a root-only API token |
+| LiteLLM | Broad provider compatibility and established proxy configuration | Generates the model list, `least-busy` routing, master key, and PostgreSQL settings |
+| Bifrost | Efficient forwarding, observability, and virtual-key governance | Generates eight vLLM keys, equal-weight routing, a virtual key, admin authentication, and PostgreSQL log storage |
+
+All three use `llm-router.service`, `llm-database.service`, port `8000`, and an OpenAI-compatible `/v1`; the shared root-only API-key variable is `GATEWAY_API_KEY`. There is no online migration: select a gateway during a clean install after old service configuration has been removed. Existing model files and exact local Docker images are independently verified and reused instead of downloaded again. The pinned New API version is currently an RC and is AGPL-3.0; Bifrost is Apache-2.0. Review license obligations for your distribution and modification model.
+
 ## Quick Start
 
 Copy the entire directory to the server, enter it, and run:
 
 ```bash
-chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py
 sudo bash install-llm-cluster.sh
 ```
 
 The interactive workflow asks you to:
 
 1. Select 中文 or English. Chinese is the default; subsequent installer and catalog interaction uses the selection.
-2. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
-3. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
-4. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
-5. Review the detailed plan, itemized recommendation reasons, and warnings. Catalog candidates, validated profiles, and manually entered models all require confirmation. Press `Y` to accept, `b` to go back, `s` to search again, or `q` to quit.
-6. Select the model directory and review TP, sequences per replica, active replicas, and the host-planned startup parallelism.
-7. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
+2. Select New API (default), LiteLLM, or Bifrost.
+3. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
+4. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
+5. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
+6. Review the detailed plan, itemized recommendation reasons, and warnings. Catalog candidates, validated profiles, and manually entered models all require confirmation. Press `Y` to accept, `b` to go back, `s` to search again, or `q` to quit.
+7. Select the model directory and review TP, sequences per replica, active replicas, and the host-planned startup parallelism.
+8. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
 
 The wizard language can also be selected directly:
 
@@ -133,13 +150,13 @@ sudo bash install-llm-cluster.sh --yes --model-source validated \
   --model-root /data/ornith/models --skip-download
 ```
 
-Reselecting a model recalculates TP, context length, and capability parameters while retaining downloaded models and the LiteLLM database:
+Reselecting a model recalculates TP, context length, and capability parameters while retaining downloaded models and gateway database state:
 
 ```bash
 sudo bash install-llm-cluster.sh --force-reconfigure
 ```
 
-The general-purpose installer never overwrites a legacy `/etc/ornith` cluster automatically. If old services are detected, installation stops with instructions so that two worker sets cannot compete for the same GPUs and ports 8100–8107. An existing Ornith deployment can keep running. Do not migrate it until its configuration, models, and LiteLLM database have been backed up.
+The general-purpose installer never overwrites a legacy `/etc/ornith` cluster automatically. It stops if old services are found so two worker sets cannot compete for the same GPUs and ports 8100–8107. This release does not implement online migration; remove the old services, retain the model files, and perform a clean install.
 
 Do not use `llmctl download` to switch directly to a different model. Different models may require different TP and parsers. The manager rejects this unsafe switch; use the installer's `--force-reconfigure` workflow instead.
 
@@ -187,12 +204,13 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `/etc/llm-cluster/secrets.env` | API key, database credentials, and web administration credentials (mode 0600) |
 | `/etc/llm-cluster/workers/*.env` | Worker-to-GPU mappings |
 | `/usr/local/lib/llm-cluster/model_catalog.py` | Installed model catalog helper |
+| `/usr/local/lib/llm-cluster/gateway_config.py` | Gateway configuration and New API reconciliation helper |
 | `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
 | `/data/llm-cluster/models` | Default model root |
 | `llm-cluster.service` | Top-level oneshot service |
 | `llm-worker@N.service` | vLLM worker |
-| `llm-router.service` | LiteLLM API and UI |
-| `llm-database.service` | LiteLLM PostgreSQL database |
+| `llm-router.service` | Selected New API, LiteLLM, or Bifrost API and UI |
+| `llm-database.service` | Gateway PostgreSQL database |
 
 ## Security Notes
 
@@ -206,7 +224,7 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 
 ```bash
 bash -n install-llm-cluster.sh llmctl.sh
-python3 -m py_compile lib/model_catalog.py
+python3 -m py_compile lib/*.py
 python3 -m unittest discover -s tests -v
 ```
 

@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import importlib.util
+import json
+import os
+import pathlib
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "lib" / "gateway_config.py"
+SPEC = importlib.util.spec_from_file_location("gateway_config", MODULE_PATH)
+gateway = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(gateway)
+
+
+BASE_ENV = {
+    "SERVED_MODEL_NAME": "local-model",
+    "WORKER_BASE_PORT": "8100",
+    "MAX_NUM_SEQS": "7",
+    "MAX_MODEL_LEN": "32768",
+    "ROUTING_STRATEGY": "least-busy",
+    "GATEWAY_DB_PORT": "15432",
+    "POSTGRES_DB": "llm_gateway",
+    "POSTGRES_USER": "llmadmin",
+    "POSTGRES_PASSWORD": "db-secret",
+    "BACKEND_API_KEY": "sk-backend-secret",
+    "GATEWAY_API_KEY": "sk-bf-public-secret",
+    "BIFROST_ENCRYPTION_KEY": "encryption-secret",
+    "UI_USERNAME": "admin",
+    "UI_PASSWORD": "admin-pass",
+}
+
+
+class FakeNewAPIClient:
+    def __init__(self):
+        self.calls = []
+        self.channels = [{"id": 9, "tag": gateway.MANAGED_TAG}]
+        self.tokens = []
+        self.next_channel = 10
+        self.next_token = 21
+
+    def setup(self):
+        self.calls.append(("SETUP", ""))
+
+    def login(self):
+        self.calls.append(("LOGIN", ""))
+
+    def request(self, method, path, payload=None):
+        self.calls.append((method, path, payload))
+        if method == "PUT" and path == "/api/option/":
+            if payload != {"key": "RetryTimes", "value": 1}:
+                raise AssertionError(payload)
+            return {"success": True}
+        if method == "GET" and path.startswith("/api/channel/"):
+            return {"success": True, "data": {"items": list(self.channels)}}
+        if method == "POST" and path == "/api/channel/":
+            channel = dict(payload["channel"])
+            channel["id"] = self.next_channel
+            self.next_channel += 1
+            self.channels.append(channel)
+            return {"success": True, "data": None}
+        if method == "DELETE" and path.startswith("/api/channel/"):
+            channel_id = int(path.rsplit("/", 1)[1])
+            self.channels = [item for item in self.channels if item.get("id") != channel_id]
+            return {"success": True}
+        if method == "GET" and path.startswith("/api/token/"):
+            return {"success": True, "data": {"items": list(self.tokens)}}
+        if method == "POST" and path == "/api/token/":
+            self.tokens.append({"id": self.next_token, "name": payload["name"]})
+            self.next_token += 1
+            return {"success": True}
+        if method == "POST" and path.startswith("/api/token/") and path.endswith("/key"):
+            return {"success": True, "data": {"key": "x" * 48}}
+        if method == "DELETE" and path.startswith("/api/token/"):
+            token_id = int(path.rsplit("/", 1)[1])
+            self.tokens = [item for item in self.tokens if item.get("id") != token_id]
+            return {"success": True}
+        raise AssertionError((method, path, payload))
+
+
+class GatewayConfigTests(unittest.TestCase):
+    def test_render_litellm_has_one_backend_per_worker_and_no_plaintext_secret(self):
+        with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+            content = gateway.litellm_config([0, 1, 7])
+        self.assertEqual(content.count('model_name: "local-model"'), 3)
+        self.assertIn("http://127.0.0.1:8100/v1", content)
+        self.assertIn("http://127.0.0.1:8107/v1", content)
+        self.assertIn("os.environ/BACKEND_API_KEY", content)
+        self.assertNotIn("sk-backend-secret", content)
+
+    def test_render_bifrost_has_weighted_vllm_keys_postgres_and_virtual_key(self):
+        with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+            config = json.loads(gateway.bifrost_config(range(8)))
+        keys = config["providers"]["vllm"]["keys"]
+        self.assertEqual(len(keys), 8)
+        self.assertEqual([key["weight"] for key in keys], [1.0] * 8)
+        self.assertEqual(keys[7]["vllm_key_config"]["url"], "http://127.0.0.1:8107")
+        self.assertEqual(keys[0]["value"], "env.BACKEND_API_KEY")
+        self.assertEqual(config["config_store"]["type"], "postgres")
+        self.assertEqual(config["logs_store"]["type"], "postgres")
+        virtual_key = config["governance"]["virtual_keys"][0]
+        self.assertEqual(virtual_key["value"], "env.GATEWAY_API_KEY")
+        self.assertEqual(virtual_key["provider_configs"][0]["allowed_models"], ["local-model"])
+        serialized = json.dumps(config)
+        self.assertNotIn("sk-backend-secret", serialized)
+        self.assertNotIn("sk-bf-public-secret", serialized)
+
+    def test_render_newapi_plan_is_auditable_and_non_secret(self):
+        with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+            plan = json.loads(gateway.newapi_plan([0, 7]))
+        self.assertEqual(plan["gateway"], "newapi")
+        self.assertEqual(plan["retry_times"], 1)
+        self.assertEqual(plan["channels"][1]["base_url"], "http://127.0.0.1:8107")
+        self.assertNotIn("key", json.dumps(plan).lower())
+
+    def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
+        client = FakeNewAPIClient()
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = pathlib.Path(directory) / "secrets.env"
+            secrets.write_text("KEEP=yes\nGATEWAY_API_KEY=old\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+                gateway.reconcile_newapi(client, [0, 1], secrets)
+            persisted = secrets.read_text(encoding="utf-8")
+        create_positions = [
+            index for index, call in enumerate(client.calls)
+            if call[0:2] == ("POST", "/api/channel/")
+        ]
+        delete_position = next(
+            index for index, call in enumerate(client.calls)
+            if call[0:2] == ("DELETE", "/api/channel/9")
+        )
+        self.assertLess(max(create_positions), delete_position)
+        self.assertEqual([item["base_url"] for item in client.channels], [
+            "http://127.0.0.1:8100", "http://127.0.0.1:8101"
+        ])
+        self.assertIn("GATEWAY_API_KEY=sk-" + "x" * 48, persisted)
+        self.assertIn("LITELLM_MASTER_KEY=sk-" + "x" * 48, persisted)
+        self.assertIn("NEWAPI_MANAGED_TOKEN_ID=21", persisted)
+        self.assertIn("KEEP=yes", persisted)
+
+    def test_newapi_reconcile_preserves_old_routes_when_replacement_creation_fails(self):
+        client = FakeNewAPIClient()
+        original_request = client.request
+
+        def fail_second_channel(method, path, payload=None):
+            if method == "POST" and path == "/api/channel/" and client.next_channel == 11:
+                raise RuntimeError("injected channel failure")
+            return original_request(method, path, payload)
+
+        client.request = fail_second_channel
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = pathlib.Path(directory) / "secrets.env"
+            secrets.write_text("GATEWAY_API_KEY=old\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    gateway.reconcile_newapi(client, [0, 1], secrets)
+        self.assertTrue(any(item.get("id") == 9 for item in client.channels))
+
+    def test_newapi_rotation_creates_and_persists_new_token_before_deleting_old(self):
+        client = FakeNewAPIClient()
+        client.tokens = [{"id": 20, "name": gateway.MANAGED_TOKEN}]
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = pathlib.Path(directory) / "secrets.env"
+            secrets.write_text("GATEWAY_API_KEY=old\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+                gateway.ensure_newapi_token(client, secrets, rotate=True)
+            persisted = secrets.read_text(encoding="utf-8")
+        create_position = next(
+            index for index, call in enumerate(client.calls)
+            if call[0:2] == ("POST", "/api/token/")
+        )
+        delete_position = next(
+            index for index, call in enumerate(client.calls)
+            if call[0:2] == ("DELETE", "/api/token/20")
+        )
+        self.assertLess(create_position, delete_position)
+        self.assertEqual(client.tokens, [{"id": 21, "name": gateway.MANAGED_TOKEN}])
+        self.assertIn("NEWAPI_MANAGED_TOKEN_ID=21", persisted)
+
+    def test_worker_id_parser_rejects_empty_and_non_numeric_values(self):
+        with self.assertRaises(SystemExit):
+            gateway.parse_worker_ids("")
+        with self.assertRaises(SystemExit):
+            gateway.parse_worker_ids("0,nope")
+
+
+if __name__ == "__main__":
+    unittest.main()

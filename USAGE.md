@@ -19,7 +19,17 @@ sudo llmctl admin set-password
 sudo llmctl timezone set Asia/Shanghai
 ```
 
-Web 管理界面默认地址为 `http://服务器IP:8000/ui`，管理员用户名 `admin`，初始通用密码 `llm-admin`。密码会写在 root-only 的 `/etc/llm-cluster/secrets.env`，也可用 `sudo llmctl admin show` 查看。首次登录后请修改。
+Web 管理界面地址由接入层决定：New API 和 Bifrost 为 `http://服务器IP:8000/`，LiteLLM 为 `http://服务器IP:8000/ui`。管理员用户名默认 `admin`，初始通用密码 `llm-admin`。凭据写在 root-only 的 `/etc/llm-cluster/secrets.env`，也可用 `sudo llmctl admin show` 查看。首次登录后请修改。
+
+全新安装时选择接入层；默认 New API，也可显式指定：
+
+```bash
+sudo bash install-llm-cluster.sh --gateway newapi
+sudo bash install-llm-cluster.sh --gateway litellm
+sudo bash install-llm-cluster.sh --gateway bifrost
+```
+
+安装器只拉取所选接入层。若精确镜像已经存在于本机，直接复用；模型身份、revision、架构、完整性和大小全部匹配时也跳过权重下载。三种接入层统一使用 root-only 的 `GATEWAY_API_KEY`，且不做在线迁移。
 
 ## SSH 断开或安装窗口看起来不动
 
@@ -70,7 +80,7 @@ sudo llmctl autostart disable
 ```
 
 - `enable/disable`：只改开机列表。
-- `activate/deactivate`：同时改开机列表、运行状态和 LiteLLM 后端。
+- `activate/deactivate`：同时改开机列表、运行状态和所选接入层的后端。
 - `scale N`：持久设置为前 N 个实例。
 - `all` 对 `start/restart` 表示持久激活列表；`stop all` 会停止所有可能实例。
 
@@ -85,7 +95,7 @@ sudo llmctl restart all
 
 启动命令按批次并发发起，并持续输出整个批次的聚合进度，不会再逐个 Worker 静默等待。直接执行 `systemctl start llm-cluster.service` 时，systemd 客户端本身不会转发服务日志；请另开窗口或 SSH 重连后运行 `sudo llmctl startup watch`。
 
-## LiteLLM 路由
+## 接入层与路由
 
 ```bash
 sudo llmctl router status
@@ -93,7 +103,21 @@ sudo llmctl router restart
 sudo llmctl database status
 ```
 
-默认 `least-busy` 根据每个后端未完成请求数选择 Worker，并结合 `max_parallel_requests=max-num-seqs` 限流。它不会直接读取 GPU 显存、KV Cache 或图片大小，因此不是完美的“按工作量”调度。大请求仍可能造成负载不均；需要用业务压测观察，再考虑请求分类、不同模型别名或独立长上下文池。
+`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 还会自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限。
+
+这些路由都不会直接读取单个请求将占用的 GPU 显存、KV Cache 或图片大小。长上下文和多图请求仍可能造成瞬时不均；用真实业务分布运行 `llmctl bench` 和 `llmctl optimize analyze` 后再调优。
+
+密钥与管理员维护：
+
+```bash
+sudo llmctl key show
+sudo llmctl key rotate
+sudo llmctl admin show
+sudo llmctl admin set-username NEW_ADMIN
+sudo llmctl admin set-password
+```
+
+New API 的调用令牌由其数据库生成，所以 `key rotate` 不接受自定义值；LiteLLM 和 Bifrost 可选传入新值，Bifrost 值必须以 `sk-bf-` 开头。
 
 ## OpenAI 兼容 API
 
@@ -247,6 +271,7 @@ sudo bash install-llm-cluster.sh --force-reconfigure
 ```bash
 sudo llmctl proxy set 10.1.0.6 7890 http
 sudo llmctl update --vllm-image vllm/vllm-openai:v0.22.1
+sudo llmctl update --gateway-image calciumion/new-api:v1.0.0-rc.22
 sudo llmctl proxy clear
 ```
 
@@ -256,6 +281,8 @@ sudo llmctl proxy clear
 sudo llmctl offline export /data/offline/llm-bundle
 sudo llmctl offline import /data/offline/llm-bundle
 ```
+
+离线包包含当前选择的接入层类型与镜像；不能把 New API 离线包直接导入 LiteLLM/Bifrost 规划。
 
 ## 日志
 
@@ -271,11 +298,11 @@ journalctl -u llm-cluster.service -n 300 --no-pager
 - `curl: (7) ... 810N` 在 Worker 加载阶段只是健康检查尚未通过，不代表已失败。
 - Worker 显存停止增长且日志长期无变化：查看是否在编译 CUDA Graph、CPU 内存/磁盘是否饱和，以及服务是否仍 active。
 - Worker 退出：日志末尾通常会给出 OOM、架构、量化内核或模型代码错误。
-- LiteLLM 不健康但 Worker 健康：检查 `llm-router` 和 `llm-database` 日志。
+- 接入层不健康但 Worker 健康：检查 `llm-router` 和 `llm-database` 日志。New API 自动配置失败时，Router 日志之后还会在 `llm-cluster.service` 日志中显示具体的 setup/login/channel/token 错误。
 
 ## 卸载
 
-默认保留模型与 LiteLLM 数据库：
+默认保留模型、接入层 PostgreSQL/本地状态卷和 root-only 恢复凭据：
 
 ```bash
 sudo llmctl uninstall
@@ -289,4 +316,4 @@ sudo llmctl uninstall
 sudo llmctl uninstall --purge-model --purge-images --purge-database
 ```
 
-`--purge-model` 只有在模型目录存在安装器标记时才允许执行；`--purge-database` 会永久删除 Web UI 数据、虚拟 key 和管理记录。
+`--purge-model` 只有在模型目录存在安装器标记时才允许执行；`--purge-database` 会永久删除 Web UI 数据、虚拟 key、New API/Bifrost 本地状态和管理记录。只想保留现有权重时不要使用 `--purge-model`。

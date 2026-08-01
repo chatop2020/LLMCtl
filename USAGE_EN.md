@@ -19,7 +19,17 @@ Change the server timezone from UTC to China Standard Time:
 sudo llmctl timezone set Asia/Shanghai
 ```
 
-The default web administration URL is `http://SERVER_IP:8000/ui`. The administrator username is `admin`, and the initial shared password is `llm-admin`. The password is stored in the root-only `/etc/llm-cluster/secrets.env` file and can also be displayed with `sudo llmctl admin show`. Change it after the first login.
+The web administration URL depends on the gateway: New API and Bifrost use `http://SERVER_IP:8000/`; LiteLLM uses `http://SERVER_IP:8000/ui`. The administrator username defaults to `admin`, and the initial shared password is `llm-admin`. Credentials are stored in the root-only `/etc/llm-cluster/secrets.env` file and can also be displayed with `sudo llmctl admin show`. Change the password after the first login.
+
+Choose the gateway during a clean install. New API is the default, or select one explicitly:
+
+```bash
+sudo bash install-llm-cluster.sh --gateway newapi
+sudo bash install-llm-cluster.sh --gateway litellm
+sudo bash install-llm-cluster.sh --gateway bifrost
+```
+
+The installer pulls only the selected gateway. An exact local image is reused without a pull. Model download is also skipped when identity, revision, architecture, completeness, and size all match. All three use the root-only `GATEWAY_API_KEY`, and there is no online migration between them.
 
 ## SSH Disconnected or the Installation Window Appears Stuck
 
@@ -70,7 +80,7 @@ sudo llmctl autostart disable
 ```
 
 - `enable/disable`: change only the next-boot list.
-- `activate/deactivate`: change the next-boot list, runtime state, and LiteLLM backends together.
+- `activate/deactivate`: change the next-boot list, runtime state, and selected-gateway backends together.
 - `scale N`: persistently select the first N instances.
 - For `start/restart`, `all` means the persistently active list. `stop all` stops every possible instance.
 
@@ -85,7 +95,7 @@ Loading eight workers concurrently is faster, but it increases peak CPU, system 
 
 Startup requests are submitted concurrently in batches, and LLMCtl continuously reports aggregated progress for the entire batch instead of silently waiting for each worker in sequence. When `systemctl start llm-cluster.service` is invoked directly, the systemd client does not forward service logs. Open another terminal or reconnect through SSH and run `sudo llmctl startup watch`.
 
-## LiteLLM Routing
+## Gateway and Routing
 
 ```bash
 sudo llmctl router status
@@ -93,7 +103,21 @@ sudo llmctl router restart
 sudo llmctl database status
 ```
 
-The default `least-busy` strategy selects a worker according to the number of unfinished requests on each backend and enforces `max_parallel_requests=max-num-seqs`. It does not directly inspect GPU memory, KV cache usage, or image size, so it is not a perfect workload-aware scheduler. Large requests may still produce imbalance. Observe the actual workload with benchmarks before considering request classification, separate model aliases, or a dedicated long-context pool.
+`llmctl router restart` rediscovers healthy workers, renders the selected gateway configuration, restarts it, waits for process health, and only then verifies authenticated `/v1/models`. New API also initializes the administrator, creates an equal-weight channel per healthy worker, and creates a managed token. Bifrost generates equal-weight vLLM keys, a virtual key, and PostgreSQL log storage. LiteLLM uses `least-busy` plus a per-worker concurrency limit.
+
+None of these routers directly knows how much GPU memory, KV cache, or image processing a particular request will consume. Long-context and multi-image requests may still create transient imbalance. Run `llmctl bench` and `llmctl optimize analyze` with a realistic workload before tuning.
+
+Key and administrator maintenance:
+
+```bash
+sudo llmctl key show
+sudo llmctl key rotate
+sudo llmctl admin show
+sudo llmctl admin set-username NEW_ADMIN
+sudo llmctl admin set-password
+```
+
+New API creates its API tokens in its database, so `key rotate` does not accept a caller-supplied value. LiteLLM and Bifrost accept an optional value; a Bifrost key must start with `sk-bf-`.
 
 ## OpenAI-Compatible API
 
@@ -247,6 +271,7 @@ The scripts do not update automatically. Run maintenance explicitly:
 ```bash
 sudo llmctl proxy set 10.1.0.6 7890 http
 sudo llmctl update --vllm-image vllm/vllm-openai:v0.22.1
+sudo llmctl update --gateway-image calciumion/new-api:v1.0.0-rc.22
 sudo llmctl proxy clear
 ```
 
@@ -256,6 +281,8 @@ Export or import an offline bundle:
 sudo llmctl offline export /data/offline/llm-bundle
 sudo llmctl offline import /data/offline/llm-bundle
 ```
+
+An offline bundle records the selected gateway kind and image. A New API bundle cannot be imported into a LiteLLM or Bifrost plan.
 
 ## Logs
 
@@ -271,11 +298,11 @@ Common interpretations:
 - `curl: (7) ... 810N` during worker loading means only that the health probe has not passed yet; it is not itself a failure.
 - If worker GPU memory stops growing and logs remain unchanged for a long time, check whether CUDA Graph compilation is in progress, whether CPU memory or disk is saturated, and whether the service is still active.
 - If a worker exits, the final log lines usually identify an out-of-memory error, architecture mismatch, quantization-kernel problem, or model-code error.
-- If LiteLLM is unhealthy while workers are healthy, inspect the `llm-router` and `llm-database` logs.
+- If the gateway is unhealthy while workers are healthy, inspect the `llm-router` and `llm-database` logs. For New API reconciliation failures, the `llm-cluster.service` log also reports the exact setup, login, channel, or token error after the router log.
 
 ## Uninstall
 
-By default, uninstall retains the models and LiteLLM database:
+By default, uninstall retains the models, gateway PostgreSQL/local-state volumes, and root-only recovery credentials:
 
 ```bash
 sudo llmctl uninstall
@@ -289,4 +316,4 @@ Optional permanent deletion:
 sudo llmctl uninstall --purge-model --purge-images --purge-database
 ```
 
-`--purge-model` is allowed only when the model directory contains the installer's marker. `--purge-database` permanently deletes web UI data, virtual keys, and administration records.
+`--purge-model` is allowed only when the model directory contains the installer's marker. `--purge-database` permanently deletes web UI data, virtual keys, New API/Bifrost local state, and administration records. Do not use `--purge-model` when the existing weights must be retained.

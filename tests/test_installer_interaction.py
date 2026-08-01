@@ -21,6 +21,41 @@ def installer_script(body: str) -> str:
 
 
 class InstallerInteractionTests(unittest.TestCase):
+    def test_gateway_selection_defaults_to_newapi_and_supports_all_three_choices(self):
+        for answer, expected in (("\n", "newapi"), ("2\n", "litellm"), ("3\n", "bifrost")):
+            with self.subTest(answer=answer):
+                completed = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        installer_script(
+                            "select_gateway_interactively; printf 'gateway=%s\\n' \"$GATEWAY_KIND\""
+                        ),
+                    ],
+                    input=answer,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(f"gateway={expected}", completed.stdout)
+
+    def test_gateway_selection_uses_english_copy_after_language_choice(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    "select_language_interactively; select_gateway_interactively; printf 'gateway=%s\\n' \"$GATEWAY_KIND\""
+                ),
+            ],
+            input="2\n1\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Choose an API gateway", completed.stderr)
+        self.assertIn("gateway=newapi", completed.stdout)
+
     def test_modelscope_downloader_path_is_not_captured_with_install_logs(self):
         installer = INSTALLER.read_text(encoding="utf-8")
         download = installer.split("ensure_modelscope_downloader() {", 1)[1].split(

@@ -7,6 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = (ROOT / "install-llm-cluster.sh").read_text(encoding="utf-8")
 MANAGER = (ROOT / "llmctl.sh").read_text(encoding="utf-8")
 OPTIMIZER = (ROOT / "lib" / "runtime_optimizer.py").read_text(encoding="utf-8")
+GATEWAY = (ROOT / "lib" / "gateway_config.py").read_text(encoding="utf-8")
 
 
 class StaticDeploymentContracts(unittest.TestCase):
@@ -15,6 +16,31 @@ class StaticDeploymentContracts(unittest.TestCase):
         unit = INSTALLER.split("Description=vLLM model worker instance %i", 1)[1].split("EOF", 1)[0]
         self.assertNotIn("--tool-call-parser qwen3_xml", unit)
         self.assertNotIn("--reasoning-parser qwen3", unit)
+
+    def test_systemd_delegates_selected_gateway_to_manager(self):
+        self.assertIn("ExecStart=/usr/local/sbin/llmctl _gateway-start", INSTALLER)
+        self.assertIn('newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}"', MANAGER)
+        self.assertIn('litellm) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${LITELLM_IMAGE}}"', MANAGER)
+        self.assertIn('bifrost) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${BIFROST_IMAGE}}"', MANAGER)
+        self.assertIn("reconcile-newapi", MANAGER)
+        self.assertIn("wait_gateway_process", MANAGER)
+        self.assertIn("GATEWAY_API_KEY", MANAGER)
+
+    def test_gateway_versions_are_pinned_and_only_selected_image_is_pulled(self):
+        self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)
+        self.assertIn("ghcr.io/berriai/litellm:v1.94.0", INSTALLER)
+        self.assertIn("maximhq/bifrost:v1.6.7", INSTALLER)
+        pull = INSTALLER.split("pull_images() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('selected_gateway_image=$(gateway_image)', pull)
+        self.assertIn('ensure_image "${selected_gateway_image}"', pull)
+        self.assertNotIn('ensure_image "${NEWAPI_IMAGE}"', pull)
+        self.assertIn('docker image inspect "${image}"', INSTALLER)
+
+    def test_gateway_generated_configs_reference_secrets_by_environment(self):
+        self.assertIn("os.environ/BACKEND_API_KEY", GATEWAY)
+        self.assertIn("env.BACKEND_API_KEY", GATEWAY)
+        self.assertIn("env.GATEWAY_API_KEY", GATEWAY)
+        self.assertNotIn("sk-backend-$(", GATEWAY)
 
     def test_runtime_is_offline_and_capability_gated(self):
         self.assertIn("HF_HUB_OFFLINE=1", MANAGER)
@@ -85,6 +111,16 @@ class StaticDeploymentContracts(unittest.TestCase):
         ):
             self.assertIn(command, chinese)
             self.assertIn(command, english)
+
+    def test_bilingual_docs_cover_all_gateway_choices_and_clean_install_semantics(self):
+        for chinese_name, english_name in (("README.md", "README_EN.md"), ("USAGE.md", "USAGE_EN.md")):
+            chinese = (ROOT / chinese_name).read_text(encoding="utf-8")
+            english = (ROOT / english_name).read_text(encoding="utf-8")
+            for term in ("New API", "LiteLLM", "Bifrost", "--gateway", "GATEWAY_API_KEY"):
+                self.assertIn(term, chinese)
+                self.assertIn(term, english)
+            self.assertIn("不做在线迁移", chinese)
+            self.assertIn("no online migration", english.lower())
 
 
 if __name__ == "__main__":

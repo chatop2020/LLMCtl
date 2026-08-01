@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.1.1"
+readonly CTL_VERSION="2.2.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -13,10 +13,14 @@ readonly RETAINED_SECRETS="${STATE_DIR}/retained-secrets.env"
 readonly CLUSTER_ENV="${CONFIG_DIR}/cluster.env"
 readonly SECRETS_ENV="${CONFIG_DIR}/secrets.env"
 readonly PROXY_ENV="${CONFIG_DIR}/proxy.env"
-readonly ROUTER_CONFIG="${CONFIG_DIR}/litellm.yaml"
+readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm.yaml"
+readonly BIFROST_DIR="${CONFIG_DIR}/bifrost"
+readonly BIFROST_CONFIG="${BIFROST_DIR}/config.json"
+readonly NEWAPI_PLAN="${CONFIG_DIR}/newapi-plan.json"
 readonly DOCKER_PROXY_DROPIN="/etc/systemd/system/docker.service.d/90-llm-cluster-temporary-proxy.conf"
 readonly CATALOG_HELPER="${LLM_CATALOG_HELPER:-/usr/local/lib/llm-cluster/model_catalog.py}"
 readonly OPTIMIZER_HELPER="${LLM_OPTIMIZER_HELPER:-/usr/local/lib/llm-cluster/runtime_optimizer.py}"
+readonly GATEWAY_HELPER="${LLM_GATEWAY_HELPER:-/usr/local/lib/llm-cluster/gateway_config.py}"
 readonly OPTIMIZATION_DIR="${STATE_DIR}/optimization"
 readonly SMOKE_DIAGNOSTIC_DIR="${STATE_DIR}/diagnostics/smoke"
 
@@ -66,6 +70,20 @@ load_config() {
   SUPPORTS_REASONING="${SUPPORTS_REASONING:-1}"
   SUPPORTS_THINKING_TOGGLE="${SUPPORTS_THINKING_TOGGLE:-1}"
   TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
+  GATEWAY_KIND="${GATEWAY_KIND:-litellm}"
+  LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.94.0}"
+  NEWAPI_IMAGE="${NEWAPI_IMAGE:-calciumion/new-api:v1.0.0-rc.22}"
+  BIFROST_IMAGE="${BIFROST_IMAGE:-maximhq/bifrost:v1.6.7}"
+  case "${GATEWAY_KIND}" in
+    newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}" ;;
+    litellm) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${LITELLM_IMAGE}}" ;;
+    bifrost) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${BIFROST_IMAGE}}" ;;
+    *) die "GATEWAY_KIND 必须是 newapi、litellm 或 bifrost" ;;
+  esac
+  GATEWAY_DB_PORT="${GATEWAY_DB_PORT:-${LITELLM_DB_PORT:-15432}}"
+  GATEWAY_API_KEY="${GATEWAY_API_KEY:-${LITELLM_MASTER_KEY:-}}"
+  LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-${GATEWAY_API_KEY}}"
+  DATABASE_URL="${DATABASE_URL:-${SQL_DSN:-}}"
 
   : "${PHYSICAL_GPU_COUNT:?PHYSICAL_GPU_COUNT missing}"
   : "${TP_SIZE:?TP_SIZE missing}"
@@ -77,9 +95,9 @@ load_config() {
   : "${MODEL_ROOT:?MODEL_ROOT missing}"
   : "${SERVED_MODEL_NAME:?SERVED_MODEL_NAME missing}"
   : "${VLLM_IMAGE:?VLLM_IMAGE missing}"
-  : "${LITELLM_IMAGE:?LITELLM_IMAGE missing}"
+  : "${GATEWAY_IMAGE:?GATEWAY_IMAGE missing}"
   : "${POSTGRES_IMAGE:?POSTGRES_IMAGE missing}"
-  : "${LITELLM_DB_PORT:?LITELLM_DB_PORT missing}"
+  : "${GATEWAY_DB_PORT:?GATEWAY_DB_PORT missing}"
   : "${MAX_MODEL_LEN:?MAX_MODEL_LEN missing}"
   : "${MAX_NUM_SEQS:?MAX_NUM_SEQS missing}"
   : "${MAX_NUM_BATCHED_TOKENS:?MAX_NUM_BATCHED_TOKENS missing}"
@@ -87,7 +105,7 @@ load_config() {
   : "${MM_LIMIT:?MM_LIMIT missing}"
   : "${ROUTING_STRATEGY:?ROUTING_STRATEGY missing}"
   : "${START_TIMEOUT:?START_TIMEOUT missing}"
-  : "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY missing}"
+  : "${GATEWAY_API_KEY:?GATEWAY_API_KEY missing}"
   : "${BACKEND_API_KEY:?BACKEND_API_KEY missing}"
   : "${LITELLM_SALT_KEY:?LITELLM_SALT_KEY missing}"
   : "${UI_USERNAME:?UI_USERNAME missing}"
@@ -96,7 +114,44 @@ load_config() {
   : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing}"
   : "${POSTGRES_DB:?POSTGRES_DB missing}"
   : "${DATABASE_URL:?DATABASE_URL missing}"
+  [[ -x "${GATEWAY_HELPER}" ]] || die "网关配置助手不可执行：${GATEWAY_HELPER}"
   [[ "${STARTUP_PARALLELISM}" =~ ^[0-9]+$ ]] && (( STARTUP_PARALLELISM >= 1 && STARTUP_PARALLELISM <= INSTANCE_COUNT )) || die "STARTUP_PARALLELISM 必须在 1-${INSTANCE_COUNT}"
+}
+
+cmd_gateway_start() {
+  require_root
+  load_config
+  local name
+  name=$(gateway_display_name)
+  log "启动 ${name}：镜像=${GATEWAY_IMAGE}，入口=${API_BIND}:${API_PORT}。"
+  case "${GATEWAY_KIND}" in
+    newapi)
+      [[ "${API_BIND}" == 0.0.0.0 || "${API_BIND}" == :: ]] || \
+        die "New API 当前仅支持 api-bind=0.0.0.0 或 ::；其进程不提供独立监听地址参数"
+      docker volume create llm-cluster-gateway-data >/dev/null
+      exec /usr/bin/docker run --rm --name llm-router --network host \
+        --env-file "${SECRETS_ENV}" \
+        -e "PORT=${API_PORT}" -e "TZ=${TZ:-Asia/Shanghai}" \
+        -e ERROR_LOG_ENABLED=true -e BATCH_UPDATE_ENABLED=true \
+        -v llm-cluster-gateway-data:/data \
+        "${GATEWAY_IMAGE}" --log-dir /data/logs
+      ;;
+    litellm)
+      exec /usr/bin/docker run --rm --name llm-router --network host \
+        --env-file "${SECRETS_ENV}" \
+        -v "${LITELLM_CONFIG}:/app/config.yaml:ro" \
+        "${GATEWAY_IMAGE}" --config /app/config.yaml --host "${API_BIND}" --port "${API_PORT}"
+      ;;
+    bifrost)
+      docker volume create llm-cluster-gateway-data >/dev/null
+      exec /usr/bin/docker run --rm --name llm-router --network host \
+        --env-file "${SECRETS_ENV}" \
+        -e APP_DIR=/app/data -e "APP_HOST=${API_BIND}" -e "APP_PORT=${API_PORT}" \
+        -v llm-cluster-gateway-data:/app/data \
+        -v "${BIFROST_CONFIG}:/app/data/config.json:ro" \
+        "${GATEWAY_IMAGE}"
+      ;;
+  esac
 }
 
 cmd_worker_start() {
@@ -171,13 +226,13 @@ usage() {
   llmctl deactivate <0,1,...|all>             移出负载均衡 + stop + disable
   llmctl scale <1-N>                          持久调整集群为前 N 个实例
   llmctl autostart <enable|disable|status>     管理整个集群的开机自启
-  llmctl router <start|stop|restart|status>    管理 LiteLLM
-  llmctl database <start|stop|restart|status>  管理 LiteLLM PostgreSQL
+  llmctl router <start|stop|restart|status>    管理所选接入层（New API/LiteLLM/Bifrost）
+  llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl timezone show|set [时区]              查看或设置系统时区（默认 Asia/Shanghai）
 
   llmctl logs [all] [-f]                      全部组件日志（默认）
   llmctl logs worker <ID> [-f]                Worker 日志
-  llmctl logs router [-f]                     LiteLLM 日志
+  llmctl logs router [-f]                     所选接入层日志
   llmctl logs database [-f]                   PostgreSQL 日志
   llmctl smoke [--worker ID] [--full]         文本/思考/工具；--full 另测 OCR/单请求6图
   llmctl ocr <图片文件> [提示词]               通过集群入口执行 OCR
@@ -199,7 +254,7 @@ usage() {
               api-bind, api-port, startup-parallelism
 
   llmctl key show                             显示调用地址、模型名和 API key
-  llmctl key rotate [新KEY]                   轮换 LiteLLM 入口 key
+  llmctl key rotate [新KEY]                   轮换入口 key（New API 不接受自定义 KEY）
   llmctl admin show                           显示 Web UI 地址和管理员凭据
   llmctl admin set-username USER              修改 Web UI 管理员用户名
   llmctl admin set-password [PASSWORD]        修改密码；省略时安全交互输入
@@ -212,7 +267,7 @@ usage() {
   llmctl models inspect <SOURCE> <MODEL_ID> [REVISION]
                                                 检查能力、兼容性和推荐拓扑
   llmctl download [MODEL_ID] [REVISION]        重新核验或补齐当前模型文件
-  llmctl update [--vllm-image IMG] [--litellm-image IMG] [--postgres-image IMG]
+  llmctl update [--vllm-image IMG] [--gateway-image IMG] [--postgres-image IMG]
                                                 显式拉取镜像；绝不自动更新
   llmctl offline export <目录>                 导出镜像、模型和清单
   llmctl offline import <目录>                 从离线包导入
@@ -452,53 +507,92 @@ healthy_worker_ids() {
   printf '%s\n' "${out}"
 }
 
+gateway_display_name() {
+  case "${GATEWAY_KIND}" in
+    newapi) printf 'New API\n' ;;
+    litellm) printf 'LiteLLM\n' ;;
+    bifrost) printf 'Bifrost\n' ;;
+  esac
+}
+
+gateway_config_path() {
+  case "${GATEWAY_KIND}" in
+    newapi) printf '%s\n' "${NEWAPI_PLAN}" ;;
+    litellm) printf '%s\n' "${LITELLM_CONFIG}" ;;
+    bifrost) printf '%s\n' "${BIFROST_CONFIG}" ;;
+  esac
+}
+
+gateway_ui_path() {
+  [[ "${GATEWAY_KIND}" == litellm ]] && printf '/ui\n' || printf '/\n'
+}
+
+gateway_helper() {
+  export SERVED_MODEL_NAME WORKER_BASE_PORT MAX_NUM_SEQS MAX_MODEL_LEN ROUTING_STRATEGY
+  export GATEWAY_DB_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD BACKEND_API_KEY
+  export GATEWAY_API_KEY BIFROST_ENCRYPTION_KEY UI_USERNAME UI_PASSWORD DATABASE_URL
+  "${GATEWAY_HELPER}" "$@"
+}
+
 render_router_config() {
-  local worker_ids="${1:-}" id port tmp
+  local worker_ids="${1:-}" output
   [[ -n "${worker_ids}" ]] || die "没有健康 Worker，拒绝生成空路由。"
-  tmp=$(mktemp "${ROUTER_CONFIG}.XXXXXX")
-  {
-    printf 'model_list:\n'
-    IFS=',' read -r -a id_list <<<"${worker_ids}"
-    for id in "${id_list[@]}"; do
-      port=$(worker_port "${id}")
-      cat <<EOF
-  - model_name: "${SERVED_MODEL_NAME}"
-    litellm_params:
-      model: "hosted_vllm/${SERVED_MODEL_NAME}"
-      api_base: "http://127.0.0.1:${port}/v1"
-      api_key: "os.environ/BACKEND_API_KEY"
-      max_parallel_requests: ${MAX_NUM_SEQS}
-      timeout: 7200
-    model_info:
-      id: "llm-instance-${id}"
-      mode: "chat"
-      max_input_tokens: ${MAX_MODEL_LEN}
-      max_output_tokens: ${MAX_MODEL_LEN}
-EOF
-    done
-    cat <<EOF
-router_settings:
-  routing_strategy: "${ROUTING_STRATEGY}"
-  num_retries: 1
-  timeout: 7200
-  allowed_fails: 1
-  cooldown_time: 30
-  retry_after: 1
-litellm_settings:
-  drop_params: false
-  turn_off_message_logging: true
-  request_timeout: 7200
-general_settings:
-  master_key: "os.environ/LITELLM_MASTER_KEY"
-  database_url: "os.environ/DATABASE_URL"
-  store_model_in_db: false
-  disable_spend_logs: false
-EOF
-  } >"${tmp}"
-  chmod 640 "${tmp}"
-  chown root:root "${tmp}"
-  mv -f "${tmp}" "${ROUTER_CONFIG}"
-  log "LiteLLM 路由已生成，后端：${worker_ids}；策略：${ROUTING_STRATEGY}。"
+  output=$(gateway_config_path)
+  [[ "${GATEWAY_KIND}" != bifrost ]] || install -d -m 750 "${BIFROST_DIR}"
+  gateway_helper render --gateway "${GATEWAY_KIND}" --worker-ids "${worker_ids}" --output "${output}"
+  chown root:root "${output}"
+  chmod 640 "${output}"
+  log "$(gateway_display_name) 配置已生成，健康后端：${worker_ids}；策略：${ROUTING_STRATEGY}。"
+}
+
+gateway_process_health() {
+  local base_url
+  base_url=$(router_local_base_url)
+  case "${GATEWAY_KIND}" in
+    newapi) curl --noproxy '*' -fsS --max-time 3 "${base_url}/api/status" >/dev/null 2>&1 ;;
+    litellm) curl --noproxy '*' -fsS --max-time 3 "${base_url}/health/liveliness" >/dev/null 2>&1 ;;
+    bifrost) curl --noproxy '*' -fsS --max-time 3 "${base_url}/health" >/dev/null 2>&1 ;;
+  esac
+}
+
+wait_gateway_process() {
+  local started now timeout=120
+  started=$(date +%s)
+  while true; do
+    gateway_process_health && return 0
+    if ! systemctl is-active --quiet llm-router.service; then
+      journalctl -u llm-router.service -n 80 --no-pager >&2 || true
+      return 1
+    fi
+    now=$(date +%s)
+    (( now - started < timeout )) || die "$(gateway_display_name) 进程启动超时"
+    sleep 2
+  done
+}
+
+reconcile_gateway() {
+  local worker_ids="${1:?}"
+  [[ "${GATEWAY_KIND}" == newapi ]] || return 0
+  export GATEWAY_LOCAL_URL
+  GATEWAY_LOCAL_URL=$(router_local_base_url)
+  log "自动初始化 New API，并同步 ${worker_ids} 个健康 Worker、管理员和调用密钥..."
+  gateway_helper reconcile-newapi --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
+  # The helper may create New API's first managed token.
+  # shellcheck disable=SC1090
+  source "${SECRETS_ENV}"
+  log "New API 自动配置完成。"
+}
+
+ensure_database_ready() {
+  local started now
+  systemctl start llm-database.service
+  started=$(date +%s)
+  until database_health; do
+    systemctl is-active --quiet llm-database.service || die "PostgreSQL 启动失败；请查看 llmctl logs database"
+    now=$(date +%s)
+    (( now - started < 120 )) || die "PostgreSQL 启动超时"
+    sleep 2
+  done
 }
 
 refresh_router() {
@@ -506,11 +600,14 @@ refresh_router() {
   ids=$(healthy_worker_ids)
   if [[ -z "${ids}" ]]; then
     systemctl stop llm-router.service 2>/dev/null || true
-    warn "没有健康 Worker，LiteLLM 已停止。"
+    warn "没有健康 Worker，$(gateway_display_name) 已停止。"
     return 0
   fi
+  ensure_database_ready
   render_router_config "${ids}"
   systemctl restart llm-router.service
+  wait_gateway_process
+  reconcile_gateway "${ids}"
   wait_router
 }
 
@@ -518,9 +615,7 @@ router_health() {
   local base_url
   base_url=$(router_local_base_url)
   curl --noproxy '*' -fsS --max-time 3 \
-    "${base_url}/health/liveliness" >/dev/null 2>&1 || \
-  curl --noproxy '*' -fsS --max-time 3 \
-    -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+    -H "Authorization: Bearer ${GATEWAY_API_KEY}" \
     "${base_url}/v1/models" >/dev/null 2>&1
 }
 
@@ -541,13 +636,13 @@ wait_router() {
   local started now timeout=90
   started=$(date +%s)
   while true; do
-    router_health && { log "LiteLLM 已就绪。"; return 0; }
+    router_health && { log "$(gateway_display_name) 已就绪。"; return 0; }
     if ! systemctl is-active --quiet llm-router.service; then
       journalctl -u llm-router.service -n 80 --no-pager >&2 || true
       return 1
     fi
     now=$(date +%s)
-    (( now - started < timeout )) || die "LiteLLM 启动超时"
+    (( now - started < timeout )) || die "$(gateway_display_name) API 验证超时"
     sleep 2
   done
 }
@@ -671,9 +766,9 @@ cmd_status() {
   printf '入口: http://%s:%s/v1  模型名: %s\n' "${API_BIND}" "${API_PORT}" "${SERVED_MODEL_NAME}"
   printf '开机激活 Worker: %s\n' "${ACTIVE_WORKERS}"
   router_state=$(systemctl is-active llm-router.service 2>/dev/null || true)
-  printf 'LiteLLM: %s (%s)\n' "${router_state:-unknown}" "$([[ -n "${router_state}" ]] && router_health && printf healthy || printf unhealthy)"
+  printf '%s: %s (%s)\n' "$(gateway_display_name)" "${router_state:-unknown}" "$([[ -n "${router_state}" ]] && router_health && printf healthy || printf unhealthy)"
   database_state=$(systemctl is-active llm-database.service 2>/dev/null || true)
-  printf 'PostgreSQL: %s (%s，仅监听 127.0.0.1:%s)\n' "${database_state:-unknown}" "$([[ -n "${database_state}" ]] && database_health && printf healthy || printf unhealthy)" "${LITELLM_DB_PORT}"
+  printf 'PostgreSQL: %s (%s，仅监听 127.0.0.1:%s)\n' "${database_state:-unknown}" "$([[ -n "${database_state}" ]] && database_health && printf healthy || printf unhealthy)" "${GATEWAY_DB_PORT}"
   printf '\n%-8s %-10s %-7s %-9s %-9s %-12s %-18s\n' INSTANCE GPUS PORT BOOT SYSTEMD HEALTH VRAM
   IFS=',' read -r -a id_list <<<"${ids}"
   for id in "${id_list[@]}"; do
@@ -700,7 +795,7 @@ cmd_health() {
   load_config
   local id failures=0 running_count=0
   if database_health; then log "PostgreSQL: healthy"; else warn "PostgreSQL: unhealthy"; failures=$((failures + 1)); fi
-  if router_health; then log "LiteLLM: healthy"; else warn "LiteLLM: unhealthy"; failures=$((failures + 1)); fi
+  if router_health; then log "$(gateway_display_name): healthy"; else warn "$(gateway_display_name): unhealthy"; failures=$((failures + 1)); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
     if worker_is_active "${id}"; then
       running_count=$((running_count + 1))
@@ -749,7 +844,7 @@ cmd_startup() {
         collect_worker_progress "${ACTIVE_WORKERS}" "${pending_mode}"
         log_worker_progress "${elapsed}" "集群启动中（cluster=${cluster_state}）"
         if (( PROGRESS_HEALTHY == PROGRESS_TOTAL )) && database_health && router_health; then
-          log "集群已就绪：PostgreSQL、${PROGRESS_TOTAL} 个 Worker 和 LiteLLM 全部健康。"
+          log "集群已就绪：PostgreSQL、${PROGRESS_TOTAL} 个 Worker 和 $(gateway_display_name) 全部健康。"
           return 0
         fi
         if [[ "${cluster_state}" == failed ]] || (( PROGRESS_FAILED > 0 )); then
@@ -885,7 +980,7 @@ cmd_database() {
     stop)
       systemctl stop llm-router.service 2>/dev/null || true
       systemctl stop llm-database.service
-      warn "数据库停止时 LiteLLM Web UI、虚拟密钥和入口路由均不可用。"
+      warn "数据库停止时 $(gateway_display_name) 的 Web UI、密钥和入口路由均不可用。"
       ;;
     status) systemctl status llm-database.service --no-pager || true ;;
     *) die "database 子命令必须是 start|stop|restart|status" ;;
@@ -1110,8 +1205,8 @@ cmd_smoke() {
     worker_health "${worker}" || die "Worker ${worker} 未就绪"
     smoke_endpoint "http://127.0.0.1:$(worker_port "${worker}")" "${BACKEND_API_KEY}" "${full}"
   else
-    router_health || die "LiteLLM 未就绪"
-    smoke_endpoint "$(router_local_base_url)" "${LITELLM_MASTER_KEY}" "${full}"
+    router_health || die "$(gateway_display_name) 未就绪"
+    smoke_endpoint "$(router_local_base_url)" "${GATEWAY_API_KEY}" "${full}"
   fi
 }
 
@@ -1120,11 +1215,11 @@ cmd_ocr() {
   (( SUPPORTS_IMAGE_INPUT == 1 )) || die "当前模型 ${MODEL_ID} 不支持图片输入"
   local image_file="${1:?请提供图片文件}" prompt="${2:-请逐字识别图片中的全部文字，只输出识别结果。}" tmp response
   [[ -r "${image_file}" ]] || die "无法读取图片：${image_file}"
-  router_health || die "LiteLLM 未就绪"
+  router_health || die "$(gateway_display_name) 未就绪"
   tmp=$(mktemp)
   trap 'rm -f "${tmp}"' RETURN
   ocr_request_file "${image_file}" "${prompt}" "${tmp}"
-  response=$(api_post "$(router_local_base_url)/v1/chat/completions" "${LITELLM_MASTER_KEY}" "${tmp}")
+  response=$(api_post "$(router_local_base_url)/v1/chat/completions" "${GATEWAY_API_KEY}" "${tmp}")
   jq -r '.choices[0].message.content // .error.message // empty' <<<"${response}"
   trap - RETURN
   rm -f "${tmp}"
@@ -1144,11 +1239,11 @@ cmd_bench() {
   [[ "${concurrency}" =~ ^[0-9]+$ ]] && (( concurrency >= 1 && concurrency <= 256 )) || die "并发范围 1-256"
   [[ "${requests}" =~ ^[0-9]+$ ]] && (( requests >= concurrency && requests <= 10000 )) || die "requests 必须 >= concurrency 且 <=10000"
   [[ "${max_tokens}" =~ ^[0-9]+$ ]] && (( max_tokens >= 16 && max_tokens <= 8192 )) || die "max-tokens 范围 16-8192"
-  router_health || die "LiteLLM 未就绪"
+  router_health || die "$(gateway_display_name) 未就绪"
   warn "即将发起 ${requests} 个请求、并发 ${concurrency}；这是实际压力测试。"
   docker run --rm --network host \
     -e "BENCH_URL=$(router_local_base_url)/v1/chat/completions" \
-    -e "BENCH_KEY=${LITELLM_MASTER_KEY}" \
+    -e "BENCH_KEY=${GATEWAY_API_KEY}" \
     -e "BENCH_MODEL=${SERVED_MODEL_NAME}" \
     -e "BENCH_CONCURRENCY=${concurrency}" \
     -e "BENCH_REQUESTS=${requests}" \
@@ -1267,7 +1362,7 @@ optimizer_preflight() {
   command -v python3 >/dev/null 2>&1 || die "python3 missing"
   command -v jq >/dev/null 2>&1 || die "jq missing"
   command -v flock >/dev/null 2>&1 || die "flock missing"
-  router_health || die "$(ctl_l10n 'LiteLLM 未就绪，不能开始调优测试' 'LiteLLM is not ready; optimization cannot start')"
+  router_health || die "$(ctl_l10n '统一入口未就绪，不能开始调优测试' 'The gateway is not ready; optimization cannot start')"
   local id
   IFS=',' read -r -a optimizer_preflight_ids <<<"${ACTIVE_WORKERS}"
   for id in "${optimizer_preflight_ids[@]}"; do
@@ -1280,7 +1375,7 @@ optimizer_run_benchmark() {
   metrics=$(optimizer_metrics_urls)
   (( SUPPORTS_THINKING_TOGGLE == 0 )) || thinking+=(--thinking-toggle)
   log "$(ctl_l10n "运行 ${label} 合成负载：并发=${OPT_BENCH_CONCURRENCY}，请求=${OPT_BENCH_REQUESTS}，输出上限=${OPT_BENCH_MAX_TOKENS}..." "Running ${label} synthetic workload: concurrency=${OPT_BENCH_CONCURRENCY}, requests=${OPT_BENCH_REQUESTS}, output limit=${OPT_BENCH_MAX_TOKENS}...")"
-  LLMCTL_BENCH_KEY="${LITELLM_MASTER_KEY}" LLMCTL_METRICS_KEY="${BACKEND_API_KEY}" \
+  LLMCTL_BENCH_KEY="${GATEWAY_API_KEY}" LLMCTL_METRICS_KEY="${BACKEND_API_KEY}" \
     python3 "${OPTIMIZER_HELPER}" benchmark \
       --url "$(router_local_base_url)/v1/chat/completions" \
       --model "${SERVED_MODEL_NAME}" \
@@ -1746,13 +1841,28 @@ cmd_key() {
       [[ "${api_host}" == 0.0.0.0 || "${api_host}" == :: ]] && api_host='<服务器IP>'
       printf 'OPENAI_BASE_URL=http://%s:%s/v1\n' "${api_host}" "${API_PORT}"
       printf 'OPENAI_MODEL=%s\n' "${SERVED_MODEL_NAME}"
-      printf 'OPENAI_API_KEY=%s\n' "${LITELLM_MASTER_KEY}"
+      printf 'OPENAI_API_KEY=%s\n' "${GATEWAY_API_KEY}"
       ;;
     rotate)
-      local new_key="${2:-sk-$(openssl rand -hex 32)}"
+      local new_key="${2:-}"
+      if [[ "${GATEWAY_KIND}" == newapi ]]; then
+        [[ -z "${new_key}" ]] || die "New API 密钥由其数据库生成；请使用不带自定义 KEY 的 llmctl key rotate"
+        export GATEWAY_LOCAL_URL
+        GATEWAY_LOCAL_URL=$(router_local_base_url)
+        gateway_helper rotate-newapi-token --secrets-file "${SECRETS_ENV}"
+        log "New API 入口密钥已轮换。用 llmctl key show 查看。"
+        return 0
+      fi
+      if [[ -z "${new_key}" ]]; then
+        [[ "${GATEWAY_KIND}" == bifrost ]] && new_key="sk-bf-$(openssl rand -hex 32)" || new_key="sk-$(openssl rand -hex 32)"
+      fi
       [[ "${new_key}" =~ ^[A-Za-z0-9._-]{16,}$ ]] || die "KEY 至少 16 位，只允许字母、数字、点、下划线和连字符"
+      [[ "${GATEWAY_KIND}" != bifrost || "${new_key}" == sk-bf-* ]] || die "Bifrost 虚拟密钥必须以 sk-bf- 开头"
+      set_env_value "${SECRETS_ENV}" GATEWAY_API_KEY "${new_key}"
       set_env_value "${SECRETS_ENV}" LITELLM_MASTER_KEY "${new_key}"
-      systemctl restart llm-router.service
+      GATEWAY_API_KEY="${new_key}"
+      LITELLM_MASTER_KEY="${new_key}"
+      refresh_router
       log "入口 API key 已轮换。用 llmctl key show 查看。"
       ;;
     *) die "key 子命令必须是 show|rotate" ;;
@@ -1765,16 +1875,24 @@ cmd_admin() {
     show)
       local ui_host="${API_BIND}"
       [[ "${ui_host}" == 0.0.0.0 || "${ui_host}" == :: ]] && ui_host='<服务器IP>'
-      printf 'LITELLM_UI_URL=http://%s:%s/ui\n' "${ui_host}" "${API_PORT}"
-      printf 'LITELLM_UI_USERNAME=%s\n' "${UI_USERNAME}"
-      printf 'LITELLM_UI_PASSWORD=%s\n' "${UI_PASSWORD}"
+      printf 'GATEWAY=%s\n' "$(gateway_display_name)"
+      printf 'GATEWAY_UI_URL=http://%s:%s%s\n' "${ui_host}" "${API_PORT}" "$(gateway_ui_path)"
+      printf 'GATEWAY_UI_USERNAME=%s\n' "${UI_USERNAME}"
+      printf 'GATEWAY_UI_PASSWORD=%s\n' "${UI_PASSWORD}"
       warn "这是管理员凭据；请勿复制到日志、工单或代码仓库。"
       ;;
     set-username)
       local new_username="${2:?请指定新用户名}"
       [[ "${new_username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "用户名只允许字母、数字、点、下划线、@ 和连字符"
-      set_env_value "${SECRETS_ENV}" UI_USERNAME "${new_username}"
-      systemctl restart llm-router.service
+      if [[ "${GATEWAY_KIND}" == newapi ]]; then
+        (( ${#new_username} <= 12 )) || die "New API 管理员用户名最多 12 位"
+        export GATEWAY_LOCAL_URL LLMCTL_NEW_USERNAME="${new_username}"
+        GATEWAY_LOCAL_URL=$(router_local_base_url)
+        gateway_helper newapi-admin set-username --secrets-file "${SECRETS_ENV}"
+      else
+        set_env_value "${SECRETS_ENV}" UI_USERNAME "${new_username}"
+        refresh_router
+      fi
       log "Web UI 管理员用户名已修改为 ${new_username}。"
       ;;
     set-password)
@@ -1788,8 +1906,15 @@ cmd_admin() {
         [[ "${new_password}" == "${confirm_password}" ]] || die "两次输入的密码不一致"
       fi
       [[ "${new_password}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "密码需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符"
-      set_env_value "${SECRETS_ENV}" UI_PASSWORD "${new_password}"
-      systemctl restart llm-router.service
+      [[ "${GATEWAY_KIND}" != newapi || ${#new_password} -le 20 ]] || die "New API 管理员密码不能超过 20 位"
+      if [[ "${GATEWAY_KIND}" == newapi ]]; then
+        export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${new_password}"
+        GATEWAY_LOCAL_URL=$(router_local_base_url)
+        gateway_helper newapi-admin set-password --secrets-file "${SECRETS_ENV}"
+      else
+        set_env_value "${SECRETS_ENV}" UI_PASSWORD "${new_password}"
+        refresh_router
+      fi
       log "Web UI 管理员密码已修改。"
       ;;
     *) die "admin 子命令必须是 show|set-username|set-password" ;;
@@ -2047,17 +2172,26 @@ cmd_download() {
 
 cmd_update() {
   require_root; load_config
-  local new_vllm="${VLLM_IMAGE}" new_litellm="${LITELLM_IMAGE}" new_postgres="${POSTGRES_IMAGE}" was_cluster_active=0 stopped_for_proxy=0
+  local new_vllm="${VLLM_IMAGE}" new_gateway="${GATEWAY_IMAGE}" new_postgres="${POSTGRES_IMAGE}" was_cluster_active=0 stopped_for_proxy=0
   while (($#)); do
     case "$1" in
       --vllm-image) new_vllm="${2:?缺少镜像}"; shift 2 ;;
-      --litellm-image) new_litellm="${2:?缺少镜像}"; shift 2 ;;
+      --gateway-image) new_gateway="${2:?缺少镜像}"; shift 2 ;;
+      --litellm-image)
+        [[ "${GATEWAY_KIND}" == litellm ]] || die "当前网关不是 LiteLLM；请使用 --gateway-image"
+        new_gateway="${2:?缺少镜像}"; shift 2 ;;
+      --newapi-image)
+        [[ "${GATEWAY_KIND}" == newapi ]] || die "当前网关不是 New API；请使用 --gateway-image"
+        new_gateway="${2:?缺少镜像}"; shift 2 ;;
+      --bifrost-image)
+        [[ "${GATEWAY_KIND}" == bifrost ]] || die "当前网关不是 Bifrost；请使用 --gateway-image"
+        new_gateway="${2:?缺少镜像}"; shift 2 ;;
       --postgres-image) new_postgres="${2:?缺少镜像}"; shift 2 ;;
       *) die "未知 update 参数：$1" ;;
     esac
   done
   [[ "${new_vllm}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "vLLM 镜像名格式无效"
-  [[ "${new_litellm}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "LiteLLM 镜像名格式无效"
+  [[ "${new_gateway}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "网关镜像名格式无效"
   [[ "${new_postgres}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "PostgreSQL 镜像名格式无效"
   prompt_proxy_if_needed
   export_proxy_env
@@ -2069,7 +2203,7 @@ cmd_update() {
   fi
   trap 'clear_temporary_proxy; (( was_cluster_active == 0 )) || systemctl start llm-cluster.service 2>/dev/null || true' EXIT
   setup_docker_proxy
-  if ! docker pull "${new_vllm}" || ! docker pull "${new_litellm}" || ! docker pull "${new_postgres}" || \
+  if ! docker pull "${new_vllm}" || ! docker pull "${new_gateway}" || ! docker pull "${new_postgres}" || \
      ! image_supports_architecture "${new_vllm}" "${MODEL_ARCHITECTURE}"; then
     clear_temporary_proxy
     trap - EXIT
@@ -2079,14 +2213,24 @@ cmd_update() {
   clear_temporary_proxy
   trap - EXIT
   set_env_value "${CLUSTER_ENV}" VLLM_IMAGE "${new_vllm}"
-  set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${new_litellm}"
+  set_env_value "${CLUSTER_ENV}" GATEWAY_IMAGE "${new_gateway}"
+  case "${GATEWAY_KIND}" in
+    newapi) set_env_value "${CLUSTER_ENV}" NEWAPI_IMAGE "${new_gateway}" ;;
+    litellm) set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${new_gateway}" ;;
+    bifrost) set_env_value "${CLUSTER_ENV}" BIFROST_IMAGE "${new_gateway}" ;;
+  esac
   set_env_value "${CLUSTER_ENV}" POSTGRES_IMAGE "${new_postgres}"
   if (( stopped_for_proxy )); then
     if ! systemctl start llm-cluster.service || ! cmd_smoke --full; then
       warn "新镜像验收失败，回滚到原镜像。"
       systemctl stop llm-cluster.service 2>/dev/null || true
       set_env_value "${CLUSTER_ENV}" VLLM_IMAGE "${VLLM_IMAGE}"
-      set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${LITELLM_IMAGE}"
+      set_env_value "${CLUSTER_ENV}" GATEWAY_IMAGE "${GATEWAY_IMAGE}"
+      case "${GATEWAY_KIND}" in
+        newapi) set_env_value "${CLUSTER_ENV}" NEWAPI_IMAGE "${NEWAPI_IMAGE}" ;;
+        litellm) set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${LITELLM_IMAGE}" ;;
+        bifrost) set_env_value "${CLUSTER_ENV}" BIFROST_IMAGE "${BIFROST_IMAGE}" ;;
+      esac
       set_env_value "${CLUSTER_ENV}" POSTGRES_IMAGE "${POSTGRES_IMAGE}"
       systemctl reset-failed >/dev/null 2>&1 || true
       systemctl start llm-cluster.service 2>/dev/null || true
@@ -2106,12 +2250,13 @@ safe_tar_listing() {
 
 read_bundle_env() {
   local file="${1:?}" key value
-  IMPORT_VLLM_IMAGE="" IMPORT_LITELLM_IMAGE="" IMPORT_POSTGRES_IMAGE="" IMPORT_MODEL_HUB="" IMPORT_MODEL_ID="" IMPORT_MODEL_REVISION="" IMPORT_MODEL_ARCHITECTURE="" IMPORT_MODEL_DIR_NAME=""
+  IMPORT_VLLM_IMAGE="" IMPORT_GATEWAY_KIND="" IMPORT_GATEWAY_IMAGE="" IMPORT_POSTGRES_IMAGE="" IMPORT_MODEL_HUB="" IMPORT_MODEL_ID="" IMPORT_MODEL_REVISION="" IMPORT_MODEL_ARCHITECTURE="" IMPORT_MODEL_DIR_NAME=""
   while IFS='=' read -r key value; do
     [[ -n "${key}" && "${key}" != \#* ]] || continue
     case "${key}" in
       VLLM_IMAGE) IMPORT_VLLM_IMAGE="${value}" ;;
-      LITELLM_IMAGE) IMPORT_LITELLM_IMAGE="${value}" ;;
+      GATEWAY_KIND) IMPORT_GATEWAY_KIND="${value}" ;;
+      GATEWAY_IMAGE) IMPORT_GATEWAY_IMAGE="${value}" ;;
       POSTGRES_IMAGE) IMPORT_POSTGRES_IMAGE="${value}" ;;
       MODEL_HUB) IMPORT_MODEL_HUB="${value}" ;;
       MODEL_ID) IMPORT_MODEL_ID="${value}" ;;
@@ -2123,7 +2268,9 @@ read_bundle_env() {
     esac
   done <"${file}"
   [[ "${IMPORT_VLLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线 vLLM 镜像名无效"
-  [[ "${IMPORT_LITELLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线 LiteLLM 镜像名无效"
+  [[ "${IMPORT_GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost)$ ]] || die "离线 GATEWAY_KIND 无效"
+  [[ "${IMPORT_GATEWAY_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线网关镜像名无效"
+  [[ "${IMPORT_GATEWAY_KIND}" == "${GATEWAY_KIND}" ]] || die "离线包网关与当前安装规划不一致"
   [[ "${IMPORT_POSTGRES_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "离线 PostgreSQL 镜像名无效"
   [[ "${IMPORT_MODEL_HUB}" =~ ^(huggingface|modelscope)$ ]] || die "离线 MODEL_HUB 无效"
   [[ "${IMPORT_MODEL_ID}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "离线 MODEL_ID 无效"
@@ -2145,15 +2292,16 @@ cmd_offline() {
       [[ -n "${current_name}" && -d "${MODEL_ROOT}/${current_name}" ]] || die "本地模型不存在"
       log "导出 vLLM 镜像（文件可能很大）..."
       docker save -o "${dir}/vllm-image.tar" "${VLLM_IMAGE}"
-      log "导出 LiteLLM 镜像..."
-      docker save -o "${dir}/litellm-image.tar" "${LITELLM_IMAGE}"
+      log "导出 $(gateway_display_name) 镜像..."
+      docker save -o "${dir}/gateway-image.tar" "${GATEWAY_IMAGE}"
       log "导出 PostgreSQL 镜像..."
       docker save -o "${dir}/postgres-image.tar" "${POSTGRES_IMAGE}"
       log "导出当前模型（未压缩以加快恢复）..."
       tar -C "${MODEL_ROOT}" -cf "${dir}/model.tar" "${current_name}" current.manifest
       cat >"${dir}/bundle.env" <<EOF
 VLLM_IMAGE=${VLLM_IMAGE}
-LITELLM_IMAGE=${LITELLM_IMAGE}
+GATEWAY_KIND=${GATEWAY_KIND}
+GATEWAY_IMAGE=${GATEWAY_IMAGE}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
 MODEL_HUB=${MODEL_HUB}
 MODEL_ID=${MODEL_ID}
@@ -2162,12 +2310,12 @@ MODEL_ARCHITECTURE=${MODEL_ARCHITECTURE}
 MODEL_DIR_NAME=${current_name}
 EXPORTED_AT=$(date -u +%FT%TZ)
 EOF
-      (cd "${dir}" && sha256sum vllm-image.tar litellm-image.tar postgres-image.tar model.tar >SHA256SUMS)
+      (cd "${dir}" && sha256sum vllm-image.tar gateway-image.tar postgres-image.tar model.tar >SHA256SUMS)
       log "离线包已导出到 ${dir}"
       ;;
     import)
       [[ -r "${dir}/bundle.env" && -r "${dir}/SHA256SUMS" ]] || die "离线包清单不完整"
-      awk 'NF==2 && length($1)==64 && $1 !~ /[^0-9a-f]/ && ($2=="vllm-image.tar" || $2=="litellm-image.tar" || $2=="postgres-image.tar" || $2=="model.tar") && !seen[$2]++ {ok++} END{exit !(ok==4)}' "${dir}/SHA256SUMS" || die "SHA256SUMS 格式或文件名不安全"
+      awk 'NF==2 && length($1)==64 && $1 !~ /[^0-9a-f]/ && ($2=="vllm-image.tar" || $2=="gateway-image.tar" || $2=="postgres-image.tar" || $2=="model.tar") && !seen[$2]++ {ok++} END{exit !(ok==4)}' "${dir}/SHA256SUMS" || die "SHA256SUMS 格式或文件名不安全"
       (cd "${dir}" && sha256sum -c SHA256SUMS) || die "离线包校验失败"
       safe_tar_listing "${dir}/model.tar"
       read_bundle_env "${dir}/bundle.env"
@@ -2176,14 +2324,19 @@ EOF
         die "离线包模型与当前硬件规划不一致；请用安装器选择该模型并生成匹配配置后再导入"
       tar -tf "${dir}/model.tar" | awk -v root="${IMPORT_MODEL_DIR_NAME}/" '$0 != "current.manifest" && index($0,root) != 1 {bad=1} END{exit bad}' || die "离线模型包路径与清单不一致"
       docker load -i "${dir}/vllm-image.tar"
-      docker load -i "${dir}/litellm-image.tar"
+      docker load -i "${dir}/gateway-image.tar"
       docker load -i "${dir}/postgres-image.tar"
       image_supports_architecture "${IMPORT_VLLM_IMAGE}" "${MODEL_ARCHITECTURE}" || die "离线 vLLM 镜像不支持 ${MODEL_ARCHITECTURE}"
       install -d -m 755 "${MODEL_ROOT}"
       tar -C "${MODEL_ROOT}" -xf "${dir}/model.tar"
       ln -sfn "${IMPORT_MODEL_DIR_NAME}" "${MODEL_ROOT}/current"
       set_env_value "${CLUSTER_ENV}" VLLM_IMAGE "${IMPORT_VLLM_IMAGE}"
-      set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${IMPORT_LITELLM_IMAGE}"
+      set_env_value "${CLUSTER_ENV}" GATEWAY_IMAGE "${IMPORT_GATEWAY_IMAGE}"
+      case "${GATEWAY_KIND}" in
+        newapi) set_env_value "${CLUSTER_ENV}" NEWAPI_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
+        litellm) set_env_value "${CLUSTER_ENV}" LITELLM_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
+        bifrost) set_env_value "${CLUSTER_ENV}" BIFROST_IMAGE "${IMPORT_GATEWAY_IMAGE}" ;;
+      esac
       set_env_value "${CLUSTER_ENV}" POSTGRES_IMAGE "${IMPORT_POSTGRES_IMAGE}"
       log "离线包导入完成；运行 llmctl restart all 生效。"
       ;;
@@ -2228,18 +2381,20 @@ cmd_uninstall() {
   remove_tree_with_progress "${CACHE_DIR}" "可再生成编译缓存" 5
   if (( purge_images )); then
     log "删除锁定的 LLM 容器镜像。"
-    docker image rm "${VLLM_IMAGE}" "${LITELLM_IMAGE}" "${POSTGRES_IMAGE}" 2>/dev/null || true
+    docker image rm "${VLLM_IMAGE}" "${GATEWAY_IMAGE}" "${POSTGRES_IMAGE}" 2>/dev/null || true
   fi
   if (( purge_database )); then
-    if docker volume inspect llm-cluster-litellm-postgres >/dev/null 2>&1; then
-      docker volume rm llm-cluster-litellm-postgres >/dev/null
-      log "LiteLLM PostgreSQL 数据卷 llm-cluster-litellm-postgres 已永久删除。"
+    if docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; then
+      docker volume rm llm-cluster-gateway-postgres >/dev/null
+      log "接入层 PostgreSQL 数据卷 llm-cluster-gateway-postgres 已永久删除。"
     else
-      log "未发现 LiteLLM PostgreSQL 数据卷，无需删除。"
+      log "未发现接入层 PostgreSQL 数据卷，无需删除。"
     fi
+    docker volume rm llm-cluster-gateway-data >/dev/null 2>&1 || true
+    log "接入层本地状态卷 llm-cluster-gateway-data 已清理（如存在）。"
     rm -f "${RETAINED_SECRETS}"
   else
-    log "LiteLLM PostgreSQL 数据卷和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装时会自动接管。"
+    log "接入层 PostgreSQL/本地状态卷和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装相同接入层时可继续使用。"
   fi
   if (( purge_model )); then
     local normalized_root="${MODEL_ROOT%/}"
@@ -2363,22 +2518,16 @@ cmd_boot_start() {
   require_root; load_config
   local startup_failed=0 healthy
   log "启动 PostgreSQL 管理数据库..."
-  systemctl start llm-database.service
-  local db_started db_now
-  db_started=$(date +%s)
-  until database_health; do
-    systemctl is-active --quiet llm-database.service || die "PostgreSQL 启动失败；请查看 llmctl logs database"
-    db_now=$(date +%s)
-    (( db_now - db_started < 120 )) || die "PostgreSQL 启动超时"
-    sleep 2
-  done
+  ensure_database_ready
   log "数据库已就绪；按每批 ${STARTUP_PARALLELISM} 个启动 Worker：${ACTIVE_WORKERS}。"
   start_worker_ids_batched "${ACTIVE_WORKERS}" || startup_failed=1
   healthy=$(healthy_worker_ids)
   [[ -n "${healthy}" ]] || die "没有 Worker 成功启动"
   render_router_config "${healthy}"
-  log "启动 LiteLLM 路由器..."
+  log "启动 $(gateway_display_name) 接入层..."
   systemctl start llm-router.service
+  wait_gateway_process
+  reconcile_gateway "${healthy}"
   wait_router
   (( startup_failed == 0 )) || warn "至少一个 Worker 启动失败；健康 Worker 已继续提供服务。"
 }
@@ -2429,6 +2578,7 @@ main() {
     offline) cmd_offline "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     _worker-start) cmd_worker_start "$@" ;;
+    _gateway-start) cmd_gateway_start "$@" ;;
     _boot-start) cmd_boot_start "$@" ;;
     _boot-stop) cmd_boot_stop "$@" ;;
     *) die "未知命令：${command}。运行 llmctl help 查看帮助。" ;;

@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.1.1"
+readonly INSTALLER_VERSION="2.2.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -43,7 +43,10 @@ SUPPORTS_THINKING_TOGGLE=1
 TRUST_REMOTE_CODE=1
 VLLM_IMAGE="vllm/vllm-openai:v0.22.1"
 LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.94.0"
+NEWAPI_IMAGE="calciumion/new-api:v1.0.0-rc.22"
+BIFROST_IMAGE="maximhq/bifrost:v1.6.7"
 POSTGRES_IMAGE="postgres:16-alpine"
+GATEWAY_KIND="newapi"
 TP_SIZE=1
 PHYSICAL_GPU_COUNT=0
 INSTANCE_COUNT=0
@@ -59,7 +62,7 @@ ROUTING_STRATEGY="least-busy"
 WORKER_BASE_PORT=8100
 API_BIND="0.0.0.0"
 API_PORT=8000
-LITELLM_DB_PORT=15432
+GATEWAY_DB_PORT=15432
 UI_USERNAME="admin"
 UI_PASSWORD="llm-admin"
 START_TIMEOUT=1800
@@ -88,10 +91,12 @@ UI_USERNAME_EXPLICIT=0
 UI_PASSWORD_EXPLICIT=0
 INTERFACE_LANGUAGE="zh"
 INTERFACE_LANGUAGE_EXPLICIT=0
+GATEWAY_EXPLICIT=0
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MANAGER_SOURCE="${SCRIPT_DIR}/llmctl.sh"
 CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
+GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -150,9 +155,11 @@ Common unattended options:
   --api-bind IP                  Default 0.0.0.0
   --api-port PORT                Default 8000
   --worker-base-port PORT        Default 8100
-  --ui-username USER             LiteLLM Web admin; default admin
-  --ui-password PASSWORD         Initial password; default llm-admin
-  --database-port PORT           Local PostgreSQL port; default 15432
+  --gateway newapi|litellm|bifrost
+                                  API gateway; default and recommendation: newapi
+  --ui-username USER             Gateway Web administrator; default admin
+  --ui-password PASSWORD         Initial gateway password; default llm-admin
+  --database-port PORT           Gateway PostgreSQL port; default 15432
   --proxy URL                    Used only during installation/downloads
   --save-proxy                   Save for future llmctl download/update operations
   --no-start                     Install and register services without starting them
@@ -160,7 +167,9 @@ Common unattended options:
   --skip-packages                Do not install Docker/NVIDIA Container Toolkit
   --force-reconfigure            Permit replacing existing LLM cluster configuration
   --vllm-image IMAGE             Override the pinned vLLM image
+  --newapi-image IMAGE           Override the pinned New API image
   --litellm-image IMAGE          Override the pinned LiteLLM image
+  --bifrost-image IMAGE          Override the pinned Bifrost image
   --postgres-image IMAGE         Override the PostgreSQL 16 image
 
 Example:
@@ -205,9 +214,11 @@ EOF
   --api-bind IP                   默认 0.0.0.0
   --api-port PORT                 默认 8000
   --worker-base-port PORT         默认 8100
-  --ui-username USER              LiteLLM Web 管理员，默认 admin
-  --ui-password PASSWORD          LiteLLM Web 初始密码，默认 llm-admin
-  --database-port PORT            PostgreSQL 本机监听端口，默认 15432
+  --gateway newapi|litellm|bifrost
+                                   API 接入层，默认并推荐 newapi
+  --ui-username USER              接入层 Web 管理员，默认 admin
+  --ui-password PASSWORD          接入层初始密码，默认 llm-admin
+  --database-port PORT            接入层 PostgreSQL 本机端口，默认 15432
   --proxy URL                     仅安装/下载阶段使用的代理
   --save-proxy                    保存供以后 llmctl download/update 使用
   --no-start                      安装并注册服务，但不立即启动
@@ -215,7 +226,9 @@ EOF
   --skip-packages                 不安装 Docker/NVIDIA Container Toolkit
   --force-reconfigure             允许覆盖已有 LLM 集群配置/服务
   --vllm-image IMAGE              覆盖锁定的 vLLM 镜像
+  --newapi-image IMAGE            覆盖锁定的 New API 镜像
   --litellm-image IMAGE           覆盖锁定的 LiteLLM 镜像
+  --bifrost-image IMAGE           覆盖锁定的 Bifrost 镜像
   --postgres-image IMAGE          覆盖 PostgreSQL 16 镜像
 
 示例：
@@ -276,9 +289,10 @@ parse_args() {
       --api-bind) need_value "$@"; API_BIND="$2"; shift 2 ;;
       --api-port) need_value "$@"; API_PORT="$2"; shift 2 ;;
       --worker-base-port) need_value "$@"; WORKER_BASE_PORT="$2"; shift 2 ;;
+      --gateway) need_value "$@"; GATEWAY_KIND="$2"; GATEWAY_EXPLICIT=1; shift 2 ;;
       --ui-username) need_value "$@"; UI_USERNAME="$2"; UI_USERNAME_EXPLICIT=1; shift 2 ;;
       --ui-password) need_value "$@"; UI_PASSWORD="$2"; UI_PASSWORD_EXPLICIT=1; shift 2 ;;
-      --database-port) need_value "$@"; LITELLM_DB_PORT="$2"; shift 2 ;;
+      --database-port) need_value "$@"; GATEWAY_DB_PORT="$2"; shift 2 ;;
       --proxy) need_value "$@"; PROXY_URL="$2"; shift 2 ;;
       --save-proxy) SAVE_PROXY=1; shift ;;
       --no-start) NO_START=1; shift ;;
@@ -286,7 +300,9 @@ parse_args() {
       --skip-packages) SKIP_PACKAGES=1; shift ;;
       --force-reconfigure) FORCE_RECONFIGURE=1; shift ;;
       --vllm-image) need_value "$@"; VLLM_IMAGE="$2"; shift 2 ;;
+      --newapi-image) need_value "$@"; NEWAPI_IMAGE="$2"; shift 2 ;;
       --litellm-image) need_value "$@"; LITELLM_IMAGE="$2"; shift 2 ;;
+      --bifrost-image) need_value "$@"; BIFROST_IMAGE="$2"; shift 2 ;;
       --postgres-image) need_value "$@"; POSTGRES_IMAGE="$2"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
       --version) printf '%s\n' "${INSTALLER_VERSION}"; exit 0 ;;
@@ -317,6 +333,70 @@ EOF
   [[ "${INTERFACE_LANGUAGE}" == zh || "${INTERFACE_LANGUAGE}" == en ]] || \
     die "$(l10n "language 只能是 zh 或 en" "language must be zh or en")"
   export LLMCTL_LANG="${INTERFACE_LANGUAGE}"
+}
+
+gateway_display_name() {
+  case "${1:-${GATEWAY_KIND}}" in
+    newapi) printf 'New API' ;;
+    litellm) printf 'LiteLLM' ;;
+    bifrost) printf 'Bifrost' ;;
+    *) printf '%s' "${1:-unknown}" ;;
+  esac
+}
+
+gateway_image() {
+  case "${1:-${GATEWAY_KIND}}" in
+    newapi) printf '%s\n' "${NEWAPI_IMAGE}" ;;
+    litellm) printf '%s\n' "${LITELLM_IMAGE}" ;;
+    bifrost) printf '%s\n' "${BIFROST_IMAGE}" ;;
+    *) return 1 ;;
+  esac
+}
+
+gateway_ui_path() {
+  [[ "${GATEWAY_KIND}" == litellm ]] && printf '/ui' || printf '/'
+}
+
+gateway_routing_summary() {
+  case "${GATEWAY_KIND}" in
+    newapi) printf '%s' "$(l10n '同优先级渠道按权重随机，失败时切换渠道' 'weighted channels at equal priority with channel failover')" ;;
+    litellm) printf 'LiteLLM %s' "${ROUTING_STRATEGY}" ;;
+    bifrost) printf '%s' "$(l10n 'vLLM keys 等权轮转并自动回退' 'equally weighted vLLM keys with automatic fallback')" ;;
+  esac
+}
+
+select_gateway_interactively() {
+  (( GATEWAY_EXPLICIT || ASSUME_YES || NON_INTERACTIVE )) && return 0
+  local choice
+  while true; do
+    if [[ "${INTERFACE_LANGUAGE}" == en ]]; then
+      cat >&2 <<'EOF'
+
+Choose an API gateway:
+  1) New API (recommended/default) — Chinese-friendly admin UI, channels, keys and usage
+  2) LiteLLM — broad provider compatibility and the legacy LLMCtl integration
+  3) Bifrost — efficient gateway with per-worker weighted routing and observability
+  0) Cancel installation
+EOF
+    else
+      cat >&2 <<'EOF'
+
+请选择 API 接入层：
+  1) New API（推荐/默认）— 中文管理界面友好，提供渠道、令牌和用量管理
+  2) LiteLLM — 供应商兼容面广，也是 LLMCtl 原有接入层
+  3) Bifrost — 高效网关，支持按 Worker 加权路由与可观测性
+  0) 退出安装
+EOF
+    fi
+    read -r -p "$(l10n '选择 [1]: ' 'Choice [1]: ')" choice
+    case "${choice:-1}" in
+      1|newapi) GATEWAY_KIND=newapi; return 0 ;;
+      2|litellm) GATEWAY_KIND=litellm; return 0 ;;
+      3|bifrost) GATEWAY_KIND=bifrost; return 0 ;;
+      0|q|Q) log "$(l10n '已取消，尚未执行安装。' 'Cancelled before installation started.')"; exit 0 ;;
+      *) warn "$(l10n '接入层选择无效，请重新选择。' 'Invalid gateway choice; choose again.')" ;;
+    esac
+  done
 }
 
 ask() {
@@ -786,14 +866,22 @@ validate_scalar_config() {
   [[ "${API_BIND}" =~ ^[0-9a-fA-F:.]+$ ]] || die "$(l10n 'api-bind 只能是 IP 地址' 'api-bind must be an IP address')"
   [[ "${API_PORT}" =~ ^[0-9]+$ ]] && (( API_PORT >= 1024 && API_PORT <= 65535 )) || die "$(l10n 'api-port 范围 1024-65535' 'api-port must be between 1024 and 65535')"
   [[ "${WORKER_BASE_PORT}" =~ ^[0-9]+$ ]] && (( WORKER_BASE_PORT >= 1024 && WORKER_BASE_PORT <= 65000 )) || die "$(l10n 'worker-base-port 范围 1024-65000' 'worker-base-port must be between 1024 and 65000')"
-  [[ "${LITELLM_DB_PORT}" =~ ^[0-9]+$ ]] && (( LITELLM_DB_PORT >= 1024 && LITELLM_DB_PORT <= 65535 )) || die "$(l10n 'database-port 范围 1024-65535' 'database-port must be between 1024 and 65535')"
+  [[ "${GATEWAY_DB_PORT}" =~ ^[0-9]+$ ]] && (( GATEWAY_DB_PORT >= 1024 && GATEWAY_DB_PORT <= 65535 )) || die "$(l10n 'database-port 范围 1024-65535' 'database-port must be between 1024 and 65535')"
   (( API_PORT < WORKER_BASE_PORT || API_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'API 端口与 Worker 端口范围冲突' 'The API port conflicts with the worker port range')"
-  (( LITELLM_DB_PORT != API_PORT )) || die "$(l10n 'database-port 不能与 API 端口相同' 'database-port cannot equal the API port')"
-  (( LITELLM_DB_PORT < WORKER_BASE_PORT || LITELLM_DB_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'database-port 与 Worker 端口范围冲突' 'database-port conflicts with the worker port range')"
+  (( GATEWAY_DB_PORT != API_PORT )) || die "$(l10n 'database-port 不能与 API 端口相同' 'database-port cannot equal the API port')"
+  (( GATEWAY_DB_PORT < WORKER_BASE_PORT || GATEWAY_DB_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'database-port 与 Worker 端口范围冲突' 'database-port conflicts with the worker port range')"
+  [[ "${GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost)$ ]] || die "$(l10n 'gateway 只能是 newapi、litellm 或 bifrost' 'gateway must be newapi, litellm, or bifrost')"
+  if [[ "${GATEWAY_KIND}" == newapi && "${API_BIND}" != 0.0.0.0 && "${API_BIND}" != :: ]]; then
+    die "$(l10n 'New API 镜像不能单独指定监听 IP；请使用默认 --api-bind 0.0.0.0，并通过防火墙限制访问' 'The New API image cannot bind a specific IP; use the default --api-bind 0.0.0.0 and restrict access with the firewall')"
+  fi
   [[ "${UI_USERNAME}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "$(l10n 'ui-username 只允许字母、数字、点、下划线、@ 和连字符' 'ui-username may contain only letters, digits, dots, underscores, @, and hyphens')"
+  [[ "${GATEWAY_KIND}" != newapi || ${#UI_USERNAME} -le 12 ]] || die "$(l10n 'New API 管理员用户名不能超过 12 个字符' 'The New API administrator username cannot exceed 12 characters')"
   [[ "${UI_PASSWORD}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "$(l10n 'ui-password 需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符' 'ui-password must be 8-128 characters using letters, digits, dots, underscores, @, and hyphens')"
+  [[ "${GATEWAY_KIND}" != newapi || ${#UI_PASSWORD} -le 20 ]] || die "$(l10n 'New API 管理员密码不能超过 20 个字符' 'The New API administrator password cannot exceed 20 characters')"
   [[ "${VLLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'vLLM 镜像名格式无效' 'Invalid vLLM image name')"
+  [[ "${NEWAPI_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'New API 镜像名格式无效' 'Invalid New API image name')"
   [[ "${LITELLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'LiteLLM 镜像名格式无效' 'Invalid LiteLLM image name')"
+  [[ "${BIFROST_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'Bifrost 镜像名格式无效' 'Invalid Bifrost image name')"
   [[ "${POSTGRES_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'PostgreSQL 镜像名格式无效' 'Invalid PostgreSQL image name')"
   if [[ -n "${PROXY_URL}" ]]; then
     [[ "${PROXY_URL}" =~ ^https?://[A-Za-z0-9._:-]+$ ]] || die "$(l10n '代理格式应为 http://IP:PORT 或 https://IP:PORT' 'Proxy must be formatted as http://IP:PORT or https://IP:PORT')"
@@ -809,6 +897,7 @@ check_discovery_host() {
   [[ -r "${MANAGER_SOURCE}" ]] || die "$(l10n 'llmctl.sh 必须与安装脚本放在同一目录' 'llmctl.sh must be in the same directory as the installer')"
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
+  [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -834,6 +923,7 @@ check_host() {
   [[ -x "${MANAGER_SOURCE}" ]] || [[ -r "${MANAGER_SOURCE}" ]] || die "$(l10n 'llmctl.sh 必须与安装脚本放在同一目录' 'llmctl.sh must be in the same directory as the installer')"
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
+  [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -876,7 +966,7 @@ check_host() {
 check_ports_available() {
   command -v ss >/dev/null 2>&1 || { warn "$(l10n '缺少 ss，跳过端口占用预检。' 'ss is unavailable; skipping the port-occupancy preflight.')"; return 0; }
   local port id
-  local -a ports=("${API_PORT}" "${LITELLM_DB_PORT}")
+  local -a ports=("${API_PORT}" "${GATEWAY_DB_PORT}")
   for ((id = 0; id < INSTANCE_COUNT; id++)); do ports+=("$((WORKER_BASE_PORT + id))"); done
   for port in "${ports[@]}"; do
     if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
@@ -997,13 +1087,22 @@ verify_container_runtime() {
   docker info >/dev/null || die "$(l10n 'Docker daemon 不可用' 'The Docker daemon is unavailable')"
 }
 
+ensure_image() {
+  local image="${1:?}" label="${2:?}"
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    log "$(l10n "复用本机 ${label} 镜像：${image}" "Reusing the local ${label} image: ${image}")"
+  else
+    log "$(l10n "拉取并锁定 ${label} 镜像：${image}" "Pulling and pinning the ${label} image: ${image}")"
+    docker pull "${image}"
+  fi
+}
+
 pull_images() {
-  log "$(l10n "拉取并锁定 vLLM 镜像：${VLLM_IMAGE}" "Pulling and pinning the vLLM image: ${VLLM_IMAGE}")"
-  docker pull "${VLLM_IMAGE}"
-  log "$(l10n "拉取并锁定 LiteLLM 镜像：${LITELLM_IMAGE}" "Pulling and pinning the LiteLLM image: ${LITELLM_IMAGE}")"
-  docker pull "${LITELLM_IMAGE}"
-  log "$(l10n "拉取 PostgreSQL 镜像：${POSTGRES_IMAGE}" "Pulling the PostgreSQL image: ${POSTGRES_IMAGE}")"
-  docker pull "${POSTGRES_IMAGE}"
+  local selected_gateway_image
+  selected_gateway_image=$(gateway_image) || die "$(l10n '无法解析接入层镜像' 'Could not resolve the gateway image')"
+  ensure_image "${VLLM_IMAGE}" vLLM
+  ensure_image "${selected_gateway_image}" "$(gateway_display_name)"
+  ensure_image "${POSTGRES_IMAGE}" PostgreSQL
 }
 
 verify_gpu_in_container() {
@@ -1184,7 +1283,11 @@ SUPPORTS_REASONING=${SUPPORTS_REASONING}
 SUPPORTS_THINKING_TOGGLE=${SUPPORTS_THINKING_TOGGLE}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE}
 VLLM_IMAGE=${VLLM_IMAGE}
+GATEWAY_KIND=${GATEWAY_KIND}
+GATEWAY_IMAGE=$(gateway_image)
+NEWAPI_IMAGE=${NEWAPI_IMAGE}
 LITELLM_IMAGE=${LITELLM_IMAGE}
+BIFROST_IMAGE=${BIFROST_IMAGE}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
 PHYSICAL_GPU_COUNT=${PHYSICAL_GPU_COUNT}
 TP_SIZE=${TP_SIZE}
@@ -1193,7 +1296,7 @@ ACTIVE_WORKERS=${active_workers}
 WORKER_BASE_PORT=${WORKER_BASE_PORT}
 API_BIND=${API_BIND}
 API_PORT=${API_PORT}
-LITELLM_DB_PORT=${LITELLM_DB_PORT}
+GATEWAY_DB_PORT=${GATEWAY_DB_PORT}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 ESTIMATED_MAX_NUM_SEQS=${ESTIMATED_MAX_NUM_SEQS}
@@ -1209,41 +1312,59 @@ EOF
   chown root:root "${CLUSTER_ENV}"
 
   local requested_ui_username="${UI_USERNAME}" requested_ui_password="${UI_PASSWORD}"
-  local existing_litellm_key="" existing_backend_key="" existing_salt_key=""
+  local existing_gateway_key="" existing_backend_key="" existing_salt_key=""
+  local existing_session_secret="" existing_encryption_key=""
   local existing_ui_username="" existing_ui_password="" existing_postgres_password=""
   local secrets_source=""
   if [[ -r "${SECRETS_ENV}" ]]; then
     secrets_source="${SECRETS_ENV}"
-  elif [[ -r "${RETAINED_SECRETS}" ]] && docker volume inspect llm-cluster-litellm-postgres >/dev/null 2>&1; then
+  elif [[ -r "${RETAINED_SECRETS}" ]] && docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; then
     secrets_source="${RETAINED_SECRETS}"
-    log "$(l10n '检测到保留的 LiteLLM 数据库和恢复凭据，将继续使用原管理数据。' 'Found a retained LiteLLM database and recovery credentials; reusing the existing administration data.')"
+    log "$(l10n '检测到保留的接入层数据库和恢复凭据，将继续使用原管理数据。' 'Found a retained gateway database and recovery credentials; reusing the existing administration data.')"
   fi
   if [[ -n "${secrets_source}" ]]; then
     # shellcheck disable=SC1090
     source "${secrets_source}"
-    existing_litellm_key="${LITELLM_MASTER_KEY:-}"
+    existing_gateway_key="${GATEWAY_API_KEY:-${LITELLM_MASTER_KEY:-}}"
     existing_backend_key="${BACKEND_API_KEY:-}"
     existing_salt_key="${LITELLM_SALT_KEY:-}"
+    existing_session_secret="${NEWAPI_SESSION_SECRET:-}"
+    existing_encryption_key="${BIFROST_ENCRYPTION_KEY:-}"
     existing_ui_username="${UI_USERNAME:-}"
     existing_ui_password="${UI_PASSWORD:-}"
     existing_postgres_password="${POSTGRES_PASSWORD:-}"
   fi
-  local postgres_user="llmadmin" postgres_db="litellm" postgres_password
-  local final_ui_username final_ui_password
+  local postgres_user="llmadmin" postgres_db="llm_gateway" postgres_password
+  local final_ui_username final_ui_password generated_gateway_key session_secret
   postgres_password="${existing_postgres_password:-$(openssl rand -hex 32)}"
   if (( UI_USERNAME_EXPLICIT )); then final_ui_username="${requested_ui_username}"; else final_ui_username="${existing_ui_username:-${requested_ui_username}}"; fi
   if (( UI_PASSWORD_EXPLICIT )); then final_ui_password="${requested_ui_password}"; else final_ui_password="${existing_ui_password:-${requested_ui_password}}"; fi
+  case "${GATEWAY_KIND}" in
+    bifrost) generated_gateway_key="sk-bf-$(openssl rand -hex 32)" ;;
+    *) generated_gateway_key="sk-$(openssl rand -hex 32)" ;;
+  esac
+  if [[ "${GATEWAY_KIND}" == bifrost && -n "${existing_gateway_key}" && "${existing_gateway_key}" != sk-bf-* ]]; then
+    warn "$(l10n '保留的入口密钥不符合 Bifrost 的 sk-bf- 格式；将生成新的 Bifrost 虚拟密钥。' "The retained gateway key does not use Bifrost's sk-bf- format; a new Bifrost virtual key will be generated.")"
+    existing_gateway_key=""
+  fi
+  session_secret="${existing_session_secret:-$(openssl rand -hex 32)}"
   umask 077
   cat >"${SECRETS_ENV}" <<EOF
-LITELLM_MASTER_KEY=${existing_litellm_key:-sk-$(openssl rand -hex 32)}
+GATEWAY_API_KEY=${existing_gateway_key:-${generated_gateway_key}}
+LITELLM_MASTER_KEY=${existing_gateway_key:-${generated_gateway_key}}
 BACKEND_API_KEY=${existing_backend_key:-sk-backend-$(openssl rand -hex 32)}
 LITELLM_SALT_KEY=${existing_salt_key:-sk-salt-$(openssl rand -hex 32)}
+NEWAPI_SESSION_SECRET=${session_secret}
+SESSION_SECRET=${session_secret}
+BIFROST_ENCRYPTION_KEY=${existing_encryption_key:-$(openssl rand -hex 32)}
+GATEWAY_STATE_KIND=${GATEWAY_KIND}
 UI_USERNAME=${final_ui_username}
 UI_PASSWORD=${final_ui_password}
 POSTGRES_USER=${postgres_user}
 POSTGRES_PASSWORD=${postgres_password}
 POSTGRES_DB=${postgres_db}
-DATABASE_URL=postgresql://${postgres_user}:${postgres_password}@127.0.0.1:${LITELLM_DB_PORT}/${postgres_db}
+DATABASE_URL=postgresql://${postgres_user}:${postgres_password}@127.0.0.1:${GATEWAY_DB_PORT}/${postgres_db}
+SQL_DSN=postgresql://${postgres_user}:${postgres_password}@127.0.0.1:${GATEWAY_DB_PORT}/${postgres_db}
 EOF
   chmod 600 "${SECRETS_ENV}"
   chown root:root "${SECRETS_ENV}"
@@ -1282,6 +1403,7 @@ install_manager() {
   install -d -m 755 /usr/local/lib/llm-cluster
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
+  install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
 }
 
 write_systemd_units() {
@@ -1313,7 +1435,7 @@ EOF
 
   cat >/etc/systemd/system/llm-database.service <<'EOF'
 [Unit]
-Description=PostgreSQL database for LiteLLM Admin UI
+Description=PostgreSQL database for the LLMCtl API gateway
 After=docker.service network-online.target
 Requires=docker.service
 PartOf=llm-cluster.service
@@ -1325,8 +1447,8 @@ Type=simple
 EnvironmentFile=/etc/llm-cluster/cluster.env
 EnvironmentFile=/etc/llm-cluster/secrets.env
 ExecStartPre=-/usr/bin/docker rm -f llm-database
-ExecStartPre=/usr/bin/docker volume create llm-cluster-litellm-postgres
-ExecStart=/usr/bin/docker run --rm --name llm-database --network bridge --env-file /etc/llm-cluster/secrets.env -p 127.0.0.1:${LITELLM_DB_PORT}:5432 -v llm-cluster-litellm-postgres:/var/lib/postgresql/data ${POSTGRES_IMAGE}
+ExecStartPre=/usr/bin/docker volume create llm-cluster-gateway-postgres
+ExecStart=/usr/bin/docker run --rm --name llm-database --network bridge --env-file /etc/llm-cluster/secrets.env -p 127.0.0.1:${GATEWAY_DB_PORT}:5432 -v llm-cluster-gateway-postgres:/var/lib/postgresql/data ${POSTGRES_IMAGE}
 ExecStop=-/usr/bin/docker stop --time 60 llm-database
 Restart=on-failure
 RestartSec=5
@@ -1340,7 +1462,7 @@ EOF
 
   cat >/etc/systemd/system/llm-router.service <<'EOF'
 [Unit]
-Description=LiteLLM router for local vLLM cluster
+Description=Selected API gateway for the local vLLM cluster
 After=docker.service network-online.target llm-database.service
 PartOf=llm-cluster.service
 StartLimitIntervalSec=300
@@ -1352,7 +1474,7 @@ EnvironmentFile=/etc/llm-cluster/cluster.env
 EnvironmentFile=/etc/llm-cluster/secrets.env
 ExecStartPre=-/usr/bin/docker rm -f llm-router
 ExecStartPre=/bin/bash -c 'for i in {1..60}; do /usr/bin/docker exec llm-database pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" && exit 0; sleep 2; done; exit 1'
-ExecStart=/usr/bin/docker run --rm --name llm-router --network host --env-file /etc/llm-cluster/secrets.env -v /etc/llm-cluster/litellm.yaml:/app/config.yaml:ro ${LITELLM_IMAGE} --config /app/config.yaml --host ${API_BIND} --port ${API_PORT}
+ExecStart=/usr/local/sbin/llmctl _gateway-start
 ExecStop=-/usr/bin/docker stop --time 30 llm-router
 Restart=on-failure
 RestartSec=5
@@ -1421,13 +1543,14 @@ Tool calling:      $([[ ${SUPPORTS_TOOL_CALLING} -eq 1 ]] && printf 'supported (
 Reasoning parser:  $([[ ${SUPPORTS_REASONING} -eq 1 ]] && printf 'supported (parser=%s)' "${REASONING_PARSER}" || printf 'disabled')
 Boot activation:   first ${ACTIVE_INSTANCE_COUNT} replicas
 Startup parallel:  up to ${STARTUP_PARALLELISM} workers per batch
-Load balancing:    LiteLLM ${ROUTING_STRATEGY}
+API gateway:       $(gateway_display_name) (${GATEWAY_KIND})
+Load balancing:    $(gateway_routing_summary)
 API:               http://${host_for_url}:${API_PORT}/v1
-Web UI:            http://${host_for_url}:${API_PORT}/ui
+Web UI:            http://${host_for_url}:${API_PORT}$(gateway_ui_path)
 Administrator:     ${UI_USERNAME}
 Initial password:  ${UI_PASSWORD}
 Served model:      ${SERVED_MODEL_NAME}
-API key:           ${LITELLM_MASTER_KEY}
+API key:           ${GATEWAY_API_KEY}
 
 Common commands:
   sudo llmctl status
@@ -1445,7 +1568,7 @@ If reasoning can be disabled, add "reasoning_effort":"none" to Chat Completions 
 Vision requests use messages[].content.image_url; data:base64 is allowed by default to limit SSRF exposure.
 
 Note: ${INSTANCE_COUNT}×${MAX_NUM_SEQS} is a scheduling-slot count, not ${INSTANCE_COUNT}×${MAX_NUM_SEQS} simultaneous 256K requests.
-LiteLLM least-busy routes by unfinished request count; it does not read GPU VRAM/KV cache.
+Gateway routing uses configured worker health/weights; none of the three gateways reads live GPU VRAM/KV-cache pressure.
 Change the shared initial Web UI password immediately with llmctl admin set-password.
 EOF
     return
@@ -1465,13 +1588,14 @@ EOF
 思考解析：   $([[ ${SUPPORTS_REASONING} -eq 1 ]] && printf '支持（parser=%s）' "${REASONING_PARSER}" || printf '未启用')
 开机激活：   前 ${ACTIVE_INSTANCE_COUNT} 个实例
 启动并行度： 每批 ${STARTUP_PARALLELISM} 个 Worker
-负载均衡：   LiteLLM ${ROUTING_STRATEGY}
+API 接入层：  $(gateway_display_name)（${GATEWAY_KIND}）
+负载均衡：   $(gateway_routing_summary)
 API：        http://${host_for_url}:${API_PORT}/v1
-Web UI：     http://${host_for_url}:${API_PORT}/ui
+Web UI：     http://${host_for_url}:${API_PORT}$(gateway_ui_path)
 管理员：     ${UI_USERNAME}
 初始密码：   ${UI_PASSWORD}
 模型名：     ${SERVED_MODEL_NAME}
-API key：    ${LITELLM_MASTER_KEY}
+API key：    ${GATEWAY_API_KEY}
 
 常用命令：
   sudo llmctl status
@@ -1489,17 +1613,30 @@ API key：    ${LITELLM_MASTER_KEY}
 图片模型使用 messages[].content.image_url；默认只接受 data:base64，避免外部 URL SSRF。
 
 注意：${INSTANCE_COUNT}×${MAX_NUM_SEQS} 是调度槽，不表示所有请求都能同时使用 256K。
-LiteLLM least-busy 按未完成请求数路由，不读取 GPU 显存/KV Cache。
+三种接入层均按已配置的健康 Worker/权重路由，不读取实时 GPU 显存或 KV Cache 压力。
 Web UI 使用通用初始密码；首次登录后请立即通过 llmctl admin set-password 修改。
 EOF
 }
 
 preflight_existing_install() {
   [[ ${EUID} -eq 0 ]] || die "$(l10n '请使用 sudo 运行安装器' 'Run the installer with sudo')"
+  local existing_kind="" retained_kind=""
   if [[ -r "${LEGACY_CONFIG_DIR}/cluster.env" && ! -r "${CLUSTER_ENV}" ]]; then
-    die "$(l10n "检测到旧版 Ornith 集群 ${LEGACY_CONFIG_DIR}。为避免两套服务抢占 GPU/端口，本版拒绝并行覆盖；请先保留现场并使用旧 llmctl 停服/备份，待执行显式迁移。" "A legacy Ornith cluster was found at ${LEGACY_CONFIG_DIR}. To prevent GPU/port conflicts, this installer will not overwrite it in place; retain the system state and stop/back up the old cluster before an explicit migration.")"
+    die "$(l10n "检测到旧版 Ornith 集群 ${LEGACY_CONFIG_DIR}。为避免两套服务抢占 GPU/端口，本版拒绝并行覆盖且不执行在线迁移；请先卸载旧服务并保留模型，再执行全新安装。" "A legacy Ornith cluster was found at ${LEGACY_CONFIG_DIR}. To prevent GPU and port conflicts, this installer neither overwrites it nor performs an online migration; remove the old services, retain the model files, and then perform a clean install.")"
+  fi
+  if [[ -r "${RETAINED_SECRETS}" ]] && command -v docker >/dev/null 2>&1 && \
+     docker volume inspect llm-cluster-gateway-postgres >/dev/null 2>&1; then
+    retained_kind=$(awk -F= '$1 == "GATEWAY_STATE_KIND" {print $2; exit}' "${RETAINED_SECRETS}")
+    if [[ -n "${retained_kind}" && "${retained_kind}" != "${GATEWAY_KIND}" ]]; then
+      die "$(l10n "检测到 ${retained_kind} 的保留管理数据；本版不在接入层之间迁移。请改选 ${retained_kind}，或确认不再需要管理数据后删除 llm-cluster-gateway-postgres 与 llm-cluster-gateway-data 卷。模型目录不受影响。" "Retained ${retained_kind} administration state was found. This release does not migrate between gateways. Select ${retained_kind}, or, after confirming that the administration state is no longer needed, delete the llm-cluster-gateway-postgres and llm-cluster-gateway-data volumes. Model files are unaffected.")"
+    fi
   fi
   [[ -e "${CLUSTER_ENV}" ]] || return 0
+  existing_kind=$(awk -F= '$1 == "GATEWAY_KIND" {print $2; exit}' "${CLUSTER_ENV}")
+  [[ -n "${existing_kind}" ]] || existing_kind=litellm
+  if [[ "${existing_kind}" != "${GATEWAY_KIND}" ]]; then
+    die "$(l10n "当前配置使用 ${existing_kind}；--force-reconfigure 不负责迁移到 ${GATEWAY_KIND}。请先用原 llmctl 卸载，按需保留模型并清理管理数据库，再全新安装。" "The current configuration uses ${existing_kind}; --force-reconfigure does not migrate it to ${GATEWAY_KIND}. Uninstall it with the existing llmctl, retain model files as needed, clear administration state, and then perform a clean install.")"
+  fi
   (( FORCE_RECONFIGURE )) || die "$(l10n '检测到已有 LLM 集群配置；请使用 llmctl 管理，或备份后加 --force-reconfigure 重配' 'An existing LLM cluster configuration was found; manage it with llmctl or back it up and add --force-reconfigure')"
   warn "$(l10n '将重配现有集群；先停止服务，模型文件不会自动删除。' 'Reconfiguring the existing cluster; services will be stopped first and model files will not be deleted automatically.')"
   systemctl stop llm-cluster.service 2>/dev/null || true
@@ -1509,6 +1646,7 @@ main() {
   preparse_language "$@"
   parse_args "$@"
   select_language_interactively
+  select_gateway_interactively
   preflight_existing_install
   check_discovery_host
   select_model_interactively
@@ -1548,7 +1686,7 @@ EOF
     [[ "${STARTUP_PARALLELISM}" =~ ^[0-9]+$ ]] && (( STARTUP_PARALLELISM >= 1 && STARTUP_PARALLELISM <= INSTANCE_COUNT )) || die "$(l10n "并行启动数必须在 1-${INSTANCE_COUNT}" "Startup parallelism must be between 1 and ${INSTANCE_COUNT}")"
   fi
 
-  log "$(l10n "部署计划：${MODEL_ID}，TP=${TP_SIZE}，实例=${INSTANCE_COUNT}，max-num-seqs=${MAX_NUM_SEQS}，每批并行启动=${STARTUP_PARALLELISM}。" "Deployment plan: ${MODEL_ID}, TP=${TP_SIZE}, replicas=${INSTANCE_COUNT}, max-num-seqs=${MAX_NUM_SEQS}, startup parallelism=${STARTUP_PARALLELISM}.")"
+  log "$(l10n "部署计划：${MODEL_ID}，接入层=$(gateway_display_name)，TP=${TP_SIZE}，实例=${INSTANCE_COUNT}，max-num-seqs=${MAX_NUM_SEQS}，每批并行启动=${STARTUP_PARALLELISM}。" "Deployment plan: ${MODEL_ID}, gateway=$(gateway_display_name), TP=${TP_SIZE}, replicas=${INSTANCE_COUNT}, max-num-seqs=${MAX_NUM_SEQS}, startup parallelism=${STARTUP_PARALLELISM}.")"
   (( TRUST_REMOTE_CODE == 0 )) || warn "$(l10n '模型配置要求 trust_remote_code；将执行固定 revision 中的仓库代码，请确认来源已审核。' 'The model requires trust_remote_code; code from the pinned revision will run, so confirm that its source has been reviewed.')"
   if (( ! ASSUME_YES && ! NON_INTERACTIVE )); then
     confirm "$(l10n '继续安装？[Y/n] ' 'Continue installation? [Y/n] ')" 0 || { log "$(l10n '已取消。' 'Cancelled.')"; exit 0; }
