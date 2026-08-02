@@ -125,7 +125,7 @@ sudo llmctl admin set-password
 
 New API and OmniRoute create maintenance tokens in their databases, so `key rotate` does not accept a caller-supplied value. LiteLLM and Bifrost accept an optional value; a Bifrost key must start with `sk-bf-`. OmniRoute users rotate their personal keys in the account portal; the administrator command does not replace those keys.
 
-### OmniRoute company account portal
+### LLMCtl account portal
 
 OmniRoute does not provide a complete company-registration and administrator-friendly billing flow. LLMCtl therefore deploys a separate Vue 3 portal and lightweight `llm-account.service`. The portal uses OmniRoute HTTP APIs for mappings, Combos, and user-key permissions, while ordinary `/v1` requests still go directly from Nginx to OmniRoute. They share a state root but never a database file:
 
@@ -328,7 +328,21 @@ This rechecks weights, architecture, TP, context, and capability parsers. Direct
 
 ## Container Image Maintenance, Proxies, and Offline Bundles
 
-The scripts do not update automatically. Run maintenance explicitly:
+Upgrade the LLMCtl control plane itself without reinstalling or restarting workers:
+
+```bash
+sudo llmctl upgrade
+```
+
+The command asks whether to fetch the latest `main` commit from GitHub. If direct access fails, it tries the saved maintenance proxy and then offers a new proxy; download starts only after the proxy retest succeeds. The upgrade is limited to `llmctl` and control-plane programs declared under `/usr/local/lib/llm-cluster/`. Models, workers, gateway runtime data, configuration, secrets, databases, and Nginx are preserved. A running account portal is stopped briefly for acceptance and automatically restored from `/var/backups/llmctl/` on failure.
+
+```bash
+sudo llmctl upgrade --proxy http://192.168.9.104:1082 --save-proxy
+sudo llmctl upgrade --from-zip /root/LLMCtl-main.zip
+sudo llmctl upgrade --check
+```
+
+`llmctl update` and `llmctl upgrade` are intentionally different: the former explicitly updates container images, while the latter updates only LLMCtl control-plane programs. Image maintenance commands follow:
 
 ```bash
 sudo llmctl proxy set 10.1.0.6 7890 http

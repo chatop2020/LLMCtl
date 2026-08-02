@@ -125,7 +125,7 @@ sudo llmctl admin set-password
 
 New API 和 OmniRoute 的维护调用令牌由各自数据库生成，所以 `key rotate` 不接受自定义值；LiteLLM 和 Bifrost 可选传入新值，Bifrost 值必须以 `sk-bf-` 开头。OmniRoute 普通用户自己的 key 应在账户门户内轮换，不受这个管理员命令影响。
 
-### OmniRoute 企业账户门户
+### LLMCtl 账户门户
 
 OmniRoute 自身没有完整的企业注册和易用计费流程。LLMCtl 因此部署独立的 Vue 3 企业门户与轻量 `llm-account.service`。门户通过 OmniRoute HTTP API 管理模型映射、Combo 和用户 key 权限，但普通 `/v1` 调用仍由 Nginx 直达 OmniRoute。两者使用同一状态根目录但绝不混表：
 
@@ -328,7 +328,21 @@ sudo bash install-llm-cluster.sh --force-reconfigure
 
 ## 镜像维护、代理和离线包
 
-脚本不会自动更新。显式维护：
+升级 LLMCtl 控制面本身（不会重新安装或重启 Worker）：
+
+```bash
+sudo llmctl upgrade
+```
+
+命令会询问是否从 GitHub 获取 `main` 最新提交。直连失败时依次尝试已保存维护代理和新输入的代理，代理复测成功后才会下载。升级内容限于 `llmctl` 与 `/usr/local/lib/llm-cluster/` 下由升级清单声明的控制面程序；当前模型、Worker、网关运行数据、配置、密钥、数据库和 Nginx 均保留。账户门户正在运行时会短暂停止并验收，失败自动从 `/var/backups/llmctl/` 回滚。
+
+```bash
+sudo llmctl upgrade --proxy http://192.168.9.104:1082 --save-proxy
+sudo llmctl upgrade --from-zip /root/LLMCtl-main.zip
+sudo llmctl upgrade --check
+```
+
+`llmctl update` 与 `llmctl upgrade` 含义不同：前者显式更新容器镜像，后者只更新 LLMCtl 控制面程序。镜像维护命令如下：
 
 ```bash
 sudo llmctl proxy set 10.1.0.6 7890 http

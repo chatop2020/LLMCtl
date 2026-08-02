@@ -195,6 +195,32 @@ sudo llmctl proxy clear
 
 Private or gated Hugging Face models require `HF_TOKEN` when the installer runs, and you must accept the model license first. Private ModelScope models use `MODELSCOPE_API_TOKEN`. Tokens are not written to the cluster configuration.
 
+## Upgrade the LLMCtl Control Plane
+
+`llmctl upgrade` upgrades only LLMCtl's own programs: the manager, model-catalog/runtime-optimization/gateway helpers, and the account-portal backend and built Vue assets. It does not rerun the installer or modify/restart model workers, the router, Nginx, Docker, model weights, runtime configuration, secrets, or databases.
+
+```bash
+sudo llmctl upgrade
+```
+
+The command first asks whether to fetch the latest `chatop2020/LLMCtl` `main` from GitHub, then pins the download to one exact commit. If GitHub is not directly reachable, it validates the saved maintenance proxy first and asks for a new proxy only when necessary. The proxy is limited to this maintenance operation and may optionally be saved; it is never injected into inference services. The entire old control plane is backed up before replacement. If the account portal is running, only that service is stopped briefly for health acceptance, with automatic rollback on failure.
+
+For a fully offline server, upload a repository ZIP and run:
+
+```bash
+sudo llmctl upgrade --from-zip /root/LLMCtl-main.zip
+```
+
+For the first upgrade from an older release that does not yet have the `upgrade` command, extract the new ZIP and run its bootstrap upgrader:
+
+```bash
+python3 -m zipfile -e /root/LLMCtl-main.zip /root/llmctl-upgrade-bootstrap
+sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
+  --from-zip /root/LLMCtl-main.zip
+```
+
+Add `--check` to download and validate without replacing files. Upgrade metadata is stored in `/var/lib/llm-cluster/control-plane-version.env`, backups are kept under `/var/backups/llmctl/`, and `llmctl info` reports the installed control-plane commit.
+
 ## Model Catalog Commands
 
 After installation, you can still inspect the hardware and browse candidate models:
@@ -220,8 +246,9 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `/etc/llm-cluster/workers/*.env` | Worker-to-GPU mappings |
 | `/usr/local/lib/llm-cluster/model_catalog.py` | Installed model catalog helper |
 | `/usr/local/lib/llm-cluster/gateway_config.py` | Gateway configuration and New API reconciliation helper |
-| `/usr/local/lib/llm-cluster/account_portal.py` | OmniRoute company account portal |
+| `/usr/local/lib/llm-cluster/account_portal.py` | LLMCtl account portal backend |
 | `/usr/local/lib/llm-cluster/account_portal_ui` | Built Vue 3 portal assets |
+| `/usr/local/lib/llm-cluster/upgrade-llmctl.sh` | LLMCtl control-plane upgrader |
 | `/etc/nginx/conf.d/llm-cluster.conf` | Isolated LLMCtl Nginx front-door configuration |
 | `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute's SQLite database |

@@ -1,0 +1,8 @@
+# type  source                         destination                                             mode  restart
+file    llmctl.sh                      /usr/local/sbin/llmctl                                  0755  none
+file    lib/model_catalog.py           /usr/local/lib/llm-cluster/model_catalog.py             0755  none
+file    lib/runtime_optimizer.py       /usr/local/lib/llm-cluster/runtime_optimizer.py         0755  none
+file    lib/gateway_config.py          /usr/local/lib/llm-cluster/gateway_config.py            0755  none
+file    lib/account_portal.py          /usr/local/lib/llm-cluster/account_portal.py            0755  account
+dir     lib/account_portal_ui          /usr/local/lib/llm-cluster/account_portal_ui             0755  account
+file    upgrade-llmctl.sh              /usr/local/lib/llm-cluster/upgrade-llmctl.sh             0755  none

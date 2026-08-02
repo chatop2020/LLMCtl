@@ -195,6 +195,32 @@ sudo llmctl proxy clear
 
 Hugging Face 私有或 gated 模型需要在运行安装器时提供 `HF_TOKEN` 并先接受模型许可。ModelScope 私有模型使用 `MODELSCOPE_API_TOKEN`。令牌不会被写入集群配置。
 
+## 升级 LLMCtl 控制面
+
+`llmctl upgrade` 只升级 LLMCtl 自身程序：管理命令、模型目录/调优/网关配置工具，以及账户门户后端和 Vue 静态资源。它不会重跑安装器，也不会修改或重启模型 Worker、Router、Nginx、Docker、模型权重、运行配置、密钥或数据库。
+
+```bash
+sudo llmctl upgrade
+```
+
+命令会先询问是否从 GitHub 获取 `chatop2020/LLMCtl` 的最新 `main`，锁定到明确提交后下载。GitHub 直连失败时，会先验证已保存的维护代理，仍不可用才询问新的代理地址并在下载前复测。代理只用于本次维护，可选择保存，不会注入推理服务。替换前会备份完整旧控制面；账户门户如正在运行，只短暂停止该服务并执行健康验收，失败自动回滚。
+
+服务器完全离线时，也可以上传仓库 ZIP 后执行：
+
+```bash
+sudo llmctl upgrade --from-zip /root/LLMCtl-main.zip
+```
+
+从尚未带有 `upgrade` 命令的旧版本首次引导时，解压新版 ZIP，并运行其中的升级器：
+
+```bash
+python3 -m zipfile -e /root/LLMCtl-main.zip /root/llmctl-upgrade-bootstrap
+sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
+  --from-zip /root/LLMCtl-main.zip
+```
+
+仅下载/校验而不替换文件可加 `--check`。升级记录保存在 `/var/lib/llm-cluster/control-plane-version.env`，备份保存在 `/var/backups/llmctl/`，并由 `llmctl info` 显示当前控制面提交。
+
 ## 模型目录命令
 
 安装后仍可检查硬件和浏览候选模型：
@@ -220,8 +246,9 @@ sudo llmctl models current
 | `/etc/llm-cluster/workers/*.env` | Worker 与 GPU 映射 |
 | `/usr/local/lib/llm-cluster/model_catalog.py` | 已安装目录助手 |
 | `/usr/local/lib/llm-cluster/gateway_config.py` | 接入层配置与 New API 同步助手 |
-| `/usr/local/lib/llm-cluster/account_portal.py` | OmniRoute 企业账户门户 |
+| `/usr/local/lib/llm-cluster/account_portal.py` | LLMCtl 账户门户后端 |
 | `/usr/local/lib/llm-cluster/account_portal_ui` | Vue 3 门户静态资源 |
+| `/usr/local/lib/llm-cluster/upgrade-llmctl.sh` | LLMCtl 控制面升级器 |
 | `/etc/nginx/conf.d/llm-cluster.conf` | LLMCtl 独立 Nginx 统一入口配置 |
 | `/var/lib/llm-cluster/cache` | 可再生成的 vLLM 缓存 |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute 自身 SQLite 数据库 |

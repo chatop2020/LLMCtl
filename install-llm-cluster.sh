@@ -120,6 +120,7 @@ OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
 ACCOUNT_UI_SOURCE="${SCRIPT_DIR}/lib/account_portal_ui"
+UPGRADER_SOURCE="${SCRIPT_DIR}/upgrade-llmctl.sh"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -1051,6 +1052,7 @@ check_discovery_host() {
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
+  [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -1079,6 +1081,7 @@ check_host() {
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
+  [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -1652,6 +1655,7 @@ EOF
 install_manager() {
   install -m 755 "${MANAGER_SOURCE}" /usr/local/sbin/llmctl
   install -d -m 755 /usr/local/lib/llm-cluster
+  install -m 755 "${UPGRADER_SOURCE}" /usr/local/lib/llm-cluster/upgrade-llmctl.sh
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.4.0"
+readonly CTL_VERSION="2.5.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -21,6 +21,8 @@ readonly OMNIROUTE_PLAN="${CONFIG_DIR}/omniroute-plan.json"
 readonly OMNIROUTE_SQLITE="${STATE_DIR}/omniroute/gateway/storage.sqlite"
 readonly ACCOUNT_SQLITE="${STATE_DIR}/omniroute/portal/account-portal.db"
 readonly ACCOUNT_HELPER="${LLM_ACCOUNT_HELPER:-/usr/local/lib/llm-cluster/account_portal.py}"
+readonly CONTROL_PLANE_UPDATER="${LLM_CONTROL_PLANE_UPDATER:-/usr/local/lib/llm-cluster/upgrade-llmctl.sh}"
+readonly CONTROL_PLANE_RELEASE="${LLM_CONTROL_PLANE_RELEASE:-/var/lib/llm-cluster/control-plane-version.env}"
 readonly DOCKER_PROXY_DROPIN="/etc/systemd/system/docker.service.d/90-llm-cluster-temporary-proxy.conf"
 readonly CATALOG_HELPER="${LLM_CATALOG_HELPER:-/usr/local/lib/llm-cluster/model_catalog.py}"
 readonly OPTIMIZER_HELPER="${LLM_OPTIMIZER_HELPER:-/usr/local/lib/llm-cluster/runtime_optimizer.py}"
@@ -335,6 +337,9 @@ usage() {
   llmctl download [MODEL_ID] [REVISION]        重新核验或补齐当前模型文件
   llmctl update [--vllm-image IMG] [--gateway-image IMG] [--postgres-image IMG]
                                                 显式拉取镜像；绝不自动更新
+  llmctl upgrade [--yes] [--proxy URL] [--save-proxy]
+                                                从 GitHub 升级 LLMCtl 控制面，不重启 Worker
+  llmctl upgrade --from-zip FILE                从本地 ZIP 离线升级 LLMCtl 控制面
   llmctl offline export <目录>                 导出镜像、模型和清单
   llmctl offline import <目录>                 从离线包导入
 
@@ -1189,8 +1194,13 @@ cmd_info() {
 
   printf '\n========== LLMCtl 恢复清单 / Recovery inventory ==========\n'
   printf '生成时间 / Generated: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
-  printf 'LLMCtl 版本: %s\n安装语言: %s\n主机名: %s\n时区: %s\n' \
-    "${CTL_VERSION}" "${INTERFACE_LANGUAGE:-zh}" "$(hostname)" "${TZ:-$(timedatectl show -p Timezone --value 2>/dev/null || printf unknown)}"
+  local control_plane_commit="unknown" control_plane_upgraded="unknown"
+  if [[ -r "${CONTROL_PLANE_RELEASE}" ]]; then
+    control_plane_commit=$(awk -F= '$1 == "LLMCTL_COMMIT" {sub(/^[^=]*=/, ""); print; exit}' "${CONTROL_PLANE_RELEASE}")
+    control_plane_upgraded=$(awk -F= '$1 == "LLMCTL_UPGRADED_AT" {sub(/^[^=]*=/, ""); print; exit}' "${CONTROL_PLANE_RELEASE}")
+  fi
+  printf 'LLMCtl 版本: %s\n控制面提交: %s\n控制面升级时间: %s\n安装语言: %s\n主机名: %s\n时区: %s\n' \
+    "${CTL_VERSION}" "${control_plane_commit:-unknown}" "${control_plane_upgraded:-unknown}" "${INTERFACE_LANGUAGE:-zh}" "$(hostname)" "${TZ:-$(timedatectl show -p Timezone --value 2>/dev/null || printf unknown)}"
 
   printf '\n[主机与运行时 / Host and runtimes]\n'
   printf '操作系统: %s\n内核/架构: %s / %s\nCPU: %s；逻辑核=%s\n内存: %s\n' \
@@ -2871,6 +2881,16 @@ cmd_download() {
   warn "当前模型文件已核验；如服务此前因缺文件停止，请运行 llmctl restart all。"
 }
 
+cmd_upgrade() {
+  require_root
+  require_installed
+  [[ -x "${CONTROL_PLANE_UPDATER}" ]] || \
+    die "未找到控制面升级器 ${CONTROL_PLANE_UPDATER}；请先从新版发布包运行一次 upgrade-llmctl.sh --from-zip FILE"
+  local language="zh"
+  if [[ -r "${CLUSTER_ENV}" ]] && grep -Eq '^INTERFACE_LANGUAGE=en$' "${CLUSTER_ENV}"; then language="en"; fi
+  exec "${CONTROL_PLANE_UPDATER}" --lang "${language}" "$@"
+}
+
 cmd_update() {
   require_root; load_config
   local new_vllm="${VLLM_IMAGE}" new_gateway="${GATEWAY_IMAGE}" new_postgres="${POSTGRES_IMAGE}" was_cluster_active=0 stopped_for_proxy=0
@@ -3300,11 +3320,18 @@ cmd_boot_stop() {
 }
 
 main() {
-  local command="${1:-help}"
+  local command="${1:-help}" release_commit=""
   (($# == 0)) || shift
   case "${command}" in
     help|-h|--help) usage ;;
-    version|--version) printf 'llmctl %s\n' "${CTL_VERSION}" ;;
+    version|--version)
+      printf 'llmctl %s' "${CTL_VERSION}"
+      if [[ -r "${CONTROL_PLANE_RELEASE}" ]]; then
+        release_commit=$(awk -F= '$1 == "LLMCTL_COMMIT" {sub(/^[^=]*=/, ""); print; exit}' "${CONTROL_PLANE_RELEASE}")
+        [[ -z "${release_commit}" ]] || printf ' (%s)' "${release_commit:0:12}"
+      fi
+      printf '\n'
+      ;;
     info) cmd_info "$@" ;;
     status) cmd_status "$@" ;;
     health) cmd_health "$@" ;;
@@ -3335,6 +3362,7 @@ main() {
     timezone) cmd_timezone "$@" ;;
     download) cmd_download "$@" ;;
     update) cmd_update "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
     offline) cmd_offline "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     _worker-start) cmd_worker_start "$@" ;;

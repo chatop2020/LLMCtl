@@ -1,0 +1,136 @@
+import subprocess
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+UPGRADER = ROOT / "upgrade-llmctl.sh"
+MANIFEST = ROOT / "upgrade-manifest.tsv"
+MANAGER = (ROOT / "llmctl.sh").read_text(encoding="utf-8")
+INSTALLER = (ROOT / "install-llm-cluster.sh").read_text(encoding="utf-8")
+
+
+class ControlPlaneUpgradeTests(unittest.TestCase):
+    def build_archive(self, archive: Path) -> None:
+        files = [
+            "llmctl.sh",
+            "upgrade-llmctl.sh",
+            "upgrade-manifest.tsv",
+            "lib/model_catalog.py",
+            "lib/runtime_optimizer.py",
+            "lib/gateway_config.py",
+            "lib/account_portal.py",
+        ]
+        files.extend(
+            str(path.relative_to(ROOT))
+            for path in sorted((ROOT / "lib/account_portal_ui").rglob("*"))
+            if path.is_file()
+        )
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
+            for relative in files:
+                handle.write(ROOT / relative, f"LLMCtl-main/{relative}")
+
+    def test_manifest_is_limited_to_control_plane_paths(self):
+        entries = []
+        for raw_line in MANIFEST.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entry_type, source, destination, mode, restart = line.split()
+            entries.append((entry_type, source, destination, mode, restart))
+
+        self.assertGreaterEqual(len(entries), 7)
+        self.assertIn(
+            ("file", "llmctl.sh", "/usr/local/sbin/llmctl", "0755", "none"),
+            entries,
+        )
+        for entry_type, source, destination, mode, restart in entries:
+            self.assertIn(entry_type, {"file", "dir"})
+            self.assertTrue(
+                destination == "/usr/local/sbin/llmctl"
+                or destination.startswith("/usr/local/lib/llm-cluster/")
+            )
+            self.assertNotIn("worker", destination.lower())
+            self.assertNotIn("/etc/", destination)
+            self.assertRegex(mode, r"^0[0-7]{3}$")
+            self.assertIn(restart, {"none", "account"})
+
+    def test_llmctl_delegates_upgrade_and_installer_installs_helper(self):
+        self.assertIn("cmd_upgrade() {", MANAGER)
+        self.assertIn('exec "${CONTROL_PLANE_UPDATER}" --lang', MANAGER)
+        self.assertIn('upgrade) cmd_upgrade "$@"', MANAGER)
+        self.assertIn("llmctl upgrade --from-zip FILE", MANAGER)
+        self.assertIn(
+            'install -m 755 "${UPGRADER_SOURCE}" /usr/local/lib/llm-cluster/upgrade-llmctl.sh',
+            INSTALLER,
+        )
+
+    def test_upgrader_does_not_operate_worker_router_docker_or_nginx(self):
+        source = UPGRADER.read_text(encoding="utf-8")
+        self.assertIn('systemctl stop "${ACCOUNT_SERVICE}"', source)
+        self.assertNotIn("systemctl stop llm-router", source)
+        self.assertNotIn("systemctl restart llm-router", source)
+        self.assertNotIn("systemctl stop llm-worker", source)
+        self.assertNotIn("systemctl restart llm-worker", source)
+        self.assertNotIn("systemctl restart docker", source)
+        self.assertNotIn("nginx -s", source)
+        self.assertIn("restore_control_plane()", source)
+        self.assertIn("load_saved_proxy()", source)
+        self.assertIn("prompt_new_proxy()", source)
+
+    def test_local_zip_check_validates_without_deploying(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "LLMCtl-main.zip"
+            self.build_archive(archive)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(UPGRADER),
+                    "--from-zip",
+                    str(archive),
+                    "--check",
+                    "--non-interactive",
+                    "--lang",
+                    "zh",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("升级包验证通过", result.stdout)
+        self.assertIn("没有修改现有控制面或服务", result.stdout)
+
+    def test_zip_path_traversal_is_rejected_before_deployment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "unsafe.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr("../escape", "unsafe")
+                handle.writestr("upgrade-manifest.tsv", "placeholder")
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(UPGRADER),
+                    "--from-zip",
+                    str(archive),
+                    "--check",
+                    "--non-interactive",
+                    "--lang",
+                    "en",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe ZIP path", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
