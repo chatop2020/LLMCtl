@@ -59,7 +59,7 @@
 | New API 镜像 | `calciumion/new-api:v1.0.0-rc.22` |
 | LiteLLM 镜像 | `ghcr.io/berriai/litellm:v1.94.0` |
 | Bifrost 镜像 | `maximhq/bifrost:v1.6.7` |
-| OmniRoute 镜像 | `diegosouzapw/omniroute:3.8.50` |
+| OmniRoute 镜像 | `diegosouzapw/omniroute:3.8.48` |
 | PostgreSQL | `postgres:16-alpine` |
 | API | `http://服务器IP:8000/v1` |
 | Web UI | New API/Bifrost/OmniRoute：`http://服务器IP:8000/`；LiteLLM：`/ui` |

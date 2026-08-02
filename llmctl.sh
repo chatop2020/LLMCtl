@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.3.0"
+readonly CTL_VERSION="2.3.1"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -78,7 +78,7 @@ load_config() {
   LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.94.0}"
   NEWAPI_IMAGE="${NEWAPI_IMAGE:-calciumion/new-api:v1.0.0-rc.22}"
   BIFROST_IMAGE="${BIFROST_IMAGE:-maximhq/bifrost:v1.6.7}"
-  OMNIROUTE_IMAGE="${OMNIROUTE_IMAGE:-diegosouzapw/omniroute:3.8.50}"
+  OMNIROUTE_IMAGE="${OMNIROUTE_IMAGE:-diegosouzapw/omniroute:3.8.48}"
   case "${GATEWAY_KIND}" in
     newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}" ;;
     litellm) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${LITELLM_IMAGE}}" ;;

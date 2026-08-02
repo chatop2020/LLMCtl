@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.3.0"
+readonly INSTALLER_VERSION="2.3.1"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -45,7 +45,7 @@ VLLM_IMAGE="vllm/vllm-openai:v0.22.1"
 LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.94.0"
 NEWAPI_IMAGE="calciumion/new-api:v1.0.0-rc.22"
 BIFROST_IMAGE="maximhq/bifrost:v1.6.7"
-OMNIROUTE_IMAGE="diegosouzapw/omniroute:3.8.50"
+OMNIROUTE_IMAGE="diegosouzapw/omniroute:3.8.48"
 POSTGRES_IMAGE="postgres:16-alpine"
 GATEWAY_KIND="newapi"
 TP_SIZE=1
@@ -1222,21 +1222,25 @@ verify_container_runtime() {
 }
 
 ensure_image() {
-  local image="${1:?}" label="${2:?}"
+  local image="${1:?}" label="${2:?}" override_option="${3:?}"
   if docker image inspect "${image}" >/dev/null 2>&1; then
     log "$(l10n "复用本机 ${label} 镜像：${image}" "Reusing the local ${label} image: ${image}")"
   else
     log "$(l10n "拉取并锁定 ${label} 镜像：${image}" "Pulling and pinning the ${label} image: ${image}")"
-    docker pull "${image}"
+    if ! docker pull "${image}"; then
+      die "$(l10n \
+        "无法拉取 ${label} 镜像 ${image}。请确认该标签已发布且 Docker 仓库可访问，然后重试；也可用 ${override_option} IMAGE 指定有效镜像。" \
+        "Could not pull the ${label} image ${image}. Confirm that the tag is published and the Docker registry is reachable, then retry; alternatively specify a valid image with ${override_option} IMAGE.")"
+    fi
   fi
 }
 
 pull_images() {
   local selected_gateway_image
   selected_gateway_image=$(gateway_image) || die "$(l10n '无法解析接入层镜像' 'Could not resolve the gateway image')"
-  ensure_image "${VLLM_IMAGE}" vLLM
-  ensure_image "${selected_gateway_image}" "$(gateway_display_name)"
-  [[ "${GATEWAY_KIND}" == omniroute ]] || ensure_image "${POSTGRES_IMAGE}" PostgreSQL
+  ensure_image "${VLLM_IMAGE}" vLLM --vllm-image
+  ensure_image "${selected_gateway_image}" "$(gateway_display_name)" "--${GATEWAY_KIND}-image"
+  [[ "${GATEWAY_KIND}" == omniroute ]] || ensure_image "${POSTGRES_IMAGE}" PostgreSQL --postgres-image
 }
 
 verify_gpu_in_container() {

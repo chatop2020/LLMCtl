@@ -320,6 +320,12 @@ sudo llmctl update --gateway-image calciumion/new-api:v1.0.0-rc.22
 sudo llmctl proxy clear
 ```
 
+安装器默认使用已发布的 OmniRoute `diegosouzapw/omniroute:3.8.48`。若镜像标签不存在或仓库不可达，安装器会保留 Docker 的原始错误并给出对应的 `--*-image` 覆盖参数，不会只报告一个脚本行号。例如可显式指定：
+
+```bash
+sudo ./install-llm-cluster.sh --omniroute-image diegosouzapw/omniroute:3.8.48
+```
+
 导出/导入：
 
 ```bash

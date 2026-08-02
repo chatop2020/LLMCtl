@@ -33,12 +33,14 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)
         self.assertIn("ghcr.io/berriai/litellm:v1.94.0", INSTALLER)
         self.assertIn("maximhq/bifrost:v1.6.7", INSTALLER)
-        self.assertIn("diegosouzapw/omniroute:3.8.50", INSTALLER)
+        self.assertIn("diegosouzapw/omniroute:3.8.48", INSTALLER)
         pull = INSTALLER.split("pull_images() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('selected_gateway_image=$(gateway_image)', pull)
         self.assertIn('ensure_image "${selected_gateway_image}"', pull)
         self.assertNotIn('ensure_image "${NEWAPI_IMAGE}"', pull)
         self.assertIn('docker image inspect "${image}"', INSTALLER)
+        self.assertIn('if ! docker pull "${image}"; then', INSTALLER)
+        self.assertIn('"--${GATEWAY_KIND}-image"', pull)
 
     def test_gateway_generated_configs_reference_secrets_by_environment(self):
         self.assertIn("os.environ/BACKEND_API_KEY", GATEWAY)

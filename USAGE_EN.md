@@ -320,6 +320,12 @@ sudo llmctl update --gateway-image calciumion/new-api:v1.0.0-rc.22
 sudo llmctl proxy clear
 ```
 
+The installer defaults to the published OmniRoute image `diegosouzapw/omniroute:3.8.48`. If an image tag is absent or the registry is unreachable, the installer preserves Docker's original error and prints the corresponding `--*-image` override instead of reporting only a script line number. For example:
+
+```bash
+sudo ./install-llm-cluster.sh --omniroute-image diegosouzapw/omniroute:3.8.48
+```
+
 Export or import an offline bundle:
 
 ```bash

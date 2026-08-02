@@ -21,6 +21,37 @@ def installer_script(body: str) -> str:
 
 
 class InstallerInteractionTests(unittest.TestCase):
+    def test_image_pull_failure_has_actionable_bilingual_diagnostic(self):
+        for language, expected in (
+            ("zh", "无法拉取 OmniRoute 镜像"),
+            ("en", "Could not pull the OmniRoute image"),
+        ):
+            with self.subTest(language=language):
+                completed = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        installer_script(
+                            f"""
+                            INTERFACE_LANGUAGE={language}
+                            docker() {{
+                              [[ "$1 $2" == "image inspect" ]] && return 1
+                              [[ "$1" == "pull" ]] && return 1
+                              return 0
+                            }}
+                            ensure_image diegosouzapw/omniroute:not-published OmniRoute --omniroute-image
+                            """
+                        ),
+                    ],
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected, completed.stderr)
+                self.assertIn("--omniroute-image IMAGE", completed.stderr)
+                self.assertNotIn("意外失败", completed.stderr)
+                self.assertNotIn("failed unexpectedly", completed.stderr)
+
     def test_gateway_selection_defaults_to_newapi_and_supports_all_four_choices(self):
         for answer, expected in (
             ("\n", "newapi"),
