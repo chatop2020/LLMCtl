@@ -107,7 +107,7 @@ sudo llmctl router restart
 sudo llmctl database status
 ```
 
-`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限；OmniRoute 自动创建每 Worker 一个 Provider 节点及一个等权 Combo，并同步模型元信息和维护 key。LLMCtl 将 OmniRoute 的会话粘性和独立的粘性轮转批量分别关闭（`disableSessionStickiness=true`、`stickyRoundRobinLimit=1`）。每个受管连接和 Combo 允许 20 个在途请求，异常排队最多等待 1 秒；`MAX_NUM_SEQS` 仍是每个 vLLM Worker 的活动序列上限，超过部分由 vLLM 调度器排队，不再先触发 OmniRoute 默认的 30 秒信号量等待。8 Worker 因而可在网关排队前容纳 160 个在途请求，突发请求会逐个推进到下一健康 Worker。
+`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限；OmniRoute 自动创建每 Worker 一个 Provider 节点及一个等权 Combo，并同步模型元信息和维护 key。LLMCtl 将 OmniRoute 的会话粘性和独立的粘性轮转批量分别关闭（`disableSessionStickiness=true`、`stickyRoundRobinLimit=1`）。每个受管连接和 Combo 允许 20 个在途请求，异常排队最多等待 1 秒；`MAX_NUM_SEQS` 仍是每个 vLLM Worker 的活动序列上限，超过部分由 vLLM 调度器排队。对于安装阶段已经核验原生图片输入能力的本地模型，LLMCtl 还会关闭 OmniRoute 的 Vision Bridge：OmniRoute 3.8.x 在检查自定义 Provider 的 Combo 成员时看不到已保存的 `supportsVision=true`，否则会错误调用默认 `openai/gpt-4o-mini` 并在 30 秒超时后才把原图转发给 vLLM。8 Worker 因而可在网关排队前容纳 160 个在途请求，突发请求会逐个推进到下一健康 Worker，原生多模态请求也不会经过冗余的外部视觉桥接。
 
 只需把升级后的受管渠道/Combo 配置写入正在运行的接入层时，使用 `llmctl router reconcile`。它会重新探测健康 Worker、在线同步配置并验证 `/v1/models`，不会重启 Router 或 GPU Worker。
 
@@ -392,7 +392,7 @@ journalctl -u llm-cluster.service -n 300 --no-pager
 - Worker 退出：日志末尾通常会给出 OOM、架构、量化内核或模型代码错误。
 - 接入层不健康但 Worker 健康：检查 `llm-router` 和 `llm-database` 日志。New API 自动配置失败时，Router 日志之后还会在 `llm-cluster.service` 日志中显示具体的 setup/login/channel/token 错误。
 - OmniRoute 健康但门户不可用：运行 `llmctl account status`、`llmctl logs account`。邮件收不到时重点检查 SMTP 主机、TLS 模式、发件地址和垃圾邮件策略；门户不会绕过邮箱验证直接发 key。
-- 同一图片或 PDF 请求直连 Worker 很快、经 OmniRoute 却稳定多出约 30 秒：这是 OmniRoute 默认 Combo 信号量排队超时的典型特征。升级 LLMCtl 后运行 `sudo llmctl router reconcile` 写入受管连接/Combo 的并发与 1 秒故障切换上限；无需重启或重装 GPU Worker。可用 `sudo llmctl logs router | grep -E 'Semaphore (timeout|queue full)|SEMAPHORE_'` 核对。
+- 同一图片或 PDF 请求直连 Worker 很快、经 OmniRoute 却稳定多出约 30 秒，而纯文本正常：这是 OmniRoute Vision Bridge 把自定义 Provider 的原生视觉 Combo 误判为未知能力后，等待默认 `openai/gpt-4o-mini` 视觉描述调用超时。升级 LLMCtl 后运行 `sudo llmctl router reconcile`；它会在确认本地模型原生支持图片时关闭这条冗余桥接，并同步受管连接/Combo 的并发设置。该操作在线生效，不重启 Router 或 GPU Worker。随后用原图片请求复测，首字节不应再固定在约 30 秒。
 
 ## 原地升级门户与控制面
 

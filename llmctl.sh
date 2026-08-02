@@ -686,6 +686,9 @@ reconcile_gateway() {
     omniroute)
       log "自动初始化 OmniRoute，并同步 ${worker_ids} 个健康 Worker、模型、Combo 和管理密钥..."
       gateway_helper reconcile-omniroute --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
+      if (( SUPPORTS_IMAGE_INPUT == 1 )); then
+        log "OmniRoute Vision Bridge 已关闭：当前模型原生支持图片，图片和 PDF 将直接转发给 vLLM。"
+      fi
       ;;
     *) return 0 ;;
   esac

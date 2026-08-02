@@ -111,6 +111,8 @@ class FakeOmniRouteClient:
         self.calls.append((method, path, payload))
         if (method, path) == ("GET", "/api/provider-nodes?limit=1000"):
             return {"nodes": list(self.nodes)}
+        if (method, path) == ("PATCH", "/api/settings"):
+            return {"visionBridgeEnabled": payload["visionBridgeEnabled"]}
         if (method, path) == ("GET", "/api/providers?limit=1000"):
             return {"connections": list(self.connections)}
         if method == "PUT" and path.startswith("/api/provider-nodes/"):
@@ -196,6 +198,7 @@ class GatewayConfigTests(unittest.TestCase):
         )
         self.assertEqual(plan["queue_timeout_ms"], gateway.OMNIROUTE_QUEUE_TIMEOUT_MS)
         self.assertTrue(plan["supports_vision"])
+        self.assertFalse(plan["vision_bridge_enabled"])
         self.assertEqual(plan["workers"][1]["base_url"], "http://127.0.0.1:8107/v1")
         self.assertNotIn("sk-backend-secret", json.dumps(plan))
 
@@ -244,6 +247,22 @@ class GatewayConfigTests(unittest.TestCase):
             client.combo["config"]["queueTimeoutMs"], gateway.OMNIROUTE_QUEUE_TIMEOUT_MS
         )
         self.assertNotIn("queueDepth", client.combo["config"])
+        self.assertIn(
+            ("PATCH", "/api/settings", {"visionBridgeEnabled": False}),
+            client.calls,
+        )
+
+    def test_omniroute_reconcile_leaves_vision_bridge_untouched_for_text_model(self):
+        client = FakeOmniRouteClient()
+        environment = {**BASE_ENV, "SUPPORTS_IMAGE_INPUT": "0"}
+        with tempfile.TemporaryDirectory() as directory:
+            secrets = pathlib.Path(directory) / "secrets.env"
+            secrets.write_text("GATEWAY_API_KEY=sk-bf-public-secret\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, environment, clear=True):
+                gateway.reconcile_omniroute(client, [0, 1], secrets)
+        self.assertFalse(
+            any(call[0:2] == ("PATCH", "/api/settings") for call in client.calls)
+        )
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

@@ -268,6 +268,15 @@ def omniroute_plan(worker_ids: Iterable[int]) -> str:
         "concurrency_per_worker": concurrency_per_worker,
         "queue_timeout_ms": OMNIROUTE_QUEUE_TIMEOUT_MS,
         "supports_vision": os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1",
+        # OmniRoute 3.8.x cannot resolve supportsVision from a custom Provider
+        # model while inspecting Combo members.  Its enabled-by-default Vision
+        # Bridge therefore waits 30 seconds for openai/gpt-4o-mini before it
+        # finally preserves the original image and calls the native-vision
+        # LLMCtl worker.  Disable that bridge for a cluster whose selected
+        # model was already verified as natively multimodal.
+        "vision_bridge_enabled": False
+        if os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
+        else None,
         "workers": [
             {
                 "id": worker_id,
@@ -473,6 +482,24 @@ def reconcile_omniroute(
     backend_key = required_env("BACKEND_API_KEY")
     supports_vision = os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
     concurrency_per_worker = OMNIROUTE_INFLIGHT_PER_WORKER
+
+    if supports_vision:
+        # The custom model rows below persist supportsVision=true, but
+        # OmniRoute's VisionBridgeGuardrail checks Combo targets through the
+        # static/synced registry and ignores that custom-provider metadata.  It
+        # consequently invokes the default openai/gpt-4o-mini bridge and waits
+        # its exact 30 s timeout on every image before forwarding the untouched
+        # image to vLLM.  The selected LLMCtl model has already passed native
+        # image capability validation, so the bridge is both redundant and
+        # harmful here.  PATCH is hot-reloaded by OmniRoute; workers and the
+        # router process do not need to restart.
+        bridge_settings = client.request(
+            "PATCH", "/api/settings", {"visionBridgeEnabled": False}
+        )
+        if bridge_settings.get("visionBridgeEnabled") is not False:
+            raise RuntimeError(
+                "OmniRoute did not persist visionBridgeEnabled=false for the native-vision cluster"
+            )
 
     nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
     connections = response_list(client.request("GET", "/api/providers?limit=1000"), "connections")
