@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.3.1"
+readonly CTL_VERSION="2.3.2"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -1215,19 +1215,29 @@ api_post() {
   local url="${1:?}" key="${2:?}" payload="${3:?}"
   curl --noproxy '*' -fsS --max-time 600 \
     -H "Authorization: Bearer ${key}" \
+    -H 'Accept: application/json' \
     -H 'Content-Type: application/json' \
     --data-binary "@${payload}" "${url}"
 }
 
 smoke_response_summary() {
-  local response="${1:-}"
+  local response="${1:-}" detected_format=unknown
   [[ -n "${response}" ]] || response='{}'
-  jq -c '{finish_reason:(.choices[0].finish_reason // null),
+  if jq -c '{finish_reason:(.choices[0].finish_reason // null),
           stop_reason:(.choices[0].stop_reason // null),
           content_chars:((.choices[0].message.content // "") | length),
           reasoning_chars:((.choices[0].message.reasoning_content // .choices[0].message.reasoning // "") | length),
           tool_calls:((.choices[0].message.tool_calls // []) | length),
-          error:(.error.message // null)}' <<<"${response}" 2>/dev/null || printf '%s' '{"invalid_json":true}'
+          error:(.error.message // null)}' <<<"${response}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "${response}" == data:* || "${response}" == *$'\ndata:'* ]]; then
+    detected_format=sse
+  elif [[ "${response}" == '<!DOCTYPE html'* || "${response}" == '<html'* ]]; then
+    detected_format=html
+  fi
+  jq -cn --arg format "${detected_format}" --argjson body_chars "${#response}" \
+    '{invalid_json:true,detected_format:$format,body_chars:$body_chars}'
 }
 
 smoke_save_response() {
@@ -1284,7 +1294,7 @@ ocr_request_file() {
   b64_file=$(mktemp)
   base64 -w 0 "${image_file}" >"${b64_file}"
   jq -n --rawfile b64 "${b64_file}" --arg mime "${mime}" --arg prompt "${prompt}" --arg model "${SERVED_MODEL_NAME}" '
-    {model:$model, max_tokens:512, temperature:0,
+    {model:$model, max_tokens:512, temperature:0, stream:false,
      reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false},
      messages:[{role:"user",content:[
        {type:"image_url",image_url:{url:("data:"+$mime+";base64,"+$b64)}},
@@ -1301,7 +1311,7 @@ smoke_endpoint() {
 
   log "开始文本冒烟测试..."
   jq -n --arg model "${SERVED_MODEL_NAME}" --argjson toggle "${SUPPORTS_THINKING_TOGGLE}" '
-    {model:$model,max_tokens:64,temperature:0,messages:[{role:"user",content:"只输出 LLM_OK，不要输出其他内容。"}]} +
+    {model:$model,max_tokens:64,temperature:0,stream:false,messages:[{role:"user",content:"只输出 LLM_OK，不要输出其他内容。"}]} +
     (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${tmp}"
   response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "文本冒烟测试请求失败"
   jq -e '.choices[0].message | type == "object"' <<<"${response}" >/dev/null 2>&1 || smoke_fail_response text "文本测试响应结构无效" "${response}"
@@ -1315,7 +1325,7 @@ smoke_endpoint() {
     log "开始思考解析冒烟测试..."
     for reasoning_limit in 2048 4096; do
       jq -n --arg model "${SERVED_MODEL_NAME}" --argjson max_tokens "${reasoning_limit}" \
-        '{model:$model,max_tokens:$max_tokens,temperature:0.6,top_p:0.95,top_k:20,
+        '{model:$model,max_tokens:$max_tokens,temperature:0.6,top_p:0.95,top_k:20,stream:false,
           messages:[{role:"user",content:"请简短思考并计算 17×19，随后给出包含计算结果的最终答案。"}]}' >"${tmp}"
       response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "思考测试请求失败"
       jq -e '.choices[0].message | type == "object"' <<<"${response}" >/dev/null 2>&1 || smoke_fail_response reasoning "思考测试响应结构无效" "${response}"
@@ -1335,7 +1345,7 @@ smoke_endpoint() {
 
   if (( SUPPORTS_TOOL_CALLING == 1 )); then
     log "开始 OpenAI 工具调用冒烟测试..."
-    jq -n --arg model "${SERVED_MODEL_NAME}" '{model:$model,max_tokens:512,temperature:0,
+    jq -n --arg model "${SERVED_MODEL_NAME}" '{model:$model,max_tokens:512,temperature:0,stream:false,
       reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false},
       messages:[{role:"user",content:"必须调用 get_weather 查询 Paris。"}],
       tools:[{type:"function",function:{name:"get_weather",description:"查询城市天气",parameters:{type:"object",properties:{city:{type:"string"}},required:["city"]}}}],tool_choice:"required"}' >"${tmp}"
@@ -1364,7 +1374,7 @@ smoke_endpoint() {
     data_url=$(jq -r '.messages[0].content[0].image_url.url' "${ocr_json}")
     six_images_json=$(mktemp)
     jq -n --arg model "${SERVED_MODEL_NAME}" --arg url "${data_url}" --argjson toggle "${SUPPORTS_THINKING_TOGGLE}" '
-      {model:$model,max_tokens:64,temperature:0,
+      {model:$model,max_tokens:64,temperature:0,stream:false,
        messages:[{role:"user",content:
          ([range(0;6)|{type:"image_url",image_url:{url:$url}}] +
           [{type:"text",text:"这些图片中的编号相同。请简短回答。"}])}]} +
@@ -1454,6 +1464,7 @@ def one(index):
         "model": model,
         "max_tokens": max_tokens,
         "temperature": 0.7,
+        "stream": False,
         "reasoning_effort": "none",
         "chat_template_kwargs": {"enable_thinking": False},
         "messages": [{"role": "user", "content":

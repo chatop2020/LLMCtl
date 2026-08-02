@@ -177,13 +177,17 @@ Text request:
 ```bash
 curl http://SERVER_IP:8000/v1/chat/completions \
   -H 'Authorization: Bearer YOUR_KEY' \
+  -H 'Accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{
     "model":"MODEL_NAME_FROM_INSTALL_SUMMARY",
     "messages":[{"role":"user","content":"Hello"}],
-    "max_tokens":256
+    "max_tokens":256,
+    "stream":false
   }'
 ```
+
+Synchronous JSON clients should send `"stream":false` explicitly. For legacy-client compatibility, OmniRoute may return SSE when that field is omitted and the request does not declare a JSON-only response; streaming clients should instead send `"stream":true` and parse each `data:` event.
 
 For models that support disabling reasoning per request, add:
 

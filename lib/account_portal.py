@@ -794,12 +794,17 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             model_rows.append(f'''<div class="model"><div><code id="{dom_id}">{html.escape(model_id)}</code><div><span class="tag">{html.escape(owned)}</span><span class="tag">{html.escape(caps[:120])}</span></div></div><button class="secondary" data-copy="{dom_id}">复制 ID / Copy</button></div>''')
         sample_model = str(models[0].get("id", "MODEL_ID")) if models else "MODEL_ID"
         sample_payload = json.dumps(
-            {"model": sample_model, "messages": [{"role": "user", "content": "你好"}]},
+            {
+                "model": sample_model,
+                "stream": False,
+                "messages": [{"role": "user", "content": "你好"}],
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         )
         curl = f'''curl {shlex.quote(self.app.config.api_public_url + "/v1/chat/completions")} \\
   -H 'Authorization: Bearer YOUR_API_KEY' \\
+  -H 'Accept: application/json' \\
   -H 'Content-Type: application/json' \\
   -d {shlex.quote(sample_payload)}'''
         flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""

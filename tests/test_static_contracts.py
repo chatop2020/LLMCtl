@@ -58,8 +58,20 @@ class StaticDeploymentContracts(unittest.TestCase):
     def test_smoke_diagnostics_and_default_aggregate_logs_are_operational(self):
         smoke = MANAGER.split("smoke_endpoint() {", 1)[1].split("cmd_smoke() {", 1)[0]
         logs = MANAGER.split("cmd_logs() {", 1)[1].split("api_post() {", 1)[0]
+        api_post = MANAGER.split("api_post() {", 1)[1].split("smoke_response_summary() {", 1)[0]
         self.assertIn("for reasoning_limit in 2048 4096", smoke)
         self.assertIn("temperature:0.6,top_p:0.95,top_k:20", smoke)
+        self.assertGreaterEqual(smoke.count("stream:false"), 4)
+        self.assertIn(
+            "stream:false",
+            MANAGER.split("ocr_request_file() {", 1)[1].split("smoke_endpoint() {", 1)[0],
+        )
+        self.assertIn(
+            '"stream": False',
+            MANAGER.split("cmd_bench() {", 1)[1].split("optimizer_metrics_urls() {", 1)[0],
+        )
+        self.assertIn("Accept: application/json", api_post)
+        self.assertIn("detected_format", MANAGER)
         self.assertIn("finish_reason", smoke)
         self.assertIn("smoke_fail_response", smoke)
         self.assertIn('local target="${1:-all}"', logs)
@@ -117,6 +129,8 @@ class StaticDeploymentContracts(unittest.TestCase):
         ):
             self.assertIn(command, chinese)
             self.assertIn(command, english)
+        self.assertIn('"stream":false', chinese)
+        self.assertIn('"stream":false', english)
 
     def test_bilingual_docs_cover_all_gateway_choices_and_clean_install_semantics(self):
         for chinese_name, english_name in (("README.md", "README_EN.md"), ("USAGE.md", "USAGE_EN.md")):

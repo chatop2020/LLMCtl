@@ -181,6 +181,8 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertIn("ornith-1.0-35b-fp8", dashboard)
         self.assertIn("https://llm.example.test/v1/chat/completions", dashboard)
         self.assertIn("curl", dashboard)
+        self.assertIn("Accept: application/json", dashboard)
+        self.assertIn("&quot;stream&quot;:false", dashboard)
 
         status, second_view, _ = self.get(client, "/")
         self.assertEqual(status, 200)

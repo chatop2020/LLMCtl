@@ -177,13 +177,17 @@ sudo llmctl key show
 ```bash
 curl http://服务器IP:8000/v1/chat/completions \
   -H 'Authorization: Bearer YOUR_KEY' \
+  -H 'Accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{
     "model":"安装摘要中的模型名",
     "messages":[{"role":"user","content":"你好"}],
-    "max_tokens":256
+    "max_tokens":256,
+    "stream":false
   }'
 ```
+
+同步 JSON 客户端应显式发送 `"stream":false`。OmniRoute 为兼容旧客户端，在省略该字段且请求没有声明只接受 JSON 时可能返回 SSE；流式客户端则应显式使用 `"stream":true` 并逐条解析 `data:` 事件。
 
 支持请求级关闭思考的模型可加入：
 

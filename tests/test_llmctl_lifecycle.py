@@ -54,6 +54,7 @@ class LlmctlLifecycleTests(unittest.TestCase):
             SUPPORTS_TOOL_CALLING=0
             SUPPORTS_IMAGE_INPUT=0
             api_post() {
+              jq -e '.stream == false' "$3" >/dev/null
               if jq -e '.reasoning_effort == "none"' "$3" >/dev/null; then
                 printf '%s\n' '{"choices":[{"finish_reason":"stop","message":{"content":"LLM_OK","reasoning":null}}]}'
               else
@@ -79,6 +80,7 @@ class LlmctlLifecycleTests(unittest.TestCase):
                 SUPPORTS_TOOL_CALLING=0
                 SUPPORTS_IMAGE_INPUT=0
                 api_post() {{
+                  jq -e '.stream == false' "$3" >/dev/null
                   if jq -e '.reasoning_effort == "none"' "$3" >/dev/null; then
                     printf '%s\\n' '{{"choices":[{{"finish_reason":"stop","message":{{"content":"LLM_OK","reasoning":null}}}}]}}'
                   else
@@ -105,6 +107,13 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn('"finish_reason":"length"', completed.stderr)
         self.assertGreaterEqual(len(diagnostics), 3)
         self.assertTrue(all("choices" in payload for payload in diagnostic_payloads))
+
+    def test_smoke_summary_identifies_sse_instead_of_only_invalid_json(self):
+        output = run_bash(r'''smoke_response_summary 'data: {"choices":[]}' ''')
+        summary = json.loads(output)
+        self.assertTrue(summary["invalid_json"])
+        self.assertEqual(summary["detected_format"], "sse")
+        self.assertGreater(summary["body_chars"], 0)
 
     def test_optimizer_workload_is_bounded_by_active_scheduling_slots(self):
         output = run_bash(
