@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.6.0"
+readonly INSTALLER_VERSION="2.7.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -74,7 +74,7 @@ ACCOUNT_ALLOWED_EMAIL_DOMAINS=""
 ACCOUNT_DEFAULT_QUOTA_TOKENS=1000000
 ACCOUNT_QUOTA_RESET="monthly"
 ACCOUNT_QUOTA_RESET_TIME="00:00"
-ACCOUNT_ADMIN_EMAIL="admin@llmctl.local"
+ACCOUNT_ADMIN_USERNAME="admin"
 SMTP_HOST=""
 SMTP_PORT=587
 SMTP_SECURITY="starttls"
@@ -119,6 +119,7 @@ CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
+BENCHMARK_SOURCE="${SCRIPT_DIR}/lib/llm_benchmark.py"
 ACCOUNT_UI_SOURCE="${SCRIPT_DIR}/lib/account_portal_ui"
 UPGRADER_SOURCE="${SCRIPT_DIR}/upgrade-llmctl.sh"
 CATALOG_QUERY=""
@@ -194,7 +195,7 @@ Common unattended options:
   --account-default-quota N      Default recurring token quota; default 1000000
   --account-quota-reset daily|weekly|monthly
   --account-quota-reset-time HH:MM
-  --account-admin-email EMAIL    Initial portal administrator login
+  --account-admin-username USER  Initial portal administrator login name
   --smtp-host HOST --smtp-port PORT
   --smtp-security starttls|ssl|plain
   --smtp-username USER --smtp-password PASSWORD --smtp-from EMAIL
@@ -268,7 +269,7 @@ EOF
   --account-default-quota N       默认周期 Token 额度，默认 1000000
   --account-quota-reset daily|weekly|monthly
   --account-quota-reset-time HH:MM
-  --account-admin-email EMAIL     门户初始管理员登录邮箱
+  --account-admin-username USER   门户初始管理员登录名（不要求是邮箱）
   --smtp-host HOST --smtp-port PORT
   --smtp-security starttls|ssl|plain
   --smtp-username USER --smtp-password PASSWORD --smtp-from EMAIL
@@ -359,7 +360,8 @@ parse_args() {
       --account-default-quota) need_value "$@"; ACCOUNT_DEFAULT_QUOTA_TOKENS="$2"; shift 2 ;;
       --account-quota-reset) need_value "$@"; ACCOUNT_QUOTA_RESET="$2"; shift 2 ;;
       --account-quota-reset-time) need_value "$@"; ACCOUNT_QUOTA_RESET_TIME="$2"; shift 2 ;;
-      --account-admin-email) need_value "$@"; ACCOUNT_ADMIN_EMAIL="$2"; shift 2 ;;
+      --account-admin-username) need_value "$@"; ACCOUNT_ADMIN_USERNAME="$2"; shift 2 ;;
+      --account-admin-email) need_value "$@"; ACCOUNT_ADMIN_USERNAME="$2"; shift 2 ;;
       --smtp-host) need_value "$@"; SMTP_HOST="$2"; shift 2 ;;
       --smtp-port) need_value "$@"; SMTP_PORT="$2"; shift 2 ;;
       --smtp-security) need_value "$@"; SMTP_SECURITY="$2"; shift 2 ;;
@@ -1000,9 +1002,13 @@ validate_scalar_config() {
   [[ "${GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost|omniroute)$ ]] || die "$(l10n 'gateway 只能是 newapi、litellm、bifrost 或 omniroute' 'gateway must be newapi, litellm, bifrost, or omniroute')"
   [[ "${UI_USERNAME}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "$(l10n 'ui-username 只允许字母、数字、点、下划线、@ 和连字符' 'ui-username may contain only letters, digits, dots, underscores, @, and hyphens')"
   [[ "${GATEWAY_KIND}" != newapi || ${#UI_USERNAME} -le 12 ]] || die "$(l10n 'New API 管理员用户名不能超过 12 个字符' 'The New API administrator username cannot exceed 12 characters')"
-  [[ "${UI_PASSWORD}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "$(l10n 'ui-password 需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符' 'ui-password must be 8-128 characters using letters, digits, dots, underscores, @, and hyphens')"
-  [[ "${GATEWAY_KIND}" != newapi || ${#UI_PASSWORD} -le 20 ]] || die "$(l10n 'New API 管理员密码不能超过 20 个字符' 'The New API administrator password cannot exceed 20 characters')"
-  [[ "${GATEWAY_KIND}" != omniroute || ${#UI_PASSWORD} -ge 12 ]] || die "$(l10n 'OmniRoute/账户门户管理员密码至少 12 位' 'The OmniRoute/account portal administrator password must be at least 12 characters')"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    [[ -n "${UI_PASSWORD}" && "${UI_PASSWORD}" != *$'\n'* && "${UI_PASSWORD}" != *$'\r'* ]] || die "$(l10n 'OmniRoute/门户管理员密码不能为空或包含换行' 'The OmniRoute/portal administrator password must be non-empty and contain no newline')"
+    python3 -c 'import sys; raise SystemExit(1 if sys.argv[1].isdecimal() else 0)' "${UI_PASSWORD}" || die "$(l10n 'OmniRoute/门户管理员密码不能全部由数字组成' 'The OmniRoute/portal administrator password cannot contain digits only')"
+  else
+    [[ "${UI_PASSWORD}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "$(l10n 'ui-password 需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符' 'ui-password must be 8-128 characters using letters, digits, dots, underscores, @, and hyphens')"
+    [[ "${GATEWAY_KIND}" != newapi || ${#UI_PASSWORD} -le 20 ]] || die "$(l10n 'New API 管理员密码不能超过 20 个字符' 'The New API administrator password cannot exceed 20 characters')"
+  fi
   [[ "${VLLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'vLLM 镜像名格式无效' 'Invalid vLLM image name')"
   [[ "${NEWAPI_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'New API 镜像名格式无效' 'Invalid New API image name')"
   [[ "${LITELLM_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'LiteLLM 镜像名格式无效' 'Invalid LiteLLM image name')"
@@ -1018,7 +1024,7 @@ validate_scalar_config() {
     [[ "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" =~ ^[0-9]+$ ]] && (( ACCOUNT_DEFAULT_QUOTA_TOKENS >= 1 && ACCOUNT_DEFAULT_QUOTA_TOKENS <= 1000000000000 )) || die "$(l10n '默认 Token 额度无效' 'Invalid default token quota')"
     [[ "${ACCOUNT_QUOTA_RESET}" =~ ^(daily|weekly|monthly)$ ]] || die "$(l10n '额度重置周期无效' 'Invalid quota reset interval')"
     [[ "${ACCOUNT_QUOTA_RESET_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$(l10n '额度重置时间必须是 HH:MM' 'Quota reset time must be HH:MM')"
-    [[ "${ACCOUNT_ADMIN_EMAIL}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || die "$(l10n '门户管理员邮箱格式无效' 'Invalid portal administrator email')"
+    python3 -c 'import sys; value=sys.argv[1].strip(); raise SystemExit(0 if value and all(ord(c) >= 32 and ord(c) != 127 for c in value) else 1)' "${ACCOUNT_ADMIN_USERNAME}" || die "$(l10n '门户管理员登录名不能为空或包含控制字符' 'The portal administrator login name must be non-empty and contain no control characters')"
     [[ -z "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" || "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || die "$(l10n '邮箱后缀只能是逗号分隔的域名' 'Email domains must be comma-separated domain names')"
     [[ -z "${ACCOUNT_PUBLIC_URL}" || "${ACCOUNT_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+(/ui/?)?$ ]] || die "$(l10n 'account-public-url 必须是 http(s) 地址，可带 /ui 路径' 'account-public-url must be an http(s) URL with an optional /ui path')"
     [[ -z "${ACCOUNT_API_PUBLIC_URL}" || "${ACCOUNT_API_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+$ ]] || die "$(l10n 'account-api-public-url 必须是无路径的 http(s) URL' 'account-api-public-url must be an http(s) URL without a path')"
@@ -1048,6 +1054,7 @@ check_discovery_host() {
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
+  [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
   [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
@@ -1077,6 +1084,7 @@ check_host() {
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
+  [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
   [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
@@ -1481,8 +1489,11 @@ write_configuration() {
   fi
   install -d -m 750 "${CONFIG_DIR}" "${WORKER_ENV_DIR}"
   install -d -m 755 "${STATE_DIR}" "${MODEL_ROOT}"
-  local active_workers
+  local active_workers encoded_admin_username normalized_admin_username
   active_workers=$(make_active_workers)
+  normalized_admin_username=$(python3 -c 'import sys; print(sys.argv[1].strip(), end="")' "${ACCOUNT_ADMIN_USERNAME}")
+  ACCOUNT_ADMIN_USERNAME="${normalized_admin_username}"
+  encoded_admin_username=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode(), end="")' "${ACCOUNT_ADMIN_USERNAME}")
   cat >"${CLUSTER_ENV}" <<EOF
 # Generated by install-llm-cluster.sh ${INSTALLER_VERSION}
 MODEL_SOURCE=${MODEL_SOURCE}
@@ -1532,7 +1543,7 @@ ACCOUNT_ALLOWED_EMAIL_DOMAINS=${ACCOUNT_ALLOWED_EMAIL_DOMAINS}
 ACCOUNT_DEFAULT_QUOTA_TOKENS=${ACCOUNT_DEFAULT_QUOTA_TOKENS}
 ACCOUNT_QUOTA_RESET=${ACCOUNT_QUOTA_RESET}
 ACCOUNT_QUOTA_RESET_TIME=${ACCOUNT_QUOTA_RESET_TIME}
-ACCOUNT_ADMIN_EMAIL=${ACCOUNT_ADMIN_EMAIL}
+ACCOUNT_ADMIN_USERNAME_B64=${encoded_admin_username}
 ACCOUNT_DB_PATH=${STATE_DIR}/omniroute/portal/account-portal.db
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
@@ -1577,6 +1588,7 @@ EOF
   fi
   local postgres_user="llmadmin" postgres_db="llm_gateway" postgres_password
   local final_ui_username final_ui_password generated_gateway_key session_secret
+  local quoted_ui_username quoted_ui_password quoted_smtp_username quoted_smtp_password quoted_smtp_from
   postgres_password="${existing_postgres_password:-$(openssl rand -hex 32)}"
   if (( UI_USERNAME_EXPLICIT )); then final_ui_username="${requested_ui_username}"; else final_ui_username="${existing_ui_username:-${requested_ui_username}}"; fi
   if (( UI_PASSWORD_EXPLICIT )); then final_ui_password="${requested_ui_password}"; else final_ui_password="${existing_ui_password:-${requested_ui_password}}"; fi
@@ -1589,6 +1601,11 @@ EOF
     existing_gateway_key=""
   fi
   session_secret="${existing_session_secret:-$(openssl rand -hex 32)}"
+  printf -v quoted_ui_username '%q' "${final_ui_username}"
+  printf -v quoted_ui_password '%q' "${final_ui_password}"
+  printf -v quoted_smtp_username '%q' "${SMTP_USERNAME}"
+  printf -v quoted_smtp_password '%q' "${SMTP_PASSWORD}"
+  printf -v quoted_smtp_from '%q' "${SMTP_FROM}"
   umask 077
   cat >"${SECRETS_ENV}" <<EOF
 GATEWAY_API_KEY=${existing_gateway_key:-${generated_gateway_key}}
@@ -1602,15 +1619,15 @@ OMNIROUTE_JWT_SECRET=${existing_omni_jwt:-$(openssl rand -hex 64)}
 OMNIROUTE_API_KEY_SECRET=${existing_omni_api_secret:-$(openssl rand -hex 32)}
 OMNIROUTE_STORAGE_ENCRYPTION_KEY=${existing_omni_storage_key:-$(openssl rand -hex 32)}
 GATEWAY_STATE_KIND=${GATEWAY_KIND}
-UI_USERNAME=${final_ui_username}
-UI_PASSWORD=${final_ui_password}
-ACCOUNT_ADMIN_PASSWORD=${final_ui_password}
+UI_USERNAME=${quoted_ui_username}
+UI_PASSWORD=${quoted_ui_password}
+ACCOUNT_ADMIN_PASSWORD=${quoted_ui_password}
 SMTP_HOST=${SMTP_HOST}
 SMTP_PORT=${SMTP_PORT}
 SMTP_SECURITY=${SMTP_SECURITY}
-SMTP_USERNAME=${SMTP_USERNAME}
-SMTP_PASSWORD=${SMTP_PASSWORD}
-SMTP_FROM=${SMTP_FROM}
+SMTP_USERNAME=${quoted_smtp_username}
+SMTP_PASSWORD=${quoted_smtp_password}
+SMTP_FROM=${quoted_smtp_from}
 POSTGRES_USER=${postgres_user}
 POSTGRES_PASSWORD=${postgres_password}
 POSTGRES_DB=${postgres_db}
@@ -1657,6 +1674,7 @@ install_manager() {
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
+  install -m 755 "${BENCHMARK_SOURCE}" /usr/local/lib/llm-cluster/llm_benchmark.py
   rm -rf /usr/local/lib/llm-cluster/account_portal_ui
   cp -a "${ACCOUNT_UI_SOURCE}" /usr/local/lib/llm-cluster/account_portal_ui
   chown -R root:root /usr/local/lib/llm-cluster/account_portal_ui
@@ -1920,9 +1938,9 @@ API gateway:       $(gateway_display_name) (${GATEWAY_KIND})
 Load balancing:    $(gateway_routing_summary)
 API:               http://${host_for_url}:${API_PORT}/v1
 Web UI:            http://${host_for_url}:${API_PORT}$(gateway_ui_path)
-Administrator:     ${UI_USERNAME}
+Administrator:     $([[ "${GATEWAY_KIND}" == omniroute ]] && printf 'password only' || printf '%s' "${UI_USERNAME}")
 Initial password:  ${UI_PASSWORD}
-$([[ "${GATEWAY_KIND}" == omniroute ]] && printf 'Account portal:    %s\nPortal admin:      %s\nRegistration:      %s; domains=%s\n' "$(account_portal_url)" "${ACCOUNT_ADMIN_EMAIL}" "$([[ ${ACCOUNT_REGISTRATION_ENABLED} -eq 1 ]] && printf enabled || printf disabled)" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-not configured}")
+$([[ "${GATEWAY_KIND}" == omniroute ]] && printf 'Native UI login:   password only (OmniRoute has no username)\nAccount portal:    %s\nPortal admin:      %s\nRegistration:      %s; domains=%s\n' "$(account_portal_url)" "${ACCOUNT_ADMIN_USERNAME}" "$([[ ${ACCOUNT_REGISTRATION_ENABLED} -eq 1 ]] && printf enabled || printf disabled)" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-not configured}")
 Served model:      ${SERVED_MODEL_NAME}
 API key:           ${GATEWAY_API_KEY}
 
@@ -1943,7 +1961,7 @@ Vision requests use messages[].content.image_url; data:base64 is allowed by defa
 
 Note: ${INSTANCE_COUNT}×${MAX_NUM_SEQS} is a scheduling-slot count, not ${INSTANCE_COUNT}×${MAX_NUM_SEQS} simultaneous 256K requests.
 Gateway routing uses configured worker health/weights; none of the four gateways reads live GPU VRAM/KV-cache pressure.
-Change the shared initial Web UI password immediately with llmctl admin set-password.
+Change the shared initial password immediately with llmctl admin set-password.
 EOF
     return
   fi
@@ -1966,9 +1984,9 @@ API 接入层：  $(gateway_display_name)（${GATEWAY_KIND}）
 负载均衡：   $(gateway_routing_summary)
 API：        http://${host_for_url}:${API_PORT}/v1
 Web UI：     http://${host_for_url}:${API_PORT}$(gateway_ui_path)
-管理员：     ${UI_USERNAME}
+管理员：     $([[ "${GATEWAY_KIND}" == omniroute ]] && printf '仅密码' || printf '%s' "${UI_USERNAME}")
 初始密码：   ${UI_PASSWORD}
-$([[ "${GATEWAY_KIND}" == omniroute ]] && printf '账户门户：   %s\n门户管理员： %s\n注册策略：   %s；邮箱后缀=%s\n' "$(account_portal_url)" "${ACCOUNT_ADMIN_EMAIL}" "$([[ ${ACCOUNT_REGISTRATION_ENABLED} -eq 1 ]] && printf 已启用 || printf 已关闭)" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-未配置}")
+$([[ "${GATEWAY_KIND}" == omniroute ]] && printf '原生 UI 登录：仅密码（OmniRoute 没有用户名）\n账户门户：   %s\n门户管理员： %s\n注册策略：   %s；邮箱后缀=%s\n' "$(account_portal_url)" "${ACCOUNT_ADMIN_USERNAME}" "$([[ ${ACCOUNT_REGISTRATION_ENABLED} -eq 1 ]] && printf 已启用 || printf 已关闭)" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-未配置}")
 模型名：     ${SERVED_MODEL_NAME}
 API key：    ${GATEWAY_API_KEY}
 

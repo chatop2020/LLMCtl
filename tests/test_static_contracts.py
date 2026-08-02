@@ -104,6 +104,7 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("reconcile-omniroute", MANAGER)
         self.assertIn("wait_gateway_process", MANAGER)
         self.assertIn("GATEWAY_API_KEY", MANAGER)
+        self.assertIn("-e ALLOW_API_KEY_REVEAL=true", MANAGER)
 
     def test_gateway_versions_are_pinned_and_only_selected_image_is_pulled(self):
         self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)

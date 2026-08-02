@@ -448,7 +448,8 @@ validate_source() {
     "${SOURCE_ROOT}/lib/model_catalog.py" \
     "${SOURCE_ROOT}/lib/runtime_optimizer.py" \
     "${SOURCE_ROOT}/lib/gateway_config.py" \
-    "${SOURCE_ROOT}/lib/account_portal.py"
+    "${SOURCE_ROOT}/lib/account_portal.py" \
+    "${SOURCE_ROOT}/lib/llm_benchmark.py"
   python3 - "${SOURCE_ROOT}/lib/account_portal_ui" <<'PY'
 import re, sys
 from pathlib import Path

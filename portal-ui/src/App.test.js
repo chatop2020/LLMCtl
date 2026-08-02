@@ -61,6 +61,7 @@ describe("LLMCtl portal contracts", () => {
       "admin-users",
       "admin-groups",
       "admin-billing",
+      "admin-stress",
       "admin-audit",
     ]) {
       expect(source).toMatch(new RegExp(`pageRows\\(\\s*["']${key}["']`));
@@ -112,6 +113,26 @@ describe("LLMCtl portal contracts", () => {
   it("keeps local administration visible when the AI gateway is degraded", () => {
     expect(source).toContain("admin?.gateway_error");
     expect(source).toContain("用户、SMTP、账本和审计仍可查看");
+  });
+
+  it("labels token usage, supports attachments, and delegates stress to the backend", () => {
+    for (const marker of ["输入 Token", "输出 Token", "合计 Token"]) {
+      expect(source).toContain(marker);
+    }
+    expect(source).toContain("prepareAttachment");
+    expect(source).toContain("buildUserContent");
+    expect(source).toContain('api("admin/stress/start"');
+    expect(source).toContain('api("admin/stress/cancel"');
+    expect(source).toContain("后台执行真实流式请求");
+    expect(source).not.toContain("Promise.all(Array(stressPlan.concurrency)");
+  });
+
+  it("keeps the registered API key stable and embeds it in curl examples", () => {
+    expect(source).toContain('api("key/reveal"');
+    expect(source).toContain("只有手工轮换才会更换");
+    expect(source).toContain("登录不会创建或更换 Key");
+    expect(source).toContain("Authorization: Bearer ${apiKey}");
+    expect(source).not.toContain("尚未保存，请输入或前往 API Key 页面轮换");
   });
 
   it("uses public-project LLMCtl language and a light operations-console visual system", () => {

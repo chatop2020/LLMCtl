@@ -23,8 +23,10 @@
 - 模型能力匹配时才启用图片/OCR、OpenAI 工具调用、思考解析和请求级思考关闭。
 - 一个 GPU 或一个 TP 分组对应一个 Worker；安装器为所选接入层自动生成全部 Worker、鉴权和数据库配置，并通过 Nginx 统一的 `:8000/v1` 提供服务。
 - 自动安装或复用现有 Nginx：公开入口统一为 `/v1/` 和 `/ui/`；推理请求直接转发到网关，不经过门户；OmniRoute 原生排障界面保留在 `/base_ui/`。LLMCtl 使用独立配置，写入前执行 `nginx -t`，失败回滚，卸载时保留软件包和其他站点。
-- OmniRoute 模式额外部署 Vue 3 企业门户：支持邮箱验证/精确企业邮箱后缀/注册开关/SMTP 在线配置、用户与用户组、用户独立 API key、金额余额、额外 token 赠额及周期自动重置、逐模型输入/输出/缓存/思考定价、用量账本和审计。
+- OmniRoute 模式额外部署 Vue 3 企业门户：支持邮箱验证/精确企业邮箱后缀/注册开关/SMTP 在线配置、用户与用户组、用户独立且登录后保持不变的 API Key（仅手工轮换时更换）、金额余额、额外 token 赠额及周期自动重置、逐模型输入/输出/缓存/思考定价、用量账本和审计。
 - 企业门户通过 OmniRoute API 原生管理模型 ID 映射、Combo、用户 key 权限和免费层资源；免费模型必须经过“发现、已配置、可用、实时测试、管理员发布”门禁。用户只获得公开模型 ID 权限，不能用底层模型或 Combo ID 绕过映射。
+- 在线测试支持图片、PDF 和常见文本附件；图片直接作为多模态内容发送，PDF 在浏览器内按页转为图片，不上传到门户后端。流式结果明确标注输入、输出和合计 Token，并展示思考内容、首 Token 延迟与输出速度。
+- 管理端提供服务器后台压测：浏览器只提交和观察任务，独立执行器按并发数与目标输入长度生成有意义的提示词，并实时汇总成功率、RPS、聚合输出 tok/s、TTFT、端到端延迟和 p50/p95/p99；高负载档位需要二次确认。
 - systemd 开机自启；Worker 可分批并行加载，SSH 断开不影响后台启动。
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
@@ -47,6 +49,7 @@
 | `lib/runtime_optimizer.py` | 流式基准、GPU/vLLM 指标采集、保守候选生成与目标评分 |
 | `lib/gateway_config.py` | 四种接入层的无密钥配置生成及 New API/OmniRoute 状态同步 |
 | `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、额度和模型目录 |
+| `lib/llm_benchmark.py` | 门户管理端的后台并发压测与流式性能指标执行器 |
 | `portal-ui/` | Vue 3 企业门户源码与前端测试 |
 | `lib/account_portal_ui/` | 已构建、安装时直接复制的门户静态资源 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
@@ -99,7 +102,7 @@ sudo llmctl admin set-password
 把整个目录复制到服务器，进入目录后运行：
 
 ```bash
-chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py lib/account_portal.py
+chmod +x install-llm-cluster.sh llmctl.sh lib/model_catalog.py lib/runtime_optimizer.py lib/gateway_config.py lib/account_portal.py lib/llm_benchmark.py
 sudo bash install-llm-cluster.sh
 ```
 

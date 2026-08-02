@@ -25,9 +25,11 @@ import pathlib
 import re
 import secrets
 import shlex
+import signal
 import smtplib
 import sqlite3
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -41,10 +43,14 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.7.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
+STRESS_CONCURRENCY_CHOICES = (1, 2, 4, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 100)
+STRESS_INPUT_TOKEN_CHOICES = (50, 100, 300, 800, 1500, 3000, 6000, 8000, 15000, 30000)
+STRESS_OUTPUT_TOKEN_CHOICES = (64, 128, 256, 512, 1024)
+STRESS_REQUEST_MULTIPLIER_CHOICES = (1, 2, 3, 4)
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+$")
 DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DUMMY_PASSWORD_HASH = "pbkdf2_sha256$600000$bGxtY3RsLWR1bW15LXNhbHQ$O5LpuYky-CKHcJaJEAX3-3B1rSxvRmdsFnyMXd5fUrg"
@@ -97,6 +103,50 @@ def normalize_email(value: str) -> tuple[str, str]:
     return f"{local}@{domain}", domain
 
 
+def normalize_login_name(value: str) -> str:
+    """Accept a human login identifier without pretending it is an email address."""
+    value = value.strip()
+    if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("登录名不能为空，也不能包含控制字符")
+    return value
+
+
+def login_candidates(value: str) -> list[str]:
+    raw = normalize_login_name(value)
+    candidates = [raw]
+    try:
+        email, _ = normalize_email(raw)
+    except ValueError:
+        pass
+    else:
+        if email not in candidates:
+            candidates.append(email)
+    return candidates
+
+
+def find_user_by_login(
+    connection: sqlite3.Connection, value: str
+) -> tuple[sqlite3.Row | None, str]:
+    try:
+        candidates = login_candidates(value)
+    except ValueError:
+        return None, ""
+    for candidate in candidates:
+        user = connection.execute(
+            "SELECT * FROM users WHERE login_name=? LIMIT 1", (candidate,)
+        ).fetchone()
+        if user:
+            return user, candidate
+    return None, candidates[0]
+
+
+def user_identity(user: sqlite3.Row | dict[str, Any]) -> str:
+    keys = set(user.keys())
+    if "login_name" in keys:
+        return str(user["login_name"] or user["email"] or user["id"])
+    return str(user["email"])
+
+
 def validate_password(password: str) -> None:
     if not 8 <= len(password) <= 200:
         raise ValueError("密码必须为 8-200 个字符")
@@ -104,8 +154,28 @@ def validate_password(password: str) -> None:
         raise ValueError("密码不能全部由数字组成")
 
 
+def validate_admin_password(password: str) -> None:
+    if not password:
+        raise ValueError("管理员密码不能为空")
+    if any(character in "\r\n\x00" for character in password):
+        raise ValueError("管理员密码不能包含换行或空字符")
+    if password.isdecimal():
+        raise ValueError("管理员密码不能全部由数字组成")
+
+
 def hash_password(password: str, salt: bytes | None = None) -> str:
     validate_password(password)
+    salt = salt or secrets.token_bytes(16)
+    iterations = 600_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations, dklen=32)
+    return "pbkdf2_sha256$600000$%s$%s" % (
+        base64.urlsafe_b64encode(salt).decode().rstrip("="),
+        base64.urlsafe_b64encode(digest).decode().rstrip("="),
+    )
+
+
+def hash_admin_password(password: str, salt: bytes | None = None) -> str:
+    validate_admin_password(password)
     salt = salt or secrets.token_bytes(16)
     iterations = 600_000
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations, dklen=32)
@@ -454,7 +524,7 @@ class Config:
     gateway_manage_key: str
     public_url: str
     api_public_url: str
-    admin_email: str
+    admin_username: str
     admin_password: str
     initial_registration: bool
     initial_domains: list[str]
@@ -524,12 +594,23 @@ class Config:
         initial_registration = env_bool("ACCOUNT_REGISTRATION_ENABLED", False)
         smtp_host = os.environ.get("SMTP_HOST", "").strip()
         smtp_from = os.environ.get("SMTP_FROM", "").strip()
-        try:
-            admin_email, _ = normalize_email(
-                os.environ.get("ACCOUNT_ADMIN_EMAIL", "admin@llmctl.local")
+        encoded_admin_username = os.environ.get("ACCOUNT_ADMIN_USERNAME_B64", "").strip()
+        if encoded_admin_username:
+            try:
+                admin_username = base64.b64decode(
+                    encoded_admin_username, validate=True
+                ).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as error:
+                raise SystemExit("ACCOUNT_ADMIN_USERNAME_B64 is invalid") from error
+        else:
+            admin_username = os.environ.get(
+                "ACCOUNT_ADMIN_USERNAME",
+                os.environ.get("ACCOUNT_ADMIN_EMAIL", "admin"),
             )
+        try:
+            admin_username = normalize_login_name(admin_username)
         except ValueError as error:
-            raise SystemExit("ACCOUNT_ADMIN_EMAIL is invalid") from error
+            raise SystemExit("ACCOUNT_ADMIN_USERNAME is invalid") from error
         port = env_int("ACCOUNT_PORT", 8001)
         smtp_port = env_int("SMTP_PORT", 587)
         initial_quota = env_int("ACCOUNT_DEFAULT_QUOTA_TOKENS", 1000000)
@@ -574,7 +655,7 @@ class Config:
             gateway_manage_key=os.environ.get("GATEWAY_API_KEY", ""),
             public_url=public_url,
             api_public_url=api_public,
-            admin_email=admin_email,
+            admin_username=admin_username,
             admin_password=os.environ.get("ACCOUNT_ADMIN_PASSWORD", os.environ.get("UI_PASSWORD", "")),
             initial_registration=initial_registration,
             initial_domains=domains,
@@ -610,6 +691,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
+  login_name TEXT,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('admin','user')),
   status TEXT NOT NULL CHECK(status IN ('pending','active','disabled')),
@@ -679,6 +761,7 @@ CREATE TABLE IF NOT EXISTS free_resources (
   terms_status TEXT NOT NULL DEFAULT '',
   configured INTEGER NOT NULL DEFAULT 0,
   available INTEGER NOT NULL DEFAULT 0,
+  native_visible INTEGER NOT NULL DEFAULT 1,
   test_status TEXT NOT NULL DEFAULT 'untested' CHECK(test_status IN ('untested','healthy','failed')),
   test_latency_ms INTEGER,
   test_error TEXT NOT NULL DEFAULT '',
@@ -795,6 +878,25 @@ CREATE TABLE IF NOT EXISTS permission_sync (
   error TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stress_runs (
+  id TEXT PRIMARY KEY,
+  public_model_id TEXT NOT NULL,
+  concurrency INTEGER NOT NULL,
+  target_input_tokens INTEGER NOT NULL,
+  max_output_tokens INTEGER NOT NULL,
+  request_multiplier INTEGER NOT NULL,
+  request_count INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('starting','running','canceling','completed','failed','canceled')),
+  pid INTEGER,
+  result_dir TEXT NOT NULL,
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER,
+  updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_free_status ON free_resources(available,test_status);
 CREATE INDEX IF NOT EXISTS idx_models_status ON published_models(status,public_model_id);
 CREATE INDEX IF NOT EXISTS idx_model_access_subject ON model_access(subject_type,subject_id);
@@ -805,6 +907,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage_ledger(public_model_id,
 CREATE INDEX IF NOT EXISTS idx_usage_model_fk ON usage_ledger(model_id,id);
 CREATE INDEX IF NOT EXISTS idx_balance_user_time ON balance_transactions(user_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_grants_user_status ON token_grants(user_id,status);
+CREATE INDEX IF NOT EXISTS idx_stress_runs_created ON stress_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stress_runs_status ON stress_runs(status,updated_at DESC);
 """
 
 
@@ -860,6 +964,29 @@ class Database:
                     "UPDATE settings SET value=?,updated_at=? WHERE key=? AND TRIM(value)=''",
                     (defaults[key], now(), key),
                 )
+            user_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(users)")
+            }
+            if "login_name" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN login_name TEXT")
+            connection.execute(
+                "UPDATE users SET login_name=email WHERE login_name IS NULL OR TRIM(login_name)=''"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_login_name "
+                "ON users(login_name) WHERE login_name IS NOT NULL"
+            )
+            free_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(free_resources)")
+            }
+            if "native_visible" not in free_columns:
+                connection.execute(
+                    "ALTER TABLE free_resources ADD COLUMN native_visible INTEGER NOT NULL DEFAULT 1"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_free_native_visibility "
+                "ON free_resources(native_visible,configured,available)"
+            )
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(published_models)")
             }
@@ -894,11 +1021,12 @@ class Database:
                 if not self.config.admin_password:
                     raise SystemExit("ACCOUNT_ADMIN_PASSWORD (or UI_PASSWORD) is required")
                 connection.execute(
-                    "INSERT INTO users(id,email,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         str(uuid.uuid4()),
-                        self.config.admin_email,
-                        hash_password(self.config.admin_password),
+                        "admin@llmctl.local",
+                        self.config.admin_username,
+                        hash_admin_password(self.config.admin_password),
                         "admin",
                         "active",
                         0,
@@ -1065,6 +1193,29 @@ class OmniRouteClient:
             raise RuntimeError("OmniRoute did not return the new API key")
         return key_id, raw_key
 
+    def reveal_user_key(self, key_id: str) -> str:
+        """Return the existing key; revealing must never rotate or replace it."""
+        path = f"/api/keys/{urllib.parse.quote(key_id, safe='')}/reveal"
+        try:
+            response = self.request("GET", path)
+        except RuntimeError as error:
+            # Older LLMCtl installations started OmniRoute with key reveal
+            # disabled. The native flag is hot-reloadable, so an upgraded
+            # portal can repair that state without restarting the gateway or
+            # any GPU worker.
+            if "HTTP 403" not in str(error) or "reveal is disabled" not in str(error):
+                raise
+            self.request(
+                "PUT",
+                "/api/settings/feature-flags",
+                {"key": "ALLOW_API_KEY_REVEAL", "value": "true"},
+            )
+            response = self.request("GET", path)
+        raw_key = str(response.get("key", "")) if isinstance(response, dict) else ""
+        if len(raw_key) < 16:
+            raise RuntimeError("OmniRoute did not return the existing API key")
+        return raw_key
+
     def set_limit(
         self,
         key_id: str,
@@ -1172,6 +1323,32 @@ class OmniRouteClient:
 
     def free_models(self) -> list[dict[str, Any]]:
         return self.items(self.request("GET", "/api/free-models"), "models")
+
+    def hidden_provider_models(self, provider: str) -> set[str]:
+        response = self.request(
+            "GET",
+            f"/api/provider-models?{urllib.parse.urlencode({'provider': provider})}",
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("OmniRoute returned invalid provider model visibility")
+        hidden: set[str] = set()
+        for key in ("models", "modelCompatOverrides"):
+            values = response.get(key, [])
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if not isinstance(item, dict) or not (
+                    item.get("isHidden") is True or item.get("isDeleted") is True
+                ):
+                    continue
+                model_id = str(item.get("id", "")).strip()
+                if not model_id:
+                    continue
+                hidden.add(model_id)
+                prefix = f"{provider}/"
+                if model_id.startswith(prefix):
+                    hidden.add(model_id[len(prefix) :])
+        return hidden
 
     def free_rankings(self, available_only: bool = False) -> list[dict[str, Any]]:
         available = "&availableOnly=1" if available_only else ""
@@ -1293,6 +1470,25 @@ class OmniRouteClient:
             raise RuntimeError("model test returned no assistant content")
         return int((time.monotonic() - started) * 1000), content.strip()[:200]
 
+    def test_provider_model(self, provider: str, model_id: str) -> tuple[int, str]:
+        """Run the same provider-aware probe used by OmniRoute's native UI."""
+        response = self.request(
+            "POST",
+            "/api/models/test",
+            {"providerId": provider, "modelId": model_id},
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("OmniRoute returned an invalid model-test response")
+        if response.get("status") != "ok":
+            detail = str(response.get("error", "Unknown model-test error")).strip()
+            raise RuntimeError(detail or "Unknown model-test error")
+        try:
+            latency = max(0, int(response.get("latencyMs", 0) or 0))
+        except (TypeError, ValueError):
+            latency = 0
+        content = str(response.get("responseText", "")).strip()
+        return latency, content[:200] or "OK"
+
 
 def effective_mail_config(config: Config, settings: dict[str, str]) -> Config:
     try:
@@ -1383,7 +1579,7 @@ def page(title: str, body: str, user: sqlite3.Row | None = None, lang: str = "zh
     auth = ""
     if user:
         auth = (
-            f'<span class="muted">{html.escape(user["email"])}</span> '
+            f'<span class="muted">{html.escape(user_identity(user))}</span> '
             '<form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="__CSRF__"><button class="secondary">退出 / Sign out</button></form>'
         )
     else:
@@ -1666,7 +1862,17 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             user, _ = self.current_session()
             self.json_response(
                 200,
-                {"authenticated": bool(user), "user": {"id": user["id"], "email": user["email"], "role": user["role"]} if user else None},
+                {
+                    "authenticated": bool(user),
+                    "user": {
+                        "id": user["id"],
+                        "email": user["email"] if user["role"] == "user" else "",
+                        "login_name": user_identity(user),
+                        "role": user["role"],
+                    }
+                    if user
+                    else None,
+                },
             )
             return
         if path == "/portal-api/dashboard":
@@ -1705,7 +1911,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             except RuntimeError as error:
                 self.json_response(502, {"error": str(error)})
                 return
-            self.app.db.audit(user["email"], "usage.detail.view", request_id, "success", self.remote_addr())
+            self.app.db.audit(user_identity(user), "usage.detail.view", request_id, "success", self.remote_addr())
             self.json_response(200, detail)
             return
         if path.startswith("/portal-api/admin/usage/"):
@@ -1724,7 +1930,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 self.json_response(502, {"error": str(error)})
                 return
             self.app.db.audit(
-                user["email"], "admin.usage.detail.view", request_id, "success", self.remote_addr()
+                user_identity(user), "admin.usage.detail.view", request_id, "success", self.remote_addr()
             )
             self.json_response(200, detail)
             return
@@ -1745,6 +1951,23 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     )
                 except ValueError as error:
                     self.json_response(400, {"error": str(error)})
+            return
+        if path == "/portal-api/admin/stress":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+                    run_id = values.get("id", [""])[-1].strip()
+                    result = (
+                        self.app.control.sync_stress_run(run_id)
+                        if run_id
+                        else {"runs": self.app.control.stress_runs()}
+                    )
+                    self.json_response(200, result)
+                except ValueError as error:
+                    self.json_response(404, {"error": str(error)})
+                except Exception as error:
+                    self.json_response(502, {"error": str(error)})
             return
         if path == "/portal-api/admin":
             user, _ = self.api_require(admin=True)
@@ -1811,20 +2034,22 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.json_response(403, {"error": "CSRF validation failed"})
             return
         try:
-            if path == "/portal-api/key/rotate":
+            if path == "/portal-api/key/reveal":
+                result = self.api_reveal_key(user)
+            elif path == "/portal-api/key/rotate":
                 result = self.api_rotate_key(user)
             elif path == "/portal-api/admin/free/discover":
                 result = self.app.control.discover_free_resources()
             elif path == "/portal-api/admin/free/test":
                 result = self.app.control.test_free_resource(str(payload.get("resource_key", "")))
             elif path == "/portal-api/admin/models/save":
-                result = self.app.control.save_model(payload, user["email"])
+                result = self.app.control.save_model(payload, user_identity(user))
             elif path == "/portal-api/admin/models/inspect":
                 result = self.app.control.inspect_model(payload)
             elif path == "/portal-api/admin/models/test":
                 result = self.app.control.test_published_model(str(payload.get("model_id", "")))
             elif path == "/portal-api/admin/users/update":
-                self.app.control.update_user(payload, user["email"])
+                self.app.control.update_user(payload, user_identity(user))
                 result = {"ok": True}
             elif path == "/portal-api/admin/groups/save":
                 # save_group owns the fail-closed quiesce/mutate/resync cycle.
@@ -1840,20 +2065,32 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 )
             elif path == "/portal-api/admin/billing/reconcile":
                 result = self.app.control.reconcile_usage()
+            elif path == "/portal-api/admin/stress/start":
+                result = self.app.control.start_stress_run(payload, user_identity(user))
+            elif path == "/portal-api/admin/stress/cancel":
+                result = self.app.control.cancel_stress_run(str(payload.get("id", "")))
             elif path == "/portal-api/admin/settings":
                 result = self.api_update_settings(payload)
             elif path == "/portal-api/admin/smtp/test":
                 config = self.smtp_config_from_payload(payload)
-                send_test_email(config, str(payload.get("recipient", user["email"])))
+                send_test_email(config, str(payload.get("recipient", "")))
                 result = {"ok": True}
             else:
                 self.json_response(404, {"error": "not found"})
                 return
         except Exception as error:
-            self.app.db.audit(user["email"], path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
+            self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
             self.json_response(400 if isinstance(error, ValueError) else 502, {"error": str(error)})
             return
-        self.app.db.audit(user["email"], path.removeprefix("/portal-api/"), str(payload.get("id", "")), "success", self.remote_addr(), result)
+        # Never persist plaintext credentials in the audit ledger. The event
+        # proves that a reveal/rotation happened without copying the secret.
+        audit_result = (
+            {"ok": bool(result.get("ok"))}
+            if path in {"/portal-api/key/reveal", "/portal-api/key/rotate"}
+            and isinstance(result, dict)
+            else result
+        )
+        self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "success", self.remote_addr(), audit_result)
         self.json_response(200, result)
 
     def api_login(self, payload: dict[str, Any]) -> None:
@@ -1861,17 +2098,18 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.json_response(403, {"error": "CSRF validation failed"})
             return
         remote = self.remote_addr()
+        supplied_identity = str(payload.get("identity", payload.get("email", "")))
         try:
-            email, _ = normalize_email(str(payload.get("email", "")))
+            normalized_identity = normalize_login_name(supplied_identity)
         except ValueError:
-            email = ""
-        identity = token_hash(f"{remote}|{email}")
+            normalized_identity = ""
+        identity = token_hash(f"{remote}|{normalized_identity}")
         with self.app.db.connect() as connection:
             failure = connection.execute("SELECT * FROM login_failures WHERE identity_hash=?", (identity,)).fetchone()
             if failure and failure["locked_until"] > now():
                 self.json_response(429, {"error": "too many attempts; try again later"})
                 return
-            user = connection.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            user, matched_identity = find_user_by_login(connection, supplied_identity)
             valid = bool(user and user["status"] == "active" and verify_password(str(payload.get("password", "")), user["password_hash"]))
             if not valid:
                 current = now()
@@ -1890,7 +2128,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 )
                 connection.execute("UPDATE users SET last_login_at=? WHERE id=?", (now(), user["id"]))
         if not valid:
-            self.app.db.audit("anonymous", "login.failed", email or "invalid", "denied", remote)
+            self.app.db.audit("anonymous", "login.failed", normalized_identity or "invalid", "denied", remote)
             self.json_response(401, {"error": "invalid credentials or account status"})
             return
         secure = "; Secure" if self.app.config.cookie_secure else ""
@@ -1898,8 +2136,19 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}",
             f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}",
         ]
-        self.app.db.audit(email, "login.success", user["id"], "success", remote)
-        self.json_response(200, {"user": {"id": user["id"], "email": email, "role": user["role"]}})
+        login_name = user_identity(user)
+        self.app.db.audit(login_name, "login.success", user["id"], "success", remote)
+        self.json_response(
+            200,
+            {
+                "user": {
+                    "id": user["id"],
+                    "email": user["email"] if user["role"] == "user" else "",
+                    "login_name": login_name,
+                    "role": user["role"],
+                }
+            },
+        )
 
     def api_register(self, payload: dict[str, Any]) -> None:
         if not self.api_csrf_valid():
@@ -1937,12 +2186,15 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             else:
                 user_id = str(uuid.uuid4())
             if not ignored_reason and user:
-                connection.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id))
+                connection.execute(
+                    "UPDATE users SET login_name=?,password_hash=? WHERE id=?",
+                    (email, password_hash, user_id),
+                )
                 connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             elif not ignored_reason:
                 connection.execute(
-                    "INSERT INTO users(id,email,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (user_id, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], stamp),
+                    "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], stamp),
                 )
             if not ignored_reason:
                 connection.execute(
@@ -2060,6 +2312,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}",
         ]
         self.json_response(200, {"ok": True, "api_key": raw_key})
+
+    def api_reveal_key(self, user: sqlite3.Row) -> dict[str, Any]:
+        if user["role"] != "user":
+            raise ValueError("only user API keys can be revealed here")
+        key_id = str(user["api_key_id"] or "")
+        if not key_id:
+            raise ValueError("账户尚未配置 API Key")
+        return {"ok": True, "api_key": self.app.omni.reveal_user_key(key_id)}
 
     def api_rotate_key(self, user: sqlite3.Row) -> dict[str, Any]:
         if user["role"] != "user":
@@ -2201,7 +2461,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
 
     def show_login(self, message: str = "", error: bool = False) -> None:
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<section class="card" style="max-width:520px;margin:auto"><h1>登录 / Sign in</h1><form method="post" action="/login"><input type="hidden" name="csrf" value="__CSRF__"><label>邮箱 / Email</label><input name="email" type="email" autocomplete="username" required><label>密码 / Password</label><input name="password" type="password" autocomplete="current-password" required><p><button>登录 / Sign in</button></p></form><a href="/register">注册新账户 / Create account</a></section>'''
+        body = f'''{flash}<section class="card" style="max-width:520px;margin:auto"><h1>登录 / Sign in</h1><form method="post" action="/login"><input type="hidden" name="csrf" value="__CSRF__"><label>登录名或邮箱 / Username or email</label><input name="identity" type="text" autocomplete="username" required><label>密码 / Password</label><input name="password" type="password" autocomplete="current-password" required><p><button>登录 / Sign in</button></p></form><a href="/register">注册新账户 / Create account</a></section>'''
         self.response(200, page("Sign in", body))
 
     def show_register(self, message: str = "", error: bool = False) -> None:
@@ -2313,7 +2573,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.response(403, page("Forbidden", '<div class="card error">CSRF validation failed</div>'))
             return
         remote = self.client_address[0]
-        identity = token_hash(f"{remote}|{form.get('email','').lower()}")
+        supplied_identity = form.get("identity", form.get("email", ""))
+        try:
+            normalized_identity = normalize_login_name(supplied_identity)
+        except ValueError:
+            normalized_identity = ""
+        identity = token_hash(f"{remote}|{normalized_identity}")
         audit_action = ""
         audit_target = ""
         with self.app.db.connect() as connection:
@@ -2325,12 +2590,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 locked = True
             else:
                 locked = False
-            try:
-                email, _ = normalize_email(form.get("email", ""))
-            except ValueError:
-                email = ""
             if not locked:
-                user = connection.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+                user, _ = find_user_by_login(connection, supplied_identity)
                 candidate_hash = user["password_hash"] if user else DUMMY_PASSWORD_HASH
                 password_valid = verify_password(form.get("password", ""), candidate_hash)
                 valid = bool(user and user["status"] == "active" and password_valid)
@@ -2342,7 +2603,10 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     attempts = 1 if not failure or current - failure["window_started_at"] > 900 else failure["attempts"] + 1
                     lock_until = current + 900 if attempts >= 5 else 0
                     connection.execute("INSERT INTO login_failures(identity_hash,attempts,window_started_at,locked_until) VALUES(?,?,?,?) ON CONFLICT(identity_hash) DO UPDATE SET attempts=excluded.attempts,window_started_at=excluded.window_started_at,locked_until=excluded.locked_until", (identity, attempts, current if attempts == 1 else failure["window_started_at"], lock_until))
-                    audit_action, audit_target = "login.failed", email or "invalid"
+                    audit_action, audit_target = (
+                        "login.failed",
+                        normalized_identity or "invalid",
+                    )
             else:
                 connection.execute("DELETE FROM login_failures WHERE identity_hash=?", (identity,))
                 raw_session = secrets.token_urlsafe(32)
@@ -2355,9 +2619,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             if locked:
                 self.show_login("尝试次数过多，请稍后重试 / Too many attempts", True)
             else:
-                self.show_login("邮箱、密码或账户状态无效 / Invalid credentials or account", True)
+                self.show_login("登录名、密码或账户状态无效 / Invalid credentials or account", True)
             return
-        self.app.db.audit(email, "login.success", user["id"], "success", remote)
+        self.app.db.audit(user_identity(user), "login.success", user["id"], "success", remote)
         secure = "; Secure" if self.app.config.cookie_secure else ""
         self.redirect("/admin" if user["role"] == "admin" else "/", [f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}"])
 
@@ -2408,11 +2672,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 if latest and now() - latest["created_at"] < 60:
                     throttled = True
                 else:
-                    connection.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id))
+                    connection.execute(
+                        "UPDATE users SET login_name=?,password_hash=? WHERE id=?",
+                        (email, password_hash, user_id),
+                    )
                     connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             else:
                 user_id = str(uuid.uuid4())
-                connection.execute("INSERT INTO users(id,email,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (user_id, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], now()))
+                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], now()))
             if not duplicate_active and not throttled:
                 connection.execute("INSERT INTO verification_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", (token_hash(raw_token), user_id, now() + self.app.config.verification_ttl, now()))
         if duplicate_active or throttled:
@@ -2602,6 +2869,7 @@ class PortalControlPlane:
         self.config, self.db, self.omni = config, db, omni
         self.lock = threading.RLock()
         self.usage_reconciled_at: dict[str, int] = {}
+        self.free_visibility_reconciled_at = 0
 
     @staticmethod
     def rows(rows: Any) -> list[dict[str, Any]]:
@@ -3005,12 +3273,46 @@ class PortalControlPlane:
                     f"UPDATE free_resources SET available=0,updated_at=? WHERE resource_key NOT IN ({placeholders})",
                     (stamp, *sorted(seen)),
                 )
+        visibility = self.refresh_free_resource_visibility()
+        self.free_visibility_reconciled_at = now()
         return {
             "catalog": len(catalog),
             "configured_providers": len(configured),
             "available_providers": len(available),
             "resources": len(seen),
+            "hidden_resources": visibility["hidden"],
         }
+
+    def refresh_free_resource_visibility(self) -> dict[str, int]:
+        """Mirror OmniRoute's native eye-hidden state without owning that state."""
+        with self.db.connect() as connection:
+            providers = [
+                str(row["provider"])
+                for row in connection.execute(
+                    "SELECT DISTINCT provider FROM free_resources WHERE configured=1"
+                )
+            ]
+        hidden_total = reconciled = failed = 0
+        for provider in providers:
+            try:
+                hidden = self.omni.hidden_provider_models(provider)
+            except RuntimeError:
+                failed += 1
+                continue
+            with self.db.connect() as connection:
+                rows = connection.execute(
+                    "SELECT resource_key,model_id FROM free_resources WHERE provider=?",
+                    (provider,),
+                ).fetchall()
+                for row in rows:
+                    visible = 0 if str(row["model_id"]) in hidden else 1
+                    hidden_total += 1 - visible
+                    connection.execute(
+                        "UPDATE free_resources SET native_visible=?,updated_at=? WHERE resource_key=?",
+                        (visible, now(), row["resource_key"]),
+                    )
+            reconciled += 1
+        return {"providers": reconciled, "failed": failed, "hidden": hidden_total}
 
     def test_free_resource(self, resource_key: str) -> dict[str, Any]:
         with self.db.connect() as connection:
@@ -3027,9 +3329,14 @@ class PortalControlPlane:
                     (error, now(), now(), resource_key),
                 )
             raise ValueError(error)
-        qualified_model_id = f"{resource['provider']}/{resource['model_id']}"
         try:
-            latency, content = self.omni.test_model(qualified_model_id)
+            # Free providers can require streaming, provider-specific endpoints,
+            # capability negotiation, or a connection selected by OmniRoute.
+            # Reuse its native dashboard probe so the portal and native UI have
+            # one testing contract instead of two subtly different adapters.
+            latency, content = self.omni.test_provider_model(
+                str(resource["provider"]), str(resource["model_id"])
+            )
             status, available, error = "healthy", 1, ""
         except Exception as exc:
             latency, content, status, available, error = None, "", "failed", 0, str(exc)[:500]
@@ -3688,6 +3995,9 @@ class PortalControlPlane:
         self.reset_due_grants()
         models = self.effective_models(user_id)
         with self.db.connect() as connection:
+            key_record = connection.execute(
+                "SELECT api_key_id FROM users WHERE id=?", (user_id,)
+            ).fetchone()
             account = connection.execute("SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)).fetchone()
             grants = self.rows(connection.execute("SELECT * FROM token_grants WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall())
             transactions = self.rows(connection.execute("SELECT * FROM balance_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall())
@@ -3703,6 +4013,7 @@ class PortalControlPlane:
         return {
             "balance": micros_to_money(int(account["balance_micros"]) if account else 0),
             "suspended": bool(account["suspended"]) if account else False,
+            "has_api_key": bool(key_record and key_record["api_key_id"]),
             "models": result_models,
             "grants": grants,
             "usage": usage_page["items"],
@@ -3812,7 +4123,272 @@ class PortalControlPlane:
         )
         return summary
 
+    @property
+    def stress_root(self) -> pathlib.Path:
+        return self.config.db_path.parent / "stress"
+
+    @staticmethod
+    def process_alive(pid: int | None) -> bool:
+        if not pid or pid <= 1:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+    @staticmethod
+    def stress_process_matches(pid: int, run_id: str) -> bool:
+        """Do not signal a recycled PID that no longer belongs to this run."""
+        try:
+            arguments = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\x00")
+        except OSError:
+            return False
+        decoded = [value.decode("utf-8", errors="replace") for value in arguments]
+        return run_id in decoded and any(
+            pathlib.Path(value).name == "llm_benchmark.py" for value in decoded
+        )
+
+    def sync_stress_run(self, run_id: str) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM stress_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        if not row:
+            raise ValueError("压测任务不存在")
+        record = dict(row)
+        status_path = pathlib.Path(record["result_dir"]) / "status.json"
+        status_document: dict[str, Any] = {}
+        if status_path.is_file():
+            try:
+                value = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    status_document = value
+            except (OSError, json.JSONDecodeError):
+                pass
+        stored_status = str(record["status"])
+        file_status = str(status_document.get("status", stored_status))
+        terminal_statuses = {"completed", "failed", "canceled"}
+        if stored_status in terminal_statuses and file_status not in terminal_statuses:
+            status = stored_status
+        elif stored_status == "canceling" and file_status not in terminal_statuses:
+            status = "canceling"
+        else:
+            status = file_status
+        if status not in {"starting", "running", "canceling", "completed", "failed", "canceled"}:
+            status = "failed"
+        pid = int(record.get("pid") or 0)
+        if status == "canceling" and not self.process_alive(pid):
+            status = "canceled"
+        elif status in {"starting", "running"} and not self.process_alive(pid):
+            grace_expired = now() - int(record["created_at"]) > 5
+            if grace_expired:
+                status = "failed"
+                status_document["error"] = status_document.get("error") or "压测执行器意外退出"
+        metrics = status_document.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        finished_at = (
+            int(status_document.get("updated_at", now()))
+            if status in {"completed", "failed", "canceled"}
+            else None
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE stress_runs SET status=?,metrics_json=?,error=?,started_at=COALESCE(started_at,?),finished_at=COALESCE(?,finished_at),updated_at=? WHERE id=?",
+                (
+                    status,
+                    json.dumps(metrics, ensure_ascii=False, separators=(",", ":")),
+                    str(status_document.get("error", ""))[:500],
+                    status_document.get("started_at"),
+                    finished_at,
+                    now(),
+                    run_id,
+                ),
+            )
+            current = connection.execute(
+                "SELECT * FROM stress_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        result = dict(current)
+        result["metrics"] = json.loads(result.pop("metrics_json") or "{}")
+        result["progress"] = float(status_document.get("progress", 0) or 0)
+        result["elapsed_seconds"] = float(status_document.get("elapsed_seconds", 0) or 0)
+        event_path = pathlib.Path(result["result_dir"]) / "events.jsonl"
+        events: list[dict[str, Any]] = []
+        if event_path.is_file():
+            try:
+                lines = event_path.read_text(encoding="utf-8").splitlines()[-20:]
+                for line in lines:
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        events.append(value)
+            except (OSError, json.JSONDecodeError):
+                events = []
+        result["recent_requests"] = events
+        result.pop("result_dir", None)
+        result.pop("pid", None)
+        return result
+
+    def stress_runs(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self.db.connect() as connection:
+            identifiers = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM stress_runs ORDER BY created_at DESC LIMIT ?",
+                    (max(1, min(limit, 100)),),
+                )
+            ]
+        return [self.sync_stress_run(identifier) for identifier in identifiers]
+
+    def start_stress_run(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        try:
+            concurrency = int(payload.get("concurrency", 1))
+            input_tokens = int(payload.get("input_tokens", 50))
+            output_tokens = int(payload.get("output_tokens", 128))
+            request_multiplier = int(payload.get("request_multiplier", 2))
+        except (TypeError, ValueError) as error:
+            raise ValueError("压测参数必须为整数") from error
+        if concurrency not in STRESS_CONCURRENCY_CHOICES:
+            raise ValueError("不支持该并发档位")
+        if input_tokens not in STRESS_INPUT_TOKEN_CHOICES:
+            raise ValueError("不支持该提示词 Token 档位")
+        if output_tokens not in STRESS_OUTPUT_TOKEN_CHOICES:
+            raise ValueError("不支持该最大输出 Token 档位")
+        if request_multiplier not in STRESS_REQUEST_MULTIPLIER_CHOICES:
+            raise ValueError("每并发请求轮次必须为 1-4")
+        if (concurrency >= 20 or input_tokens >= 8000) and payload.get("risk_confirmed") is not True:
+            raise ValueError("高负载压测必须确认风险")
+        model = str(payload.get("model", "")).strip()
+        with self.lock:
+            with self.db.connect() as connection:
+                published = connection.execute(
+                    "SELECT 1 FROM published_models WHERE public_model_id=? AND status='published'",
+                    (model,),
+                ).fetchone()
+                active = connection.execute(
+                    "SELECT id FROM stress_runs WHERE status IN ('starting','running','canceling') ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+            if not published:
+                raise ValueError("只能压测已发布的公开模型 ID")
+            if active:
+                current = self.sync_stress_run(str(active["id"]))
+                if current["status"] in {"starting", "running", "canceling"}:
+                    raise ValueError("已有压测任务正在运行，请等待完成或先停止")
+            runner = pathlib.Path(__file__).resolve().with_name("llm_benchmark.py")
+            if not runner.is_file():
+                raise RuntimeError("缺少后台压测执行器 llm_benchmark.py")
+            run_id = str(uuid.uuid4())
+            run_dir = self.stress_root / run_id
+            run_dir.mkdir(parents=True, exist_ok=False)
+            os.chmod(run_dir, 0o700)
+            command = [
+                sys.executable,
+                str(runner),
+                "--run-id", run_id,
+                "--base-url", self.config.gateway_url,
+                "--model", model,
+                "--concurrency", str(concurrency),
+                "--input-tokens", str(input_tokens),
+                "--output-tokens", str(output_tokens),
+                "--request-multiplier", str(request_multiplier),
+                "--result-dir", str(run_dir),
+            ]
+            environment = os.environ.copy()
+            environment["LLMCTL_BENCHMARK_API_KEY"] = self.config.gateway_manage_key
+            log_file = (run_dir / "runner.log").open("ab", buffering=0)
+            try:
+                process = subprocess.Popen(  # noqa: S603 - fixed local executable and validated arguments
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            finally:
+                log_file.close()
+            stamp = now()
+            try:
+                with self.db.connect() as connection:
+                    connection.execute(
+                        """INSERT INTO stress_runs(id,public_model_id,concurrency,target_input_tokens,max_output_tokens,request_multiplier,request_count,status,pid,result_dir,created_by,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            run_id, model, concurrency, input_tokens, output_tokens,
+                            request_multiplier, concurrency * request_multiplier,
+                            "starting", process.pid, str(run_dir), actor, stamp, stamp,
+                        ),
+                    )
+            except Exception:
+                # Popen succeeded but the durable run record did not.  Never leave an
+                # untracked benchmark consuming the gateway/GPU in the background.
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                raise
+            threading.Thread(
+                target=process.wait,
+                name=f"stress-reaper-{run_id[:8]}",
+                daemon=True,
+            ).start()
+        return self.sync_stress_run(run_id)
+
+    def cancel_stress_run(self, run_id: str) -> dict[str, Any]:
+        current = self.sync_stress_run(run_id)
+        if current["status"] not in {"starting", "running", "canceling"}:
+            return current
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT pid FROM stress_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            connection.execute(
+                "UPDATE stress_runs SET status='canceling',updated_at=? WHERE id=?",
+                (now(), run_id),
+            )
+        pid = int(row["pid"] or 0)
+        if self.process_alive(pid) and self.stress_process_matches(pid, run_id):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pid, signal.SIGTERM)
+
+            def enforce_stop() -> None:
+                time.sleep(10)
+                with self.db.connect() as connection:
+                    latest = connection.execute(
+                        "SELECT pid,status FROM stress_runs WHERE id=?", (run_id,)
+                    ).fetchone()
+                if not latest or latest["status"] != "canceling":
+                    return
+                latest_pid = int(latest["pid"] or 0)
+                if not (
+                    self.process_alive(latest_pid)
+                    and self.stress_process_matches(latest_pid, run_id)
+                ):
+                    return
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(latest_pid, signal.SIGKILL)
+                with self.db.connect() as connection:
+                    connection.execute(
+                        "UPDATE stress_runs SET status='canceled',error=?,finished_at=?,updated_at=? WHERE id=? AND status='canceling'",
+                        ("停止等待超过 10 秒，已强制结束后台压测进程", now(), now(), run_id),
+                    )
+
+            threading.Thread(
+                target=enforce_stop,
+                name=f"stress-stop-{run_id[:8]}",
+                daemon=True,
+            ).start()
+        return self.sync_stress_run(run_id)
+
     def admin_snapshot(self) -> dict[str, Any]:
+        stamp = now()
+        if stamp - self.free_visibility_reconciled_at >= 30:
+            self.refresh_free_resource_visibility()
+            self.free_visibility_reconciled_at = stamp
         with self.db.connect() as connection:
             users = self.rows(connection.execute("SELECT u.*,b.balance_micros,b.suspended,p.status permission_status,p.error permission_error FROM users u LEFT JOIN billing_accounts b ON b.user_id=u.id LEFT JOIN permission_sync p ON p.user_id=u.id ORDER BY u.created_at DESC").fetchall())
             groups = self.rows(connection.execute("SELECT g.*,COUNT(m.user_id) member_count FROM user_groups g LEFT JOIN user_group_members m ON m.group_id=g.id GROUP BY g.id ORDER BY g.name").fetchall())
@@ -3847,13 +4423,14 @@ class PortalControlPlane:
             # The control plane remains useful for account, SMTP, ledger, and
             # audit recovery while the data plane is temporarily unavailable.
             gateway_error = str(error)
+        stress_runs = self.stress_runs()
         return {
             "users": users, "groups": groups, "memberships": memberships, "models": models,
             "free_resources": free, "settings": settings, "audit": audits, "grants": grants,
             "usage": usage_page["items"],
             "usage_pagination": {key: usage_page[key] for key in ("page", "page_size", "pages", "total")},
             "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
-            "gateway_error": gateway_error,
+            "gateway_error": gateway_error, "stress_runs": stress_runs,
         }
 
     def update_user(self, payload: dict[str, Any], actor: str) -> None:
@@ -4054,7 +4631,13 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("serve", "check-config", "reset-admin-password", "dump-config"),
+        choices=(
+            "serve",
+            "check-config",
+            "set-admin-username",
+            "reset-admin-password",
+            "dump-config",
+        ),
         default="serve",
     )
     parser.add_argument(
@@ -4067,6 +4650,25 @@ def main() -> None:
     if args.command == "check-config":
         print(json.dumps({"ok": True, "db": str(config.db_path), "registration": config.initial_registration}))
         return
+    if args.command == "set-admin-username":
+        database = Database(config)
+        database.initialize()
+        with database.connect() as connection:
+            changed = connection.execute(
+                "UPDATE users SET login_name=? WHERE role='admin'",
+                (config.admin_username,),
+            ).rowcount
+        if changed != 1:
+            raise SystemExit("expected exactly one portal administrator")
+        database.audit(
+            "system",
+            "admin.username.updated",
+            config.admin_username,
+            "success",
+            "local",
+        )
+        print("portal administrator username updated")
+        return
     if args.command == "reset-admin-password":
         if not config.admin_password:
             raise SystemExit("ACCOUNT_ADMIN_PASSWORD is required")
@@ -4075,11 +4677,17 @@ def main() -> None:
         with database.connect() as connection:
             changed = connection.execute(
                 "UPDATE users SET password_hash=? WHERE role='admin'",
-                (hash_password(config.admin_password),),
+                (hash_admin_password(config.admin_password),),
             ).rowcount
         if changed != 1:
             raise SystemExit("expected exactly one portal administrator")
-        database.audit("system", "admin.password.reset", config.admin_email, "success", "local")
+        database.audit(
+            "system",
+            "admin.password.reset",
+            config.admin_username,
+            "success",
+            "local",
+        )
         print("portal administrator password updated")
         return
     if args.command == "dump-config":

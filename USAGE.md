@@ -121,7 +121,13 @@ sudo llmctl key rotate
 sudo llmctl admin show
 sudo llmctl admin set-username NEW_ADMIN
 sudo llmctl admin set-password
+sudo llmctl admin set-portal-username NEW_ADMIN
+sudo llmctl admin set-portal-password
+sudo llmctl admin set-gateway-username NEW_ADMIN
+sudo llmctl admin set-gateway-password
 ```
+
+`set-username`/`set-password` 修改所有适用的管理员入口；带 `portal` 或 `gateway` 的命令只修改指定入口。OmniRoute 原生界面只有管理员密码，没有用户名，因此 `set-gateway-username` 在 OmniRoute 模式会明确提示不适用，门户用户名仍可设为任意非空登录名，不要求是邮箱。门户/网关管理员密码只要求非空、不能全是数字，也不能含换行或空字符；普通注册用户密码仍要求 8–200 位且不能全是数字。
 
 New API 和 OmniRoute 的维护调用令牌由各自数据库生成，所以 `key rotate` 不接受自定义值；LiteLLM 和 Bifrost 可选传入新值，Bifrost 值必须以 `sk-bf-` 开头。OmniRoute 普通用户自己的 key 应在账户门户内轮换，不受这个管理员命令影响。
 
@@ -134,7 +140,7 @@ OmniRoute 自身没有完整的企业注册和易用计费流程。LLMCtl 因此
 /var/lib/llm-cluster/omniroute/portal/account-portal.db
 ```
 
-第一项完全归 OmniRoute 管理；第二项保存门户用户/用户组、验证状态、会话、公开模型、授权、价格版本、金额流水、token 赠额、使用账本和门户审计。门户数据库不保存明文 API key；用户验证邮箱后只显示一次新 key，之后只能轮换。门户定期读取 OmniRoute 调用日志，以请求 ID 幂等结算；进行结算和权限变更时先停用用户 key，提交账本后再同步新权限，失败时保持关闭。
+第一项完全归 OmniRoute 管理；第二项保存门户用户/用户组、验证状态、会话、公开模型、授权、价格版本、金额流水、token 赠额、使用账本和门户审计。门户数据库不保存明文 API Key。用户验证邮箱时创建一把长期固定 Key；以后登录只通过受保护的 OmniRoute 管理接口读取同一把 Key，并暂存在当前浏览器会话，curl 示例也自动使用它。读取动作会审计但不会记录明文；只有用户主动点击“轮换”才会创建新 Key 并撤销旧 Key。门户定期读取 OmniRoute 调用日志，以请求 ID 幂等结算；进行结算和权限变更时先停用用户 Key，提交账本后再同步新权限，失败时保持关闭。
 
 默认关闭公开注册。启用时必须配置精确邮箱域名白名单、公开门户地址和外部 SMTP。例如：
 
@@ -145,7 +151,7 @@ sudo bash install-llm-cluster.sh \
   --allowed-email-domains example.com,subsidiary.example.com \
   --account-public-url https://llm.example.com \
   --account-api-public-url https://llm-api.example.com \
-  --account-admin-email llm-admin@example.com \
+  --account-admin-username llm-admin \
   --account-default-quota 1000000 \
   --account-quota-reset monthly \
   --smtp-host smtp.example.com \
@@ -169,7 +175,9 @@ sudo llmctl account restart
 sudo llmctl logs account -f
 ```
 
-门户公开地址是 `http://服务器IP:8000/ui/`，`8001` 只是回环内部监听。用户登录后可查看金额、token 赠额、逐请求用量和流水；模型广场只显示本人有效授权，提供价格/能力、可复制模型 ID、调用地址和 `curl` 示例。在线聊天窗口由浏览器直接调用公开 `/v1`，个人 key 只存在当前浏览器 sessionStorage，不经过门户后端。OCR/视觉/工具等标签来自安装时已核验或管理员确认的能力元数据，不改变 vLLM 的实际能力。
+门户公开地址是 `http://服务器IP:8000/ui/`，`8001` 只是回环内部监听。用户登录后可查看金额、token 赠额、逐请求用量和流水；模型广场只显示本人有效授权，提供价格/能力、可复制模型 ID、调用地址和 `curl` 示例。在线聊天窗口由浏览器直接调用公开 `/v1`，个人 key 只存在当前浏览器 sessionStorage，不经过门户后端。它支持图片、PDF、TXT、Markdown、CSV 和 JSON 附件：图片以 data URL 发给具备视觉能力的模型，PDF 最多取前 8 页在本地渲染为 JPEG，多余或超限文件会在发送前明确拒绝；附件不会保存进门户数据库。OCR/视觉/工具等标签来自安装时已核验或管理员确认的能力元数据，不改变 vLLM 的实际能力。
+
+管理端“性能压测”由服务器上的 `llm_benchmark.py` 执行，页面不会自行创建并发请求。可选并发为 1–100 的预设档位，目标输入为 50–30K Token；执行器生成可复现且有语义的企业场景文本，通过公开模型 ID 发起真实流式请求，并以网关 `usage` 返回值作为实际 Token 统计。页面每两秒读取任务状态，展示成功率、总/成功 RPS、聚合输出 tok/s、单请求 tok/s、TTFT 与端到端延迟分位数、实际输入/输出 Token 和错误分类。并发不少于 20 或输入不少于 8K 时必须确认对在线用户和 GPU 的影响；同一时间只允许一个任务，API key 只通过进程环境传递，不写入命令行或结果文件。
 
 OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显示降级告警，并允许查看用户、SMTP、账本和审计；依赖网关的模型、Key、权限和实时对账操作会明确失败，不会伪装成功。`llmctl startup status` 会把这种状态标为 `degraded`，而完整启动验收仍要求门户 `/ready` 与 OmniRoute 一起恢复。
 

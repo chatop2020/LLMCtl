@@ -23,6 +23,7 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/runtime_optimizer.py",
             "lib/gateway_config.py",
             "lib/account_portal.py",
+            "lib/llm_benchmark.py",
         ]
         files.extend(
             str(path.relative_to(ROOT))

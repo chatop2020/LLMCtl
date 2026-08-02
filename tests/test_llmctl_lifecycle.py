@@ -466,8 +466,8 @@ class LlmctlLifecycleTests(unittest.TestCase):
             )
         lines = completed.stdout.splitlines()
         self.assertLess(lines.index("portal <NewPassword456>"), lines.index("gateway <NewPassword456>"))
-        self.assertIn("systemctl <restart> <llm-account.service>", lines)
-        self.assertIn("portal-ready", lines)
+        self.assertNotIn("systemctl <restart> <llm-account.service>", lines)
+        self.assertNotIn("portal-ready", lines)
 
 
 if __name__ == "__main__":

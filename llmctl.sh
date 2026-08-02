@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.6.0"
+readonly CTL_VERSION="2.7.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -108,7 +108,13 @@ load_config() {
   DOCKER_NETWORK="${DOCKER_NETWORK:-llm-cluster-net}"
   ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-}"
   ACCOUNT_API_PUBLIC_URL="${ACCOUNT_API_PUBLIC_URL:-}"
-  ACCOUNT_ADMIN_EMAIL="${ACCOUNT_ADMIN_EMAIL:-admin@llmctl.local}"
+  ACCOUNT_ADMIN_USERNAME_B64="${ACCOUNT_ADMIN_USERNAME_B64:-}"
+  if [[ -n "${ACCOUNT_ADMIN_USERNAME_B64}" ]]; then
+    ACCOUNT_ADMIN_USERNAME=$(python3 -c 'import base64,sys; print(base64.b64decode(sys.argv[1], validate=True).decode("utf-8"), end="")' "${ACCOUNT_ADMIN_USERNAME_B64}") || \
+      die "ACCOUNT_ADMIN_USERNAME_B64 无效"
+  else
+    ACCOUNT_ADMIN_USERNAME="${ACCOUNT_ADMIN_USERNAME:-${ACCOUNT_ADMIN_EMAIL:-admin}}"
+  fi
   ACCOUNT_DB_PATH="${ACCOUNT_DB_PATH:-${ACCOUNT_SQLITE}}"
   ACCOUNT_REGISTRATION_ENABLED="${ACCOUNT_REGISTRATION_ENABLED:-0}"
   ACCOUNT_ALLOWED_EMAIL_DOMAINS="${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-}"
@@ -168,6 +174,7 @@ cmd_gateway_start() {
   load_config
   local name
   name=$(gateway_display_name)
+  export UI_USERNAME UI_PASSWORD
   log "启动 ${name}：镜像=${GATEWAY_IMAGE}，内部入口=127.0.0.1:${GATEWAY_INTERNAL_PORT}，公开入口由 Nginx ${API_BIND}:${API_PORT} 提供。"
   ensure_docker_network
   case "${GATEWAY_KIND}" in
@@ -175,7 +182,7 @@ cmd_gateway_start() {
       docker volume create llm-cluster-gateway-data >/dev/null
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" \
+        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
         -e "PORT=${GATEWAY_INTERNAL_PORT}" -e "TZ=${TZ:-Asia/Shanghai}" \
         -e ERROR_LOG_ENABLED=true -e BATCH_UPDATE_ENABLED=true \
         -v llm-cluster-gateway-data:/data \
@@ -184,7 +191,7 @@ cmd_gateway_start() {
     litellm)
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" \
+        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
         -v "${LITELLM_CONFIG}:/app/config.yaml:ro" \
         "${GATEWAY_IMAGE}" --config /app/config.yaml --host 0.0.0.0 --port "${GATEWAY_INTERNAL_PORT}"
       ;;
@@ -192,7 +199,7 @@ cmd_gateway_start() {
       docker volume create llm-cluster-gateway-data >/dev/null
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" \
+        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
         -e APP_DIR=/app/data -e APP_HOST=0.0.0.0 -e "APP_PORT=${GATEWAY_INTERNAL_PORT}" \
         -v llm-cluster-gateway-data:/app/data \
         -v "${BIFROST_CONFIG}:/app/data/config.json:ro" \
@@ -202,7 +209,7 @@ cmd_gateway_start() {
       install -d -m 770 -o 1000 -g 1000 "${STATE_DIR}/omniroute/gateway"
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" \
+        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
         -e HOST=0.0.0.0 -e API_HOST=0.0.0.0 \
         -e "PORT=${GATEWAY_INTERNAL_PORT}" -e "DASHBOARD_PORT=${GATEWAY_INTERNAL_PORT}" -e "API_PORT=${GATEWAY_INTERNAL_PORT}" \
         -e "INITIAL_PASSWORD=${UI_PASSWORD}" -e "JWT_SECRET=${OMNIROUTE_JWT_SECRET}" \
@@ -210,6 +217,7 @@ cmd_gateway_start() {
         -e "STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}" \
         -e STORAGE_ENCRYPTION_KEY_VERSION=v1 -e REQUIRE_API_KEY=true \
         -e AUTH_COOKIE_SECURE=false -e OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS=true \
+        -e ALLOW_API_KEY_REVEAL=true \
         -e ALLOW_MULTI_CONNECTIONS_PER_COMPAT_NODE=true \
         -v "${STATE_DIR}/omniroute/gateway:/app/data" \
         "${GATEWAY_IMAGE}"
@@ -324,8 +332,12 @@ usage() {
   llmctl key show                             显示调用地址、模型名和 API key
   llmctl key rotate [新KEY]                   轮换入口 key（New API 不接受自定义 KEY）
   llmctl admin show                           显示 Web UI 地址和管理员凭据
-  llmctl admin set-username USER              修改 Web UI 管理员用户名
-  llmctl admin set-password [PASSWORD]        修改密码；省略时安全交互输入
+  llmctl admin set-username USER              修改所有支持用户名的管理员入口
+  llmctl admin set-password [PASSWORD]        修改关联管理员密码；省略时安全交互输入
+  llmctl admin set-portal-username USER       仅修改账户门户管理员登录名
+  llmctl admin set-portal-password [PASSWORD] 仅修改账户门户管理员密码
+  llmctl admin set-gateway-username USER      仅修改原生网关用户名
+  llmctl admin set-gateway-password [PASSWORD] 仅修改原生网关密码
   llmctl proxy set <IP> <端口> [http|https]    保存“仅维护使用”的代理
   llmctl proxy show|clear|test                 查看/清除/测试维护代理
 
@@ -421,10 +433,11 @@ csv_remove() {
 }
 
 set_env_value() {
-  local file="${1:?}" key="${2:?}" value="${3-}" tmp
+  local file="${1:?}" key="${2:?}" value="${3-}" tmp quoted
   tmp=$(mktemp "${file}.XXXXXX")
   awk -F= -v key="${key}" '$1 != key {print}' "${file}" >"${tmp}"
-  printf '%s=%s\n' "${key}" "${value}" >>"${tmp}"
+  printf -v quoted '%q' "${value}"
+  printf '%s=%s\n' "${key}" "${quoted}" >>"${tmp}"
   chmod --reference="${file}" "${tmp}" 2>/dev/null || chmod 600 "${tmp}"
   chown --reference="${file}" "${tmp}" 2>/dev/null || true
   mv -f "${tmp}" "${file}"
@@ -612,7 +625,7 @@ gateway_helper() {
 
 account_helper() {
   export ACCOUNT_BIND ACCOUNT_PORT ACCOUNT_PUBLIC_URL ACCOUNT_API_PUBLIC_URL
-  export ACCOUNT_ADMIN_EMAIL ACCOUNT_ADMIN_PASSWORD ACCOUNT_DB_PATH
+  export ACCOUNT_ADMIN_USERNAME ACCOUNT_ADMIN_USERNAME_B64 ACCOUNT_ADMIN_PASSWORD ACCOUNT_DB_PATH
   export ACCOUNT_REGISTRATION_ENABLED ACCOUNT_ALLOWED_EMAIL_DOMAINS
   export ACCOUNT_DEFAULT_QUOTA_TOKENS ACCOUNT_QUOTA_RESET ACCOUNT_QUOTA_RESET_TIME
   export SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USERNAME SMTP_PASSWORD SMTP_FROM
@@ -1239,9 +1252,13 @@ cmd_info() {
   printf '\n[接入层与管理员 / Gateway and administrators]\n'
   printf '网关: %s (%s)\n镜像: %s\n路由策略: %s\n' "$(gateway_display_name)" "${GATEWAY_KIND}" "${GATEWAY_IMAGE}" "${ROUTING_STRATEGY}"
   printf '网关镜像 ID: %s\n' "$(docker image inspect --format '{{.Id}}' "${GATEWAY_IMAGE}" 2>/dev/null || printf unavailable)"
-  printf '原生 UI 管理员用户名: %s\n原生 UI 管理员密码: %s\n' "${UI_USERNAME}" "$(secret_value "${UI_PASSWORD}")"
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-    printf '门户管理员邮箱: %s\n门户管理员密码: %s\n' "${ACCOUNT_ADMIN_EMAIL}" "$(secret_value "${ACCOUNT_ADMIN_PASSWORD}")"
+    printf '原生 UI 管理员用户名: 不适用（OmniRoute 原生 UI 仅使用密码）\n原生 UI 管理员密码: %s\n' "$(secret_value "${UI_PASSWORD}")"
+  else
+    printf '原生 UI 管理员用户名: %s\n原生 UI 管理员密码: %s\n' "${UI_USERNAME}" "$(secret_value "${UI_PASSWORD}")"
+  fi
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf '门户管理员登录名: %s\n门户管理员密码: %s\n' "${ACCOUNT_ADMIN_USERNAME}" "$(secret_value "${ACCOUNT_ADMIN_PASSWORD}")"
   fi
 
   printf '\n[API 与内部密钥 / API and internal secrets]\n'
@@ -2500,78 +2517,141 @@ cmd_key() {
   esac
 }
 
+validate_admin_password_input() {
+  local password="${1-}"
+  [[ -n "${password}" ]] || die "管理员密码不能为空"
+  [[ "${password}" != *$'\n'* && "${password}" != *$'\r'* ]] || die "管理员密码不能包含换行"
+  python3 -c 'import sys; raise SystemExit(1 if sys.argv[1].isdecimal() else 0)' "${password}" || \
+    die "管理员密码不能全部由数字组成"
+}
+
+read_admin_password() {
+  local supplied="${1-}" password confirm=""
+  if [[ -n "${supplied}" ]]; then
+    password="${supplied}"
+  else
+    [[ -t 0 ]] || die "非交互模式请将新密码作为参数传入"
+    read -r -s -p '输入新的管理员密码: ' password
+    printf '\n' >&2
+    read -r -s -p '再次输入新密码: ' confirm
+    printf '\n' >&2
+    [[ "${password}" == "${confirm}" ]] || die "两次输入的密码不一致"
+  fi
+  validate_admin_password_input "${password}"
+  printf '%s' "${password}"
+}
+
+set_portal_username() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || die "当前部署没有 LLMCtl 账户门户"
+  local username="${1-}" encoded
+  username=$(python3 -c 'import sys; value=sys.argv[1].strip(); raise SystemExit(1 if not value or any(ord(c) < 32 or ord(c) == 127 for c in value) else 0); print(value, end="")' "${username}") || \
+    die "门户管理员登录名不能为空或包含控制字符"
+  encoded=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode(), end="")' "${username}")
+  export ACCOUNT_ADMIN_USERNAME="${username}" ACCOUNT_ADMIN_USERNAME_B64="${encoded}"
+  account_helper set-admin-username || die "门户管理员登录名修改失败"
+  set_env_value "${CLUSTER_ENV}" ACCOUNT_ADMIN_USERNAME_B64 "${encoded}"
+  log "账户门户管理员登录名已修改为：${username}"
+}
+
+set_portal_password() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || die "当前部署没有 LLMCtl 账户门户"
+  local password="${1:?}"
+  export ACCOUNT_ADMIN_PASSWORD="${password}"
+  account_helper reset-admin-password || die "账户门户管理员密码更新失败"
+  set_env_value "${SECRETS_ENV}" ACCOUNT_ADMIN_PASSWORD "${password}"
+}
+
+set_gateway_username() {
+  local username="${1-}"
+  [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 原生管理界面只有密码，没有用户名；请使用 set-portal-username 修改门户登录名。"
+  [[ "${username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "原生网关用户名只允许字母、数字、点、下划线、@ 和连字符"
+  if [[ "${GATEWAY_KIND}" == newapi ]]; then
+    (( ${#username} <= 12 )) || die "New API 管理员用户名最多 12 位"
+    export GATEWAY_LOCAL_URL LLMCTL_NEW_USERNAME="${username}"
+    GATEWAY_LOCAL_URL=$(router_local_base_url)
+    gateway_helper newapi-admin set-username --secrets-file "${SECRETS_ENV}"
+  else
+    set_env_value "${SECRETS_ENV}" UI_USERNAME "${username}"
+    refresh_router
+  fi
+  log "原生网关管理员用户名已修改为：${username}"
+}
+
+set_gateway_password() {
+  local password="${1:?}"
+  if [[ "${GATEWAY_KIND}" == newapi ]]; then
+    export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${password}"
+    GATEWAY_LOCAL_URL=$(router_local_base_url)
+    gateway_helper newapi-admin set-password --secrets-file "${SECRETS_ENV}"
+  elif [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${password}"
+    GATEWAY_LOCAL_URL=$(router_local_base_url)
+    gateway_helper omniroute-admin set-password --secrets-file "${SECRETS_ENV}"
+  else
+    set_env_value "${SECRETS_ENV}" UI_PASSWORD "${password}"
+    refresh_router
+  fi
+}
+
 cmd_admin() {
   require_root; load_config
-  case "${1:-show}" in
+  local action="${1:-show}"
+  case "${action}" in
     show)
       local ui_host="${API_BIND}"
       [[ "${ui_host}" == 0.0.0.0 || "${ui_host}" == :: ]] && ui_host='<服务器IP>'
       printf 'GATEWAY=%s\n' "$(gateway_display_name)"
       printf 'GATEWAY_UI_URL=http://%s:%s%s\n' "${ui_host}" "${API_PORT}" "$(gateway_ui_path)"
-      printf 'GATEWAY_UI_USERNAME=%s\n' "${UI_USERNAME}"
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        printf 'GATEWAY_UI_USERNAME=(不适用：OmniRoute 原生 UI 仅使用密码)\n'
+      else
+        printf 'GATEWAY_UI_USERNAME=%s\n' "${UI_USERNAME}"
+      fi
       printf 'GATEWAY_UI_PASSWORD=%s\n' "${UI_PASSWORD}"
       if [[ "${GATEWAY_KIND}" == omniroute ]]; then
         printf 'ACCOUNT_PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-http://${ui_host}:${API_PORT}/ui/}"
         printf 'OMNIROUTE_BASE_UI_URL=http://%s:%s/base_ui/\n' "${ui_host}" "${API_PORT}"
-        printf 'ACCOUNT_PORTAL_ADMIN=%s\n' "${ACCOUNT_ADMIN_EMAIL}"
+        printf 'ACCOUNT_PORTAL_ADMIN=%s\n' "${ACCOUNT_ADMIN_USERNAME}"
+        printf 'ACCOUNT_PORTAL_PASSWORD=%s\n' "${ACCOUNT_ADMIN_PASSWORD}"
       fi
       warn "这是管理员凭据；请勿复制到日志、工单或代码仓库。"
       ;;
     set-username)
-      local new_username="${2:?请指定新用户名}"
-      [[ "${new_username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "用户名只允许字母、数字、点、下划线、@ 和连字符"
-      [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 管理界面只使用密码；账户门户管理员使用邮箱登录，不能通过 set-username 修改。"
-      if [[ "${GATEWAY_KIND}" == newapi ]]; then
-        (( ${#new_username} <= 12 )) || die "New API 管理员用户名最多 12 位"
-        export GATEWAY_LOCAL_URL LLMCTL_NEW_USERNAME="${new_username}"
-        GATEWAY_LOCAL_URL=$(router_local_base_url)
-        gateway_helper newapi-admin set-username --secrets-file "${SECRETS_ENV}"
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        set_portal_username "${2-}"
+        log "OmniRoute 原生管理界面没有用户名，因此无需同步用户名。"
       else
-        set_env_value "${SECRETS_ENV}" UI_USERNAME "${new_username}"
-        refresh_router
+        set_gateway_username "${2-}"
       fi
-      log "Web UI 管理员用户名已修改为 ${new_username}。"
       ;;
-    set-password)
-      local new_password="${2:-}" confirm_password=""
-      if [[ -z "${new_password}" ]]; then
-        [[ -t 0 ]] || die "非交互模式请将新密码作为参数传入"
-        read -r -s -p '输入新的 Web UI 管理员密码: ' new_password
-        printf '\n' >&2
-        read -r -s -p '再次输入新密码: ' confirm_password
-        printf '\n' >&2
-        [[ "${new_password}" == "${confirm_password}" ]] || die "两次输入的密码不一致"
-      fi
-      [[ "${new_password}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "密码需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符"
-      [[ "${GATEWAY_KIND}" != newapi || ${#new_password} -le 20 ]] || die "New API 管理员密码不能超过 20 位"
-      [[ "${GATEWAY_KIND}" != omniroute || ${#new_password} -ge 12 ]] || die "OmniRoute/账户门户共享管理员密码至少 12 位"
-      if [[ "${GATEWAY_KIND}" == newapi ]]; then
-        export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${new_password}"
-        GATEWAY_LOCAL_URL=$(router_local_base_url)
-        gateway_helper newapi-admin set-password --secrets-file "${SECRETS_ENV}"
+    set-portal-username) set_portal_username "${2-}" ;;
+    set-gateway-username) set_gateway_username "${2-}" ;;
+    set-password|set-portal-password|set-gateway-password)
+      local password
+      password=$(read_admin_password "${2-}")
+      if [[ "${action}" == set-portal-password ]]; then
+        set_portal_password "${password}"
+        log "账户门户管理员密码已修改。"
+      elif [[ "${action}" == set-gateway-password ]]; then
+        set_gateway_password "${password}"
+        log "原生网关管理员密码已修改。"
       elif [[ "${GATEWAY_KIND}" == omniroute ]]; then
-        local old_password="${UI_PASSWORD}"
-        export ACCOUNT_ADMIN_PASSWORD="${new_password}"
+        local old_portal_password="${ACCOUNT_ADMIN_PASSWORD}"
+        export ACCOUNT_ADMIN_PASSWORD="${password}"
         account_helper reset-admin-password || die "账户门户管理员密码更新失败；OmniRoute 密码未修改"
-        export GATEWAY_LOCAL_URL LLMCTL_NEW_PASSWORD="${new_password}"
-        GATEWAY_LOCAL_URL=$(router_local_base_url)
-        if ! gateway_helper omniroute-admin set-password --secrets-file "${SECRETS_ENV}"; then
-          export ACCOUNT_ADMIN_PASSWORD="${old_password}"
+        if ! set_gateway_password "${password}"; then
+          export ACCOUNT_ADMIN_PASSWORD="${old_portal_password}"
           account_helper reset-admin-password || warn "账户门户管理员密码回滚失败，请立即检查"
           die "OmniRoute 管理员密码更新失败；账户门户密码已回滚"
         fi
-        # The gateway helper atomically persisted both shared credentials.
-        # shellcheck disable=SC1090
-        source "${SECRETS_ENV}"
-        systemctl restart llm-account.service
-        wait_account_portal
+        set_env_value "${SECRETS_ENV}" ACCOUNT_ADMIN_PASSWORD "${password}"
+        log "账户门户与 OmniRoute 原生管理密码已一起修改。"
       else
-        set_env_value "${SECRETS_ENV}" UI_PASSWORD "${new_password}"
-        refresh_router
+        set_gateway_password "${password}"
+        log "原生网关管理员密码已修改。"
       fi
-      log "Web UI 管理员密码已修改。"
       ;;
-    *) die "admin 子命令必须是 show|set-username|set-password" ;;
+    *) die "admin 子命令必须是 show|set-username|set-password|set-portal-username|set-portal-password|set-gateway-username|set-gateway-password" ;;
   esac
 }
 

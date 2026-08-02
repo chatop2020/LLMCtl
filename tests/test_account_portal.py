@@ -34,17 +34,30 @@ class FakeOmniRoute:
         self.logs = []
         self.test_error = None
         self.tested_models = []
+        self.tested_provider_models = []
+        self.hidden_models = {}
         self.call_log_details = {}
         self.combo_items = []
         self.context_updates = []
         self.output_updates = []
         self.aliases = []
+        self.revealed = []
 
     def create_user_key(self, user_id, email):
         key_id = f"key-{len(self.created) + 1}"
         raw = f"sk-user-secret-{len(self.created) + 1}-abcdefghijklmnopqrstuvwxyz"
         self.created.append((key_id, user_id, email, raw))
         return key_id, raw
+
+    def reveal_user_key(self, key_id):
+        self.revealed.append(key_id)
+        for created_key_id, _user_id, _email, raw_key in self.created:
+            if created_key_id == key_id:
+                return raw_key
+        return f"sk-existing-{key_id}-abcdefghijklmnopqrstuvwxyz"
+
+    def delete_key(self, key_id):
+        self.deleted.append((key_id, ""))
 
     def set_limit(self, key_id, quota, reset, reset_time, limit_id=None):
         result = limit_id or f"limit-{key_id}"
@@ -129,6 +142,15 @@ class FakeOmniRoute:
             raise RuntimeError(self.test_error)
         return 12, "OK"
 
+    def test_provider_model(self, provider, model_id):
+        self.tested_provider_models.append((provider, model_id))
+        if self.test_error:
+            raise RuntimeError(self.test_error)
+        return 12, "OK"
+
+    def hidden_provider_models(self, provider):
+        return set(self.hidden_models.get(provider, set()))
+
     def call_log(self, request_id):
         return self.call_log_details.get(
             request_id,
@@ -165,7 +187,7 @@ class PortalIntegrationTests(unittest.TestCase):
             gateway_manage_key="sk-management-test",
             public_url="http://portal.example.test",
             api_public_url="https://llm.example.test",
-            admin_email="admin@example.com",
+            admin_username="admin",
             admin_password="correct horse battery staple",
             initial_registration=True,
             initial_domains=["example.com"],
@@ -277,7 +299,7 @@ class PortalIntegrationTests(unittest.TestCase):
             client,
             jar,
             "/portal-api/auth/login",
-            {"email": "admin@example.com", "password": "correct horse battery staple"},
+            {"identity": "admin", "password": "correct horse battery staple"},
         )
         self.assertEqual(status, 200)
         self.assertEqual(body["user"]["role"], "admin")
@@ -317,6 +339,53 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(row, ("active", "key-1", "limit-key-1"))
         self.assertIn("register.email", audit_actions)
         self.assertIn("verify.provision", audit_actions)
+
+    def test_login_reveals_the_same_existing_key_without_rotating_or_auditing_secret(self):
+        raw_key = "sk-existing-stable-user-key-abcdefghijklmnopqrstuvwxyz"
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id,email,login_name,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "stable-user", "stable@example.com", "stable@example.com",
+                    portal.hash_password("a secure password 123"), "user", "active",
+                    "stable-key", 0, "monthly", "00:00", stamp, stamp,
+                ),
+            )
+        self.fake_omni.created.append(
+            ("stable-key", "stable-user", "stable@example.com", raw_key)
+        )
+
+        client, jar = self.opener()
+        status, _, _ = self.get(client, "/portal-api/public")
+        self.assertEqual(status, 200)
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/auth/login",
+            {"identity": "stable@example.com", "password": "a secure password 123"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["user"]["id"], "stable-user")
+        created_before = list(self.fake_omni.created)
+
+        first_status, first, _ = self.json_post(client, jar, "/portal-api/key/reveal", {})
+        second_status, second, _ = self.json_post(client, jar, "/portal-api/key/reveal", {})
+        self.assertEqual((first_status, second_status), (200, 200))
+        self.assertEqual(first["api_key"], raw_key)
+        self.assertEqual(second["api_key"], raw_key)
+        self.assertEqual(self.fake_omni.created, created_before)
+        self.assertEqual(self.fake_omni.revealed, ["stable-key", "stable-key"])
+        self.assertNotIn(raw_key.encode(), self.db_path.read_bytes())
+
+        with self.server.db.connect() as connection:
+            audit_details = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT detail FROM audit_events WHERE action='key/reveal'"
+                )
+            ]
+        self.assertEqual(audit_details, ['{"ok":true}', '{"ok":true}'])
 
     def test_disabling_user_invalidates_existing_session(self):
         client, jar = self.opener()
@@ -424,7 +493,7 @@ class PortalIntegrationTests(unittest.TestCase):
             "/login",
             {
                 "csrf": csrf,
-                "email": "admin@example.com",
+                "identity": "admin",
                 "password": "correct horse battery staple",
             },
         )
@@ -867,18 +936,103 @@ class PortalIntegrationTests(unittest.TestCase):
             self.server.control.test_free_resource(
                 "agentrouter:claude-haiku-4-5-20251001"
             )
-        self.assertEqual(self.fake_omni.tested_models, [])
+        self.assertEqual(self.fake_omni.tested_provider_models, [])
 
-    def test_free_resource_test_uses_provider_qualified_model_id(self):
+    def test_free_resource_test_uses_omniroute_native_provider_probe(self):
         self.insert_free_resource(1)
         result = self.server.control.test_free_resource(
             "agentrouter:claude-haiku-4-5-20251001"
         )
         self.assertEqual(result["status"], "healthy")
         self.assertEqual(
-            self.fake_omni.tested_models[-1],
-            "agentrouter/claude-haiku-4-5-20251001",
+            self.fake_omni.tested_provider_models[-1],
+            ("agentrouter", "claude-haiku-4-5-20251001"),
         )
+
+    def test_native_hidden_free_resource_is_reconciled_from_omniroute(self):
+        self.insert_free_resource(1)
+        self.fake_omni.hidden_models = {
+            "agentrouter": {"claude-haiku-4-5-20251001"}
+        }
+        result = self.server.control.refresh_free_resource_visibility()
+        self.assertEqual(result, {"providers": 1, "failed": 0, "hidden": 1})
+        with self.server.db.connect() as connection:
+            resource = connection.execute(
+                "SELECT native_visible FROM free_resources WHERE resource_key=?",
+                ("agentrouter:claude-haiku-4-5-20251001",),
+            ).fetchone()
+        self.assertEqual(resource["native_visible"], 0)
+
+    def test_stress_run_is_backend_owned_and_keeps_key_out_of_arguments(self):
+        self.insert_control_user_and_model()
+        with self.assertRaisesRegex(ValueError, "高负载压测必须确认风险"):
+            self.server.control.start_stress_run(
+                {
+                    "model": "gdn-inside",
+                    "concurrency": 20,
+                    "input_tokens": 100,
+                    "output_tokens": 128,
+                    "request_multiplier": 1,
+                },
+                "admin",
+            )
+
+        process = mock.Mock(pid=4321)
+        process.wait.return_value = 0
+        with (
+            mock.patch.object(portal.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(
+                self.server.control, "process_alive", return_value=True
+            ),
+        ):
+            run = self.server.control.start_stress_run(
+                {
+                    "model": "gdn-inside",
+                    "concurrency": 2,
+                    "input_tokens": 100,
+                    "output_tokens": 128,
+                    "request_multiplier": 1,
+                },
+                "admin",
+            )
+
+        command = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(run["status"], "starting")
+        self.assertEqual(run["request_count"], 2)
+        self.assertIn("llm_benchmark.py", " ".join(command))
+        self.assertNotIn("sk-management-test", " ".join(command))
+        self.assertEqual(
+            environment["LLMCTL_BENCHMARK_API_KEY"], "sk-management-test"
+        )
+        self.assertEqual(popen.call_args.kwargs["stderr"], portal.subprocess.STDOUT)
+        self.assertTrue(popen.call_args.kwargs["stdout"].closed)
+
+        with self.server.db.connect() as connection:
+            indexes = {
+                row["name"]
+                for row in connection.execute("PRAGMA index_list('stress_runs')")
+            }
+        self.assertIn("idx_stress_runs_created", indexes)
+        self.assertIn("idx_stress_runs_status", indexes)
+
+        with self.server.db.connect() as connection:
+            stored = connection.execute(
+                "SELECT result_dir FROM stress_runs WHERE id=?", (run["id"],)
+            ).fetchone()
+            connection.execute(
+                "UPDATE stress_runs SET status='canceling' WHERE id=?", (run["id"],)
+            )
+        pathlib.Path(stored["result_dir"], "status.json").write_text(
+            json.dumps({"status": "running", "metrics": {"completed": 1}}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(self.server.control, "process_alive", return_value=True):
+            canceling = self.server.control.sync_stress_run(run["id"])
+        self.assertEqual(canceling["status"], "canceling")
+        with mock.patch.object(self.server.control, "process_alive", return_value=False):
+            canceled = self.server.control.sync_stress_run(run["id"])
+        self.assertEqual(canceled["status"], "canceled")
 
     def test_failed_free_model_is_withdrawn_after_three_health_failures(self):
         self.insert_control_user_and_model(source_kind="model", upstream_free=1)
@@ -900,6 +1054,42 @@ class PortalIntegrationTests(unittest.TestCase):
 
 
 class PortalUnitTests(unittest.TestCase):
+    def test_existing_key_reveal_enables_omniroute_native_flag_without_restart(self):
+        config = mock.Mock(
+            gateway_manage_key="sk-management-test",
+            gateway_url="http://127.0.0.1:18000",
+        )
+        client = portal.OmniRouteClient(config)
+        calls = []
+
+        def request(method, path, payload=None):
+            calls.append((method, path, payload))
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "OmniRoute GET /api/keys/key-1/reveal: HTTP 403: API key reveal is disabled"
+                )
+            if method == "GET":
+                return {"key": "sk-existing-stable-key-abcdefghijklmnopqrstuvwxyz"}
+            return {"effectiveValue": "true"}
+
+        client.request = request
+        self.assertEqual(
+            client.reveal_user_key("key-1"),
+            "sk-existing-stable-key-abcdefghijklmnopqrstuvwxyz",
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "/api/keys/key-1/reveal", None),
+                (
+                    "PUT",
+                    "/api/settings/feature-flags",
+                    {"key": "ALLOW_API_KEY_REVEAL", "value": "true"},
+                ),
+                ("GET", "/api/keys/key-1/reveal", None),
+            ],
+        )
+
     def test_model_health_check_disables_thinking_and_has_a_bounded_timeout(self):
         request_state = {}
 
@@ -950,6 +1140,14 @@ class PortalUnitTests(unittest.TestCase):
             portal.hash_password("12345678")
         with self.assertRaisesRegex(ValueError, "8-200"):
             portal.hash_password("abc1234")
+
+    def test_admin_password_has_no_length_floor_but_rejects_numeric_only(self):
+        encoded = portal.hash_admin_password("a")
+        self.assertTrue(portal.verify_password("a", encoded))
+        with self.assertRaisesRegex(ValueError, "不能全部由数字"):
+            portal.hash_admin_password("39873987")
+        with self.assertRaisesRegex(ValueError, "不能为空"):
+            portal.hash_admin_password("")
 
     def test_group_names_support_unicode_but_reject_invisible_controls(self):
         self.assertEqual(portal.normalize_group_name("  中文　小组  "), "中文 小组")

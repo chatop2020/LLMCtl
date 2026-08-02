@@ -14,6 +14,15 @@ import {
   consumeChatResponse,
   splitThinkingMarkup,
 } from "./chatStream.js";
+import {
+  ACCEPTED_ATTACHMENTS,
+  MAX_TOTAL_ATTACHMENT_BYTES,
+  MAX_VISUAL_INPUTS,
+  attachmentKind,
+  buildUserContent,
+  prepareAttachment,
+  visualInputCount,
+} from "./attachments.js";
 import { writeClipboardText } from "./clipboard.js";
 
 const session = ref(null);
@@ -28,6 +37,7 @@ const toast = reactive({ text: "", kind: "ok" });
 let toastTimer = null;
 let workspaceLoadVersion = 0;
 let usageRefreshTimer = null;
+let stressRefreshTimer = null;
 const authMode = ref(
   location.hash.startsWith("#/register")
     ? "register"
@@ -37,7 +47,7 @@ const authMode = ref(
 );
 const section = ref("overview");
 const auth = reactive({
-  email: "",
+  identity: "",
   password: "",
   confirm: "",
   token:
@@ -66,11 +76,15 @@ const chat = reactive({
   provider: "",
   cost: "",
   cacheHit: "",
+  attachments: [],
+  preparingAttachments: false,
 });
 let chatController = null;
 let chatTimer = null;
+const attachmentInput = ref(null);
 const keyOnce = ref(sessionStorage.getItem("llmctl_api_key") || "");
 const showApiKey = ref(false);
+const keyLoading = ref(false);
 const apiKeyField = ref(null);
 const userEdit = reactive({
   user_id: "",
@@ -115,7 +129,50 @@ const modelEdit = reactive({
   access: [{ type: "all", id: "" }],
 });
 const settings = reactive({});
+const smtpTestRecipient = ref("");
+const showHiddenFreeResources = ref(false);
+const stressPlan = reactive({
+  model: "",
+  concurrency: 1,
+  input_tokens: 50,
+  output_tokens: 128,
+  request_multiplier: 2,
+  risk_confirmed: false,
+});
+const selectedStressRunId = ref("");
 const PAGE_SIZE = 20;
+
+const stressRuns = computed(() => admin.value?.stress_runs || []);
+const activeStressRun = computed(() =>
+  stressRuns.value.find((run) =>
+    ["starting", "running", "canceling"].includes(run.status),
+  ),
+);
+const selectedStressRun = computed(() =>
+  stressRuns.value.find((run) => run.id === selectedStressRunId.value) ||
+  activeStressRun.value ||
+  stressRuns.value[0] ||
+  null,
+);
+const stressIsHighRisk = computed(
+  () => stressPlan.concurrency >= 20 || stressPlan.input_tokens >= 8000,
+);
+
+const selectedChatModel = computed(() =>
+  dashboard.value?.models?.find(
+    (model) => model.public_model_id === chat.model,
+  ),
+);
+const selectedChatCapabilities = computed(() =>
+  Array.isArray(selectedChatModel.value?.capabilities)
+    ? selectedChatModel.value.capabilities.map((item) => String(item).toLowerCase())
+    : [],
+);
+const selectedChatSupportsVision = computed(() =>
+  selectedChatCapabilities.value.some((item) =>
+    ["vision", "ocr", "image", "multimodal"].includes(item),
+  ),
+);
 const pages = reactive({});
 const requestDetails = reactive({});
 const listFilters = reactive(
@@ -129,6 +186,7 @@ const listFilters = reactive(
       "admin-users",
       "admin-groups",
       "admin-billing",
+      "admin-stress",
       "admin-audit",
     ].map((key) => [key, { query: "", status: "all", category: "all" }]),
   ),
@@ -179,6 +237,7 @@ const filterFields = {
   "admin-users": ["email", "status", "permission_status"],
   "admin-groups": ["name", "description", "status"],
   "admin-billing": ["user_email", "user_id", "kind", "note"],
+  "admin-stress": ["public_model_id", "status", "created_by", "error"],
   "admin-audit": ["actor", "action", "target", "status", "detail"],
 };
 const PaginationBar = (props, { emit }) =>
@@ -305,6 +364,7 @@ const nav = computed(() =>
         ["users", "用户"],
         ["groups", "用户组"],
         ["billing", "账单"],
+        ["stress", "性能压测"],
         ["settings", "注册与 SMTP"],
         ["audit", "审计"],
       ]
@@ -388,8 +448,24 @@ function clearAuthenticatedClientState() {
 }
 
 function applyAdminSnapshot(snapshot) {
+  snapshot.stress_runs ||= [];
   admin.value = snapshot;
+  if (
+    !stressPlan.model ||
+    !snapshot.models?.some(
+      (model) =>
+        model.public_model_id === stressPlan.model &&
+        model.status === "published",
+    )
+  )
+    stressPlan.model =
+      snapshot.models?.find((model) => model.status === "published")
+        ?.public_model_id || "";
+  if (!selectedStressRunId.value && snapshot.stress_runs?.length)
+    selectedStressRunId.value = snapshot.stress_runs[0].id;
   Object.assign(settings, snapshot.settings);
+  if (!smtpTestRecipient.value)
+    smtpTestRecipient.value = settings.smtp_from || "";
   const currentOrigin = location.origin;
   const currentIsRemote =
     !/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(
@@ -424,6 +500,7 @@ async function refreshWorkspace() {
         !snapshot.models.some((model) => model.public_model_id === chat.model)
       )
         chat.model = snapshot.models[0]?.public_model_id || "";
+      if (snapshot.has_api_key && !keyOnce.value) await loadExistingKey();
     }
     if (
       section.value === "billing" &&
@@ -432,6 +509,21 @@ async function refreshWorkspace() {
       await loadUsagePage(1);
   } finally {
     if (version === workspaceLoadVersion) workspaceRefreshing.value = false;
+  }
+}
+
+async function loadExistingKey() {
+  if (isAdmin.value || keyOnce.value || keyLoading.value) return;
+  keyLoading.value = true;
+  try {
+    const result = await api("key/reveal", { method: "POST", body: "{}" });
+    if (!result?.api_key) throw new Error("接入层未返回现有 Key");
+    keyOnce.value = result.api_key;
+    sessionStorage.setItem("llmctl_api_key", result.api_key);
+  } catch (error) {
+    notify(`现有 API Key 读取失败：${error.message}`, "bad");
+  } finally {
+    keyLoading.value = false;
   }
 }
 
@@ -478,6 +570,78 @@ async function selectSection(nextSection) {
   }
 }
 
+function replaceStressRun(run) {
+  if (!admin.value || !run?.id) return;
+  const index = admin.value.stress_runs.findIndex((item) => item.id === run.id);
+  if (index >= 0) admin.value.stress_runs.splice(index, 1, run);
+  else admin.value.stress_runs.unshift(run);
+  selectedStressRunId.value = run.id;
+}
+
+async function pollStressRun() {
+  if (!isAdmin.value || document.hidden || section.value !== "stress") return;
+  const target = activeStressRun.value || selectedStressRun.value;
+  if (!target?.id) return;
+  try {
+    replaceStressRun(
+      await api(`admin/stress?id=${encodeURIComponent(target.id)}`),
+    );
+  } catch (error) {
+    notify(`读取压测进度失败：${error.message}`, "bad");
+  }
+}
+
+async function startStressRun() {
+  if (!stressPlan.model) return notify("请选择已发布模型", "bad");
+  if (stressIsHighRisk.value && !stressPlan.risk_confirmed)
+    return notify("请先确认高负载风险", "bad");
+  const result = await action(
+    () =>
+      api("admin/stress/start", {
+        method: "POST",
+        body: JSON.stringify(stressPlan),
+      }),
+    "后台压测已启动",
+    {
+      key: "stress-start",
+      pending: "正在启动后台压测执行器…",
+      refresh: false,
+    },
+  );
+  if (result) replaceStressRun(result);
+}
+
+async function cancelStressRun() {
+  const target = activeStressRun.value;
+  if (!target) return;
+  const result = await action(
+    () =>
+      api("admin/stress/cancel", {
+        method: "POST",
+        body: JSON.stringify({ id: target.id }),
+      }),
+    "已要求后台停止压测",
+    { key: "stress-cancel", pending: "正在停止压测…", refresh: false },
+  );
+  if (result) replaceStressRun(result);
+}
+
+function metric(run, group, key) {
+  return run?.metrics?.[group]?.[key] ?? null;
+}
+
+function metricNumber(value, digits = 1) {
+  return value === null || value === undefined || !Number.isFinite(Number(value))
+    ? "—"
+    : Number(value).toFixed(digits);
+}
+
+function compactTokens(value) {
+  const number = Number(value || 0);
+  if (number >= 1000) return `${number / 1000}k`;
+  return String(number);
+}
+
 async function goToSection(nextSection) {
   await selectSection(nextSection);
 }
@@ -511,7 +675,13 @@ async function action(fn, success = "操作成功", options = {}) {
 
 async function login() {
   await action(async () => {
-    await api("auth/login", { method: "POST", body: JSON.stringify(auth) });
+    await api("auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        identity: auth.identity,
+        password: auth.password,
+      }),
+    });
     auth.password = "";
     auth.confirm = "";
   }, "登录成功");
@@ -525,7 +695,15 @@ async function register() {
   if (auth.password !== auth.confirm)
     return notify("两次输入的密码不一致", "bad");
   await action(
-    () => api("auth/register", { method: "POST", body: JSON.stringify(auth) }),
+    () =>
+      api("auth/register", {
+        method: "POST",
+        body: JSON.stringify({
+          email: auth.identity,
+          password: auth.password,
+          confirm: auth.confirm,
+        }),
+      }),
     "验证邮件已发送，请点击邮件中的链接完成验证",
   );
 }
@@ -599,6 +777,11 @@ function statusLabel(value) {
       pending: "待同步",
       synced: "已同步",
       success: "成功",
+      starting: "正在启动",
+      running: "运行中",
+      canceling: "正在停止",
+      completed: "已完成",
+      canceled: "已停止",
       expired: "已过期",
     }[value] ||
     value ||
@@ -641,6 +824,12 @@ function filteredRows(key, rows) {
   if (!filter) return rows || [];
   const query = filter.query.trim().toLocaleLowerCase();
   return (rows || []).filter((row) => {
+    if (
+      key === "admin-free" &&
+      !showHiddenFreeResources.value &&
+      Number(row.native_visible) === 0
+    )
+      return false;
     if (
       query &&
       !(filterFields[key] || []).some((field) =>
@@ -799,6 +988,60 @@ function stopChat() {
   if (chatController) chatController.abort();
 }
 
+function attachmentSize(value) {
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KiB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function removeAttachment(id) {
+  if (chat.sending || chat.preparingAttachments) return;
+  const index = chat.attachments.findIndex((item) => item.id === id);
+  if (index >= 0) chat.attachments.splice(index, 1);
+}
+
+async function addAttachmentFiles(event) {
+  const files = Array.from(event?.target?.files || event?.dataTransfer?.files || []);
+  if (event?.target) event.target.value = "";
+  if (!files.length || chat.preparingAttachments || chat.sending) return;
+  chat.preparingAttachments = true;
+  let added = 0;
+  try {
+    for (const file of files) {
+      const kind = attachmentKind(file);
+      if (
+        ["image", "pdf"].includes(kind) &&
+        !selectedChatSupportsVision.value
+      )
+        throw new Error(
+          `当前模型未声明图片/OCR 能力，不能添加 ${file.name}；请选择支持 vision 或 ocr 的模型。`,
+        );
+      const totalBytes = chat.attachments.reduce(
+        (total, item) => total + Number(item.size || 0),
+        file.size,
+      );
+      if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES)
+        throw new Error("本次请求的附件原文件合计不能超过 24 MiB");
+      const remainingVisuals =
+        MAX_VISUAL_INPUTS - visualInputCount(chat.attachments);
+      const attachment = await prepareAttachment(file, remainingVisuals);
+      chat.attachments.push(attachment);
+      added += 1;
+      if (attachment.truncated)
+        notify(
+          attachment.kind === "pdf"
+            ? `${attachment.name} 共 ${attachment.pageCount} 页，本次按视觉输入上限读取前 ${attachment.pages.length} 页。`
+            : `${attachment.name} 内容过长，本次只读取前 100 万字符。`,
+          "warn",
+        );
+    }
+    if (added) notify(`已添加 ${added} 个附件，仅随本次推理请求发送。`);
+  } catch (error) {
+    notify(error.message, "bad");
+  } finally {
+    chat.preparingAttachments = false;
+  }
+}
+
 async function responseError(response) {
   const raw = await response.text();
   try {
@@ -817,7 +1060,13 @@ async function responseError(response) {
 async function sendChat() {
   if (!keyOnce.value) return notify("请先输入或轮换个人 API Key", "bad");
   if (!chat.model) return notify("请选择模型", "bad");
-  if (!chat.prompt.trim()) return notify("请输入消息", "bad");
+  if (!chat.prompt.trim() && !chat.attachments.length)
+    return notify("请输入消息或添加附件", "bad");
+  if (
+    chat.attachments.some((item) => ["image", "pdf"].includes(item.kind)) &&
+    !selectedChatSupportsVision.value
+  )
+    return notify("当前模型不支持图片或 PDF 视觉输入，请更换模型或移除附件", "bad");
   resetChatResult();
   chat.sending = true;
   chatController = new AbortController();
@@ -833,7 +1082,12 @@ async function sendChat() {
     stream_options: { include_usage: true },
     max_tokens: Math.max(1, Math.min(32768, Number(chat.maxTokens) || 1024)),
     temperature: Math.max(0, Math.min(2, Number(chat.temperature) || 0)),
-    messages: [{ role: "user", content: chat.prompt }],
+    messages: [
+      {
+        role: "user",
+        content: buildUserContent(chat.prompt, chat.attachments),
+      },
+    ],
   };
   if (chat.thinking === "enabled")
     Object.assign(payload, {
@@ -1208,7 +1462,7 @@ async function testSmtp() {
         method: "POST",
         body: JSON.stringify({
           ...smtpPayload(),
-          recipient: session.value.user.email,
+          recipient: smtpTestRecipient.value,
         }),
       }),
     "测试邮件已发送",
@@ -1237,6 +1491,7 @@ onMounted(async () => {
         silent: true,
       });
     }, 15_000);
+    stressRefreshTimer = window.setInterval(pollStressRun, 2_000);
   } catch (error) {
     notify(error.message, "bad");
   }
@@ -1244,6 +1499,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (usageRefreshTimer) window.clearInterval(usageRefreshTimer);
+  if (stressRefreshTimer) window.clearInterval(stressRefreshTimer);
   if (chatTimer) window.clearInterval(chatTimer);
   if (toastTimer) window.clearTimeout(toastTimer);
 });
@@ -1260,7 +1516,9 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div class="top-actions" v-if="session?.authenticated">
-        <span class="identity">{{ session.user.email }}</span
+        <span class="identity">{{
+          session.user.login_name || session.user.email
+        }}</span
         ><button class="ghost" @click="logout">退出</button>
       </div>
     </header>
@@ -1315,9 +1573,9 @@ onBeforeUnmount(() => {
             }}
           </p>
           <label
-            >邮箱<input
-              v-model="auth.email"
-              type="email"
+            >{{ authMode === "login" ? "登录名或邮箱" : "邮箱" }}<input
+              v-model="auth.identity"
+              :type="authMode === 'login' ? 'text' : 'email'"
               autocomplete="username"
               required
           /></label>
@@ -1523,10 +1781,10 @@ onBeforeUnmount(() => {
             </div>
             <section class="panel catalog-key">
               <div>
-                <strong>当前浏览器会话 API Key</strong
+                <strong>个人 API Key</strong
                 ><small
-                  >curl 示例会自动使用此
-                  Key；仅保存在当前浏览器会话，不会传给门户后端。</small
+                  >登录后自动读取注册时创建的同一把 Key，并内置到 curl
+                  示例；只有手工轮换才会更换。</small
                 >
               </div>
               <div class="catalog-key-input">
@@ -1534,9 +1792,9 @@ onBeforeUnmount(() => {
                   ref="apiKeyField"
                   v-model="keyOnce"
                   :type="showApiKey ? 'text' : 'password'"
-                  placeholder="尚未保存，请输入或前往 API Key 页面轮换"
+                  :placeholder="keyLoading ? '正在读取现有 Key…' : '现有 Key 暂不可用'"
                   autocomplete="off"
-                  @input="sessionStorage.setItem('llmctl_api_key', keyOnce)"
+                  readonly
                 /><button
                   type="button"
                   class="ghost"
@@ -1555,9 +1813,10 @@ onBeforeUnmount(() => {
                   type="button"
                   class="ghost"
                   v-if="!keyOnce"
-                  @click="goToSection('keys')"
+                  :disabled="keyLoading"
+                  @click="loadExistingKey"
                 >
-                  前往 API Key
+                  {{ keyLoading ? "读取中…" : "重新读取" }}
                 </button>
               </div>
             </section>
@@ -1660,7 +1919,7 @@ onBeforeUnmount(() => {
               <div>
                 <span class="eyebrow">PLAYGROUND</span>
                 <h1>在线测试</h1>
-                <p>浏览器流式调用 /v1；API Key 仅保存在本次会话。</p>
+                <p>浏览器流式调用 /v1；使用账户固定 Key，手工轮换前持续有效。</p>
               </div>
               <span
                 class="status"
@@ -1698,9 +1957,9 @@ onBeforeUnmount(() => {
                   >API Key<input
                     v-model="keyOnce"
                     type="password"
-                    placeholder="sk-..."
+                    :placeholder="keyLoading ? '正在读取现有 Key…' : '现有 Key 暂不可用'"
                     autocomplete="off"
-                    @change="sessionStorage.setItem('llmctl_api_key', keyOnce)"
+                    readonly
                 /></label>
                 <div class="playground-options">
                   <label
@@ -1737,10 +1996,77 @@ onBeforeUnmount(() => {
                     @keydown.ctrl.enter.prevent="sendChat"
                   ></textarea>
                 </label>
+                <div
+                  class="attachment-dropzone"
+                  :class="{ disabled: chat.sending || chat.preparingAttachments }"
+                  @dragover.prevent
+                  @drop.prevent="addAttachmentFiles"
+                >
+                  <input
+                    ref="attachmentInput"
+                    class="visually-hidden"
+                    type="file"
+                    multiple
+                    :accept="ACCEPTED_ATTACHMENTS"
+                    :disabled="chat.sending || chat.preparingAttachments"
+                    @change="addAttachmentFiles"
+                  />
+                  <div>
+                    <strong>附件</strong>
+                    <small>图片、PDF、TXT、Markdown、CSV、JSON；单个 12 MiB</small>
+                  </div>
+                  <button
+                    type="button"
+                    class="ghost compact"
+                    :disabled="chat.sending || chat.preparingAttachments"
+                    @click="attachmentInput?.click()"
+                  >
+                    {{ chat.preparingAttachments ? "处理中…" : "选择文件" }}
+                  </button>
+                </div>
+                <p class="field-hint" v-if="!selectedChatSupportsVision">
+                  当前模型未声明图片/OCR 能力；仍可上传文本类附件。
+                </p>
+                <div class="attachment-list" v-if="chat.attachments.length">
+                  <article
+                    v-for="attachment in chat.attachments"
+                    :key="attachment.id"
+                  >
+                    <img
+                      v-if="attachment.kind === 'image'"
+                      :src="attachment.dataUrl"
+                      alt=""
+                    />
+                    <span v-else class="attachment-icon">{{
+                      attachment.kind === "pdf" ? "PDF" : "TXT"
+                    }}</span>
+                    <div>
+                      <strong>{{ attachment.name }}</strong>
+                      <small>
+                        {{ attachmentSize(attachment.size) }}
+                        <template v-if="attachment.kind === 'pdf'">
+                          · {{ attachment.pages.length }}/{{ attachment.pageCount }} 页
+                        </template>
+                      </small>
+                    </div>
+                    <button
+                      type="button"
+                      class="icon-button"
+                      :disabled="chat.sending || chat.preparingAttachments"
+                      :aria-label="`移除 ${attachment.name}`"
+                      @click="removeAttachment(attachment.id)"
+                    >
+                      ×
+                    </button>
+                  </article>
+                </div>
+                <p class="field-hint">
+                  PDF 会在浏览器内转成页面图片后直传 /v1；附件不会上传到门户服务器或写入门户数据库。
+                </p>
                 <div class="button-row">
                   <button
                     class="primary playground-send"
-                    :disabled="chat.sending"
+                    :disabled="chat.sending || chat.preparingAttachments"
                     @click="sendChat"
                   >
                     发送请求 <small>Ctrl + Enter</small></button
@@ -1775,17 +2101,20 @@ onBeforeUnmount(() => {
                         : `${chat.tokensPerSecond.toFixed(1)} tok/s`
                     }}</strong>
                   </article>
-                  <article>
-                    <span>Token 用量</span
-                    ><strong
-                      >{{ chat.inputTokens === null ? "—" : chat.inputTokens }}
-                      /
-                      {{ chat.outputTokens === null ? "—" : chat.outputTokens }}
-                      /
-                      {{
-                        chat.totalTokens === null ? "—" : chat.totalTokens
-                      }}</strong
-                    >
+                  <article class="token-metric-card">
+                    <span>Token 用量</span>
+                    <div class="token-metric-values">
+                      <b
+                        ><small>输入 Token</small
+                        >{{ chat.inputTokens === null ? "—" : chat.inputTokens }}</b
+                      ><b
+                        ><small>输出 Token</small
+                        >{{ chat.outputTokens === null ? "—" : chat.outputTokens }}</b
+                      ><b
+                        ><small>合计 Token</small
+                        >{{ chat.totalTokens === null ? "—" : chat.totalTokens }}</b
+                      >
+                    </div>
                   </article>
                 </div>
                 <section
@@ -2131,17 +2460,17 @@ onBeforeUnmount(() => {
               <div>
                 <span class="eyebrow">API SECURITY</span>
                 <h1>API Key</h1>
-                <p>LLMCtl 不保存明文；轮换后旧 Key 立即失效。</p>
+                <p>注册时创建并保持不变；只有你手工轮换后旧 Key 才会失效。</p>
               </div>
             </div>
             <section class="panel key-panel">
               <label
-                >当前浏览器会话中的 Key<input
+                >个人 API Key<input
                   ref="apiKeyField"
                   v-model="keyOnce"
                   :type="showApiKey ? 'text' : 'password'"
-                  @change="sessionStorage.setItem('llmctl_api_key', keyOnce)"
-                  placeholder="未保存；可手工输入或轮换"
+                  readonly
+                  :placeholder="keyLoading ? '正在读取现有 Key…' : '现有 Key 暂不可用'"
               /></label>
               <div class="button-row">
                 <button
@@ -2159,6 +2488,14 @@ onBeforeUnmount(() => {
                 >
                   {{ showApiKey ? "隐藏" : "显示" }}</button
                 ><button
+                  class="ghost"
+                  type="button"
+                  v-if="!keyOnce"
+                  :disabled="keyLoading"
+                  @click="loadExistingKey"
+                >
+                  {{ keyLoading ? "读取中…" : "重新读取现有 Key" }}</button
+                ><button
                   class="danger"
                   type="button"
                   :disabled="busy"
@@ -2168,8 +2505,8 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <div class="warning">
-                请不要把 Key
-                写入前端源码、工单或聊天记录。生产应用应从密钥管理系统读取。
+                登录不会创建或更换 Key。curl 示例会自动填入这把 Key；请不要把它
+                写入前端源码、工单或聊天记录，生产应用应从密钥管理系统读取。
               </div>
             </section>
           </section>
@@ -2475,6 +2812,10 @@ onBeforeUnmount(() => {
               :count="filteredRows('admin-free', admin.free_resources).length"
               placeholder="搜索模型或供应商"
             />
+            <label class="visibility-filter">
+              <input v-model="showHiddenFreeResources" type="checkbox" />
+              显示已在原生接入层隐藏的资源
+            </label>
             <div class="resource-grid">
               <article
                 class="resource"
@@ -2499,7 +2840,11 @@ onBeforeUnmount(() => {
                           : 'warn'
                     "
                     >{{
-                      item.configured ? statusLabel(item.test_status) : "未配置"
+                      !item.native_visible
+                        ? "原生已隐藏"
+                        : item.configured
+                          ? statusLabel(item.test_status)
+                          : "未配置"
                     }}</span
                   >
                 </div>
@@ -2508,6 +2853,7 @@ onBeforeUnmount(() => {
                   ><span>月额 {{ item.monthly_tokens || "—" }}</span
                   ><span>已配置 {{ item.configured ? "是" : "否" }}</span
                   ><span>当前可用 {{ item.available ? "是" : "否" }}</span>
+                  <span v-if="!item.native_visible">原生可见性 隐藏</span>
                 </div>
                 <p class="error-text" v-if="item.test_error">
                   {{ item.test_error }}
@@ -2519,7 +2865,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="ghost"
-                    :disabled="busy"
+                    :disabled="busy || !item.native_visible"
                     :title="
                       item.configured
                         ? '使用供应商限定的模型 ID 测试'
@@ -2535,7 +2881,7 @@ onBeforeUnmount(() => {
                   ><button
                     type="button"
                     class="primary"
-                    :disabled="busy"
+                    :disabled="busy || !item.native_visible"
                     @click="publishFree(item)"
                   >
                     开放给用户
@@ -3034,6 +3380,159 @@ onBeforeUnmount(() => {
             </section>
           </section>
 
+          <section v-if="section === 'stress'" class="page stress-page">
+            <div class="page-head">
+              <div>
+                <span class="eyebrow">PERFORMANCE LAB</span>
+                <h1>性能压测</h1>
+                <p>后台执行真实流式请求；页面只负责配置、观察与停止任务。</p>
+              </div>
+              <span
+                v-if="activeStressRun"
+                class="status warn"
+              >{{ statusLabel(activeStressRun.status) }}</span>
+            </div>
+
+            <div class="stress-plan-layout">
+              <section class="panel form-stack stress-plan">
+                <div class="panel-head">
+                  <div>
+                    <h2>测试计划</h2>
+                    <p>每个并发 Worker 顺序执行所选轮次，总请求数会自动计算。</p>
+                  </div>
+                </div>
+                <label>公开模型 ID<select v-model="stressPlan.model" :disabled="!!activeStressRun">
+                  <option
+                    v-for="model in admin.models.filter((item) => item.status === 'published')"
+                    :key="model.id"
+                    :value="model.public_model_id"
+                  >{{ model.public_model_id }}</option>
+                </select></label>
+                <div class="form-grid stress-fields">
+                  <label>并发数<select v-model.number="stressPlan.concurrency" :disabled="!!activeStressRun">
+                    <option v-for="value in [1,2,4,6,8,10,15,20,25,30,40,50,60,70,80,100]" :key="value" :value="value">{{ value }}</option>
+                  </select></label>
+                  <label>目标输入 Token<select v-model.number="stressPlan.input_tokens" :disabled="!!activeStressRun">
+                    <option v-for="value in [50,100,300,800,1500,3000,6000,8000,15000,30000]" :key="value" :value="value">{{ compactTokens(value) }}</option>
+                  </select></label>
+                  <label>最大输出 Token<select v-model.number="stressPlan.output_tokens" :disabled="!!activeStressRun">
+                    <option v-for="value in [64,128,256,512,1024]" :key="value" :value="value">{{ value }}</option>
+                  </select></label>
+                  <label>每并发轮次<select v-model.number="stressPlan.request_multiplier" :disabled="!!activeStressRun">
+                    <option v-for="value in [1,2,3,4]" :key="value" :value="value">{{ value }} 轮</option>
+                  </select></label>
+                </div>
+                <div class="stress-request-total">
+                  <span>计划请求</span>
+                  <strong>{{ stressPlan.concurrency * stressPlan.request_multiplier }}</strong>
+                  <small>并发 {{ stressPlan.concurrency }} × {{ stressPlan.request_multiplier }} 轮</small>
+                </div>
+                <label v-if="stressIsHighRisk" class="risk-confirmation">
+                  <input v-model="stressPlan.risk_confirmed" type="checkbox" />
+                  <span><strong>我确认这是高负载测试。</strong>它可能占满 GPU、拉高延迟并影响正在使用 API 的用户。</span>
+                </label>
+                <div class="warning compact-warning">
+                  输入档位是生成提示词的目标值；最终以模型 tokenizer 返回的实际输入 Token 为准。LLMCtl 同一时间只运行一个压测任务。
+                </div>
+                <div class="button-row">
+                  <button
+                    class="primary"
+                    type="button"
+                    :disabled="busy || !!activeStressRun || (stressIsHighRisk && !stressPlan.risk_confirmed)"
+                    @click="startStressRun"
+                  >启动后台压测</button>
+                  <button
+                    class="danger"
+                    type="button"
+                    :disabled="busy || !activeStressRun"
+                    @click="cancelStressRun"
+                  >停止当前任务</button>
+                </div>
+              </section>
+
+              <section class="panel stress-live" v-if="selectedStressRun">
+                <div class="panel-head">
+                  <div>
+                    <h2>实时结果</h2>
+                    <p><code>{{ selectedStressRun.public_model_id }}</code> · 并发 {{ selectedStressRun.concurrency }} · 目标输入 {{ compactTokens(selectedStressRun.target_input_tokens) }}</p>
+                  </div>
+                  <span
+                    class="status"
+                    :class="selectedStressRun.status === 'completed' ? 'ok' : selectedStressRun.status === 'failed' ? 'bad' : 'warn'"
+                  >{{ statusLabel(selectedStressRun.status) }}</span>
+                </div>
+                <div class="stress-progress" role="progressbar" :aria-valuenow="selectedStressRun.progress || 0" aria-valuemin="0" aria-valuemax="100">
+                  <i :style="{ width: `${selectedStressRun.progress || 0}%` }"></i>
+                </div>
+                <p class="stress-progress-label">
+                  {{ selectedStressRun.metrics?.completed || 0 }} / {{ selectedStressRun.request_count }} 请求
+                  · {{ metricNumber(selectedStressRun.elapsed_seconds, 1) }} 秒
+                  · {{ metricNumber(selectedStressRun.progress, 1) }}%
+                </p>
+                <div class="metrics stress-metrics">
+                  <article><span>成功率</span><strong>{{ metricNumber(selectedStressRun.metrics?.success_rate, 2) }}%</strong><small>{{ selectedStressRun.metrics?.successful || 0 }} 成功 / {{ selectedStressRun.metrics?.failed || 0 }} 失败</small></article>
+                  <article><span>请求吞吐</span><strong>{{ metricNumber(selectedStressRun.metrics?.request_rps, 2) }} RPS</strong><small>成功 {{ metricNumber(selectedStressRun.metrics?.successful_rps, 2) }} RPS</small></article>
+                  <article><span>Token 吞吐</span><strong>{{ metricNumber(selectedStressRun.metrics?.output_tokens_per_second, 1) }} tok/s</strong><small>全任务总输出速率</small></article>
+                  <article><span>单请求输出速度</span><strong>{{ metricNumber(metric(selectedStressRun, 'request_tokens_per_second', 'p50'), 1) }} tok/s</strong><small>P50 · P95 {{ metricNumber(metric(selectedStressRun, 'request_tokens_per_second', 'p95'), 1) }}</small></article>
+                  <article><span>实际输入 Token</span><strong>{{ (selectedStressRun.metrics?.input_tokens || 0).toLocaleString() }}</strong><small>由网关 usage 汇总</small></article>
+                  <article><span>实际输出 Token</span><strong>{{ (selectedStressRun.metrics?.output_tokens || 0).toLocaleString() }}</strong><small>由网关 usage 汇总</small></article>
+                </div>
+                <div class="latency-grid">
+                  <div><strong>首 Token 延迟（TTFT）</strong><span>平均 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'average'), 0) }} ms</span><span>P50 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'p50'), 0) }} ms</span><span>P95 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'p95'), 0) }} ms</span><span>P99 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'p99'), 0) }} ms</span></div>
+                  <div><strong>端到端延迟</strong><span>平均 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'average'), 0) }} ms</span><span>P50 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'p50'), 0) }} ms</span><span>P95 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'p95'), 0) }} ms</span><span>P99 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'p99'), 0) }} ms</span></div>
+                </div>
+                <p class="error-text" v-if="selectedStressRun.error">{{ selectedStressRun.error }}</p>
+                <details v-if="Object.keys(selectedStressRun.metrics?.errors || {}).length" class="stress-errors">
+                  <summary>错误分类</summary>
+                  <code v-for="(count, kind) in selectedStressRun.metrics.errors" :key="kind">{{ kind }}: {{ count }}</code>
+                </details>
+              </section>
+            </div>
+
+            <section class="panel" v-if="selectedStressRun?.recent_requests?.length">
+              <div class="panel-head"><div><h2>最近完成的请求</h2><p>后台 JSONL 事件的最近 20 条，不包含提示词或模型输出正文。</p></div></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>#</th><th>结果</th><th>TTFT</th><th>总延迟</th><th>输入 / 输出</th><th>tok/s</th><th>错误</th></tr></thead>
+                  <tbody><tr v-for="item in [...selectedStressRun.recent_requests].reverse()" :key="item.index">
+                    <td>{{ item.index + 1 }}</td><td><span class="status" :class="item.ok ? 'ok' : 'bad'">{{ item.ok ? '成功' : '失败' }}</span></td><td>{{ metricNumber(item.ttft_ms, 0) }} ms</td><td>{{ metricNumber(item.latency_ms, 0) }} ms</td><td>{{ item.input_tokens || 0 }} / {{ item.output_tokens || 0 }}</td><td>{{ metricNumber(item.tokens_per_second, 1) }}</td><td class="detail">{{ item.error_kind || '—' }}</td>
+                  </tr></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head"><div><h2>历史任务</h2><p>保存测试计划和聚合指标，便于对比不同并发与上下文档位。</p></div></div>
+              <ListFilterBar
+                v-model="listFilters['admin-stress'].query"
+                v-model:status="listFilters['admin-stress'].status"
+                :status-options="[
+                  { value: 'running', label: '运行中' },
+                  { value: 'completed', label: '已完成' },
+                  { value: 'failed', label: '失败' },
+                  { value: 'canceled', label: '已停止' },
+                ]"
+                status-label="全部状态"
+                :count="filteredRows('admin-stress', stressRuns).length"
+                placeholder="搜索模型、操作者或错误"
+              />
+              <div class="table-wrap">
+                <table><thead><tr><th>开始时间</th><th>模型</th><th>计划</th><th>结果</th><th>吞吐</th><th></th></tr></thead>
+                  <tbody><tr v-for="run in pageRows('admin-stress', filteredRows('admin-stress', stressRuns))" :key="run.id" :class="{ selected: selectedStressRunId === run.id }">
+                    <td>{{ date(run.created_at) }}</td><td><code>{{ run.public_model_id }}</code></td><td>并发 {{ run.concurrency }} · 输入 {{ compactTokens(run.target_input_tokens) }} · {{ run.request_count }} 请求</td><td><span class="status" :class="run.status === 'completed' ? 'ok' : run.status === 'failed' ? 'bad' : 'warn'">{{ statusLabel(run.status) }}</span><small>{{ metricNumber(run.metrics?.success_rate, 1) }}% 成功</small></td><td>{{ metricNumber(run.metrics?.request_rps, 2) }} RPS<br><small>{{ metricNumber(run.metrics?.output_tokens_per_second, 1) }} tok/s</small></td><td><button class="ghost compact" type="button" @click="selectedStressRunId = run.id; pollStressRun()">查看</button></td>
+                  </tr></tbody>
+                </table>
+              </div>
+              <PaginationBar
+                :page="pageNumber('admin-stress', filteredRows('admin-stress', stressRuns))"
+                :pages="pageCount(filteredRows('admin-stress', stressRuns))"
+                :total="filteredRows('admin-stress', stressRuns).length"
+                @previous="changePage('admin-stress', filteredRows('admin-stress', stressRuns), -1)"
+                @next="changePage('admin-stress', filteredRows('admin-stress', stressRuns), 1)"
+              />
+            </section>
+          </section>
+
           <section v-if="section === 'settings'" class="page">
             <div class="page-head">
               <div>
@@ -3121,6 +3620,12 @@ onBeforeUnmount(() => {
                     " /></label
                 ><label
                   >发件人<input v-model="settings.smtp_from" type="email"
+                /></label
+                ><label
+                  >测试收件人<input
+                    v-model="smtpTestRecipient"
+                    type="email"
+                    placeholder="测试邮件将发送到这里"
                 /></label>
                 <p class="muted setting-note">
                   测试邮件使用当前表单内容，不必先保存。

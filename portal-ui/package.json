@@ -1,13 +1,14 @@
 {
   "name": "llmctl-account-portal",
   "private": true,
-  "version": "2.6.2",
+  "version": "2.7.0",
   "type": "module",
   "scripts": {
     "build": "vite build",
     "test": "vitest run"
   },
   "dependencies": {
+    "pdfjs-dist": "5.4.624",
     "vue": "3.5.18"
   },
   "devDependencies": {

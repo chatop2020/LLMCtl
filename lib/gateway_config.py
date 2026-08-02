@@ -15,6 +15,7 @@ import http.cookiejar
 import json
 import os
 import pathlib
+import shlex
 import tempfile
 import urllib.error
 import urllib.parse
@@ -654,10 +655,10 @@ def update_env_file(path: pathlib.Path, updates: dict[str, str]) -> None:
                 continue
             key = line.split("=", 1)[0]
             if key in remaining:
-                output.append(f"{key}={remaining.pop(key)}")
+                output.append(f"{key}={shlex.quote(remaining.pop(key))}")
             else:
                 output.append(line)
-        output.extend(f"{key}={value}" for key, value in remaining.items())
+        output.extend(f"{key}={shlex.quote(value)}" for key, value in remaining.items())
         content = "\n".join(output) + "\n"
         atomic_write(path, content, 0o600)
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
@@ -804,7 +805,7 @@ def command_omniroute_admin(args: argparse.Namespace) -> None:
     )
     update_env_file(
         pathlib.Path(args.secrets_file),
-        {"UI_PASSWORD": new_password, "ACCOUNT_ADMIN_PASSWORD": new_password},
+        {"UI_PASSWORD": new_password},
     )
 
 

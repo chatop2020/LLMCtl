@@ -121,7 +121,13 @@ sudo llmctl key rotate
 sudo llmctl admin show
 sudo llmctl admin set-username NEW_ADMIN
 sudo llmctl admin set-password
+sudo llmctl admin set-portal-username NEW_ADMIN
+sudo llmctl admin set-portal-password
+sudo llmctl admin set-gateway-username NEW_ADMIN
+sudo llmctl admin set-gateway-password
 ```
+
+`set-username` and `set-password` update every applicable administrator entry point; the `portal` and `gateway` variants update only the selected entry point. OmniRoute's native interface has an administrator password but no username, so `set-gateway-username` explicitly reports that it is not applicable in OmniRoute mode. The portal login name may be any non-empty value and need not be an email address. Portal/gateway administrator passwords need only be non-empty, not all numeric, and free of newline/NUL characters; ordinary registered-user passwords still require 8–200 characters and cannot be all numeric.
 
 New API and OmniRoute create maintenance tokens in their databases, so `key rotate` does not accept a caller-supplied value. LiteLLM and Bifrost accept an optional value; a Bifrost key must start with `sk-bf-`. OmniRoute users rotate their personal keys in the account portal; the administrator command does not replace those keys.
 
@@ -134,7 +140,7 @@ OmniRoute does not provide a complete company-registration and administrator-fri
 /var/lib/llm-cluster/omniroute/portal/account-portal.db
 ```
 
-The first file is owned entirely by OmniRoute. The second stores portal users/groups, verification state, sessions, published models, access rules, price versions, balances, token grants, the usage ledger, and portal audit events. The portal never stores a plaintext user API key: a newly issued key is displayed once after email verification, and later it can only be rotated. It periodically reconciles OmniRoute call logs by unique request ID. Entitlement-changing reconciliation disables the user key first, commits the ledger, then publishes the new permission set; a failed sync remains closed.
+The first file is owned entirely by OmniRoute. The second stores portal users/groups, verification state, sessions, published models, access rules, price versions, balances, token grants, the usage ledger, and portal audit events. The portal database never stores a plaintext user API key. Email verification creates one long-lived key; later sign-ins retrieve that same key through OmniRoute's protected management API and keep it only in the current browser session, including in generated curl examples. Reveal events are audited without the plaintext. Only an explicit user rotation creates a new key and revokes the old one. The portal periodically reconciles OmniRoute call logs by unique request ID. Entitlement-changing reconciliation disables the user key first, commits the ledger, then publishes the new permission set; a failed sync remains closed.
 
 Public registration is disabled by default. Enabling it requires an exact email-domain allowlist, the public portal origin, and external SMTP:
 
@@ -145,7 +151,7 @@ sudo bash install-llm-cluster.sh \
   --allowed-email-domains example.com,subsidiary.example.com \
   --account-public-url https://llm.example.com \
   --account-api-public-url https://llm-api.example.com \
-  --account-admin-email llm-admin@example.com \
+  --account-admin-username llm-admin \
   --account-default-quota 1000000 \
   --account-quota-reset monthly \
   --smtp-host smtp.example.com \
@@ -169,7 +175,9 @@ sudo llmctl account restart
 sudo llmctl logs account -f
 ```
 
-The public portal URL is `http://SERVER_IP:8000/ui/`; port `8001` is loopback-only. Users see balances, grants, per-request usage, and transactions. The catalog shows only their effective models with prices/capabilities, copyable IDs, endpoints, and curl examples. The browser playground calls public `/v1` directly; the personal key stays in browser `sessionStorage` and does not pass through the portal backend. OCR, vision, and tool labels come from verified or administrator-confirmed metadata and do not alter vLLM behavior.
+The public portal URL is `http://SERVER_IP:8000/ui/`; port `8001` is loopback-only. Users see balances, grants, per-request usage, and transactions. The catalog shows only their effective models with prices/capabilities, copyable IDs, endpoints, and curl examples. The browser playground calls public `/v1` directly; the personal key stays in browser `sessionStorage` and does not pass through the portal backend. It accepts image, PDF, TXT, Markdown, CSV, and JSON attachments. Images are sent as data URLs to a vision-capable model; up to the first eight PDF pages are rendered locally as JPEGs, and oversize or unsupported files are rejected before sending. Attachments are not persisted in the portal database. OCR, vision, and tool labels come from verified or administrator-confirmed metadata and do not alter vLLM behavior.
+
+The administration console's **Performance benchmark** is executed by server-side `llm_benchmark.py`; the page does not create concurrent requests. Presets cover concurrency from 1 to 100 and target input sizes from 50 to 30K tokens. The runner creates reproducible, meaningful enterprise scenarios, calls the public model ID with real streaming requests, and treats gateway `usage` as the source of truth for actual tokens. The page polls job state every two seconds and shows success rate, total/successful RPS, aggregate output tok/s, per-request tok/s, TTFT and end-to-end latency percentiles, actual input/output tokens, and categorized failures. Plans with concurrency at least 20 or input at least 8K require explicit acknowledgement of GPU and online-user impact. Only one job may run at a time, and its API key is passed through the process environment rather than command arguments or result files.
 
 If OmniRoute is temporarily unavailable, the portal's local administration pages remain accessible with a degradation warning so users, SMTP settings, ledgers, and audits can still be inspected. Operations that depend on the gateway—models, keys, permissions, and live reconciliation—fail explicitly rather than reporting false success. `llmctl startup status` reports this state as `degraded`, while full startup acceptance still requires the portal `/ready` endpoint and OmniRoute to recover together.
 
