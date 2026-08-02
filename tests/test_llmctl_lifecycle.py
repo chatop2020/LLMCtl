@@ -31,6 +31,47 @@ def run_bash(body: str) -> str:
 
 
 class LlmctlLifecycleTests(unittest.TestCase):
+    def test_huggingface_model_search_runs_network_preflight_before_catalog(self):
+        output = run_bash(
+            r"""
+            require_root() { :; }
+            load_config() { GPU_MEMORY_UTILIZATION=0.92; }
+            prompt_proxy_if_needed() { printf 'network-preflight\n'; }
+            export_proxy_env() { :; }
+            run_catalog_maintenance() {
+              printf 'catalog'
+              printf ' %s' "$@"
+              printf '\n'
+            }
+            cmd_models search ornith --source huggingface
+            """
+        )
+        lines = output.splitlines()
+        self.assertEqual(lines[0], "network-preflight")
+        self.assertIn("catalog search", lines[1])
+        self.assertIn("--source huggingface", lines[1])
+
+    def test_nginx_front_door_keeps_portal_api_and_inference_paths_separate(self):
+        output = run_bash(
+            r"""
+            API_BIND=0.0.0.0
+            API_PORT=8000
+            GATEWAY_INTERNAL_PORT=18000
+            ACCOUNT_PORT=8001
+            GATEWAY_KIND=omniroute
+            render_nginx_config
+            """
+        )
+        self.assertIn("listen 0.0.0.0:8000", output)
+        self.assertIn("server_name localhost 127.0.0.1", output)
+        self.assertIn("location ^~ /ui/", output)
+        self.assertIn("location ^~ /portal-api/", output)
+        self.assertIn("location ^~ /base_ui/", output)
+        api = output.split("location ^~ /v1/", 1)[1].split("}", 1)[0]
+        self.assertIn("127.0.0.1:18000", api)
+        self.assertIn("proxy_buffering off", api)
+        self.assertNotIn("127.0.0.1:8001", api)
+
     def test_default_logs_aggregate_router_database_and_active_workers(self):
         output = run_bash(
             r"""

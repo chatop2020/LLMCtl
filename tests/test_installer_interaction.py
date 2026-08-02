@@ -21,6 +21,81 @@ def installer_script(body: str) -> str:
 
 
 class InstallerInteractionTests(unittest.TestCase):
+    def test_international_network_preflight_runs_before_gateway_and_model_selection(self):
+        installer = INSTALLER.read_text(encoding="utf-8")
+        main = installer.split("main() {", 1)[1].split(
+            'if [[ "${INSTALLER_SOURCE_ONLY:-0}" != 1 ]]', 1
+        )[0]
+        self.assertLess(main.index("select_language_interactively"), main.index("prompt_proxy_if_needed"))
+        self.assertLess(main.index("prompt_proxy_if_needed"), main.index("select_gateway_interactively"))
+        self.assertLess(main.index("prompt_proxy_if_needed"), main.index("select_model_interactively"))
+        self.assertIn("https://huggingface.co/api/models?limit=1", installer)
+
+    def test_failed_network_preflight_can_be_explicitly_declined(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    internet_available() { return 1; }
+                    prompt_proxy_if_needed
+                    printf 'declined=%s complete=%s proxy=%s\n' \
+                      "$NETWORK_PROXY_DECLINED" "$NETWORK_CHECK_COMPLETE" "${PROXY_URL:-none}"
+                    """
+                ),
+            ],
+            input="n\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("declined=1 complete=1 proxy=none", completed.stdout)
+        self.assertIn("模型目录可能只显示国内可达来源", completed.stderr)
+
+    def test_failed_network_preflight_validates_proxy_and_rejects_non_yes_answers(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    internet_available() { return 1; }
+                    network_probe() { [[ "$1" == proxy && "$PROXY_URL" == http://192.0.2.10:1080 ]]; }
+                    prompt_proxy_if_needed
+                    printf 'complete=%s proxy=%s save=%s\n' \
+                      "$NETWORK_CHECK_COMPLETE" "$PROXY_URL" "$SAVE_PROXY"
+                    """
+                ),
+            ],
+            input="m\ny\n192.0.2.10\n1080\n\nn\n",
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("请输入 y 或 n", completed.stderr)
+        self.assertIn("complete=1 proxy=http://192.0.2.10:1080 save=0", completed.stdout)
+        self.assertIn("代理后的 Hugging Face 网络测试通过", completed.stdout)
+
+    def test_unattended_network_failure_requires_explicit_proxy(self):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                installer_script(
+                    r"""
+                    ASSUME_YES=1
+                    internet_available() { return 1; }
+                    prompt_proxy_if_needed
+                    """
+                ),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("--proxy http://IP:PORT", completed.stderr)
+
     def test_image_pull_failure_has_actionable_bilingual_diagnostic(self):
         for language, expected in (
             ("zh", "无法拉取 OmniRoute 镜像"),

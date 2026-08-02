@@ -7,6 +7,7 @@
 ```bash
 sudo llmctl status
 sudo llmctl health
+sudo llmctl info --redact
 sudo llmctl smoke --full
 sudo llmctl key show
 sudo llmctl admin show
@@ -19,7 +20,9 @@ Change the server timezone from UTC to China Standard Time:
 sudo llmctl timezone set Asia/Shanghai
 ```
 
-The web administration URL depends on the gateway: New API, Bifrost, and OmniRoute use `http://SERVER_IP:8000/`; LiteLLM uses `http://SERVER_IP:8000/ui`. The administrator username defaults to `admin`. OmniRoute generates a strong random password when none is provided; the other gateways initially use `llm-admin`. Credentials are stored in root-only `/etc/llm-cluster/secrets.env` and can be displayed with `sudo llmctl admin show`.
+Nginx provides one public front door: `http://SERVER_IP:8000/v1/` for the API and `http://SERVER_IP:8000/ui/` for the daily web interface. In OmniRoute mode, `/ui/` is the company portal and the native troubleshooting UI remains at `/base_ui/`; for other gateways `/ui/` is their native interface. The actual gateway listens only on `127.0.0.1:18000`, and the company portal listens only on `127.0.0.1:8001`, so users do not need a second public port.
+
+The administrator username defaults to `admin`. OmniRoute generates a strong random password when none is provided; other gateways initially use `llm-admin`. Credentials are stored in root-only `/etc/llm-cluster/secrets.env`. `sudo llmctl admin show` prints routine sign-in details. `sudo llmctl info` is the disaster-recovery inventory and, by default in a root terminal, prints all plaintext passwords, API keys, database and SMTP credentials, public/internal endpoints, model/runtime state, services, files, and SQLite checks. Always use `sudo llmctl info --redact` before copying output to a ticket.
 
 Choose the gateway during a clean install. New API is the default, or select one explicitly:
 
@@ -106,6 +109,8 @@ sudo llmctl database status
 
 `llmctl router restart` rediscovers healthy workers, renders the selected gateway configuration, restarts it, waits for process health, and only then verifies authenticated `/v1/models`. New API initializes the administrator, creates an equal-weight channel per healthy worker, and creates a managed token. Bifrost generates equal-weight vLLM keys, a virtual key, and PostgreSQL log storage. LiteLLM uses `least-busy` plus a per-worker concurrency limit. OmniRoute creates one provider node per worker and an equal-weight Combo, then synchronizes model metadata and the maintenance key.
 
+The installer installs Nginx or reuses an existing installation. LLMCtl manages only `/etc/nginx/conf.d/llm-cluster.conf`, requires `nginx -t` before reload, and restores the prior content on failure. If a same-name config existed before installation it is restored on uninstall; the Nginx package, other virtual hosts, and certificate configuration are always preserved. `/v1/` disables proxy buffering and goes straight to the gateway rather than the Python portal, preserving streaming and high-throughput behavior.
+
 None of these routers directly knows how much GPU memory, KV cache, or image processing a particular request will consume. Long-context and multi-image requests may still create transient imbalance. Run `llmctl bench` and `llmctl optimize analyze` with a realistic workload before tuning.
 
 Key and administrator maintenance:
@@ -122,14 +127,14 @@ New API and OmniRoute create maintenance tokens in their databases, so `key rota
 
 ### OmniRoute company account portal
 
-OmniRoute does not provide an SMTP registration flow. LLMCtl therefore deploys a separate `llm-account.service`, which uses OmniRoute's management API to create user keys and token limits. They share a state directory but never a database file:
+OmniRoute does not provide a complete company-registration and administrator-friendly billing flow. LLMCtl therefore deploys a separate Vue 3 portal and lightweight `llm-account.service`. The portal uses OmniRoute HTTP APIs for mappings, Combos, and user-key permissions, while ordinary `/v1` requests still go directly from Nginx to OmniRoute. They share a state root but never a database file:
 
 ```text
 /var/lib/llm-cluster/omniroute/gateway/storage.sqlite
 /var/lib/llm-cluster/omniroute/portal/account-portal.db
 ```
 
-The first file is owned entirely by OmniRoute. The second stores portal users, verification state, quota policy, sessions, and portal audit events. The portal never stores a plaintext API key: a newly issued key is displayed once after email verification, and later it can only be rotated. OmniRoute remains the source for inference calls and token usage, so portal account audit and inference-call audit are viewed separately.
+The first file is owned entirely by OmniRoute. The second stores portal users/groups, verification state, sessions, published models, access rules, price versions, balances, token grants, the usage ledger, and portal audit events. The portal never stores a plaintext user API key: a newly issued key is displayed once after email verification, and later it can only be rotated. It periodically reconciles OmniRoute call logs by unique request ID. Entitlement-changing reconciliation disables the user key first, commits the ledger, then publishes the new permission set; a failed sync remains closed.
 
 Public registration is disabled by default. Enabling it requires an exact email-domain allowlist, the public portal origin, and external SMTP:
 
@@ -151,7 +156,11 @@ sudo bash install-llm-cluster.sh \
   --smtp-from llm@example.com
 ```
 
-The allowlist matches the complete part after `@`; allowing `example.com` does not allow `evil-example.com` or `dept.example.com`. It is checked both at registration and verification. In the administrator UI, registration can be enabled or disabled, the allowlist and new-user default can be changed, and existing users can receive a new quota/reset period or be disabled. Supported periods are `daily`, `weekly`, and `monthly`; enforcement and reset are handled by OmniRoute token limits.
+The allowlist matches the complete part after `@`; allowing `example.com` does not allow `evil-example.com` or `dept.example.com`. It is checked at both registration and verification. Administrators can configure and test SMTP online, enable/disable registration, change the allowlist and welcome grant, disable users, manage groups, adjust money balances, and issue generic or model-specific token grants. Grants support `daily`, `weekly`, and `monthly` resets at an explicit time. A background reset runs independently, so an exhausted and disabled key can become eligible again on schedule.
+
+The model page maps a public ID such as `gdn-inside` to `ornith-1.0-35b-fp8` with OmniRoute's native Combo mapping or model alias. User keys authorize only the public ID—not the underlying model or Combo ID. Each model can have separate input, output, cache-read, and reasoning-token prices per million tokens and multiple `all`, group, or individual access rules. Token grants are consumed first; only the excess debits the money balance. Prices are versioned and snapshotted into the ledger, so later edits never reprice old calls.
+
+The free-resource page reads OmniRoute's catalog plus configured/currently-available provider rankings. A resource can be published only after discovery, provider configuration, current availability, a real portal live test, and explicit administrator approval. Published free models are retested every 15 minutes. After three consecutive failures the portal disables keys first, withdraws the native mapping, and removes the model from effective permissions.
 
 ```bash
 sudo llmctl account status
@@ -160,9 +169,11 @@ sudo llmctl account restart
 sudo llmctl logs account -f
 ```
 
-The portal defaults to `http://SERVER_IP:8001/`. After login, users can view usage and reset time. Its model page reads OmniRoute `/v1/models` live and provides copyable model IDs, the concrete `/v1` endpoint, and a runnable `curl` example. OCR, vision, and tool tags come from model capabilities verified during installation; they do not change vLLM behavior.
+The public portal URL is `http://SERVER_IP:8000/ui/`; port `8001` is loopback-only. Users see balances, grants, per-request usage, and transactions. The catalog shows only their effective models with prices/capabilities, copyable IDs, endpoints, and curl examples. The browser playground calls public `/v1` directly; the personal key stays in browser `sessionStorage` and does not pass through the portal backend. OCR, vision, and tool labels come from verified or administrator-confirmed metadata and do not alter vLLM behavior.
 
-In production, place ports 8001 and 8000 behind an HTTPS reverse proxy. `--account-public-url` and `--account-api-public-url` must be the path-free origins users actually reach. SMTP credentials and the management key live only in root-only `secrets.env`; avoid placing passwords in shell history and use a protected environment or temporary argument source for unattended deployment.
+If OmniRoute is temporarily unavailable, the portal's local administration pages remain accessible with a degradation warning so users, SMTP settings, ledgers, and audits can still be inspected. Operations that depend on the gateway—models, keys, permissions, and live reconciliation—fail explicitly rather than reporting false success. `llmctl startup status` reports this state as `degraded`, while full startup acceptance still requires the portal `/ready` endpoint and OmniRoute to recover together.
+
+In production, protect only public port `8000` and terminate HTTPS in an existing Nginx/TLS site or upstream load balancer; never expose loopback ports `8001`, `18000`, or `810x`. `--account-public-url` may be the public origin or its `/ui` path, while `--account-api-public-url` is a path-free origin. SMTP and management credentials are in root-only configuration; the portal SQLite file also stores runtime SMTP settings and must be backed up and protected as a sensitive file.
 
 ## OpenAI-Compatible API
 
@@ -297,7 +308,9 @@ sudo llmctl models inspect modelscope Qwen/Qwen3-8B
 sudo llmctl models current
 ```
 
-The installer performs a read-only preflight before model search. It covers OS/architecture, CPU/cores/threads, memory/swap, GPUs/VRAM/driver/compute capability, current and maximum PCIe links, GPU/NUMA/NVLink topology, and model-filesystem capacity. PCIe/topology information is a capability snapshot, not an active NCCL bandwidth test.
+Immediately after language selection, before gateway or model selection, the installer directly probes `https://huggingface.co/api/models?limit=1`. If it fails, it offers proxy setup and retests after entry; declining produces an explicit warning that Hugging Face candidates may be absent. With `--yes` or `--non-interactive`, it never waits for input and requires `--proxy http://IP:PORT`. After installation, `llmctl models search --source all|huggingface` also validates direct access or a saved proxy first. ModelScope-only search, health checks, and offline inference do not prompt for international networking.
+
+The installer then performs a read-only host preflight before model search. It covers OS/architecture, CPU/cores/threads, memory/swap, GPUs/VRAM/driver/compute capability, current and maximum PCIe links, GPU/NUMA/NVLink topology, and model-filesystem capacity. PCIe/topology information is a capability snapshot, not an active NCCL bandwidth test.
 
 The catalog excludes platform-specific conversions such as Apple MLX weights. `mlx-community/*` targets MLX on Apple Silicon and cannot be used as NVIDIA CUDA/vLLM weights. Selecting a candidate expands its VRAM budget, TP links, host memory, disk, startup parallelism, and itemized recommendation reasons. You can then confirm, return to the candidate list, or search again.
 

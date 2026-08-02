@@ -21,11 +21,14 @@
 - 选择候选后显示显存预算、拓扑链路、主机内存/磁盘预算、逐项推荐原因和风险提示；可确认、返回列表、重新搜索或退出。
 - 下载前在固定 vLLM 容器的 `ModelRegistry` 中再次核验架构；下载后校验配置、权重存在性和体积。
 - 模型能力匹配时才启用图片/OCR、OpenAI 工具调用、思考解析和请求级思考关闭。
-- 一个 GPU 或一个 TP 分组对应一个 Worker；安装器为所选接入层自动生成全部 Worker、鉴权和数据库配置，并通过统一的 `:8000/v1` 提供服务。
-- OmniRoute 模式额外部署轻量账户门户：支持邮箱验证、精确企业邮箱后缀白名单、注册开关、用户独立 API key、周期 token 额度/自动重置、用量、门户审计和实时模型目录。
+- 一个 GPU 或一个 TP 分组对应一个 Worker；安装器为所选接入层自动生成全部 Worker、鉴权和数据库配置，并通过 Nginx 统一的 `:8000/v1` 提供服务。
+- 自动安装或复用现有 Nginx：公开入口统一为 `/v1/` 和 `/ui/`；推理请求直接转发到网关，不经过门户；OmniRoute 原生排障界面保留在 `/base_ui/`。LLMCtl 使用独立配置，写入前执行 `nginx -t`，失败回滚，卸载时保留软件包和其他站点。
+- OmniRoute 模式额外部署 Vue 3 企业门户：支持邮箱验证/精确企业邮箱后缀/注册开关/SMTP 在线配置、用户与用户组、用户独立 API key、金额余额、额外 token 赠额及周期自动重置、逐模型输入/输出/缓存/思考定价、用量账本和审计。
+- 企业门户通过 OmniRoute API 原生管理模型 ID 映射、Combo、用户 key 权限和免费层资源；免费模型必须经过“发现、已配置、可用、实时测试、管理员发布”门禁。用户只获得公开模型 ID 权限，不能用底层模型或 Combo ID 绕过映射。
 - systemd 开机自启；Worker 可分批并行加载，SSH 断开不影响后台启动。
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
+- `llmctl info` 提供分门别类的完整灾备清单：公开/内部入口、硬件、镜像、服务、自启、Worker、数据库、管理员、全部密钥/密码、SMTP、代理、模型与文件路径；默认仅供可信 root 终端明文查看，分享时用 `--redact`。
 - `llmctl optimize` 可采集流式 TTFT/ITL/E2E、聚合吞吐、GPU/显存/温度、CPU/内存/Swap 和 vLLM KV Cache/排队/抢占/前缀缓存指标；先解释候选原因、代价和边界，经用户确认后才备份配置、逐项重启试验、自动择优、完整冒烟，并在失败或中断时回滚。
 
 ## 重要边界
@@ -44,6 +47,8 @@
 | `lib/runtime_optimizer.py` | 流式基准、GPU/vLLM 指标采集、保守候选生成与目标评分 |
 | `lib/gateway_config.py` | 四种接入层的无密钥配置生成及 New API/OmniRoute 状态同步 |
 | `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、额度和模型目录 |
+| `portal-ui/` | Vue 3 企业门户源码与前端测试 |
+| `lib/account_portal_ui/` | 已构建、安装时直接复制的门户静态资源 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
 | `tests/test_runtime_optimizer.py` | 调优建议、评分、指标解析与流式时延测试 |
 | `README.md` / `README_EN.md` | 中英文项目说明 |
@@ -61,9 +66,10 @@
 | Bifrost 镜像 | `maximhq/bifrost:v1.6.7` |
 | OmniRoute 镜像 | `diegosouzapw/omniroute:3.8.48` |
 | PostgreSQL | `postgres:16-alpine` |
-| API | `http://服务器IP:8000/v1` |
-| Web UI | New API/Bifrost/OmniRoute：`http://服务器IP:8000/`；LiteLLM：`/ui` |
-| OmniRoute 账户门户 | `http://服务器IP:8001/` |
+| 统一 API | `http://服务器IP:8000/v1` |
+| 统一 Web UI | `http://服务器IP:8000/ui/` |
+| OmniRoute 原生 UI | `http://服务器IP:8000/base_ui/` |
+| 内部监听 | 网关 `127.0.0.1:18000`；OmniRoute 门户 `127.0.0.1:8001` |
 | 管理员用户名 | `admin` |
 | 初始密码 | 默认 `llm-admin`；OmniRoute 未指定时生成强随机值 |
 | 路由 | 8 个健康 Worker 等权分发并故障切换；LiteLLM 使用 `least-busy` |
@@ -86,7 +92,7 @@ sudo llmctl admin set-password
 | Bifrost | 高效转发、可观测与虚拟密钥治理 | 生成 8 个 vLLM key、等权路由、虚拟密钥、管理认证和 PostgreSQL 日志存储 |
 | OmniRoute | 本地 SQLite 网关及公司账户门户 | 创建 8 个 Provider 节点和一个等权 Combo；部署独立门户数据库、邮箱注册、用户 key、周期额度、用量与模型目录 |
 
-四者都使用 `llm-router.service`、端口 `8000` 和 OpenAI 兼容 `/v1`，统一维护密钥保存在 root-only 的 `GATEWAY_API_KEY`。New API、LiteLLM、Bifrost 使用 `llm-database.service` 的 PostgreSQL；OmniRoute 使用自己的 SQLite，不启动 PostgreSQL，并额外启动 `llm-account.service`。本版不做在线迁移；切换接入层时应使用没有旧服务配置的全新安装。本地模型和已存在的精确 Docker 镜像会分别核验后复用。部署前还应按使用方式审查各上游项目许可证。
+四者都使用 `llm-router.service`，实际网关只监听回环地址 `127.0.0.1:18000`；Nginx 在公开 `8000` 端口统一提供 OpenAI 兼容 `/v1/` 和 `/ui/`。统一维护密钥保存在 root-only 的 `GATEWAY_API_KEY`。New API、LiteLLM、Bifrost 使用 `llm-database.service` 的 PostgreSQL；OmniRoute 使用自己的 SQLite，不启动 PostgreSQL，并额外启动只监听回环 `8001` 的 `llm-account.service`。本版不做在线迁移；切换接入层时应使用没有旧服务配置的全新安装。本地模型和已存在的精确 Docker 镜像会分别核验后复用。部署前还应按使用方式审查各上游项目许可证。
 
 ## 快速开始
 
@@ -100,13 +106,13 @@ sudo bash install-llm-cluster.sh
 交互流程会依次询问：
 
 1. 选择中文或 English；默认中文，后续安装向导和模型目录使用所选语言。
-2. 选择 New API（默认）、LiteLLM、Bifrost 或 OmniRoute；OmniRoute 会继续询问企业注册、邮箱域名和 SMTP 设置。
-3. 只读显示本机 OS、CPU、内存、GPU/驱动、PCIe/拓扑/NUMA 与磁盘体检。
-4. 搜索 Hugging Face、ModelScope、两者，或直接输入模型；再输入关键词和用途。
-5. 从通过门禁的候选中选择。输入 `0`/`b` 返回，`q` 退出。
-6. 阅读模型详细计划、逐项推荐原因和风险；目录候选、已验证配置和手工输入模型都必须先确认。`Y` 确认、`b` 返回、`s` 重新搜索、`q` 退出。
-7. 选择模型目录，确认 TP、每实例序列数、激活实例数和按本机资源规划的并行启动数。
-8. 需要国际资源时才询问代理 IP 和端口；代理可选择保存供维护使用。
+2. 立即直连 Hugging Face 模型目录执行国际网络测试。失败时明确询问是否配置代理，填写后立即复测；无人值守失败必须显式提供 `--proxy`。
+3. 选择 New API（默认）、LiteLLM、Bifrost 或 OmniRoute；OmniRoute 会继续询问企业注册、邮箱域名和 SMTP 设置。
+4. 只读显示本机 OS、CPU、内存、GPU/驱动、PCIe/拓扑/NUMA 与磁盘体检。
+5. 搜索 Hugging Face、ModelScope、两者，或直接输入模型；再输入关键词和用途。
+6. 从通过门禁的候选中选择。输入 `0`/`b` 返回，`q` 退出。
+7. 阅读模型详细计划、逐项推荐原因和风险；目录候选、已验证配置和手工输入模型都必须先确认。`Y` 确认、`b` 返回、`s` 重新搜索、`q` 退出。
+8. 选择模型目录，确认 TP、每实例序列数、激活实例数和按本机资源规划的并行启动数。
 
 也可用参数直接选择安装向导语言：
 
@@ -167,6 +173,10 @@ sudo bash install-llm-cluster.sh --force-reconfigure
 
 ## 网络与代理
 
+安装器在语言选择后、任何网关或模型选择之前，直接请求 Hugging Face 模型目录 API。直连失败时会显示原因并询问代理，代理填写后必须复测成功才继续；拒绝代理可以继续，但会明确提示 Hugging Face 结果可能缺失。`--yes` 或 `--non-interactive` 不会卡在输入框，而是要求显式添加 `--proxy http://IP:PORT`。
+
+`llmctl models search --source all|huggingface` 同样先测试网络：优先直连，其次验证保存的维护代理，仍失败才重新询问。健康检查、状态查询和离线推理不会因为没有国际网络而弹出代理问题。
+
 代理只用于安装、模型下载或显式维护命令。安装结束前脚本会：
 
 1. 清除当前进程的代理变量。
@@ -211,6 +221,8 @@ sudo llmctl models current
 | `/usr/local/lib/llm-cluster/model_catalog.py` | 已安装目录助手 |
 | `/usr/local/lib/llm-cluster/gateway_config.py` | 接入层配置与 New API 同步助手 |
 | `/usr/local/lib/llm-cluster/account_portal.py` | OmniRoute 企业账户门户 |
+| `/usr/local/lib/llm-cluster/account_portal_ui` | Vue 3 门户静态资源 |
+| `/etc/nginx/conf.d/llm-cluster.conf` | LLMCtl 独立 Nginx 统一入口配置 |
 | `/var/lib/llm-cluster/cache` | 可再生成的 vLLM 缓存 |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute 自身 SQLite 数据库 |
 | `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | 账户门户独立 SQLite 数据库 |
@@ -220,10 +232,11 @@ sudo llmctl models current
 | `llm-router.service` | 所选 New API/LiteLLM/Bifrost/OmniRoute API/UI |
 | `llm-database.service` | 非 OmniRoute 接入层 PostgreSQL |
 | `llm-account.service` | 仅 OmniRoute 模式的企业账户门户 |
+| `nginx.service` | `/v1/`、`/ui/` 和可选 `/base_ui/` 统一公开入口 |
 
 ## 安全说明
 
-- API 默认监听 `0.0.0.0:8000`；OmniRoute 账户门户默认监听 `0.0.0.0:8001`。生产环境应使用防火墙限制来源，并在反向代理上启用 HTTPS；PostgreSQL 只监听 `127.0.0.1`。
+- Nginx 默认监听 `0.0.0.0:8000`；网关、门户、Worker 和 PostgreSQL 均只绑定回环或内部 Docker 网络。生产环境仍应使用防火墙限制来源并配置 HTTPS。安装器可利旧已有 Nginx，但不会自动签发 TLS 证书。
 - 模型 revision 会写入清单。Hugging Face 默认固定 commit；ModelScope 默认 `master`，若要求可复现部署，请显式提供 tag 或 commit hash。
 - 只有模型配置声明 `auto_map` 时才启用 `--trust-remote-code`。这仍意味着会执行仓库代码，只选择经过审核且固定 revision 的模型。
 - 外部图片域名默认不放行；OCR 示例使用 `data:` base64，降低 SSRF 风险。
@@ -235,6 +248,11 @@ sudo llmctl models current
 bash -n install-llm-cluster.sh llmctl.sh
 python3 -m py_compile lib/*.py
 python3 -m unittest discover -s tests -v
+cd portal-ui
+npm ci
+npm test
+npm run build
+npm audit --audit-level=high
 ```
 
 真实发布前还应在目标服务器执行完整安装、`llmctl smoke --full` 和符合业务请求分布的 `llmctl bench`。40 token/s、25 并发或 256K 上下文是性能目标，不能仅靠显存估算承诺，必须用实际模型、输入长度、图片数量和输出长度压测。

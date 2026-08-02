@@ -12,6 +12,62 @@ ACCOUNT = (ROOT / "lib" / "account_portal.py").read_text(encoding="utf-8")
 
 
 class StaticDeploymentContracts(unittest.TestCase):
+    def test_llmctl_info_is_a_comprehensive_root_recovery_inventory(self):
+        info = MANAGER.split("cmd_info() {", 1)[1].split("cmd_health() {", 1)[0]
+        for marker in (
+            "[主机与运行时 / Host and runtimes]",
+            "[统一公开入口 / Public front door]",
+            "[内部网络 / Internal networking]",
+            "[接入层与管理员 / Gateway and administrators]",
+            "[API 与内部密钥 / API and internal secrets]",
+            "[数据库 / Databases]",
+            "[注册、额度与 SMTP / Registration, quota and SMTP]",
+            "[维护网络 / Maintenance networking]",
+            "[模型与推理 / Model and inference]",
+            "[服务、自启与 Worker / Services and workers]",
+            "[文件、日志与维护 / Files, logs and maintenance]",
+        ):
+            self.assertIn(marker, info)
+        for secret in (
+            "GATEWAY_API_KEY",
+            "BACKEND_API_KEY",
+            "UI_PASSWORD",
+            "ACCOUNT_ADMIN_PASSWORD",
+            "POSTGRES_PASSWORD",
+            "DATABASE_URL",
+            "SMTP_PASSWORD",
+            "OMNIROUTE_STORAGE_ENCRYPTION_KEY",
+        ):
+            self.assertIn(secret, info)
+        self.assertIn("--redact", info)
+        self.assertIn("dump-config --show-secrets", info)
+
+    def test_nginx_install_isolated_config_has_validation_rollback_and_restore(self):
+        nginx = MANAGER.split("render_nginx_config() {", 1)[1].split("database_health() {", 1)[0]
+        self.assertIn("/etc/nginx/conf.d/llm-cluster.conf", MANAGER)
+        self.assertIn("nginx -t", nginx)
+        self.assertIn("install-mode", nginx)
+        self.assertIn("previous.conf", nginx)
+        self.assertIn("已恢复安装前同名 Nginx 配置", nginx)
+        self.assertIn("现有 Nginx 软件包和其他站点均保留", nginx)
+
+    def test_portal_health_distinguishes_local_liveness_from_gateway_readiness(self):
+        health = MANAGER.split("account_portal_health() {", 1)[1].split(
+            "account_local_base_url() {", 1
+        )[0]
+        self.assertIn('account_local_base_url)/health', health)
+        self.assertIn('account_portal_ready() {', health)
+        self.assertIn('account_local_base_url)/ready', health)
+        self.assertIn('elif account_portal_health; then', MANAGER)
+        self.assertIn('portal_state=degraded', MANAGER)
+        account_unit = INSTALLER.split(
+            "Description=LLMCtl company account portal for OmniRoute", 1
+        )[1].split("EOF", 1)[0]
+        self.assertIn("Wants=llm-router.service", account_unit)
+        self.assertIn("PartOf=llm-cluster.service", account_unit)
+        self.assertNotIn("Requires=llm-router.service", account_unit)
+        self.assertNotIn("PartOf=llm-cluster.service llm-router.service", account_unit)
+
     def test_systemd_delegates_worker_arguments_to_manager(self):
         self.assertIn("ExecStart=/usr/local/sbin/llmctl _worker-start %i", INSTALLER)
         unit = INSTALLER.split("Description=vLLM model worker instance %i", 1)[1].split("EOF", 1)[0]

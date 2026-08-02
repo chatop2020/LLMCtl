@@ -28,6 +28,13 @@ OMNIROUTE_MANAGED_KEY = "llmctl-management"
 OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually."
 
 
+def worker_origin(worker_id: int) -> str:
+    """Return the origin visible from the selected gateway container."""
+    base_port = int(required_env("WORKER_BASE_PORT"))
+    host = f"llm-worker-{worker_id}" if os.environ.get("DOCKER_NETWORK") else "127.0.0.1"
+    return f"http://{host}:{base_port + worker_id}"
+
+
 def required_env(name: str) -> str:
     value = os.environ.get(name, "")
     if not value:
@@ -81,7 +88,7 @@ def litellm_config(worker_ids: Iterable[int]) -> str:
                 f'  - model_name: "{model}"',
                 "    litellm_params:",
                 f'      model: "hosted_vllm/{model}"',
-                f'      api_base: "http://127.0.0.1:{base_port + worker_id}/v1"',
+                f'      api_base: "{worker_origin(worker_id)}/v1"',
                 '      api_key: "os.environ/BACKEND_API_KEY"',
                 f"      max_parallel_requests: {max_seqs}",
                 "      timeout: 7200",
@@ -120,8 +127,8 @@ def postgres_store(max_idle: int, max_open: int) -> dict[str, Any]:
         "enabled": True,
         "type": "postgres",
         "config": {
-            "host": "127.0.0.1",
-            "port": required_env("GATEWAY_DB_PORT"),
+            "host": "llm-database" if os.environ.get("DOCKER_NETWORK") else "127.0.0.1",
+            "port": "5432" if os.environ.get("DOCKER_NETWORK") else required_env("GATEWAY_DB_PORT"),
             "user": "env.POSTGRES_USER",
             "password": "env.POSTGRES_PASSWORD",
             "db_name": required_env("POSTGRES_DB"),
@@ -145,7 +152,7 @@ def bifrost_config(worker_ids: Iterable[int]) -> str:
                 "models": [model],
                 "weight": 1.0,
                 "vllm_key_config": {
-                    "url": f"http://127.0.0.1:{base_port + worker_id}",
+                    "url": worker_origin(worker_id),
                     "model_name": model,
                 },
             }
@@ -219,7 +226,7 @@ def newapi_plan(worker_ids: Iterable[int]) -> str:
         "channels": [
             {
                 "name": f"LLMCtl worker {worker_id}",
-                "base_url": f"http://127.0.0.1:{base_port + worker_id}",
+                "base_url": worker_origin(worker_id),
                 "weight": 100,
                 "priority": 0,
             }
@@ -244,7 +251,7 @@ def omniroute_plan(worker_ids: Iterable[int]) -> str:
                 "id": worker_id,
                 "node_name": f"LLMCtl worker {worker_id}",
                 "prefix": f"llmctl-w{worker_id}",
-                "base_url": f"http://127.0.0.1:{base_port + worker_id}/v1",
+                "base_url": f"{worker_origin(worker_id)}/v1",
             }
             for worker_id in worker_ids
         ],
@@ -452,7 +459,7 @@ def reconcile_omniroute(
     for worker_id in worker_ids:
         name = f"LLMCtl worker {worker_id}"
         prefix = f"llmctl-w{worker_id}"
-        base_url = f"http://127.0.0.1:{base_port + worker_id}/v1"
+        base_url = f"{worker_origin(worker_id)}/v1"
         matches = [node for node in nodes if node.get("name") == name]
         node: dict[str, Any]
         if matches:
@@ -728,7 +735,7 @@ def reconcile_newapi(client: NewAPIClient, worker_ids: list[int], secrets_file: 
                     "status": 1,
                     "name": f"LLMCtl worker {worker_id}",
                     "weight": 100,
-                    "base_url": f"http://127.0.0.1:{base_port + worker_id}",
+                    "base_url": worker_origin(worker_id),
                     "models": model,
                     "group": "default",
                     "priority": 0,

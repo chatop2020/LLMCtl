@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.3.2"
+readonly CTL_VERSION="2.4.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -27,16 +27,26 @@ readonly OPTIMIZER_HELPER="${LLM_OPTIMIZER_HELPER:-/usr/local/lib/llm-cluster/ru
 readonly GATEWAY_HELPER="${LLM_GATEWAY_HELPER:-/usr/local/lib/llm-cluster/gateway_config.py}"
 readonly OPTIMIZATION_DIR="${STATE_DIR}/optimization"
 readonly SMOKE_DIAGNOSTIC_DIR="${STATE_DIR}/diagnostics/smoke"
+readonly NGINX_CONFIG="/etc/nginx/conf.d/llm-cluster.conf"
+readonly NGINX_STATE_DIR="${STATE_DIR}/nginx"
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
 OPTIMIZER_ROLLBACK_WORKERS=""
+MAINTENANCE_PROXY_DECLINED=0
 
 log()  { printf '[llmctl] %s\n' "$*"; }
 warn() { printf '[llmctl] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[llmctl] ERROR: %s\n' "$*" >&2; exit 1; }
 ctl_l10n() {
   if [[ "${INTERFACE_LANGUAGE:-zh}" == en ]]; then printf '%s' "${2:-}"; else printf '%s' "${1:-}"; fi
+}
+
+ensure_docker_network() {
+  /usr/bin/docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 && return 0
+  /usr/bin/docker network create "${DOCKER_NETWORK}" >/dev/null 2>&1 || \
+    /usr/bin/docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 || \
+    die "无法创建 Docker 内部网络 ${DOCKER_NETWORK}"
 }
 
 require_root() {
@@ -91,7 +101,9 @@ load_config() {
   LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-${GATEWAY_API_KEY}}"
   DATABASE_URL="${DATABASE_URL:-${SQL_DSN:-}}"
   ACCOUNT_PORT="${ACCOUNT_PORT:-8001}"
-  ACCOUNT_BIND="${ACCOUNT_BIND:-0.0.0.0}"
+  ACCOUNT_BIND="${ACCOUNT_BIND:-127.0.0.1}"
+  GATEWAY_INTERNAL_PORT="${GATEWAY_INTERNAL_PORT:-18000}"
+  DOCKER_NETWORK="${DOCKER_NETWORK:-llm-cluster-net}"
   ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-}"
   ACCOUNT_API_PUBLIC_URL="${ACCOUNT_API_PUBLIC_URL:-}"
   ACCOUNT_ADMIN_EMAIL="${ACCOUNT_ADMIN_EMAIL:-admin@llmctl.local}"
@@ -115,6 +127,7 @@ load_config() {
   : "${WORKER_BASE_PORT:?WORKER_BASE_PORT missing}"
   : "${API_BIND:?API_BIND missing}"
   : "${API_PORT:?API_PORT missing}"
+  : "${GATEWAY_INTERNAL_PORT:?GATEWAY_INTERNAL_PORT missing}"
   : "${MODEL_ROOT:?MODEL_ROOT missing}"
   : "${SERVED_MODEL_NAME:?SERVED_MODEL_NAME missing}"
   : "${VLLM_IMAGE:?VLLM_IMAGE missing}"
@@ -153,41 +166,43 @@ cmd_gateway_start() {
   load_config
   local name
   name=$(gateway_display_name)
-  log "启动 ${name}：镜像=${GATEWAY_IMAGE}，入口=${API_BIND}:${API_PORT}。"
+  log "启动 ${name}：镜像=${GATEWAY_IMAGE}，内部入口=127.0.0.1:${GATEWAY_INTERNAL_PORT}，公开入口由 Nginx ${API_BIND}:${API_PORT} 提供。"
+  ensure_docker_network
   case "${GATEWAY_KIND}" in
     newapi)
-      [[ "${API_BIND}" == 0.0.0.0 || "${API_BIND}" == :: ]] || \
-        die "New API 当前仅支持 api-bind=0.0.0.0 或 ::；其进程不提供独立监听地址参数"
       docker volume create llm-cluster-gateway-data >/dev/null
-      exec /usr/bin/docker run --rm --name llm-router --network host \
+      exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
+        -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
         --env-file "${SECRETS_ENV}" \
-        -e "PORT=${API_PORT}" -e "TZ=${TZ:-Asia/Shanghai}" \
+        -e "PORT=${GATEWAY_INTERNAL_PORT}" -e "TZ=${TZ:-Asia/Shanghai}" \
         -e ERROR_LOG_ENABLED=true -e BATCH_UPDATE_ENABLED=true \
         -v llm-cluster-gateway-data:/data \
         "${GATEWAY_IMAGE}" --log-dir /data/logs
       ;;
     litellm)
-      exec /usr/bin/docker run --rm --name llm-router --network host \
+      exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
+        -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
         --env-file "${SECRETS_ENV}" \
         -v "${LITELLM_CONFIG}:/app/config.yaml:ro" \
-        "${GATEWAY_IMAGE}" --config /app/config.yaml --host "${API_BIND}" --port "${API_PORT}"
+        "${GATEWAY_IMAGE}" --config /app/config.yaml --host 0.0.0.0 --port "${GATEWAY_INTERNAL_PORT}"
       ;;
     bifrost)
       docker volume create llm-cluster-gateway-data >/dev/null
-      exec /usr/bin/docker run --rm --name llm-router --network host \
+      exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
+        -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
         --env-file "${SECRETS_ENV}" \
-        -e APP_DIR=/app/data -e "APP_HOST=${API_BIND}" -e "APP_PORT=${API_PORT}" \
+        -e APP_DIR=/app/data -e APP_HOST=0.0.0.0 -e "APP_PORT=${GATEWAY_INTERNAL_PORT}" \
         -v llm-cluster-gateway-data:/app/data \
         -v "${BIFROST_CONFIG}:/app/data/config.json:ro" \
         "${GATEWAY_IMAGE}"
       ;;
     omniroute)
-      [[ "${API_BIND}" == 0.0.0.0 || "${API_BIND}" == :: ]] || \
-        die "OmniRoute 当前仅支持 api-bind=0.0.0.0 或 ::；请通过防火墙限制入口"
       install -d -m 770 -o 1000 -g 1000 "${STATE_DIR}/omniroute/gateway"
-      exec /usr/bin/docker run --rm --name llm-router --network host \
+      exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
+        -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
         --env-file "${SECRETS_ENV}" \
-        -e "PORT=${API_PORT}" -e "DASHBOARD_PORT=${API_PORT}" -e "API_PORT=${API_PORT}" \
+        -e HOST=0.0.0.0 -e API_HOST=0.0.0.0 \
+        -e "PORT=${GATEWAY_INTERNAL_PORT}" -e "DASHBOARD_PORT=${GATEWAY_INTERNAL_PORT}" -e "API_PORT=${GATEWAY_INTERNAL_PORT}" \
         -e "INITIAL_PASSWORD=${UI_PASSWORD}" -e "JWT_SECRET=${OMNIROUTE_JWT_SECRET}" \
         -e "API_KEY_SECRET=${OMNIROUTE_API_KEY_SECRET}" \
         -e "STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}" \
@@ -210,10 +225,12 @@ cmd_worker_start() {
   source "${worker_env}"
   : "${GPU_DEVICES:?GPU_DEVICES missing}"
   : "${WORKER_PORT:?WORKER_PORT missing}"
+  ensure_docker_network
 
   local -a docker_args=(
     /usr/bin/docker run --rm --name "llm-worker-${id}"
-    --network host --ipc host --runtime=nvidia
+    --network "${DOCKER_NETWORK}" --ipc host --runtime=nvidia
+    -p "127.0.0.1:${WORKER_PORT}:${WORKER_PORT}"
     -e "NVIDIA_VISIBLE_DEVICES=${GPU_DEVICES}"
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1
     -e VLLM_NO_USAGE_STATS=1 -e VLLM_MEDIA_URL_ALLOW_REDIRECTS=0
@@ -221,7 +238,7 @@ cmd_worker_start() {
     -v "${CACHE_DIR}/shared:/root/.cache"
     "${VLLM_IMAGE}" /models/current
     --served-model-name "${SERVED_MODEL_NAME}"
-    --host 127.0.0.1 --port "${WORKER_PORT}"
+    --host 0.0.0.0 --port "${WORKER_PORT}"
     --api-key "${BACKEND_API_KEY}"
     --tensor-parallel-size "${TP_SIZE}"
     --max-model-len "${MAX_MODEL_LEN}"
@@ -258,6 +275,7 @@ usage() {
 通用 vLLM 集群管理器
 
 用法：
+  llmctl info [--redact]                      完整恢复清单；默认含所有明文密码和密钥
   llmctl status [all|0,1,...]                集群、GPU、Router 和 Worker 状态
   llmctl health                               检查 Router 与所有已运行 Worker
   llmctl startup status                      显示一次聚合启动进度
@@ -574,7 +592,7 @@ gateway_config_path() {
 }
 
 gateway_ui_path() {
-  [[ "${GATEWAY_KIND}" == litellm ]] && printf '/ui\n' || printf '/\n'
+  printf '/ui/\n'
 }
 
 gateway_helper() {
@@ -583,6 +601,7 @@ gateway_helper() {
   export GATEWAY_API_KEY BIFROST_ENCRYPTION_KEY UI_USERNAME UI_PASSWORD DATABASE_URL
   export SUPPORTS_IMAGE_INPUT SUPPORTS_OCR OMNIROUTE_JWT_SECRET OMNIROUTE_API_KEY_SECRET
   export OMNIROUTE_STORAGE_ENCRYPTION_KEY ACCOUNT_PORT ACCOUNT_BIND
+  export DOCKER_NETWORK GATEWAY_INTERNAL_PORT
   "${GATEWAY_HELPER}" "$@"
 }
 
@@ -592,7 +611,7 @@ account_helper() {
   export ACCOUNT_REGISTRATION_ENABLED ACCOUNT_ALLOWED_EMAIL_DOMAINS
   export ACCOUNT_DEFAULT_QUOTA_TOKENS ACCOUNT_QUOTA_RESET ACCOUNT_QUOTA_RESET_TIME
   export SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USERNAME SMTP_PASSWORD SMTP_FROM
-  export GATEWAY_API_KEY API_PORT SUPPORTS_OCR
+  export GATEWAY_API_KEY API_PORT GATEWAY_INTERNAL_PORT SUPPORTS_OCR
   "${ACCOUNT_HELPER}" "$@"
 }
 
@@ -719,6 +738,12 @@ router_health() {
 }
 
 router_local_base_url() {
+  # API_PORT fallback keeps source-only diagnostics for pre-2.4 configs usable;
+  # installed 2.4 configurations always define the isolated internal port.
+  printf 'http://127.0.0.1:%s\n' "${GATEWAY_INTERNAL_PORT:-${API_PORT}}"
+}
+
+public_local_base_url() {
   case "${API_BIND}" in
     0.0.0.0) printf 'http://127.0.0.1:%s\n' "${API_PORT}" ;;
     ::) printf 'http://[::1]:%s\n' "${API_PORT}" ;;
@@ -727,12 +752,196 @@ router_local_base_url() {
   esac
 }
 
+public_router_health() {
+  reload_gateway_api_key || return 1
+  curl --noproxy '*' -fsS --max-time 5 \
+    -H "Authorization: Bearer ${GATEWAY_API_KEY}" \
+    "$(public_local_base_url)/v1/models" >/dev/null 2>&1
+}
+
+public_ui_health() {
+  curl --noproxy '*' -fsS --max-time 5 "$(public_local_base_url)/ui/" >/dev/null 2>&1
+}
+
+render_nginx_config() {
+  local listen_address ui_block server_names
+  case "${API_BIND}" in
+    ::) listen_address="[::]:${API_PORT}" ;;
+    *) listen_address="${API_BIND}:${API_PORT}" ;;
+  esac
+  server_names="localhost 127.0.0.1 $(hostname 2>/dev/null || true) $(hostname -f 2>/dev/null || true) $(hostname -I 2>/dev/null || true) _"
+  case "${GATEWAY_KIND}" in
+    omniroute)
+      ui_block="
+  location ^~ /ui/ {
+    proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
+    proxy_buffering off;
+  }
+  location ^~ /portal-api/ {
+    proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
+    proxy_buffering off;
+  }
+  location = /base_ui { return 302 /base_ui/; }
+  location ^~ /base_ui/ {
+    rewrite ^/base_ui/(.*)$ /\$1 break;
+    proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
+    proxy_buffering off;
+  }"
+      ;;
+    litellm)
+      ui_block="
+  location ^~ /ui/ {
+    proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
+    proxy_buffering off;
+  }"
+      ;;
+    *)
+      ui_block="
+  location ^~ /ui/ {
+    rewrite ^/ui/(.*)$ /\$1 break;
+    proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
+    proxy_buffering off;
+  }"
+      ;;
+  esac
+  cat <<EOF
+# Generated by LLMCtl ${CTL_VERSION}. Do not edit; use llmctl tune/info.
+map \$http_upgrade \$llmctl_connection_upgrade {
+  default upgrade;
+  '' close;
+}
+
+server {
+  listen ${listen_address};
+  # Exact host/IP names allow this isolated server to coexist with an existing
+  # Nginx installation on the same listen socket without replacing its sites.
+  server_name ${server_names};
+  client_max_body_size 128m;
+
+  proxy_http_version 1.1;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection \$llmctl_connection_upgrade;
+  proxy_connect_timeout 30s;
+  proxy_send_timeout 7200s;
+  proxy_read_timeout 7200s;
+  proxy_request_buffering off;
+
+  location = / { return 302 /ui/; }
+  location = /ui { return 302 /ui/; }
+${ui_block}
+
+  location ^~ /v1/ {
+    proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
+    proxy_buffering off;
+    add_header X-Accel-Buffering no always;
+  }
+  location ^~ /v1beta/ {
+    proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
+    proxy_buffering off;
+    add_header X-Accel-Buffering no always;
+  }
+
+  # Native gateway assets, management APIs, OAuth callbacks and deep links.
+  location / {
+    proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
+    proxy_buffering off;
+  }
+}
+EOF
+}
+
+cmd_nginx_install() {
+  require_root
+  load_config
+  command -v nginx >/dev/null 2>&1 || die "Nginx 未安装；请先安装 nginx 软件包"
+  local temporary rollback="" backup="${NGINX_STATE_DIR}/previous.conf"
+  local mode_file="${NGINX_STATE_DIR}/install-mode" install_mode=""
+  install -d -m 700 "${NGINX_STATE_DIR}"
+  temporary=$(mktemp /etc/nginx/conf.d/.llm-cluster.conf.XXXXXX)
+  rollback=$(mktemp "${NGINX_STATE_DIR}/rollback.XXXXXX")
+  render_nginx_config >"${temporary}"
+  chmod 644 "${temporary}"
+  if [[ -f "${NGINX_CONFIG}" ]]; then
+    install -m 600 "${NGINX_CONFIG}" "${rollback}"
+  fi
+  if [[ ! -f "${mode_file}" ]]; then
+    if [[ -f "${NGINX_CONFIG}" ]] && ! grep -q '^# Generated by LLMCtl ' "${NGINX_CONFIG}"; then
+      install -m 600 "${NGINX_CONFIG}" "${backup}"
+      install_mode=replaced
+    elif [[ -f "${backup}" ]]; then
+      # Upgrade from an earlier 2.4 development build that already captured an
+      # original same-name site before the install-mode marker existed.
+      install_mode=replaced
+    else
+      rm -f "${backup}"
+      install_mode=created
+    fi
+    printf '%s\n' "${install_mode}" >"${mode_file}"
+    chmod 600 "${mode_file}"
+  fi
+  mv -f "${temporary}" "${NGINX_CONFIG}"
+  if ! nginx -t; then
+    if [[ -s "${rollback}" ]]; then
+      install -m 644 "${rollback}" "${NGINX_CONFIG}"
+    else
+      rm -f "${NGINX_CONFIG}"
+    fi
+    rm -f "${rollback}"
+    nginx -t >/dev/null 2>&1 || true
+    die "Nginx 配置校验失败，已恢复修改前状态"
+  fi
+  rm -f "${rollback}"
+  systemctl enable nginx.service >/dev/null
+  if systemctl is-active --quiet nginx.service; then
+    systemctl reload nginx.service
+  else
+    systemctl start nginx.service
+  fi
+  log "Nginx 统一入口已配置：$(public_local_base_url)/ui/ 与 $(public_local_base_url)/v1/"
+}
+
+remove_nginx_config() {
+  local backup="${NGINX_STATE_DIR}/previous.conf" mode_file="${NGINX_STATE_DIR}/install-mode"
+  local install_mode=created action=deleted
+  [[ -r "${mode_file}" ]] && install_mode=$(<"${mode_file}")
+  if [[ "${install_mode}" == replaced && -f "${backup}" ]]; then
+    install -m 644 "${backup}" "${NGINX_CONFIG}"
+    action=restored
+  else
+    [[ -f "${NGINX_CONFIG}" ]] || return 0
+    rm -f "${NGINX_CONFIG}"
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then
+      if systemctl is-active --quiet nginx.service; then
+        systemctl reload nginx.service || warn "Nginx 配置已更新，但 reload 失败；请手工检查 nginx.service"
+      fi
+    else
+      warn "卸载后的 Nginx 全局配置校验失败；未 reload，请检查其他现有站点。"
+    fi
+  fi
+  if [[ "${action}" == restored ]]; then
+    log "已恢复安装前同名 Nginx 配置；现有 Nginx 软件包和其他站点均保留。"
+  else
+    log "已删除 LLMCtl 的 Nginx 配置；现有 Nginx 软件包和其他站点均保留。"
+  fi
+}
+
 database_health() {
   [[ "${GATEWAY_KIND}" != omniroute ]] || return 0
   docker exec llm-database pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1
 }
 
 account_portal_health() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
+  curl --noproxy '*' -fsS --max-time 5 "$(account_local_base_url)/health" >/dev/null 2>&1
+}
+
+account_portal_ready() {
   [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
   curl --noproxy '*' -fsS --max-time 5 "$(account_local_base_url)/ready" >/dev/null 2>&1
 }
@@ -750,7 +959,7 @@ wait_account_portal() {
   [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
   local started now
   started=$(date +%s)
-  until account_portal_health; do
+  until account_portal_ready; do
     systemctl is-active --quiet llm-account.service || {
       journalctl -u llm-account.service -n 100 --no-pager >&2 || true
       die "账户门户启动失败；请查看 llmctl logs account"
@@ -926,14 +1135,200 @@ cmd_status() {
   done
 }
 
+cmd_info() {
+  require_root
+  load_config
+  local redact=0 value public_host public_origin id state portal_inventory="" portal_inventory_status=unavailable
+  local portal_users="n/a" portal_groups="n/a" portal_models="n/a" portal_free="n/a"
+  local portal_usage="n/a" portal_transactions="n/a" portal_audits="n/a" portal_integrity="n/a"
+  case "${1:-}" in
+    "") ;;
+    --redact) redact=1 ;;
+    *) die "用法：llmctl info [--redact]" ;;
+  esac
+  if (( redact == 0 )); then
+    warn "以下恢复清单包含明文密码、API Key、数据库和 SMTP 凭据；只应在可信 root 终端查看。"
+  fi
+  secret_value() {
+    if (( redact )); then printf '<redacted>'; else printf '%s' "${1:-<empty>}"; fi
+  }
+  public_host=$(hostname -I 2>/dev/null | awk '{print $1}')
+  public_host="${public_host:-<服务器IP>}"
+  public_origin="http://${public_host}:${API_PORT}"
+  if [[ "${GATEWAY_KIND}" == omniroute && -f "${ACCOUNT_DB_PATH}" ]]; then
+    if (( redact )); then
+      portal_inventory=$(account_helper dump-config 2>/dev/null || true)
+    else
+      portal_inventory=$(account_helper dump-config --show-secrets 2>/dev/null || true)
+    fi
+    if [[ -n "${portal_inventory}" ]] && printf '%s' "${portal_inventory}" | jq -e '.settings and .counts and .database' >/dev/null 2>&1; then
+      portal_inventory_status=loaded
+      ACCOUNT_REGISTRATION_ENABLED=$(printf '%s' "${portal_inventory}" | jq -r '.settings.registration_enabled // "0"')
+      ACCOUNT_ALLOWED_EMAIL_DOMAINS=$(printf '%s' "${portal_inventory}" | jq -r '.settings.allowed_domains // ""')
+      ACCOUNT_DEFAULT_QUOTA_TOKENS=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_tokens // "0"')
+      ACCOUNT_QUOTA_RESET=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset // "monthly"')
+      ACCOUNT_QUOTA_RESET_TIME=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset_time // "00:00"')
+      ACCOUNT_PUBLIC_URL=$(printf '%s' "${portal_inventory}" | jq -r '.settings.public_url // ""')
+      ACCOUNT_API_PUBLIC_URL=$(printf '%s' "${portal_inventory}" | jq -r '.settings.api_public_url // ""')
+      SMTP_HOST=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_host // ""')
+      SMTP_PORT=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_port // "587"')
+      SMTP_SECURITY=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_security // "starttls"')
+      SMTP_USERNAME=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_username // ""')
+      SMTP_PASSWORD=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_password // ""')
+      SMTP_FROM=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_from // ""')
+      portal_users=$(printf '%s' "${portal_inventory}" | jq -r '.counts.users')
+      portal_groups=$(printf '%s' "${portal_inventory}" | jq -r '.counts.user_groups')
+      portal_models=$(printf '%s' "${portal_inventory}" | jq -r '.counts.published_models')
+      portal_free=$(printf '%s' "${portal_inventory}" | jq -r '.counts.free_resources')
+      portal_usage=$(printf '%s' "${portal_inventory}" | jq -r '.counts.usage_ledger')
+      portal_transactions=$(printf '%s' "${portal_inventory}" | jq -r '.counts.balance_transactions')
+      portal_audits=$(printf '%s' "${portal_inventory}" | jq -r '.counts.audit_events')
+      portal_integrity=$(printf '%s' "${portal_inventory}" | jq -r '.database.quick_check')
+    fi
+  fi
+
+  printf '\n========== LLMCtl 恢复清单 / Recovery inventory ==========\n'
+  printf '生成时间 / Generated: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
+  printf 'LLMCtl 版本: %s\n安装语言: %s\n主机名: %s\n时区: %s\n' \
+    "${CTL_VERSION}" "${INTERFACE_LANGUAGE:-zh}" "$(hostname)" "${TZ:-$(timedatectl show -p Timezone --value 2>/dev/null || printf unknown)}"
+
+  printf '\n[主机与运行时 / Host and runtimes]\n'
+  printf '操作系统: %s\n内核/架构: %s / %s\nCPU: %s；逻辑核=%s\n内存: %s\n' \
+    "$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")" "$(uname -r)" "$(uname -m)" \
+    "$(awk -F: '/model name/{sub(/^[[:space:]]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || printf unknown)" \
+    "$(nproc 2>/dev/null || printf unknown)" "$(awk '/MemTotal/{printf "%.1f GiB",$2/1048576}' /proc/meminfo 2>/dev/null || printf unknown)"
+  printf 'NVIDIA 驱动: %s；GPU: %s\nDocker: %s\nNginx: %s\n' \
+    "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || printf unavailable)" \
+    "$(nvidia-smi --query-gpu=index,name,memory.total,pci.bus_id --format=csv,noheader 2>/dev/null | paste -sd ';' - || printf unavailable)" \
+    "$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf unavailable)" \
+    "$(nginx -v 2>&1 | sed 's#nginx version: ##' || printf unavailable)"
+
+  printf '\n[统一公开入口 / Public front door]\n'
+  printf 'Nginx 监听: %s:%s\nAPI Base URL: %s/v1\nWeb UI: %s/ui/\n' "${API_BIND}" "${API_PORT}" "${public_origin}" "${public_origin}"
+  printf 'Nginx 状态: %s；开机自启: %s；配置: %s\n' \
+    "$(systemctl is-active nginx.service 2>/dev/null || printf unknown)" \
+    "$(systemctl is-enabled nginx.service 2>/dev/null || printf unknown)" "${NGINX_CONFIG}"
+  printf 'TLS: 未由 LLMCtl 自动配置；如由现有 Nginx 站点终止 TLS，请以站点配置为准\n'
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf '企业门户: %s/ui/\n门户管理 API: %s/portal-api/\nOmniRoute 原生 UI: %s/base_ui/\n' \
+      "${public_origin}" "${public_origin}" "${public_origin}"
+  else
+    printf '原生网关 UI: %s/ui/\n' "${public_origin}"
+  fi
+
+  printf '\n[内部网络 / Internal networking]\n'
+  printf 'Docker 网络: %s (%s)\n网关回环地址: http://127.0.0.1:%s\n' \
+    "${DOCKER_NETWORK}" "$(docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1 && printf present || printf missing)" "${GATEWAY_INTERNAL_PORT}"
+  printf 'Worker 回环端口: 127.0.0.1:%s-%s\n' "${WORKER_BASE_PORT}" "$((WORKER_BASE_PORT + INSTANCE_COUNT - 1))"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf '门户回环地址: http://127.0.0.1:%s（bind=%s）\n' "${ACCOUNT_PORT}" "${ACCOUNT_BIND}"
+  else
+    printf 'PostgreSQL 回环地址: 127.0.0.1:%s；容器内地址: llm-database:5432\n' "${GATEWAY_DB_PORT}"
+  fi
+
+  printf '\n[接入层与管理员 / Gateway and administrators]\n'
+  printf '网关: %s (%s)\n镜像: %s\n路由策略: %s\n' "$(gateway_display_name)" "${GATEWAY_KIND}" "${GATEWAY_IMAGE}" "${ROUTING_STRATEGY}"
+  printf '网关镜像 ID: %s\n' "$(docker image inspect --format '{{.Id}}' "${GATEWAY_IMAGE}" 2>/dev/null || printf unavailable)"
+  printf '原生 UI 管理员用户名: %s\n原生 UI 管理员密码: %s\n' "${UI_USERNAME}" "$(secret_value "${UI_PASSWORD}")"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf '门户管理员邮箱: %s\n门户管理员密码: %s\n' "${ACCOUNT_ADMIN_EMAIL}" "$(secret_value "${ACCOUNT_ADMIN_PASSWORD}")"
+  fi
+
+  printf '\n[API 与内部密钥 / API and internal secrets]\n'
+  printf '公开调用/维护 API Key: %s\nWorker 后端 API Key: %s\nLiteLLM Salt Key: %s\n' \
+    "$(secret_value "${GATEWAY_API_KEY}")" "$(secret_value "${BACKEND_API_KEY}")" "$(secret_value "${LITELLM_SALT_KEY}")"
+  printf 'New API Session Secret: %s\nBifrost Encryption Key: %s\n' \
+    "$(secret_value "${NEWAPI_SESSION_SECRET:-}")" "$(secret_value "${BIFROST_ENCRYPTION_KEY:-}")"
+  printf 'OmniRoute JWT Secret: %s\nOmniRoute API-Key Secret: %s\nOmniRoute Storage Encryption Key: %s\n' \
+    "$(secret_value "${OMNIROUTE_JWT_SECRET:-}")" "$(secret_value "${OMNIROUTE_API_KEY_SECRET:-}")" "$(secret_value "${OMNIROUTE_STORAGE_ENCRYPTION_KEY:-}")"
+
+  printf '\n[数据库 / Databases]\n'
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf 'OmniRoute SQLite: %s (mode=%s, size=%s)\n门户 SQLite: %s (mode=%s, size=%s)\n两者隔离: yes\n' \
+      "${OMNIROUTE_SQLITE}" "$(stat -c %a "${OMNIROUTE_SQLITE}" 2>/dev/null || printf missing)" "$(du -h "${OMNIROUTE_SQLITE}" 2>/dev/null | awk '{print $1}' || printf missing)" \
+      "${ACCOUNT_DB_PATH}" "$(stat -c %a "${ACCOUNT_DB_PATH}" 2>/dev/null || printf missing)" "$(du -h "${ACCOUNT_DB_PATH}" 2>/dev/null | awk '{print $1}' || printf missing)"
+    printf '门户持久配置读取: %s；SQLite quick_check: %s\n门户对象: users=%s groups=%s models=%s free-resources=%s usage=%s transactions=%s audits=%s\n' \
+      "${portal_inventory_status}" "${portal_integrity}" "${portal_users}" "${portal_groups}" "${portal_models}" "${portal_free}" "${portal_usage}" "${portal_transactions}" "${portal_audits}"
+  else
+    printf 'PostgreSQL 数据库: %s\nPostgreSQL 用户名: %s\nPostgreSQL 密码: %s\nDATABASE_URL: %s\n数据卷: llm-cluster-gateway-postgres\n' \
+      "${POSTGRES_DB}" "${POSTGRES_USER}" "$(secret_value "${POSTGRES_PASSWORD}")" "$(secret_value "${DATABASE_URL}")"
+  fi
+
+  printf '\n[注册、额度与 SMTP / Registration, quota and SMTP]\n'
+  printf '允许注册: %s\n允许邮箱后缀: %s\n默认 Token 赠额: %s\n重置: %s @ %s\n门户公开 URL: %s\nAPI 公开 URL: %s\n' \
+    "${ACCOUNT_REGISTRATION_ENABLED}" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-<empty>}" "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" \
+    "${ACCOUNT_QUOTA_RESET}" "${ACCOUNT_QUOTA_RESET_TIME}" "${ACCOUNT_PUBLIC_URL:-${public_origin}/ui/}" "${ACCOUNT_API_PUBLIC_URL:-${public_origin}}"
+  printf 'SMTP: %s:%s (%s)\nSMTP 用户名: %s\nSMTP 密码: %s\n发件人: %s\n' \
+    "${SMTP_HOST:-<empty>}" "${SMTP_PORT}" "${SMTP_SECURITY}" "${SMTP_USERNAME:-<empty>}" "$(secret_value "${SMTP_PASSWORD}")" "${SMTP_FROM:-<empty>}"
+
+  load_saved_proxy
+  printf '\n[维护网络 / Maintenance networking]\n'
+  printf '国际网络预检: 安装启动和 Hugging Face 模型搜索前自动执行\n保存的维护代理: %s\nNO_PROXY: %s\n代理配置文件: %s\n' \
+    "$(secret_value "${MAINTENANCE_PROXY:-}")" "${MAINTENANCE_NO_PROXY:-127.0.0.1,localhost,::1}" "${PROXY_ENV}"
+
+  printf '\n[模型与推理 / Model and inference]\n'
+  printf 'Hub/模型/revision: %s / %s @ %s\n本地目录: %s/current\n模型服务 ID: %s\n架构/精度/任务: %s / %s / %s\n' \
+    "${MODEL_HUB}" "${MODEL_ID}" "${MODEL_REVISION}" "${MODEL_ROOT}" "${SERVED_MODEL_NAME}" "${MODEL_ARCHITECTURE}" "${MODEL_PRECISION}" "${MODEL_TASK}"
+  printf 'GPU/TP/实例: %s / %s / %s；开机激活: %s；启动并行度: %s\n' \
+    "${PHYSICAL_GPU_COUNT}" "${TP_SIZE}" "${INSTANCE_COUNT}" "${ACTIVE_WORKERS}" "${STARTUP_PARALLELISM}"
+  printf 'Context/max-seqs/batched-tokens/GPU-memory: %s / %s / %s / %s\n' \
+    "${MAX_MODEL_LEN}" "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GPU_MEMORY_UTILIZATION}"
+  printf '图片/OCR/工具/思考/关闭思考: %s / %s / %s / %s / %s\n' \
+    "${SUPPORTS_IMAGE_INPUT}" "${SUPPORTS_OCR}" "${SUPPORTS_TOOL_CALLING}" "${SUPPORTS_REASONING}" "${SUPPORTS_THINKING_TOGGLE}"
+  printf 'vLLM 镜像: %s (ID=%s)\nPostgreSQL 镜像: %s (ID=%s)\n' \
+    "${VLLM_IMAGE}" "$(docker image inspect --format '{{.Id}}' "${VLLM_IMAGE}" 2>/dev/null || printf unavailable)" \
+    "${POSTGRES_IMAGE}" "$(docker image inspect --format '{{.Id}}' "${POSTGRES_IMAGE}" 2>/dev/null || printf unavailable)"
+
+  printf '\n[服务、自启与 Worker / Services and workers]\n'
+  printf 'llm-cluster: %s；enabled=%s\nllm-router: %s\n' \
+    "$(systemctl is-active llm-cluster.service 2>/dev/null || printf unknown)" \
+    "$(systemctl is-enabled llm-cluster.service 2>/dev/null || printf unknown)" \
+    "$(systemctl is-active llm-router.service 2>/dev/null || printf unknown)"
+  [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemctl is-active llm-account.service 2>/dev/null || printf unknown)"
+  [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemctl is-active llm-database.service 2>/dev/null || printf unknown)"
+  for ((id = 0; id < INSTANCE_COUNT; id++)); do
+    state=$(systemctl is-active "$(worker_unit "${id}")" 2>/dev/null || printf unknown)
+    printf 'Worker %s: GPU=%s port=%s systemd=%s boot=%s\n' "${id}" "$(worker_devices "${id}")" "$(worker_port "${id}")" "${state}" "$(csv_has "${ACTIVE_WORKERS}" "${id}" && printf yes || printf no)"
+  done
+
+  printf '\n[文件、日志与维护 / Files, logs and maintenance]\n'
+  printf '主配置: %s\n密钥配置: %s (mode=%s)\n状态目录: %s\n缓存目录: %s\n网关计划: %s\n' \
+    "${CLUSTER_ENV}" "${SECRETS_ENV}" "$(stat -c %a "${SECRETS_ENV}" 2>/dev/null || printf unknown)" "${STATE_DIR}" "${CACHE_DIR}" "$(gateway_config_path)"
+  printf '模型当前链接: %s/current -> %s\n门户程序: %s\n门户静态资源: %s\nNginx 配置备份目录: %s\n' \
+    "${MODEL_ROOT}" "$(readlink -f "${MODEL_ROOT}/current" 2>/dev/null || printf missing)" "${ACCOUNT_HELPER}" "${ACCOUNT_STATIC_DIR:-/usr/local/lib/llm-cluster/account_portal_ui}" "${NGINX_STATE_DIR}"
+  printf 'systemd 单元: %s\nDocker 网络: %s\nDocker 数据卷: %s\n' \
+    "$(find /etc/systemd/system -maxdepth 1 -type f -name 'llm-*.service' -printf '%f ' 2>/dev/null || printf unavailable)" \
+    "${DOCKER_NETWORK}" "$(docker volume ls --format '{{.Name}}' 2>/dev/null | awk '/^llm-cluster-/{printf "%s ",$0}' || printf unavailable)"
+  printf 'systemd 日志: journalctl -u llm-cluster -u llm-router\n完整健康检查: llmctl health\n完整状态: llmctl status\n'
+  printf '===========================================================\n'
+}
+
 cmd_health() {
   load_config
   local id failures=0 running_count=0
+  if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx.service; then
+    log "Nginx 统一入口: healthy"
+  else
+    warn "Nginx 统一入口: unhealthy"
+    failures=$((failures + 1))
+  fi
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
     log "SQLite 数据库：隔离文件，无独立数据库实例"
     if account_portal_health; then log "账户门户: healthy"; else warn "账户门户: unhealthy"; failures=$((failures + 1)); fi
   elif database_health; then log "PostgreSQL: healthy"; else warn "PostgreSQL: unhealthy"; failures=$((failures + 1)); fi
   if router_health; then log "$(gateway_display_name): healthy"; else warn "$(gateway_display_name): unhealthy"; failures=$((failures + 1)); fi
+  if public_router_health; then
+    log "统一公开 API /v1: healthy"
+  else
+    warn "统一公开 API /v1: unhealthy（内部网关可能正常，但 Nginx 路由不可用）"
+    failures=$((failures + 1))
+  fi
+  if public_ui_health; then
+    log "统一 Web UI /ui/: healthy"
+  else
+    warn "统一 Web UI /ui/: unhealthy"
+    failures=$((failures + 1))
+  fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
     if worker_is_active "${id}"; then
       running_count=$((running_count + 1))
@@ -960,7 +1355,7 @@ cmd_startup() {
       if [[ "${GATEWAY_KIND}" == omniroute ]]; then
         printf 'sqlite=embedded router=%s account=%s\n' \
           "$(router_health && printf healthy || printf unavailable)" \
-          "$(account_portal_health && printf healthy || printf unavailable)"
+          "$(account_portal_ready && printf healthy || { account_portal_health && printf degraded || printf unavailable; })"
       else
         printf 'database=%s router=%s\n' \
           "$(database_health && printf healthy || printf unavailable)" \
@@ -999,7 +1394,12 @@ cmd_startup() {
           database_state=embedded
           portal_ready=0
           portal_state=unavailable
-          if account_portal_health; then portal_ready=1; portal_state=healthy; fi
+          if account_portal_ready; then
+            portal_ready=1
+            portal_state=healthy
+          elif account_portal_health; then
+            portal_state=degraded
+          fi
           dependency_text="；Dependencies=[SQLite:${database_state},$(gateway_display_name):${gateway_state},AccountPortal:${portal_state}]"
         else
           dependency_text="；Dependencies=[PostgreSQL:${database_state},$(gateway_display_name):${gateway_state}]"
@@ -1406,8 +1806,9 @@ cmd_smoke() {
     worker_health "${worker}" || die "Worker ${worker} 未就绪"
     smoke_endpoint "http://127.0.0.1:$(worker_port "${worker}")" "${BACKEND_API_KEY}" "${full}"
   else
-    router_health || die "$(gateway_display_name) 未就绪"
-    smoke_endpoint "$(router_local_base_url)" "${GATEWAY_API_KEY}" "${full}"
+    router_health || die "$(gateway_display_name) 内部 API 未就绪"
+    public_router_health || die "Nginx 统一公开 API 未就绪"
+    smoke_endpoint "$(public_local_base_url)" "${GATEWAY_API_KEY}" "${full}"
   fi
 }
 
@@ -1986,7 +2387,7 @@ cmd_tune() {
       printf 'mm-limit=%s\n' "${MM_LIMIT}"
       ;;
     set)
-      local key="${2:?缺少键}" value="${3:?缺少值}" env_key restart_workers=1 apply_router=0
+      local key="${2:?缺少键}" value="${3:?缺少值}" env_key restart_workers=1 apply_router=0 apply_nginx=0
       case "${key}" in
         max-model-len)
           [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 8192 && value <= MODEL_NATIVE_CONTEXT && value <= 262144 )) || die "范围 8192-${MODEL_NATIVE_CONTEXT}（且不超过 262144）"
@@ -2011,10 +2412,11 @@ cmd_tune() {
           env_key=ROUTING_STRATEGY; restart_workers=0; apply_router=1 ;;
         api-bind)
           [[ "${value}" =~ ^[0-9a-fA-F:.]+$ ]] || die "无效监听地址"
-          env_key=API_BIND; restart_workers=0; apply_router=1 ;;
+          env_key=API_BIND; restart_workers=0; apply_nginx=1 ;;
         api-port)
           [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1024 && value <= 65535 )) || die "端口范围 1024-65535"
-          env_key=API_PORT; restart_workers=0; apply_router=1 ;;
+          [[ "${value}" != "${GATEWAY_INTERNAL_PORT}" ]] || die "公开端口不能等于内部网关端口"
+          env_key=API_PORT; restart_workers=0; apply_nginx=1 ;;
         startup-parallelism)
           [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= INSTANCE_COUNT )) || die "范围 1-${INSTANCE_COUNT}"
           env_key=STARTUP_PARALLELISM; restart_workers=0 ;;
@@ -2022,7 +2424,10 @@ cmd_tune() {
       esac
       set_env_value "${CLUSTER_ENV}" "${env_key}" "${value}"
       log "已写入 ${key}=${value}"
-      if (( restart_workers )); then
+      if (( apply_nginx )); then
+        load_config
+        cmd_nginx_install
+      elif (( restart_workers )); then
         warn "该参数需重启 Worker 才生效：llmctl restart all"
       elif (( apply_router )); then
         # Reload values and apply router-only changes now.
@@ -2096,7 +2501,8 @@ cmd_admin() {
       printf 'GATEWAY_UI_USERNAME=%s\n' "${UI_USERNAME}"
       printf 'GATEWAY_UI_PASSWORD=%s\n' "${UI_PASSWORD}"
       if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-        printf 'ACCOUNT_PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-http://${ui_host}:${ACCOUNT_PORT}}"
+        printf 'ACCOUNT_PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-http://${ui_host}:${API_PORT}/ui/}"
+        printf 'OMNIROUTE_BASE_UI_URL=http://%s:%s/base_ui/\n' "${ui_host}" "${API_PORT}"
         printf 'ACCOUNT_PORTAL_ADMIN=%s\n' "${ACCOUNT_ADMIN_EMAIL}"
       fi
       warn "这是管理员凭据；请勿复制到日志、工单或代码仓库。"
@@ -2161,9 +2567,9 @@ cmd_admin() {
 
 proxy_url_from_args() {
   local ip="${1:?缺少代理 IP}" port="${2:?缺少代理端口}" scheme="${3:-http}"
-  [[ "${ip}" =~ ^[A-Za-z0-9._:-]+$ ]] || die "代理 IP/主机名格式无效"
-  [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "代理端口无效"
-  [[ "${scheme}" == http || "${scheme}" == https ]] || die "代理协议只能是 http 或 https"
+  [[ "${ip}" =~ ^[A-Za-z0-9._:-]+$ ]] || die "$(ctl_l10n '代理 IP/主机名格式无效' 'Invalid proxy IP/hostname')"
+  [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "$(ctl_l10n '代理端口无效' 'Invalid proxy port')"
+  [[ "${scheme}" == http || "${scheme}" == https ]] || die "$(ctl_l10n '代理协议只能是 http 或 https' 'Proxy scheme must be http or https')"
   printf '%s://%s:%s\n' "${scheme}" "${ip}" "${port}"
 }
 
@@ -2176,23 +2582,76 @@ load_saved_proxy() {
   MAINTENANCE_NO_PROXY="${MAINTENANCE_NO_PROXY:-127.0.0.1,localhost,::1}"
 }
 
+hf_network_probe() {
+  local mode="${1:?}" http_code
+  if [[ "${mode}" == direct ]]; then
+    http_code=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 10 \
+      -o /dev/null -w '%{http_code}' 'https://huggingface.co/api/models?limit=1' 2>/dev/null) || return 1
+  else
+    http_code=$(curl -sS --connect-timeout 8 --max-time 15 \
+      -o /dev/null -w '%{http_code}' 'https://huggingface.co/api/models?limit=1' 2>/dev/null) || return 1
+  fi
+  [[ "${http_code}" =~ ^[0-9]{3}$ ]] && (( 10#${http_code} >= 100 && 10#${http_code} < 500 ))
+}
+
 prompt_proxy_if_needed() {
   load_saved_proxy
-  if curl --noproxy '*' -sS --connect-timeout 5 --max-time 8 -o /dev/null https://huggingface.co 2>/dev/null; then
+  log "$(ctl_l10n 'Hugging Face 搜索前网络测试：正在检查国际直连...' 'Pre-search network test: checking direct Hugging Face access...')"
+  if hf_network_probe direct; then
     # A saved proxy is only a fallback. Prefer direct access when available.
     MAINTENANCE_PROXY=""
+    log "$(ctl_l10n '国际网络测试通过：Hugging Face 可直连。' 'International connectivity passed: Hugging Face is directly reachable.')"
     return 0
   fi
-  [[ -n "${MAINTENANCE_PROXY}" ]] && return 0
-  [[ -t 0 ]] || die "需要国际出口；请先执行 llmctl proxy set <IP> <端口>"
-  local ip port scheme
-  printf '当前操作需要临时国际出口。\n' >&2
-  read -r -p '代理 IP/主机名: ' ip
-  read -r -p '代理端口: ' port
-  read -r -p '协议 [http]: ' scheme
+  if [[ -n "${MAINTENANCE_PROXY}" ]]; then
+    export_proxy_env
+    if hf_network_probe proxy; then
+      log "$(ctl_l10n '已保存代理的 Hugging Face 网络测试通过。' 'Hugging Face connectivity through the saved proxy passed.')"
+      return 0
+    fi
+    warn "$(ctl_l10n '已保存的维护代理不可用，将重新询问。' 'The saved maintenance proxy failed; asking again.')"
+    MAINTENANCE_PROXY=""
+  fi
+  (( MAINTENANCE_PROXY_DECLINED == 0 )) || return 0
+  [[ -t 0 ]] || die "$(ctl_l10n '需要国际出口；请先执行 llmctl proxy set <IP> <端口>' 'International access is required; first run llmctl proxy set <IP> <PORT>')"
+  local ip port scheme answer save_answer
+  printf '%s\n' "$(ctl_l10n '国际网络检测失败；Hugging Face 搜索结果会缺失。' 'International connectivity failed; Hugging Face results will be missing.')" >&2
+  while true; do
+    read -r -p "$(ctl_l10n '是否现在配置代理？[Y/n] ' 'Configure a proxy now? [Y/n] ')" answer
+    case "${answer}" in
+      ""|y|Y|yes|YES) break ;;
+      n|N|no|NO)
+        MAINTENANCE_PROXY_DECLINED=1
+        warn "$(ctl_l10n '已跳过代理；本次搜索可能只有 ModelScope 等当前可达来源。' 'Proxy setup was skipped; this search may contain only currently reachable sources such as ModelScope.')"
+        return 0
+        ;;
+      *) warn "$(ctl_l10n '请输入 y 或 n。' 'Enter y or n.')" ;;
+    esac
+  done
+  read -r -p "$(ctl_l10n '代理 IP/主机名: ' 'Proxy IP/hostname: ')" ip
+  read -r -p "$(ctl_l10n '代理端口: ' 'Proxy port: ')" port
+  read -r -p "$(ctl_l10n '协议 [http]: ' 'Scheme [http]: ')" scheme
   scheme="${scheme:-http}"
   MAINTENANCE_PROXY=$(proxy_url_from_args "${ip}" "${port}" "${scheme}")
   MAINTENANCE_NO_PROXY="127.0.0.1,localhost,::1"
+  export_proxy_env
+  hf_network_probe proxy || \
+    die "$(ctl_l10n '代理后的 Hugging Face 网络复测失败，请检查代理配置' 'The Hugging Face retest through the proxy failed; check the proxy configuration')"
+  while true; do
+    read -r -p "$(ctl_l10n '是否保存为以后 llmctl 维护使用？[y/N] ' 'Save this proxy for future llmctl maintenance? [y/N] ')" save_answer
+    case "${save_answer}" in
+      y|Y|yes|YES) save_answer=y; break ;;
+      ""|n|N|no|NO) save_answer=n; break ;;
+      *) warn "$(ctl_l10n '请输入 y 或 n。' 'Enter y or n.')" ;;
+    esac
+  done
+  if [[ "${save_answer}" == y ]]; then
+    install -d -m 750 "${CONFIG_DIR}"
+    umask 077
+    printf 'MAINTENANCE_PROXY=%s\nMAINTENANCE_NO_PROXY=%s\n' "${MAINTENANCE_PROXY}" "${MAINTENANCE_NO_PROXY}" >"${PROXY_ENV}"
+    chmod 600 "${PROXY_ENV}"
+    log "$(ctl_l10n '维护代理已保存；不会注入推理服务。' 'The maintenance proxy was saved and will not be injected into inference services.')"
+  fi
 }
 
 export_proxy_env() {
@@ -2294,6 +2753,10 @@ cmd_models() {
           *) die "未知 models search 参数：$1" ;;
         esac
       done
+      if [[ "${source}" == all || "${source}" == huggingface ]]; then
+        prompt_proxy_if_needed
+        export_proxy_env
+      fi
       local -a args=(search "${query}" --source "${source}" --task "${task}" --limit "${limit}" \
         --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
       (( show_rejected == 0 )) || args+=(--show-rejected)
@@ -2628,10 +3091,20 @@ cmd_uninstall() {
   stop_managed_services_with_progress 180 || \
     die "LLM 服务未能在限定时间内安全停止；配置尚未删除，请根据上方单位/容器状态检查"
   log "卸载 3/4：删除 systemd 单元和可再生成数据；配置保留到最后一步。"
+  remove_nginx_config
+  remove_tree_with_progress "${NGINX_STATE_DIR}" "可再生成的 Nginx 回滚缓存" 2
   rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
   clear_temporary_proxy
+  if docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1; then
+    if [[ "$(docker network inspect --format '{{len .Containers}}' "${DOCKER_NETWORK}" 2>/dev/null || printf 1)" == 0 ]]; then
+      docker network rm "${DOCKER_NETWORK}" >/dev/null
+      log "Docker 内部网络 ${DOCKER_NETWORK} 已清理。"
+    else
+      warn "Docker 网络 ${DOCKER_NETWORK} 仍有非 LLMCtl 端点，已保留。"
+    fi
+  fi
   if (( ! purge_database )); then
     install -d -m 700 "${STATE_DIR}"
     install -m 600 "${SECRETS_ENV}" "${RETAINED_SECRETS}"
@@ -2832,6 +3305,7 @@ main() {
   case "${command}" in
     help|-h|--help) usage ;;
     version|--version) printf 'llmctl %s\n' "${CTL_VERSION}" ;;
+    info) cmd_info "$@" ;;
     status) cmd_status "$@" ;;
     health) cmd_health "$@" ;;
     startup) cmd_startup "$@" ;;
@@ -2865,6 +3339,7 @@ main() {
     uninstall) cmd_uninstall "$@" ;;
     _worker-start) cmd_worker_start "$@" ;;
     _gateway-start) cmd_gateway_start "$@" ;;
+    _nginx-install) cmd_nginx_install "$@" ;;
     _boot-start) cmd_boot_start "$@" ;;
     _boot-stop) cmd_boot_stop "$@" ;;
     *) die "未知命令：${command}。运行 llmctl help 查看帮助。" ;;

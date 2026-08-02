@@ -12,12 +12,14 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import datetime
 import hashlib
 import hmac
 import html
 import http.cookies
 import http.server
 import json
+import mimetypes
 import os
 import pathlib
 import re
@@ -27,6 +29,7 @@ import smtplib
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -34,9 +37,10 @@ import urllib.request
 import uuid
 from email.message import EmailMessage
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.4.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -127,6 +131,73 @@ def now() -> int:
     return int(time.time())
 
 
+def next_reset_at(
+    interval: str,
+    current: int | None = None,
+    reset_time: str = "00:00",
+    timezone_name: str | None = None,
+) -> int | None:
+    """Return the next recurring boundary in the configured service timezone."""
+    if interval == "none":
+        return None
+    if interval not in {"daily", "weekly", "monthly"} or not re.fullmatch(
+        r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time
+    ):
+        raise ValueError("invalid reset schedule")
+    try:
+        zone = ZoneInfo(timezone_name or os.environ.get("TZ", "Asia/Shanghai"))
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("UTC")
+    point = datetime.datetime.fromtimestamp(current or now(), zone)
+    hour, minute = (int(value) for value in reset_time.split(":"))
+    if interval == "daily":
+        candidate = point.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= point:
+            candidate += datetime.timedelta(days=1)
+    elif interval == "weekly":
+        candidate = (point - datetime.timedelta(days=point.weekday())).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if candidate <= point:
+            candidate += datetime.timedelta(days=7)
+    else:
+        candidate = point.replace(day=1, hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= point:
+            year = candidate.year + (1 if candidate.month == 12 else 0)
+            month = 1 if candidate.month == 12 else candidate.month + 1
+            candidate = candidate.replace(year=year, month=month)
+    return int(candidate.timestamp())
+
+
+def money_to_micros(value: Any) -> int:
+    try:
+        text = str(value).strip()
+        if not re.fullmatch(r"-?\d+(?:\.\d{1,6})?", text):
+            raise ValueError
+        negative = text.startswith("-")
+        if negative:
+            text = text[1:]
+        whole, _, fraction = text.partition(".")
+        result = int(whole) * 1_000_000 + int((fraction + "000000")[:6])
+        return -result if negative else result
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid monetary amount") from error
+
+
+def micros_to_money(value: int) -> str:
+    sign = "-" if value < 0 else ""
+    value = abs(int(value))
+    return f"{sign}{value // 1_000_000}.{value % 1_000_000:06d}".rstrip("0").rstrip(".")
+
+
+def portal_ui_url(value: str) -> str:
+    """Canonicalize a public portal origin to the Nginx /ui entry point."""
+    value = value.rstrip("/")
+    if value and not urllib.parse.urlsplit(value).path:
+        return value + "/ui"
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     bind: str
@@ -152,12 +223,18 @@ class Config:
     smtp_password: str
     smtp_from: str
     supports_ocr: bool
+    static_dir: pathlib.Path = pathlib.Path(__file__).resolve().with_name("account_portal_ui")
 
     @classmethod
     def from_env(cls) -> "Config":
-        public_url = os.environ.get("ACCOUNT_PUBLIC_URL", "http://127.0.0.1:8001").rstrip("/")
+        public_url = os.environ.get(
+            "ACCOUNT_PUBLIC_URL", f"http://127.0.0.1:{env_int('API_PORT', 8000)}/ui"
+        ).rstrip("/")
         api_public = os.environ.get("ACCOUNT_API_PUBLIC_URL", "").rstrip("/")
-        for name, value in (("ACCOUNT_PUBLIC_URL", public_url), ("ACCOUNT_API_PUBLIC_URL", api_public)):
+        for name, value, allowed_paths in (
+            ("ACCOUNT_PUBLIC_URL", public_url, {"", "/ui"}),
+            ("ACCOUNT_API_PUBLIC_URL", api_public, {""}),
+        ):
             if value:
                 try:
                     parsed_value = urllib.parse.urlsplit(value)
@@ -169,11 +246,12 @@ class Config:
                     or not parsed_value.hostname
                     or parsed_value.username
                     or parsed_value.password
-                    or parsed_value.path not in {"", "/"}
+                    or parsed_value.path.rstrip("/") not in allowed_paths
                     or parsed_value.query
                     or parsed_value.fragment
                 ):
                     raise SystemExit(f"{name} must be an http(s) origin without credentials or a path")
+        public_url = portal_ui_url(public_url)
         if not api_public:
             parsed = urllib.parse.urlsplit(public_url)
             api_port = env_int("API_PORT", 8000)
@@ -233,12 +311,12 @@ class Config:
         if db_path.resolve(strict=False) == gateway_db_path.resolve(strict=False):
             raise SystemExit("ACCOUNT_DB_PATH must not be OmniRoute's storage.sqlite")
         return cls(
-            bind=os.environ.get("ACCOUNT_BIND", "0.0.0.0"),
+            bind=os.environ.get("ACCOUNT_BIND", "127.0.0.1"),
             port=port,
             db_path=db_path,
             gateway_url=os.environ.get(
                 "ACCOUNT_GATEWAY_LOCAL_URL",
-                f"http://127.0.0.1:{env_int('API_PORT', 8000)}",
+                f"http://127.0.0.1:{env_int('GATEWAY_INTERNAL_PORT', 18000)}",
             ).rstrip("/"),
             gateway_manage_key=os.environ.get("GATEWAY_API_KEY", ""),
             public_url=public_url,
@@ -259,6 +337,12 @@ class Config:
             smtp_password=os.environ.get("SMTP_PASSWORD", ""),
             smtp_from=smtp_from,
             supports_ocr=env_bool("SUPPORTS_OCR", False),
+            static_dir=pathlib.Path(
+                os.environ.get(
+                    "ACCOUNT_STATIC_DIR",
+                    str(pathlib.Path(__file__).resolve().with_name("account_portal_ui")),
+                )
+            ),
         )
 
 
@@ -317,6 +401,147 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_verify_user ON verification_tokens(user_id);
+CREATE TABLE IF NOT EXISTS user_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_group_members (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  group_id TEXT NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, group_id)
+);
+CREATE TABLE IF NOT EXISTS free_resources (
+  resource_key TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  free_type TEXT NOT NULL,
+  monthly_tokens INTEGER,
+  credit_tokens INTEGER,
+  terms_status TEXT NOT NULL DEFAULT '',
+  configured INTEGER NOT NULL DEFAULT 0,
+  available INTEGER NOT NULL DEFAULT 0,
+  test_status TEXT NOT NULL DEFAULT 'untested' CHECK(test_status IN ('untested','healthy','failed')),
+  test_latency_ms INTEGER,
+  test_error TEXT NOT NULL DEFAULT '',
+  last_tested_at INTEGER,
+  source_json TEXT NOT NULL,
+  discovered_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(provider, model_id)
+);
+CREATE TABLE IF NOT EXISTS published_models (
+  id TEXT PRIMARY KEY,
+  public_model_id TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('combo','model','free')),
+  source_ref TEXT NOT NULL DEFAULT '',
+  source_provider TEXT NOT NULL DEFAULT '',
+  source_model TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL DEFAULT '[]',
+  input_price_micros INTEGER NOT NULL DEFAULT 0,
+  output_price_micros INTEGER NOT NULL DEFAULT 0,
+  cached_price_micros INTEGER NOT NULL DEFAULT 0,
+  reasoning_price_micros INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'published' CHECK(status IN ('draft','published','disabled','error')),
+  upstream_free INTEGER NOT NULL DEFAULT 0,
+  mapping_kind TEXT NOT NULL DEFAULT '',
+  mapping_id TEXT NOT NULL DEFAULT '',
+  health_status TEXT NOT NULL DEFAULT 'unknown' CHECK(health_status IN ('unknown','healthy','failed')),
+  health_latency_ms INTEGER,
+  health_error TEXT NOT NULL DEFAULT '',
+  last_health_at INTEGER,
+  health_failures INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_price_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_id TEXT NOT NULL REFERENCES published_models(id) ON DELETE CASCADE,
+  effective_at INTEGER NOT NULL,
+  input_price_micros INTEGER NOT NULL,
+  output_price_micros INTEGER NOT NULL,
+  cached_price_micros INTEGER NOT NULL,
+  reasoning_price_micros INTEGER NOT NULL,
+  actor TEXT NOT NULL,
+  UNIQUE(model_id, effective_at)
+);
+CREATE TABLE IF NOT EXISTS model_access (
+  model_id TEXT NOT NULL REFERENCES published_models(id) ON DELETE CASCADE,
+  subject_type TEXT NOT NULL CHECK(subject_type IN ('all','group','user')),
+  subject_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(model_id, subject_type, subject_id)
+);
+CREATE TABLE IF NOT EXISTS billing_accounts (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  balance_micros INTEGER NOT NULL DEFAULT 0,
+  suspended INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS token_grants (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  model_id TEXT REFERENCES published_models(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  tokens_initial INTEGER NOT NULL CHECK(tokens_initial > 0),
+  tokens_remaining INTEGER NOT NULL CHECK(tokens_remaining >= 0),
+  reset_interval TEXT NOT NULL DEFAULT 'none' CHECK(reset_interval IN ('none','daily','weekly','monthly')),
+  reset_time TEXT NOT NULL DEFAULT '00:00',
+  reset_at INTEGER,
+  expires_at INTEGER,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','expired')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  api_key_id TEXT NOT NULL,
+  model_id TEXT REFERENCES published_models(id) ON DELETE SET NULL,
+  public_model_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  resolved_model TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  cached_tokens INTEGER NOT NULL,
+  reasoning_tokens INTEGER NOT NULL,
+  granted_tokens INTEGER NOT NULL,
+  amount_micros INTEGER NOT NULL,
+  price_snapshot_json TEXT NOT NULL,
+  occurred_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS balance_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('credit','debit','adjustment','refund')),
+  amount_micros INTEGER NOT NULL,
+  balance_after_micros INTEGER NOT NULL,
+  actor TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  usage_id INTEGER REFERENCES usage_ledger(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS permission_sync (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK(status IN ('pending','synced','failed')),
+  error TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_free_status ON free_resources(available,test_status);
+CREATE INDEX IF NOT EXISTS idx_models_status ON published_models(status,public_model_id);
+CREATE INDEX IF NOT EXISTS idx_model_access_subject ON model_access(subject_type,subject_id);
+CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_ledger(user_id,occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_balance_user_time ON balance_transactions(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_grants_user_status ON token_grants(user_id,status);
 """
 
 
@@ -349,11 +574,34 @@ class Database:
                 "default_quota_tokens": str(self.config.initial_quota),
                 "default_quota_reset": self.config.initial_reset,
                 "default_quota_reset_time": self.config.initial_reset_time,
+                "public_url": self.config.public_url,
+                "api_public_url": self.config.api_public_url,
+                "smtp_host": self.config.smtp_host,
+                "smtp_port": str(self.config.smtp_port),
+                "smtp_security": self.config.smtp_security,
+                "smtp_username": self.config.smtp_username,
+                "smtp_password": self.config.smtp_password,
+                "smtp_from": self.config.smtp_from,
+                "currency": "USD",
             }
             for key, value in defaults.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                     (key, value, now()),
+                )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(published_models)")
+            }
+            if "health_failures" not in columns:
+                connection.execute(
+                    "ALTER TABLE published_models ADD COLUMN health_failures INTEGER NOT NULL DEFAULT 0"
+                )
+            grant_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(token_grants)")
+            }
+            if "reset_time" not in grant_columns:
+                connection.execute(
+                    "ALTER TABLE token_grants ADD COLUMN reset_time TEXT NOT NULL DEFAULT '00:00'"
                 )
             admin = connection.execute(
                 "SELECT id FROM users WHERE role='admin' LIMIT 1"
@@ -376,11 +624,92 @@ class Database:
                         now(),
                     ),
                 )
+            stamp = now()
+            connection.execute(
+                "INSERT OR IGNORE INTO user_groups(id,name,description,status,created_at,updated_at) VALUES('default','default','Default company users','active',?,?)",
+                (stamp, stamp),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO billing_accounts(user_id,balance_micros,suspended,updated_at) SELECT id,0,0,? FROM users",
+                (stamp,),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO user_group_members(user_id,group_id,created_at) SELECT id,'default',? FROM users WHERE role='user'",
+                (stamp,),
+            )
+            for row in connection.execute(
+                "SELECT id,quota_tokens,quota_reset FROM users WHERE role='user' AND status='active'"
+            ).fetchall():
+                existing = connection.execute(
+                    "SELECT 1 FROM token_grants WHERE user_id=? LIMIT 1", (row["id"],)
+                ).fetchone()
+                if not existing and int(row["quota_tokens"] or 0) > 0:
+                    connection.execute(
+                        "INSERT INTO token_grants(id,user_id,model_id,label,tokens_initial,tokens_remaining,reset_interval,reset_time,reset_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            str(uuid.uuid4()), row["id"], None, "Migrated recurring grant",
+                            int(row["quota_tokens"]), int(row["quota_tokens"]), row["quota_reset"],
+                            row["quota_reset_time"],
+                            next_reset_at(row["quota_reset"], reset_time=row["quota_reset_time"]),
+                            "active", stamp, stamp,
+                        ),
+                    )
         os.chmod(self.config.db_path, 0o600)
 
     def settings(self) -> dict[str, str]:
         with self.connect() as connection:
             return {row["key"]: row["value"] for row in connection.execute("SELECT key,value FROM settings")}
+
+    def update_settings(self, values: dict[str, str]) -> None:
+        with self.connect() as connection:
+            for key, value in values.items():
+                connection.execute(
+                    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (key, value, now()),
+                )
+
+    def recovery_inventory(self, show_secrets: bool = False) -> dict[str, Any]:
+        """Return the current persisted portal state for `llmctl info`.
+
+        This intentionally reads the portal-owned SQLite database instead of
+        repeating installation-time environment defaults: administrators can
+        change SMTP and registration settings from the Vue portal later.
+        """
+        if not self.config.db_path.is_file():
+            raise RuntimeError(f"portal database does not exist: {self.config.db_path}")
+        tables = (
+            "users",
+            "user_groups",
+            "published_models",
+            "free_resources",
+            "usage_ledger",
+            "balance_transactions",
+            "audit_events",
+        )
+        with self.connect() as connection:
+            settings = {
+                row["key"]: row["value"]
+                for row in connection.execute("SELECT key,value FROM settings ORDER BY key")
+            }
+            counts = {
+                table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in tables
+            }
+            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+        if not show_secrets and settings.get("smtp_password"):
+            settings["smtp_password"] = "<redacted>"
+        stat = self.config.db_path.stat()
+        return {
+            "version": APP_VERSION,
+            "database": {
+                "path": str(self.config.db_path),
+                "bytes": stat.st_size,
+                "mode": oct(stat.st_mode & 0o777),
+                "quick_check": integrity,
+            },
+            "settings": settings,
+            "counts": counts,
+        }
 
     def audit(
         self, actor: str, action: str, target: str, status: str, remote: str, detail: Any = ""
@@ -402,7 +731,7 @@ class OmniRouteClient:
         self.key = config.gateway_manage_key
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def request(self, method: str, path: str, payload: Any = None) -> dict[str, Any]:
+    def request(self, method: str, path: str, payload: Any = None) -> Any:
         data = None
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self.key}"}
         if payload is not None:
@@ -425,15 +754,23 @@ class OmniRouteClient:
             parsed = json.loads(raw)
         except json.JSONDecodeError as error:
             raise RuntimeError(f"OmniRoute {method} {path}: invalid JSON") from error
-        if not isinstance(parsed, dict):
-            raise RuntimeError(f"OmniRoute {method} {path}: unexpected response")
         return parsed
 
     def create_user_key(self, user_id: str, email: str) -> tuple[str, str]:
         response = self.request(
             "POST",
             "/api/keys",
-            {"name": f"portal:{user_id}:{email}", "scopes": ["self:usage"]},
+            {
+                "name": f"portal:{user_id}:{email}",
+                "scopes": ["self:usage"],
+                # OmniRoute interprets empty allowlists as unrestricted. Start
+                # closed and let the portal publish the effective user/group
+                # policy before the plaintext key is returned to the user.
+                "allowedModels": ["__llmctl_no_models__"],
+                "allowedCombos": ["__llmctl_no_combos__"],
+                "streamDefaultMode": "json",
+                "noLog": False,
+            },
         )
         key_id, raw_key = str(response.get("id", "")), str(response.get("key", ""))
         if not key_id or len(raw_key) < 16:
@@ -495,14 +832,158 @@ class OmniRouteClient:
 
     def models(self) -> list[dict[str, Any]]:
         response = self.request("GET", "/v1/models")
+        if not isinstance(response, dict):
+            return []
         data = response.get("data", [])
         return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    @staticmethod
+    def items(response: Any, *keys: str) -> list[dict[str, Any]]:
+        if isinstance(response, list):
+            return [item for item in response if isinstance(item, dict)]
+        if not isinstance(response, dict):
+            return []
+        for key in keys:
+            value = response.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def combos(self) -> list[dict[str, Any]]:
+        return self.items(self.request("GET", "/api/combos?limit=1000"), "combos")
+
+    def free_models(self) -> list[dict[str, Any]]:
+        return self.items(self.request("GET", "/api/free-models"), "models")
+
+    def free_rankings(self, available_only: bool = False) -> list[dict[str, Any]]:
+        available = "&availableOnly=1" if available_only else ""
+        return self.items(
+            self.request(
+                "GET",
+                f"/api/free-provider-rankings?configuredOnly=1{available}&limit=100",
+            ),
+            "rankings",
+        )
+
+    def call_logs(self, key_id: str, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+        query = urllib.parse.urlencode({"apiKey": key_id, "limit": limit, "offset": offset})
+        return self.items(self.request("GET", f"/api/usage/call-logs?{query}"), "logs")
+
+    def patch_key_permissions(
+        self, key_id: str, allowed_models: list[str], allowed_combos: list[str], active: bool
+    ) -> None:
+        self.request(
+            "PATCH",
+            f"/api/keys/{urllib.parse.quote(key_id, safe='')}",
+            {
+                "allowedModels": allowed_models or ["__llmctl_no_models__"],
+                "allowedCombos": allowed_combos or ["__llmctl_no_combos__"],
+                "isActive": active,
+                "noLog": False,
+            },
+        )
+
+    def set_combo_mapping(
+        self, pattern: str, combo_id: str, mapping_id: str = "", enabled: bool = True
+    ) -> str:
+        payload = {
+            "pattern": pattern,
+            "comboId": combo_id,
+            "priority": 100,
+            "enabled": enabled,
+            "description": "Managed by LLMCtl account portal",
+        }
+        if mapping_id:
+            response = self.request(
+                "PUT", f"/api/model-combo-mappings/{urllib.parse.quote(mapping_id, safe='')}", payload
+            )
+        else:
+            response = self.request("POST", "/api/model-combo-mappings", payload)
+        mapping = response.get("mapping", {}) if isinstance(response, dict) else {}
+        result = str(mapping.get("id", mapping_id)) if isinstance(mapping, dict) else mapping_id
+        if not result:
+            raise RuntimeError("OmniRoute did not return the model-combo mapping id")
+        return result
+
+    def delete_combo_mapping(self, mapping_id: str) -> None:
+        self.request(
+            "DELETE", f"/api/model-combo-mappings/{urllib.parse.quote(mapping_id, safe='')}"
+        )
+
+    def set_model_alias(self, public_id: str, source_model: str) -> str:
+        self.request("PUT", "/api/models/alias", {"model": source_model, "alias": public_id})
+        return public_id
+
+    def delete_model_alias(self, public_id: str) -> None:
+        self.request(
+            "DELETE", f"/api/models/alias?{urllib.parse.urlencode({'alias': public_id})}"
+        )
+
+    def test_model(self, model_id: str) -> tuple[int, str]:
+        payload = {
+            "model": model_id,
+            "stream": False,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Reply with exactly OK"}],
+        }
+        started = time.monotonic()
+        data = json.dumps(payload, separators=(",", ":")).encode()
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=data,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.key}",
+            },
+            method="POST",
+        )
+        try:
+            with self.opener.open(request, timeout=90) as response:
+                raw = response.read().decode(errors="replace")
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode(errors="replace")[:500]
+            raise RuntimeError(f"model test HTTP {error.code}: {detail}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"model test failed: {error.reason}") from error
+        content = ""
+        try:
+            parsed = json.loads(raw)
+            content = str(parsed.get("choices", [{}])[0].get("message", {}).get("content", ""))
+        except (json.JSONDecodeError, IndexError, AttributeError):
+            for line in raw.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                with contextlib.suppress(json.JSONDecodeError, IndexError, AttributeError):
+                    event = json.loads(line[6:])
+                    content += str(event.get("choices", [{}])[0].get("delta", {}).get("content", ""))
+        if not content.strip():
+            raise RuntimeError("model test returned no assistant content")
+        return int((time.monotonic() - started) * 1000), content.strip()[:200]
+
+
+def effective_mail_config(config: Config, settings: dict[str, str]) -> Config:
+    try:
+        smtp_port = int(settings.get("smtp_port", str(config.smtp_port)))
+    except ValueError:
+        smtp_port = config.smtp_port
+    return dataclasses.replace(
+        config,
+        public_url=portal_ui_url(settings.get("public_url", config.public_url)),
+        api_public_url=settings.get("api_public_url", config.api_public_url).rstrip("/"),
+        smtp_host=settings.get("smtp_host", config.smtp_host),
+        smtp_port=smtp_port,
+        smtp_security=settings.get("smtp_security", config.smtp_security),
+        smtp_username=settings.get("smtp_username", config.smtp_username),
+        smtp_password=settings.get("smtp_password", config.smtp_password),
+        smtp_from=settings.get("smtp_from", config.smtp_from),
+    )
 
 
 def send_verification_email(config: Config, recipient: str, raw_token: str) -> None:
     if not config.smtp_host or not config.smtp_from:
         raise RuntimeError("SMTP is not configured")
-    verify_url = f"{config.public_url}/verify?token={urllib.parse.quote(raw_token)}"
+    verify_url = f"{config.public_url}/#/verify?token={urllib.parse.quote(raw_token)}"
     message = EmailMessage()
     message["Subject"] = "验证您的 LLM API 账户 / Verify your LLM API account"
     message["From"] = config.smtp_from
@@ -518,6 +999,34 @@ def send_verification_email(config: Config, recipient: str, raw_token: str) -> N
         client: smtplib.SMTP = smtplib.SMTP_SSL(
             config.smtp_host, config.smtp_port, timeout=20, context=context
         )
+    else:
+        client = smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=20)
+    try:
+        client.ehlo()
+        if config.smtp_security == "starttls":
+            client.starttls(context=context)
+            client.ehlo()
+        if config.smtp_username:
+            client.login(config.smtp_username, config.smtp_password)
+        client.send_message(message)
+    finally:
+        with contextlib.suppress(Exception):
+            client.quit()
+
+
+def send_test_email(config: Config, recipient: str) -> None:
+    recipient, _ = normalize_email(recipient)
+    if not config.smtp_host or not config.smtp_from:
+        raise RuntimeError("SMTP is not configured")
+    message = EmailMessage()
+    message["Subject"] = "LLMCtl SMTP test / 邮件服务测试"
+    message["From"] = config.smtp_from
+    message["To"] = recipient
+    message.set_content("LLMCtl SMTP configuration works.\nLLMCtl 邮件配置测试成功。\n")
+    context = ssl.create_default_context()
+    client: smtplib.SMTP
+    if config.smtp_security == "ssl":
+        client = smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=20, context=context)
     else:
         client = smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=20)
     try:
@@ -551,7 +1060,7 @@ def page(title: str, body: str, user: sqlite3.Row | None = None, lang: str = "zh
 
 
 class PortalHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "LLMCtlAccountPortal/1"
+    server_version = "LLMCtlAccountPortal/2"
 
     @property
     def app(self) -> "PortalServer":
@@ -619,6 +1128,74 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
     def json_response(self, status: int, value: Any) -> None:
         raw = json.dumps(value, ensure_ascii=False).encode()
         self.send_headers(status, "application/json")
+        if not self.csrf_token():
+            csrf = secrets.token_urlsafe(24)
+            secure = "; Secure" if self.app.config.cookie_secure else ""
+            self.send_header(
+                "Set-Cookie", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}"
+            )
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def json_body(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("invalid content length") from error
+        if length <= 0 or length > MAX_FORM_BYTES:
+            raise ValueError("invalid JSON body size")
+        try:
+            value = json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid JSON body") from error
+        if not isinstance(value, dict):
+            raise ValueError("JSON body must be an object")
+        return value
+
+    def remote_addr(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        return forwarded if forwarded and self.client_address[0] in {"127.0.0.1", "::1"} else self.client_address[0]
+
+    def api_require(self, admin: bool = False) -> tuple[sqlite3.Row | None, str]:
+        user, csrf = self.current_session()
+        if not user or (admin and user["role"] != "admin"):
+            self.json_response(401 if not user else 403, {"error": "authentication required" if not user else "administrator required"})
+            return None, ""
+        return user, csrf
+
+    def api_csrf_valid(self, expected: str = "") -> bool:
+        supplied = self.headers.get("X-CSRF-Token", "")
+        expected = expected or self.csrf_token()
+        return bool(supplied and expected and hmac.compare_digest(supplied, expected))
+
+    def serve_vue(self, path: str) -> None:
+        relative = path[len("/ui/") :] if path.startswith("/ui/") else ""
+        target = self.app.config.static_dir / (relative or "index.html")
+        try:
+            resolved = target.resolve(strict=True)
+            root = self.app.config.static_dir.resolve(strict=True)
+            resolved.relative_to(root)
+            if not resolved.is_file():
+                raise FileNotFoundError
+        except (FileNotFoundError, ValueError):
+            resolved = self.app.config.static_dir / "index.html"
+            if not resolved.is_file():
+                self.json_response(503, {"error": "Vue portal assets are not installed"})
+                return
+        raw = resolved.read_bytes()
+        content_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; "
+            "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        )
+        self.send_header("Cache-Control", "no-cache" if resolved.name == "index.html" else "public,max-age=31536000,immutable")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -654,6 +1231,15 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/ui":
+            self.redirect("/ui/")
+            return
+        if parsed.path.startswith("/ui/"):
+            self.serve_vue(parsed.path)
+            return
+        if parsed.path.startswith("/portal-api/"):
+            self.handle_api_get(parsed.path)
+            return
         if parsed.path == "/health":
             try:
                 with self.app.db.connect() as connection:
@@ -700,12 +1286,20 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         self.response(404, page("Not found", '<div class="card"><h1>404</h1></div>'))
 
     def do_POST(self) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/portal-api/"):
+            try:
+                payload = self.json_body()
+            except ValueError as error:
+                self.json_response(400, {"error": str(error)})
+                return
+            self.handle_api_post(path, payload)
+            return
         try:
             form = self.form()
         except ValueError:
             self.response(400, page("Bad request", '<div class="card error">Invalid request</div>'))
             return
-        path = urllib.parse.urlsplit(self.path).path
         if path == "/login":
             self.handle_login(form)
         elif path == "/logout":
@@ -722,6 +1316,402 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.handle_admin_user(form)
         else:
             self.response(404, page("Not found", '<div class="card"><h1>404</h1></div>'))
+
+    def handle_api_get(self, path: str) -> None:
+        if path == "/portal-api/public":
+            settings = self.app.db.settings()
+            self.json_response(
+                200,
+                {
+                    "version": APP_VERSION,
+                    "registration_enabled": settings.get("registration_enabled") == "1",
+                    "allowed_domains": normalize_domains(settings.get("allowed_domains", "")),
+                    "api_public_url": settings.get("api_public_url", self.app.config.api_public_url),
+                },
+            )
+            return
+        if path == "/portal-api/session":
+            user, _ = self.current_session()
+            self.json_response(
+                200,
+                {"authenticated": bool(user), "user": {"id": user["id"], "email": user["email"], "role": user["role"]} if user else None},
+            )
+            return
+        if path == "/portal-api/dashboard":
+            user, _ = self.api_require()
+            if user:
+                self.json_response(200, self.app.control.user_dashboard(user["id"]))
+            return
+        if path == "/portal-api/admin":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    self.json_response(200, self.app.control.admin_snapshot())
+                except Exception as error:
+                    self.json_response(502, {"error": str(error)})
+            return
+        self.json_response(404, {"error": "not found"})
+
+    def handle_api_post(self, path: str, payload: dict[str, Any]) -> None:
+        if path == "/portal-api/auth/login":
+            self.api_login(payload)
+            return
+        if path == "/portal-api/auth/register":
+            self.api_register(payload)
+            return
+        if path == "/portal-api/auth/verify":
+            self.api_verify(payload)
+            return
+        if path == "/portal-api/auth/logout":
+            user, csrf = self.api_require()
+            if not user:
+                return
+            if not self.api_csrf_valid(csrf):
+                self.json_response(403, {"error": "CSRF validation failed"})
+                return
+            morsel = self.cookies().get(SESSION_COOKIE)
+            if morsel:
+                with self.app.db.connect() as connection:
+                    connection.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(morsel.value),))
+            secure = "; Secure" if self.app.config.cookie_secure else ""
+            self.extra_response_cookies = [f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"]
+            self.json_response(200, {"ok": True})
+            return
+        user, csrf = self.api_require(admin=path.startswith("/portal-api/admin/"))
+        if not user:
+            return
+        if not self.api_csrf_valid(csrf):
+            self.json_response(403, {"error": "CSRF validation failed"})
+            return
+        try:
+            if path == "/portal-api/key/rotate":
+                result = self.api_rotate_key(user)
+            elif path == "/portal-api/admin/free/discover":
+                result = self.app.control.discover_free_resources()
+            elif path == "/portal-api/admin/free/test":
+                result = self.app.control.test_free_resource(str(payload.get("resource_key", "")))
+            elif path == "/portal-api/admin/models/save":
+                result = self.app.control.save_model(payload, user["email"])
+            elif path == "/portal-api/admin/models/test":
+                result = self.app.control.test_published_model(str(payload.get("model_id", "")))
+            elif path == "/portal-api/admin/users/update":
+                self.app.control.update_user(payload, user["email"])
+                result = {"ok": True}
+            elif path == "/portal-api/admin/groups/save":
+                # save_group owns the fail-closed quiesce/mutate/resync cycle.
+                # Repeating it here needlessly disables every user key twice.
+                result = {"id": self.app.control.save_group(payload)}
+            elif path == "/portal-api/admin/permissions/reconcile":
+                result = self.app.control.sync_all_users()
+            elif path == "/portal-api/admin/billing/reconcile":
+                result = self.app.control.reconcile_usage()
+            elif path == "/portal-api/admin/settings":
+                result = self.api_update_settings(payload)
+            elif path == "/portal-api/admin/smtp/test":
+                config = effective_mail_config(self.app.config, self.app.db.settings())
+                send_test_email(config, str(payload.get("recipient", user["email"])))
+                result = {"ok": True}
+            else:
+                self.json_response(404, {"error": "not found"})
+                return
+        except Exception as error:
+            self.app.db.audit(user["email"], path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
+            self.json_response(400 if isinstance(error, ValueError) else 502, {"error": str(error)})
+            return
+        self.app.db.audit(user["email"], path.removeprefix("/portal-api/"), str(payload.get("id", "")), "success", self.remote_addr(), result)
+        self.json_response(200, result)
+
+    def api_login(self, payload: dict[str, Any]) -> None:
+        if not self.api_csrf_valid():
+            self.json_response(403, {"error": "CSRF validation failed"})
+            return
+        remote = self.remote_addr()
+        try:
+            email, _ = normalize_email(str(payload.get("email", "")))
+        except ValueError:
+            email = ""
+        identity = token_hash(f"{remote}|{email}")
+        with self.app.db.connect() as connection:
+            failure = connection.execute("SELECT * FROM login_failures WHERE identity_hash=?", (identity,)).fetchone()
+            if failure and failure["locked_until"] > now():
+                self.json_response(429, {"error": "too many attempts; try again later"})
+                return
+            user = connection.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            valid = bool(user and user["status"] == "active" and verify_password(str(payload.get("password", "")), user["password_hash"]))
+            if not valid:
+                current = now()
+                attempts = 1 if not failure or current - failure["window_started_at"] > 900 else int(failure["attempts"]) + 1
+                connection.execute(
+                    "INSERT INTO login_failures(identity_hash,attempts,window_started_at,locked_until) VALUES(?,?,?,?) ON CONFLICT(identity_hash) DO UPDATE SET attempts=excluded.attempts,window_started_at=excluded.window_started_at,locked_until=excluded.locked_until",
+                    (identity, attempts, current if attempts == 1 else failure["window_started_at"], current + 900 if attempts >= 5 else 0),
+                )
+            else:
+                connection.execute("DELETE FROM login_failures WHERE identity_hash=?", (identity,))
+                raw_session, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+                connection.execute("DELETE FROM sessions WHERE user_id=? OR expires_at<=?", (user["id"], now()))
+                connection.execute(
+                    "INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at) VALUES(?,?,?,?,?)",
+                    (token_hash(raw_session), user["id"], csrf, now() + 7 * 86400, now()),
+                )
+                connection.execute("UPDATE users SET last_login_at=? WHERE id=?", (now(), user["id"]))
+        if not valid:
+            self.app.db.audit("anonymous", "login.failed", email or "invalid", "denied", remote)
+            self.json_response(401, {"error": "invalid credentials or account status"})
+            return
+        secure = "; Secure" if self.app.config.cookie_secure else ""
+        self.extra_response_cookies = [
+            f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}",
+            f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}",
+        ]
+        self.app.db.audit(email, "login.success", user["id"], "success", remote)
+        self.json_response(200, {"user": {"id": user["id"], "email": email, "role": user["role"]}})
+
+    def api_register(self, payload: dict[str, Any]) -> None:
+        if not self.api_csrf_valid():
+            self.json_response(403, {"error": "CSRF validation failed"})
+            return
+        settings = self.app.db.settings()
+        if settings.get("registration_enabled") != "1":
+            self.json_response(403, {"error": "registration is closed"})
+            return
+        try:
+            email, domain = normalize_email(str(payload.get("email", "")))
+            if domain not in normalize_domains(settings.get("allowed_domains", "")):
+                raise ValueError("email domain is not allowed")
+            password = str(payload.get("password", ""))
+            if password != str(payload.get("confirm", "")):
+                raise ValueError("passwords do not match")
+            password_hash = hash_password(password)
+        except ValueError as error:
+            self.json_response(400, {"error": str(error)})
+            return
+        raw_token, stamp = secrets.token_urlsafe(40), now()
+        ignored_reason = ""
+        with self.app.db.connect() as connection:
+            user = connection.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            if user and user["status"] != "pending":
+                ignored_reason = "duplicate"
+            elif user:
+                user_id = user["id"]
+                latest = connection.execute(
+                    "SELECT created_at FROM verification_tokens WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if latest and stamp - int(latest["created_at"]) < 60:
+                    ignored_reason = "throttled"
+            else:
+                user_id = str(uuid.uuid4())
+            if not ignored_reason and user:
+                connection.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id))
+                connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
+            elif not ignored_reason:
+                connection.execute(
+                    "INSERT INTO users(id,email,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (user_id, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], stamp),
+                )
+            if not ignored_reason:
+                connection.execute(
+                    "INSERT INTO verification_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+                    (token_hash(raw_token), user_id, stamp + self.app.config.verification_ttl, stamp),
+                )
+        if ignored_reason:
+            self.app.db.audit(
+                "anonymous", f"register.{ignored_reason}", email, "ignored", self.remote_addr()
+            )
+            self.json_response(
+                200, {"ok": True, "message": "If eligible, a verification email was sent"}
+            )
+            return
+        try:
+            send_verification_email(effective_mail_config(self.app.config, settings), email, raw_token)
+        except Exception as error:
+            with self.app.db.connect() as connection:
+                connection.execute("DELETE FROM verification_tokens WHERE token_hash=?", (token_hash(raw_token),))
+            self.app.db.audit(
+                "anonymous", "register.email", email, "failed", self.remote_addr(), type(error).__name__
+            )
+            self.json_response(502, {"error": f"email delivery failed: {error}"})
+            return
+        self.app.db.audit("anonymous", "register.email", email, "success", self.remote_addr())
+        self.json_response(200, {"ok": True, "message": "Verification email sent"})
+
+    def api_verify(self, payload: dict[str, Any]) -> None:
+        if not self.api_csrf_valid():
+            self.json_response(403, {"error": "CSRF validation failed"})
+            return
+        raw_token = str(payload.get("token", ""))
+        with self.app.db.connect() as connection:
+            record = connection.execute(
+                "SELECT v.*,u.* FROM verification_tokens v JOIN users u ON u.id=v.user_id WHERE v.token_hash=? AND v.used_at IS NULL AND v.expires_at>?",
+                (token_hash(raw_token), now()),
+            ).fetchone()
+        if not record:
+            self.json_response(410, {"error": "verification link expired"})
+            return
+        settings = self.app.db.settings()
+        key_id = ""
+        grant_id = ""
+        try:
+            _, domain = normalize_email(record["email"])
+            if domain not in normalize_domains(settings.get("allowed_domains", "")):
+                raise ValueError("email domain is no longer allowed")
+            key_id, raw_key = self.app.omni.create_user_key(record["user_id"], record["email"])
+            stamp = now()
+            with self.app.db.connect() as connection:
+                changed = connection.execute(
+                    "UPDATE verification_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL",
+                    (stamp, token_hash(raw_token)),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("verification token already consumed")
+                connection.execute("UPDATE users SET status='active',verified_at=?,api_key_id=?,token_limit_id=NULL WHERE id=?", (stamp, key_id, record["user_id"]))
+                connection.execute("INSERT OR IGNORE INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,0,0,?)", (record["user_id"], stamp))
+                connection.execute("INSERT OR IGNORE INTO user_group_members(user_id,group_id,created_at) VALUES(?,'default',?)", (record["user_id"], stamp))
+                quota = int(settings.get("default_quota_tokens", "0") or 0)
+                if quota:
+                    reset = settings.get("default_quota_reset", "monthly")
+                    grant_id = str(uuid.uuid4())
+                    connection.execute(
+                        "INSERT INTO token_grants(id,user_id,label,tokens_initial,tokens_remaining,reset_interval,reset_time,reset_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            grant_id, record["user_id"], "Welcome recurring grant", quota, quota,
+                            reset, settings.get("default_quota_reset_time", "00:00"),
+                            next_reset_at(
+                                reset,
+                                reset_time=settings.get("default_quota_reset_time", "00:00"),
+                            ),
+                            "active", stamp, stamp,
+                        ),
+                    )
+            self.app.control.sync_user(record["user_id"])
+        except Exception as error:
+            if key_id:
+                with contextlib.suppress(Exception):
+                    self.app.omni.delete_key(key_id)
+            # Provisioning spans the portal DB and OmniRoute. Restore the
+            # pending registration state if any later permission sync fails so
+            # a transient gateway error never consumes the verification link
+            # or leaves an active account backed by a deleted key.
+            with self.app.db.connect() as connection:
+                if grant_id:
+                    connection.execute("DELETE FROM token_grants WHERE id=?", (grant_id,))
+                connection.execute("DELETE FROM permission_sync WHERE user_id=?", (record["user_id"],))
+                connection.execute("DELETE FROM user_group_members WHERE user_id=?", (record["user_id"],))
+                connection.execute(
+                    "DELETE FROM billing_accounts WHERE user_id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM balance_transactions WHERE user_id=?) AND NOT EXISTS "
+                    "(SELECT 1 FROM usage_ledger WHERE user_id=?)",
+                    (record["user_id"], record["user_id"], record["user_id"]),
+                )
+                connection.execute(
+                    "UPDATE users SET status='pending',verified_at=NULL,api_key_id=NULL,token_limit_id=NULL WHERE id=?",
+                    (record["user_id"],),
+                )
+                connection.execute(
+                    "UPDATE verification_tokens SET used_at=NULL WHERE token_hash=?",
+                    (token_hash(raw_token),),
+                )
+            self.json_response(502, {"error": f"provisioning failed: {error}"})
+            return
+        raw_session, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+        with self.app.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at) VALUES(?,?,?,?,?)",
+                (token_hash(raw_session), record["user_id"], csrf, now() + 7 * 86400, now()),
+            )
+        secure = "; Secure" if self.app.config.cookie_secure else ""
+        self.extra_response_cookies = [
+            f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}",
+            f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}",
+        ]
+        self.json_response(200, {"ok": True, "api_key": raw_key})
+
+    def api_rotate_key(self, user: sqlite3.Row) -> dict[str, Any]:
+        if user["role"] != "user":
+            raise ValueError("only user API keys can be rotated here")
+        old_id = str(user["api_key_id"] or "")
+        new_id, raw_key = self.app.omni.create_user_key(user["id"], user["email"])
+        try:
+            with self.app.db.connect() as connection:
+                connection.execute("UPDATE users SET api_key_id=?,token_limit_id=NULL WHERE id=?", (new_id, user["id"]))
+            self.app.control.sync_user(user["id"])
+            if old_id:
+                self.app.omni.delete_key(old_id)
+        except Exception:
+            with self.app.db.connect() as connection:
+                connection.execute("UPDATE users SET api_key_id=? WHERE id=?", (old_id or None, user["id"]))
+            with contextlib.suppress(Exception):
+                self.app.omni.delete_key(new_id)
+            raise
+        return {"ok": True, "api_key": raw_key}
+
+    def api_update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        enabled = bool(payload.get("registration_enabled", False))
+        domains = normalize_domains(str(payload.get("allowed_domains", "")))
+        public_url = str(payload.get("public_url", "")).rstrip("/")
+        api_url = str(payload.get("api_public_url", "")).rstrip("/")
+        smtp_security = str(payload.get("smtp_security", "starttls"))
+        smtp_port = int(payload.get("smtp_port", 587))
+        quota = int(payload.get("default_quota_tokens", 1000000))
+        reset = str(payload.get("default_quota_reset", "monthly"))
+        reset_time = str(payload.get("default_quota_reset_time", "00:00"))
+        currency = str(payload.get("currency", "USD")).strip().upper()
+        if enabled and not domains:
+            raise ValueError("registration requires at least one allowed email domain")
+        if not 1 <= quota <= 10**12:
+            raise ValueError("default token quota must be 1-1000000000000")
+        if reset not in {"daily", "weekly", "monthly"}:
+            raise ValueError("invalid quota reset interval")
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
+            raise ValueError("invalid quota reset time")
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("currency must be a three-letter code")
+        if smtp_security not in {"starttls", "ssl", "plain"} or not 1 <= smtp_port <= 65535:
+            raise ValueError("invalid SMTP configuration")
+        for label, url, allow_ui in (("public_url", public_url, True), ("api_public_url", api_url, False)):
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                parsed.port
+            except ValueError as error:
+                raise ValueError(f"invalid {label}") from error
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(f"invalid {label}")
+            if (allow_ui and parsed.path.rstrip("/") not in {"", "/ui"}) or (not allow_ui and parsed.path.rstrip("/")):
+                raise ValueError(f"invalid {label} path")
+        public_url = portal_ui_url(public_url)
+        current = self.app.db.settings()
+        smtp_password = str(payload.get("smtp_password", "")) or current.get("smtp_password", "")
+        values = {
+            "registration_enabled": "1" if enabled else "0",
+            "allowed_domains": ",".join(domains),
+            "default_quota_tokens": str(quota),
+            "default_quota_reset": reset,
+            "default_quota_reset_time": reset_time,
+            "public_url": public_url,
+            "api_public_url": api_url,
+            "smtp_host": str(payload.get("smtp_host", "")),
+            "smtp_port": str(smtp_port),
+            "smtp_security": smtp_security,
+            "smtp_username": str(payload.get("smtp_username", "")),
+            "smtp_password": smtp_password,
+            "smtp_from": str(payload.get("smtp_from", "")),
+            "currency": currency,
+        }
+        if values["smtp_host"] and (len(values["smtp_host"]) > 253 or re.search(r"\s", values["smtp_host"])):
+            raise ValueError("invalid SMTP host")
+        if values["smtp_from"]:
+            normalize_email(values["smtp_from"])
+        if enabled and (not values["public_url"] or not values["smtp_host"] or not values["smtp_from"]):
+            raise ValueError("registration requires public URL, SMTP host and from address")
+        self.app.db.update_settings(values)
+        return {"ok": True}
 
     def show_landing(self) -> None:
         settings = self.app.db.settings()
@@ -951,7 +1941,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.show_register("若该邮箱可注册，验证邮件已经发送 / If eligible, a verification email was sent")
             return
         try:
-            send_verification_email(self.app.config, email, raw_token)
+            send_verification_email(effective_mail_config(self.app.config, settings), email, raw_token)
         except Exception as error:
             with self.app.db.connect() as connection:
                 connection.execute("DELETE FROM verification_tokens WHERE token_hash=?", (token_hash(raw_token),))
@@ -1126,6 +2116,901 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         self.show_admin("用户设置已保存 / User settings saved")
 
 
+class PortalControlPlane:
+    """Business policy layered on OmniRoute's native routing and enforcement APIs."""
+
+    def __init__(self, config: Config, db: Database, omni: OmniRouteClient):
+        self.config, self.db, self.omni = config, db, omni
+        self.lock = threading.RLock()
+
+    @staticmethod
+    def rows(rows: Any) -> list[dict[str, Any]]:
+        return [dict(row) for row in rows]
+
+    def seed_managed_model(self) -> None:
+        model_name = os.environ.get("SERVED_MODEL_NAME", "").strip()
+        if not model_name:
+            return
+        combos = self.omni.combos()
+        combo = next((item for item in combos if str(item.get("name", "")) == model_name), None)
+        if not combo:
+            return
+        capabilities = ["chat"]
+        if env_bool("SUPPORTS_IMAGE_INPUT"):
+            capabilities.append("vision")
+        if env_bool("SUPPORTS_OCR"):
+            capabilities.append("ocr")
+        if env_bool("SUPPORTS_TOOL_CALLING"):
+            capabilities.append("tools")
+        if env_bool("SUPPORTS_REASONING"):
+            capabilities.append("reasoning")
+        stamp = now()
+        with self.db.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM published_models WHERE public_model_id=?", (model_name,)
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "UPDATE published_models SET source_kind='combo',source_ref=?,source_model=?,capabilities_json=?,health_status='healthy',health_failures=0,updated_at=? WHERE id=?",
+                    (str(combo.get("id", "")), model_name, json.dumps(capabilities), stamp, existing["id"]),
+                )
+                model_id = existing["id"]
+            else:
+                model_id = str(uuid.uuid4())
+                connection.execute(
+                    "INSERT INTO published_models(id,public_model_id,display_name,description,source_kind,source_ref,source_model,capabilities_json,status,health_status,last_health_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        model_id, model_name, model_name, "LLMCtl local vLLM cluster", "combo",
+                        str(combo.get("id", "")), model_name, json.dumps(capabilities), "published",
+                        "healthy", stamp, stamp, stamp,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO model_price_versions(model_id,effective_at,input_price_micros,output_price_micros,cached_price_micros,reasoning_price_micros,actor) VALUES(?,?,?,?,?,?,?)",
+                    (model_id, stamp, 0, 0, 0, 0, "system"),
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO model_access(model_id,subject_type,subject_id,created_at) VALUES(?, 'all', '', ?)",
+                (model_id, stamp),
+            )
+
+    def effective_models(self, user_id: str) -> list[dict[str, Any]]:
+        stamp = now()
+        with self.db.connect() as connection:
+            account = connection.execute(
+                "SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)
+            ).fetchone()
+            models = self.rows(
+                connection.execute(
+                    """SELECT DISTINCT p.* FROM published_models p
+                       JOIN model_access a ON a.model_id=p.id
+                       WHERE p.status='published' AND p.health_status!='failed' AND (
+                         a.subject_type='all' OR
+                         (a.subject_type='user' AND a.subject_id=?) OR
+                         (a.subject_type='group' AND a.subject_id IN
+                           (SELECT m.group_id FROM user_group_members m
+                            JOIN user_groups g ON g.id=m.group_id
+                            WHERE m.user_id=? AND g.status='active'))
+                       ) ORDER BY p.public_model_id""",
+                    (user_id, user_id),
+                ).fetchall()
+            )
+            grants = connection.execute(
+                "SELECT model_id,tokens_remaining FROM token_grants WHERE user_id=? AND status='active' AND tokens_remaining>0 AND (expires_at IS NULL OR expires_at>?)",
+                (user_id, stamp),
+            ).fetchall()
+        balance = int(account["balance_micros"]) if account else 0
+        suspended = bool(account["suspended"]) if account else False
+        generic_grant = any(row["model_id"] is None and int(row["tokens_remaining"]) > 0 for row in grants)
+        model_grants = {row["model_id"] for row in grants if row["model_id"]}
+        result = []
+        for model in models:
+            paid = any(
+                int(model[key]) > 0
+                for key in (
+                    "input_price_micros", "output_price_micros", "cached_price_micros",
+                    "reasoning_price_micros",
+                )
+            )
+            if not suspended and (not paid or balance > 0 or generic_grant or model["id"] in model_grants):
+                result.append(model)
+        return result
+
+    def sync_user(self, user_id: str) -> None:
+        with self.db.connect() as connection:
+            user = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user or not user["api_key_id"]:
+            return
+        models = self.effective_models(user_id) if user["status"] == "active" else []
+        allowed_models: list[str] = []
+        allowed_combos: list[str] = []
+        for model in models:
+            # Only authorize the public ID. OmniRoute resolves the portal-owned
+            # combo mapping/model alias after its API-key policy check. Adding
+            # source IDs here would let users bypass the administrator's public
+            # naming and access policy by calling the underlying route directly.
+            public_id = str(model["public_model_id"])
+            target = allowed_combos if model["source_kind"] == "combo" else allowed_models
+            if public_id and public_id not in target:
+                target.append(public_id)
+        try:
+            self.omni.patch_key_permissions(
+                user["api_key_id"], allowed_models, allowed_combos,
+                user["status"] == "active" and bool(models),
+            )
+            sync_status, error = "synced", ""
+        except Exception as exc:
+            sync_status, error = "failed", str(exc)[:500]
+        with self.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO permission_sync(user_id,status,error,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET status=excluded.status,error=excluded.error,updated_at=excluded.updated_at",
+                (user_id, sync_status, error, now()),
+            )
+        if error:
+            raise RuntimeError(error)
+
+    def quiesce_all_users(self) -> int:
+        """Fail closed before changing a policy shared by multiple API keys."""
+        with self.db.connect() as connection:
+            keys = [
+                str(row["api_key_id"])
+                for row in connection.execute(
+                    "SELECT api_key_id FROM users WHERE role='user' AND api_key_id IS NOT NULL"
+                )
+            ]
+        disabled: list[str] = []
+        try:
+            for key_id in keys:
+                self.omni.activate_key(key_id, False)
+                disabled.append(key_id)
+        except Exception:
+            # Restore the last committed effective policy when quiescing cannot
+            # complete. The requested policy mutation has not started yet.
+            with contextlib.suppress(Exception):
+                self.sync_all_users()
+            raise RuntimeError("could not safely quiesce all user API keys")
+        return len(disabled)
+
+    def sync_all_users(self) -> dict[str, int]:
+        with self.db.connect() as connection:
+            ids = [row["id"] for row in connection.execute("SELECT id FROM users WHERE role='user'")]
+        success = failed = 0
+        for user_id in ids:
+            try:
+                self.sync_user(user_id)
+                success += 1
+            except RuntimeError:
+                failed += 1
+        return {"synced": success, "failed": failed}
+
+    def discover_free_resources(self) -> dict[str, int]:
+        catalog = self.omni.free_models()
+        rankings = self.omni.free_rankings()
+        available_rankings = self.omni.free_rankings(available_only=True)
+        configured = {str(item.get("id", "")): item for item in rankings}
+        available = {str(item.get("id", "")): item for item in available_rankings}
+        stamp = now()
+        seen: set[str] = set()
+        with self.db.connect() as connection:
+            for item in catalog:
+                provider = str(item.get("provider", "")).strip()
+                model_id = str(item.get("modelId", "")).strip()
+                if not provider or not model_id:
+                    continue
+                resource_key = f"{provider}:{model_id}"
+                seen.add(resource_key)
+                provider_state = configured.get(provider)
+                source = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                connection.execute(
+                    """INSERT INTO free_resources(resource_key,provider,model_id,display_name,free_type,monthly_tokens,credit_tokens,terms_status,configured,available,source_json,discovered_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(resource_key) DO UPDATE SET
+                       display_name=excluded.display_name,free_type=excluded.free_type,monthly_tokens=excluded.monthly_tokens,
+                       credit_tokens=excluded.credit_tokens,terms_status=excluded.terms_status,configured=excluded.configured,
+                       available=excluded.available,source_json=excluded.source_json,updated_at=excluded.updated_at""",
+                    (
+                        resource_key, provider, model_id, str(item.get("displayName", model_id)),
+                        str(item.get("freeType", "unknown")), item.get("monthlyTokens"), item.get("creditTokens"),
+                        str(item.get("tos", "")), 1 if provider_state else 0, 1 if provider in available else 0,
+                        source, stamp, stamp,
+                    ),
+                )
+            if seen:
+                placeholders = ",".join("?" for _ in seen)
+                connection.execute(
+                    f"UPDATE free_resources SET available=0,updated_at=? WHERE resource_key NOT IN ({placeholders})",
+                    (stamp, *sorted(seen)),
+                )
+        return {
+            "catalog": len(catalog),
+            "configured_providers": len(configured),
+            "available_providers": len(available),
+            "resources": len(seen),
+        }
+
+    def test_free_resource(self, resource_key: str) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            resource = connection.execute(
+                "SELECT * FROM free_resources WHERE resource_key=?", (resource_key,)
+            ).fetchone()
+        if not resource:
+            raise ValueError("free resource not found")
+        try:
+            latency, content = self.omni.test_model(resource["model_id"])
+            status, available, error = "healthy", 1, ""
+        except Exception as exc:
+            latency, content, status, available, error = None, "", "failed", 0, str(exc)[:500]
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE free_resources SET test_status=?,test_latency_ms=?,test_error=?,available=?,last_tested_at=?,updated_at=? WHERE resource_key=?",
+                (status, latency, error, available, now(), now(), resource_key),
+            )
+        if error:
+            raise RuntimeError(error)
+        return {"status": status, "latency_ms": latency, "response": content}
+
+    def save_model(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        public_id = str(payload.get("public_model_id", "")).strip()
+        source_kind = str(payload.get("source_kind", "")).strip()
+        source_model = str(payload.get("source_model", "")).strip()
+        source_ref = str(payload.get("source_ref", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", public_id):
+            raise ValueError("invalid public model id")
+        if source_kind not in {"combo", "model", "free"} or not source_model:
+            raise ValueError("invalid source model")
+        capabilities = payload.get("capabilities", ["chat"])
+        if not isinstance(capabilities, list) or any(
+            not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_-]{1,32}", item)
+            for item in capabilities
+        ):
+            raise ValueError("invalid capabilities")
+        status = str(payload.get("status", "published"))
+        if status not in {"draft", "published", "disabled"}:
+            raise ValueError("invalid model status")
+        access = payload.get("access") or [{"type": "all", "id": ""}]
+        if not isinstance(access, list):
+            raise ValueError("invalid model access")
+        prices = {
+            key: money_to_micros(payload.get(key.replace("_micros", ""), "0"))
+            for key in (
+                "input_price_micros", "output_price_micros", "cached_price_micros",
+                "reasoning_price_micros",
+            )
+        }
+        if any(value < 0 for value in prices.values()):
+            raise ValueError("model prices cannot be negative")
+        if source_kind == "free":
+            with self.db.connect() as connection:
+                free = connection.execute(
+                    "SELECT * FROM free_resources WHERE resource_key=?", (source_ref,)
+                ).fetchone()
+            if not free or free["test_status"] != "healthy" or not free["available"]:
+                raise ValueError("free resource must pass a live test before publishing")
+        with self.db.connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM published_models WHERE id=? OR public_model_id=? LIMIT 1",
+                (str(payload.get("id", "")), public_id),
+            ).fetchone()
+        self.quiesce_all_users()
+        old_mapping_id = str(existing["mapping_id"] or "") if existing else ""
+        old_mapping_kind = str(existing["mapping_kind"] or "") if existing else ""
+        old_public_id = str(existing["public_model_id"] or "") if existing else ""
+        old_source_ref = str(existing["source_ref"] or "") if existing else ""
+        old_source_model = str(existing["source_model"] or "") if existing else ""
+        old_status = str(existing["status"] or "") if existing else ""
+        mapping_id = ""
+        mapping_kind = ""
+        created_mapping = False
+        mutated_mapping = False
+        try:
+            if source_kind == "combo":
+                if not source_ref:
+                    combo = next(
+                        (item for item in self.omni.combos() if str(item.get("name", "")) == source_model),
+                        None,
+                    )
+                    source_ref = str(combo.get("id", "")) if combo else ""
+                if not source_ref:
+                    raise ValueError("combo id is required")
+                reuse_id = old_mapping_id if old_mapping_kind == "combo" else ""
+                mapping_id = self.omni.set_combo_mapping(
+                    public_id, source_ref, reuse_id, status == "published"
+                )
+                mapping_kind = "combo"
+                mutated_mapping = bool(reuse_id)
+                created_mapping = not mutated_mapping
+            elif public_id != source_model:
+                mapping_id = self.omni.set_model_alias(public_id, source_model)
+                mapping_kind = "alias"
+                mutated_mapping = old_mapping_kind == "alias" and old_public_id == public_id
+                created_mapping = not mutated_mapping
+            if status == "published":
+                latency, _ = self.omni.test_model(public_id)
+            else:
+                latency = None
+            stamp = now()
+            model_id = str(existing["id"]) if existing else str(uuid.uuid4())
+            with self.db.connect() as connection:
+                connection.execute(
+                    """INSERT INTO published_models(id,public_model_id,display_name,description,source_kind,source_ref,source_provider,source_model,capabilities_json,input_price_micros,output_price_micros,cached_price_micros,reasoning_price_micros,status,upstream_free,mapping_kind,mapping_id,health_status,health_latency_ms,last_health_at,health_failures,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                       public_model_id=excluded.public_model_id,display_name=excluded.display_name,description=excluded.description,
+                       source_kind=excluded.source_kind,source_ref=excluded.source_ref,source_provider=excluded.source_provider,
+                       source_model=excluded.source_model,capabilities_json=excluded.capabilities_json,input_price_micros=excluded.input_price_micros,
+                       output_price_micros=excluded.output_price_micros,cached_price_micros=excluded.cached_price_micros,
+                       reasoning_price_micros=excluded.reasoning_price_micros,status=excluded.status,upstream_free=excluded.upstream_free,
+                       mapping_kind=excluded.mapping_kind,mapping_id=excluded.mapping_id,health_status=excluded.health_status,
+                       health_latency_ms=excluded.health_latency_ms,last_health_at=excluded.last_health_at,health_failures=0,updated_at=excluded.updated_at""",
+                    (
+                        model_id, public_id, str(payload.get("display_name", public_id)), str(payload.get("description", "")),
+                        source_kind, source_ref, str(payload.get("source_provider", "")), source_model,
+                        json.dumps(capabilities, ensure_ascii=False), prices["input_price_micros"], prices["output_price_micros"],
+                        prices["cached_price_micros"], prices["reasoning_price_micros"], status,
+                        1 if source_kind == "free" else 0, mapping_kind, mapping_id,
+                        "healthy" if status == "published" else "unknown", latency, stamp if latency else None,
+                        0, int(existing["created_at"]) if existing else stamp, stamp,
+                    ),
+                )
+                connection.execute("DELETE FROM model_access WHERE model_id=?", (model_id,))
+                for item in access:
+                    subject_type = str(item.get("type", "")) if isinstance(item, dict) else ""
+                    subject_id = str(item.get("id", "")) if isinstance(item, dict) else ""
+                    if subject_type not in {"all", "group", "user"}:
+                        raise ValueError("invalid access subject")
+                    if subject_type == "group" and not connection.execute(
+                        "SELECT 1 FROM user_groups WHERE id=?", (subject_id,)
+                    ).fetchone():
+                        raise ValueError("access group does not exist")
+                    if subject_type == "user" and not connection.execute(
+                        "SELECT 1 FROM users WHERE id=? AND role='user'", (subject_id,)
+                    ).fetchone():
+                        raise ValueError("access user does not exist")
+                    connection.execute(
+                        "INSERT INTO model_access(model_id,subject_type,subject_id,created_at) VALUES(?,?,?,?)",
+                        (model_id, subject_type, subject_id if subject_type != "all" else "", stamp),
+                    )
+                previous = connection.execute(
+                    "SELECT input_price_micros,output_price_micros,cached_price_micros,reasoning_price_micros FROM model_price_versions WHERE model_id=? ORDER BY effective_at DESC LIMIT 1",
+                    (model_id,),
+                ).fetchone()
+                current_prices = tuple(prices[key] for key in prices)
+                if not previous or tuple(previous) != current_prices:
+                    connection.execute(
+                        "INSERT INTO model_price_versions(model_id,effective_at,input_price_micros,output_price_micros,cached_price_micros,reasoning_price_micros,actor) VALUES(?,?,?,?,?,?,?)",
+                        (model_id, stamp, *current_prices, actor),
+                    )
+            permission_sync = self.sync_all_users()
+            # Remove a superseded alias/mapping only after the new OmniRoute
+            # route, portal policy and user permissions have all committed.
+            if old_mapping_kind == "combo" and old_mapping_id and (
+                mapping_kind != "combo" or mapping_id != old_mapping_id
+            ):
+                with contextlib.suppress(Exception):
+                    self.omni.delete_combo_mapping(old_mapping_id)
+            elif old_mapping_kind == "alias" and old_public_id and (
+                mapping_kind != "alias" or old_public_id != public_id
+            ):
+                with contextlib.suppress(Exception):
+                    self.omni.delete_model_alias(old_public_id)
+            return {
+                "id": model_id,
+                "public_model_id": public_id,
+                "latency_ms": latency,
+                "permission_sync": permission_sync,
+            }
+        except Exception:
+            if created_mapping:
+                with contextlib.suppress(Exception):
+                    if mapping_kind == "combo":
+                        self.omni.delete_combo_mapping(mapping_id)
+                    elif mapping_kind == "alias":
+                        self.omni.delete_model_alias(public_id)
+            elif mutated_mapping and existing:
+                # Restore the last committed OmniRoute mapping when live test,
+                # policy validation, or SQLite persistence fails.
+                with contextlib.suppress(Exception):
+                    if old_mapping_kind == "combo":
+                        self.omni.set_combo_mapping(
+                            old_public_id,
+                            old_source_ref,
+                            old_mapping_id,
+                            old_status == "published",
+                        )
+                    elif old_mapping_kind == "alias":
+                        self.omni.set_model_alias(old_public_id, old_source_model)
+            with contextlib.suppress(Exception):
+                self.sync_all_users()
+            raise
+
+    def test_published_model(self, model_id: str) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            model = connection.execute("SELECT * FROM published_models WHERE id=?", (model_id,)).fetchone()
+        if not model:
+            raise ValueError("model not found")
+        try:
+            latency, response = self.omni.test_model(model["public_model_id"])
+            failures, health, error = 0, "healthy", ""
+        except Exception as exc:
+            latency, response, failures, error = None, "", int(model["health_failures"] or 0) + 1, str(exc)[:500]
+            health = "failed" if failures >= 3 else "unknown"
+        withdraw = bool(model["upstream_free"]) and health == "failed"
+        if withdraw:
+            # Free upstreams can disappear without notice. Stop every portal
+            # key before withdrawing the shared route so no request can slip
+            # through between the health transition and permission refresh.
+            self.quiesce_all_users()
+            try:
+                if model["mapping_kind"] == "combo" and model["mapping_id"]:
+                    self.omni.set_combo_mapping(
+                        model["public_model_id"], model["source_ref"], model["mapping_id"], False
+                    )
+                elif model["mapping_kind"] == "alias":
+                    self.omni.delete_model_alias(model["public_model_id"])
+            except Exception:
+                # Keys intentionally remain disabled when native withdrawal
+                # cannot be proven. An administrator can repair and resync.
+                with self.db.connect() as connection:
+                    connection.execute(
+                        "UPDATE published_models SET status='error',health_status='failed',health_error=?,last_health_at=?,health_failures=?,updated_at=? WHERE id=?",
+                        (error or "native route withdrawal failed", now(), failures, now(), model_id),
+                    )
+                raise
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE published_models SET health_status=?,health_latency_ms=?,health_error=?,last_health_at=?,health_failures=?,status=CASE WHEN ?='failed' AND upstream_free=1 THEN 'error' ELSE status END,updated_at=? WHERE id=?",
+                (health, latency, error, now(), failures, health, now(), model_id),
+            )
+        if withdraw:
+            self.sync_all_users()
+        if error:
+            raise RuntimeError(error)
+        return {"status": health, "latency_ms": latency, "response": response}
+
+    @staticmethod
+    def parse_timestamp(value: Any) -> int:
+        try:
+            return int(datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+        except (ValueError, TypeError):
+            return now()
+
+    def reset_due_grants(self) -> int:
+        """Reset grants without requiring a request to pass through a disabled key."""
+        stamp = now()
+        with self.db.connect() as connection:
+            due = connection.execute(
+                "SELECT id,user_id,reset_interval,reset_time FROM token_grants "
+                "WHERE status='active' AND reset_interval!='none' AND reset_at IS NOT NULL AND reset_at<=?",
+                (stamp,),
+            ).fetchall()
+            user_ids = {str(row["user_id"]) for row in due}
+            for grant in due:
+                reset_time = str(grant["reset_time"] or "00:00")
+                connection.execute(
+                    "UPDATE token_grants SET tokens_remaining=tokens_initial,reset_at=?,updated_at=? WHERE id=?",
+                    (
+                        next_reset_at(
+                            str(grant["reset_interval"]), stamp, reset_time=reset_time
+                        ),
+                        stamp,
+                        grant["id"],
+                    ),
+                )
+        for user_id in user_ids:
+            try:
+                self.sync_user(user_id)
+            except RuntimeError as error:
+                print(
+                    f"[account-portal] grant reset permission sync warning "
+                    f"(user={user_id}): {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return len(due)
+
+    def reconcile_usage(self) -> dict[str, int]:
+        # Admin-triggered reconciliation and the maintenance thread may run at
+        # the same time. Serialize the complete fetch/ledger/key-sync cycle.
+        with self.lock:
+            return self._reconcile_usage()
+
+    def _reconcile_usage(self) -> dict[str, int]:
+        self.reset_due_grants()
+        processed = skipped = 0
+        changed_users: set[str] = set()
+        with self.db.connect() as connection:
+            users = connection.execute(
+                "SELECT id,api_key_id FROM users WHERE role='user' AND api_key_id IS NOT NULL"
+            ).fetchall()
+        for user in users:
+            logs: list[dict[str, Any]] = []
+            reached_checkpoint = False
+            for offset in range(0, 100_000, 200):
+                page = self.omni.call_logs(user["api_key_id"], 200, offset)
+                page_ids = [str(item.get("id", "")) for item in page if item.get("id")]
+                known: set[str] = set()
+                if page_ids:
+                    placeholders = ",".join("?" for _ in page_ids)
+                    with self.db.connect() as connection:
+                        known = {
+                            str(row["request_id"])
+                            for row in connection.execute(
+                                f"SELECT request_id FROM usage_ledger WHERE request_id IN ({placeholders})",
+                                page_ids,
+                            )
+                        }
+                for item in page:
+                    if str(item.get("id", "")) in known:
+                        reached_checkpoint = True
+                        break
+                    logs.append(item)
+                if reached_checkpoint:
+                    break
+                if len(page) < 200:
+                    break
+            else:
+                raise RuntimeError(
+                    f"usage reconciliation backlog exceeds 100000 calls for API key {user['api_key_id']}"
+                )
+
+            billable_logs = []
+            for item in logs:
+                status_code = int(item.get("status", 0) or 0)
+                detail_state = str(item.get("detailState", "")).lower()
+                if (
+                    item.get("id")
+                    and 200 <= status_code < 400
+                    and not item.get("active")
+                    and detail_state != "in-memory"
+                ):
+                    billable_logs.append(item)
+            if not billable_logs:
+                skipped += len(logs)
+                continue
+
+            # Reconciliation changes money/token entitlement. Disable the key
+            # first, commit every completed request, then atomically publish its
+            # new allowlists and active state through sync_user().
+            self.omni.activate_key(str(user["api_key_id"]), False)
+            changed_users.add(str(user["id"]))
+            for item in reversed(billable_logs):
+                request_id = str(item.get("id", ""))
+                status_code = int(item.get("status", 0) or 0)
+                if not request_id or status_code < 200 or status_code >= 400:
+                    skipped += 1
+                    continue
+                tokens = item.get("tokens", {}) if isinstance(item.get("tokens"), dict) else {}
+                input_tokens = int(tokens.get("in", 0) or 0)
+                output_tokens = int(tokens.get("out", 0) or 0)
+                cached_tokens = int(tokens.get("cacheRead", 0) or 0)
+                reasoning_tokens = int(tokens.get("reasoning", 0) or 0)
+                occurred = self.parse_timestamp(item.get("timestamp"))
+                candidates = [
+                    str(item.get("requestedModel", "")), str(item.get("comboName", "")),
+                    str(item.get("model", "")),
+                ]
+                with self.db.connect() as connection:
+                    if connection.execute(
+                        "SELECT 1 FROM usage_ledger WHERE request_id=?", (request_id,)
+                    ).fetchone():
+                        continue
+                    model = None
+                    for candidate in candidates:
+                        if not candidate:
+                            continue
+                        model = connection.execute(
+                            "SELECT * FROM published_models WHERE public_model_id=? OR source_model=? ORDER BY public_model_id=? DESC LIMIT 1",
+                            (candidate, candidate, candidate),
+                        ).fetchone()
+                        if model:
+                            break
+                    if not model:
+                        skipped += 1
+                        continue
+                    price = connection.execute(
+                        "SELECT * FROM model_price_versions WHERE model_id=? AND effective_at<=? ORDER BY effective_at DESC LIMIT 1",
+                        (model["id"], occurred),
+                    ).fetchone() or model
+                    stamp = now()
+                    grants = connection.execute(
+                        "SELECT * FROM token_grants WHERE user_id=? AND status='active' AND (model_id IS NULL OR model_id=?) ORDER BY expires_at IS NULL,expires_at,created_at",
+                        (user["id"], model["id"]),
+                    ).fetchall()
+                    for grant in grants:
+                        if grant["expires_at"] and int(grant["expires_at"]) <= stamp:
+                            connection.execute("UPDATE token_grants SET status='expired',updated_at=? WHERE id=?", (stamp, grant["id"]))
+                        elif grant["reset_at"] and int(grant["reset_at"]) <= stamp and grant["reset_interval"] != "none":
+                            connection.execute(
+                                "UPDATE token_grants SET tokens_remaining=tokens_initial,reset_at=?,updated_at=? WHERE id=?",
+                                (
+                                    next_reset_at(
+                                        grant["reset_interval"],
+                                        stamp,
+                                        reset_time=grant["reset_time"] or "00:00",
+                                    ),
+                                    stamp,
+                                    grant["id"],
+                                ),
+                            )
+                    grants = connection.execute(
+                        "SELECT * FROM token_grants WHERE user_id=? AND status='active' AND tokens_remaining>0 AND (model_id IS NULL OR model_id=?) AND (expires_at IS NULL OR expires_at>?) ORDER BY expires_at IS NULL,expires_at,created_at",
+                        (user["id"], model["id"], stamp),
+                    ).fetchall()
+                    total_tokens = max(0, input_tokens + output_tokens)
+                    remaining, granted = total_tokens, 0
+                    for grant in grants:
+                        take = min(remaining, int(grant["tokens_remaining"]))
+                        if take:
+                            connection.execute(
+                                "UPDATE token_grants SET tokens_remaining=tokens_remaining-?,updated_at=? WHERE id=?",
+                                (take, stamp, grant["id"]),
+                            )
+                            granted += take
+                            remaining -= take
+                        if remaining == 0:
+                            break
+                    noncached = max(0, input_tokens - cached_tokens)
+                    nonreasoning = max(0, output_tokens - reasoning_tokens)
+                    gross_numerator = (
+                        noncached * int(price["input_price_micros"]) +
+                        cached_tokens * int(price["cached_price_micros"]) +
+                        nonreasoning * int(price["output_price_micros"]) +
+                        reasoning_tokens * int(price["reasoning_price_micros"])
+                    )
+                    gross = (gross_numerator + 999_999) // 1_000_000
+                    amount = 0 if total_tokens == 0 else (gross * remaining + total_tokens - 1) // total_tokens
+                    account = connection.execute(
+                        "SELECT * FROM billing_accounts WHERE user_id=?", (user["id"],)
+                    ).fetchone()
+                    balance = int(account["balance_micros"]) if account else 0
+                    balance_after = balance - amount
+                    connection.execute(
+                        "INSERT OR IGNORE INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,?,0,?)",
+                        (user["id"], balance, stamp),
+                    )
+                    cursor = connection.execute(
+                        """INSERT INTO usage_ledger(request_id,user_id,api_key_id,model_id,public_model_id,provider,resolved_model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,granted_tokens,amount_micros,price_snapshot_json,occurred_at,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            request_id, user["id"], user["api_key_id"], model["id"], model["public_model_id"],
+                            str(item.get("provider", "")), str(item.get("model", "")), input_tokens,
+                            output_tokens, cached_tokens, reasoning_tokens, granted, amount,
+                            json.dumps({key: int(price[key]) for key in ("input_price_micros", "output_price_micros", "cached_price_micros", "reasoning_price_micros")}),
+                            occurred, stamp,
+                        ),
+                    )
+                    if amount:
+                        connection.execute(
+                            "UPDATE billing_accounts SET balance_micros=?,updated_at=? WHERE user_id=?",
+                            (balance_after, stamp, user["id"]),
+                        )
+                        connection.execute(
+                            "INSERT INTO balance_transactions(user_id,kind,amount_micros,balance_after_micros,actor,note,usage_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (user["id"], "debit", -amount, balance_after, "system", request_id, cursor.lastrowid, stamp),
+                        )
+                processed += 1
+        sync_failed = 0
+        for user_id in changed_users:
+            try:
+                self.sync_user(user_id)
+            except RuntimeError as error:
+                sync_failed += 1
+                print(
+                    f"[account-portal] post-billing permission sync warning "
+                    f"(user={user_id}): {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return {
+            "processed": processed,
+            "skipped": skipped,
+            "users": len(changed_users),
+            "sync_failed": sync_failed,
+        }
+
+    def user_dashboard(self, user_id: str) -> dict[str, Any]:
+        self.reset_due_grants()
+        models = self.effective_models(user_id)
+        with self.db.connect() as connection:
+            account = connection.execute("SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)).fetchone()
+            grants = self.rows(connection.execute("SELECT * FROM token_grants WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall())
+            usage = self.rows(connection.execute("SELECT * FROM usage_ledger WHERE user_id=? ORDER BY occurred_at DESC LIMIT 200", (user_id,)).fetchall())
+            transactions = self.rows(connection.execute("SELECT * FROM balance_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall())
+        result_models = []
+        for model in models:
+            item = dict(model)
+            item["capabilities"] = json.loads(item.pop("capabilities_json") or "[]")
+            for key in ("input", "output", "cached", "reasoning"):
+                item[f"{key}_price"] = micros_to_money(item[f"{key}_price_micros"])
+            result_models.append(item)
+        return {
+            "balance": micros_to_money(int(account["balance_micros"]) if account else 0),
+            "suspended": bool(account["suspended"]) if account else False,
+            "models": result_models,
+            "grants": grants,
+            "usage": usage,
+            "transactions": transactions,
+            "api_base": self.db.settings().get("api_public_url", self.config.api_public_url).rstrip("/") + "/v1",
+        }
+
+    def admin_snapshot(self) -> dict[str, Any]:
+        with self.db.connect() as connection:
+            users = self.rows(connection.execute("SELECT u.*,b.balance_micros,b.suspended,p.status permission_status,p.error permission_error FROM users u LEFT JOIN billing_accounts b ON b.user_id=u.id LEFT JOIN permission_sync p ON p.user_id=u.id ORDER BY u.created_at DESC").fetchall())
+            groups = self.rows(connection.execute("SELECT g.*,COUNT(m.user_id) member_count FROM user_groups g LEFT JOIN user_group_members m ON m.group_id=g.id GROUP BY g.id ORDER BY g.name").fetchall())
+            memberships = self.rows(connection.execute("SELECT * FROM user_group_members").fetchall())
+            models = self.rows(connection.execute("SELECT * FROM published_models ORDER BY public_model_id").fetchall())
+            access = self.rows(connection.execute("SELECT * FROM model_access").fetchall())
+            free = self.rows(connection.execute("SELECT * FROM free_resources ORDER BY available DESC,test_status,provider,model_id").fetchall())
+            audits = self.rows(connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 300").fetchall())
+            grants = self.rows(connection.execute("SELECT * FROM token_grants ORDER BY created_at DESC LIMIT 500").fetchall())
+            transactions = self.rows(connection.execute("SELECT * FROM balance_transactions ORDER BY id DESC LIMIT 500").fetchall())
+        for user in users:
+            user["balance"] = micros_to_money(int(user.get("balance_micros") or 0))
+            user.pop("password_hash", None)
+        for model in models:
+            model["capabilities"] = json.loads(model.pop("capabilities_json") or "[]")
+            model["access"] = [item for item in access if item["model_id"] == model["id"]]
+            for key in ("input", "output", "cached", "reasoning"):
+                model[f"{key}_price"] = micros_to_money(model[f"{key}_price_micros"])
+        settings = self.db.settings()
+        if settings.get("smtp_password"):
+            settings["smtp_password_configured"] = "1"
+            settings["smtp_password"] = ""
+        gateway_models: list[dict[str, Any]] = []
+        combos: list[dict[str, Any]] = []
+        gateway_error = ""
+        try:
+            gateway_models = self.omni.models()
+            combos = self.omni.combos()
+        except RuntimeError as error:
+            # The control plane remains useful for account, SMTP, ledger, and
+            # audit recovery while the data plane is temporarily unavailable.
+            gateway_error = str(error)
+        return {
+            "users": users, "groups": groups, "memberships": memberships, "models": models,
+            "free_resources": free, "settings": settings, "audit": audits, "grants": grants,
+            "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
+            "gateway_error": gateway_error,
+        }
+
+    def update_user(self, payload: dict[str, Any], actor: str) -> None:
+        user_id = str(payload.get("user_id", ""))
+        status = str(payload.get("status", "active"))
+        if status not in {"active", "disabled"}:
+            raise ValueError("invalid user status")
+        balance_delta = money_to_micros(payload.get("balance_delta", "0"))
+        raw_group_ids = payload.get("group_ids", [])
+        if not isinstance(raw_group_ids, list):
+            raise ValueError("invalid groups")
+        group_ids = list(dict.fromkeys(str(item) for item in raw_group_ids))
+        grant_tokens = int(payload.get("grant_tokens", 0) or 0)
+        grant_reset = str(payload.get("grant_reset", "none"))
+        if grant_tokens < 0 or grant_tokens > 10**12 or grant_reset not in {"none", "daily", "weekly", "monthly"}:
+            raise ValueError("invalid token grant")
+        model_id = str(payload.get("grant_model_id", "")) or None
+        grant_reset_time = str(
+            payload.get(
+                "grant_reset_time",
+                self.db.settings().get("default_quota_reset_time", "00:00"),
+            )
+        )
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", grant_reset_time):
+            raise ValueError("invalid grant reset time")
+        stamp = now()
+        with self.db.connect() as connection:
+            user = connection.execute("SELECT * FROM users WHERE id=? AND role='user'", (user_id,)).fetchone()
+            if not user:
+                raise ValueError("user not found")
+            if group_ids:
+                placeholders = ",".join("?" for _ in group_ids)
+                found = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM user_groups WHERE id IN ({placeholders})", group_ids
+                    ).fetchone()[0]
+                )
+                if found != len(group_ids):
+                    raise ValueError("group does not exist")
+            if model_id and not connection.execute(
+                "SELECT 1 FROM published_models WHERE id=?", (model_id,)
+            ).fetchone():
+                raise ValueError("grant model does not exist")
+        if user["api_key_id"]:
+            # Keep the old key fail-closed while status, groups, grants and
+            # balance are changed. A failed resync leaves it disabled.
+            self.omni.activate_key(str(user["api_key_id"]), False)
+        try:
+            with self.db.connect() as connection:
+                connection.execute("UPDATE users SET status=? WHERE id=?", (status, user_id))
+                connection.execute("DELETE FROM user_group_members WHERE user_id=?", (user_id,))
+                for group_id in group_ids:
+                    connection.execute(
+                        "INSERT INTO user_group_members(user_id,group_id,created_at) VALUES(?,?,?)",
+                        (user_id, group_id, stamp),
+                    )
+                account = connection.execute("SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)).fetchone()
+                balance = int(account["balance_micros"]) if account else 0
+                after = balance + balance_delta
+                connection.execute(
+                    "INSERT INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET balance_micros=excluded.balance_micros,updated_at=excluded.updated_at",
+                    (user_id, after, stamp),
+                )
+                if balance_delta:
+                    connection.execute(
+                        "INSERT INTO balance_transactions(user_id,kind,amount_micros,balance_after_micros,actor,note,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (user_id, "adjustment", balance_delta, after, actor, str(payload.get("note", "Admin adjustment")), stamp),
+                    )
+                if grant_tokens:
+                    connection.execute(
+                        "INSERT INTO token_grants(id,user_id,model_id,label,tokens_initial,tokens_remaining,reset_interval,reset_time,reset_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            str(uuid.uuid4()), user_id, model_id, str(payload.get("grant_label", "Admin token grant")),
+                            grant_tokens, grant_tokens, grant_reset, grant_reset_time,
+                            next_reset_at(grant_reset, reset_time=grant_reset_time), "active", stamp, stamp,
+                        ),
+                    )
+        except Exception:
+            # SQLite rolled back; restore the last committed policy rather than
+            # leaving a correctly configured user disabled.
+            with contextlib.suppress(Exception):
+                self.sync_user(user_id)
+            raise
+        self.sync_user(user_id)
+
+    def save_group(self, payload: dict[str, Any]) -> str:
+        group_id = str(payload.get("id", "")).strip() or str(uuid.uuid4())
+        name = str(payload.get("name", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_. -]{1,80}", name):
+            raise ValueError("invalid group name")
+        status = str(payload.get("status", "active"))
+        if status not in {"active", "disabled"}:
+            raise ValueError("invalid group status")
+        stamp = now()
+        self.quiesce_all_users()
+        try:
+            with self.db.connect() as connection:
+                connection.execute(
+                    "INSERT INTO user_groups(id,name,description,status,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,status=excluded.status,updated_at=excluded.updated_at",
+                    (group_id, name, str(payload.get("description", "")), status, stamp, stamp),
+                )
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.sync_all_users()
+            raise
+        self.sync_all_users()
+        return group_id
+
+    def background_tick(self) -> None:
+        try:
+            self.reset_due_grants()
+        except Exception as error:
+            print(
+                f"[account-portal] grant reset warning: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        try:
+            self.reconcile_usage()
+        except Exception as error:
+            print(
+                f"[account-portal] usage reconciliation warning: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        with self.db.connect() as connection:
+            due = connection.execute(
+                "SELECT id FROM published_models WHERE status='published' AND upstream_free=1 AND (last_health_at IS NULL OR last_health_at<?)",
+                (now() - 900,),
+            ).fetchall()
+        for row in due:
+            try:
+                self.test_published_model(row["id"])
+            except Exception as error:
+                print(
+                    f"[account-portal] free-model health warning "
+                    f"(model={row['id']}): {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+
 class PortalHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1137,12 +3022,36 @@ class PortalServer:
         self.db = Database(config)
         self.db.initialize()
         self.omni = OmniRouteClient(config)
+        self.control = PortalControlPlane(config, self.db, self.omni)
+        try:
+            self.control.seed_managed_model()
+        except Exception as error:
+            print(
+                f"[account-portal] managed-model seed warning: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.stop_event = threading.Event()
         self.httpd = PortalHTTPServer((config.bind, config.port), PortalHandler)
         self.httpd.app = self  # type: ignore[attr-defined]
 
+    def maintenance_loop(self) -> None:
+        if self.stop_event.wait(30):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.control.background_tick()
+            except Exception as error:
+                print(f"[account-portal] maintenance warning: {error}", file=sys.stderr, flush=True)
+            self.stop_event.wait(60)
+
     def serve(self) -> None:
         print(f"[account-portal] listening on {self.config.bind}:{self.config.port}", flush=True)
-        self.httpd.serve_forever(poll_interval=0.5)
+        threading.Thread(target=self.maintenance_loop, name="portal-maintenance", daemon=True).start()
+        try:
+            self.httpd.serve_forever(poll_interval=0.5)
+        finally:
+            self.stop_event.set()
 
 
 def main() -> None:
@@ -1150,8 +3059,13 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("serve", "check-config", "reset-admin-password"),
+        choices=("serve", "check-config", "reset-admin-password", "dump-config"),
         default="serve",
+    )
+    parser.add_argument(
+        "--show-secrets",
+        action="store_true",
+        help="include persisted SMTP credentials in dump-config output",
     )
     args = parser.parse_args()
     config = Config.from_env()
@@ -1172,6 +3086,16 @@ def main() -> None:
             raise SystemExit("expected exactly one portal administrator")
         database.audit("system", "admin.password.reset", config.admin_email, "success", "local")
         print("portal administrator password updated")
+        return
+    if args.command == "dump-config":
+        database = Database(config)
+        print(
+            json.dumps(
+                database.recovery_inventory(show_secrets=args.show_secrets),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
         return
     PortalServer(config).serve()
 

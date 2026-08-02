@@ -21,11 +21,14 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - After candidate selection, show VRAM, topology, host-memory and disk budgets, itemized recommendation reasons, and warnings. The user can confirm, return to the list, search again, or quit.
 - Recheck the architecture with `ModelRegistry` inside the pinned vLLM container before download, then verify configuration, weight presence, and size after download.
 - Enable image/OCR input, OpenAI tool calling, reasoning parsing, and per-request reasoning disable controls only when the model capability matches.
-- Map one GPU or one TP group to each worker. The installer configures all workers, authentication, and database state for the selected gateway and exposes a consistent `:8000/v1` endpoint.
-- In OmniRoute mode, deploy a lightweight account portal with email verification, an exact corporate-domain allowlist, registration controls, personal API keys, recurring token quotas, usage, portal audit events, and a live model catalog.
+- Map one GPU or one TP group to each worker. The installer configures all workers, authentication, and database state for the selected gateway and exposes a consistent Nginx-fronted `:8000/v1` endpoint.
+- Install or reuse Nginx automatically. `/v1/` and `/ui/` are the consistent public entry points; inference goes directly to the gateway without passing through the portal; OmniRoute's native troubleshooting UI remains available at `/base_ui/`. LLMCtl owns an isolated config, validates it with `nginx -t`, rolls back failed changes, and preserves the package and unrelated sites on uninstall.
+- In OmniRoute mode, deploy a Vue 3 company portal with email verification, an exact corporate-domain allowlist, registration and SMTP controls, users and groups, personal API keys, money balances, additional recurring token grants, per-model input/output/cache/reasoning prices, a usage ledger, and audit events.
+- Use native OmniRoute APIs for model-ID mappings, Combos, per-key access, and free-tier resources. A free model must be discovered, configured, currently available, live-tested, and explicitly published. User keys authorize only the public model ID, so underlying model or Combo IDs cannot bypass portal policy.
 - Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
+- Use `llmctl info` as a categorized recovery inventory covering public/internal endpoints, hardware, images, services, autostart, workers, databases, administrators, every key/password, SMTP, proxy state, model details, and file paths. Plaintext is the root-terminal default; use `--redact` before sharing it.
 - Use `llmctl optimize` to collect streaming TTFT/ITL/E2E, aggregate throughput, GPU/VRAM/temperature, CPU/memory/swap, and vLLM KV-cache/queue/preemption/prefix-cache metrics. It explains every candidate's rationale, tradeoffs, and boundaries before consent, then backs up configuration, restarts and tests candidates, selects the objective-specific winner, runs full smoke acceptance, and rolls back on failure or interruption.
 
 ## Important Boundaries
@@ -44,6 +47,8 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `lib/runtime_optimizer.py` | Streaming benchmarks, GPU/vLLM metrics, conservative candidates, and objective scoring |
 | `lib/gateway_config.py` | Secret-free configuration for all four gateways and New API/OmniRoute reconciliation |
 | `lib/account_portal.py` | OmniRoute company account portal, verification, quotas, and model catalog |
+| `portal-ui/` | Vue 3 company-portal source and frontend tests |
+| `lib/account_portal_ui/` | Built portal assets copied directly by the installer |
 | `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
 | `tests/test_runtime_optimizer.py` | Tuning advice, scoring, metrics parsing, and streaming-latency tests |
 | `README.md` / `README_EN.md` | Chinese and English project overview |
@@ -61,9 +66,10 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | Bifrost image | `maximhq/bifrost:v1.6.7` |
 | OmniRoute image | `diegosouzapw/omniroute:3.8.48` |
 | PostgreSQL | `postgres:16-alpine` |
-| API | `http://SERVER_IP:8000/v1` |
-| Web UI | New API/Bifrost/OmniRoute: `http://SERVER_IP:8000/`; LiteLLM: `/ui` |
-| OmniRoute account portal | `http://SERVER_IP:8001/` |
+| Unified API | `http://SERVER_IP:8000/v1` |
+| Unified Web UI | `http://SERVER_IP:8000/ui/` |
+| OmniRoute native UI | `http://SERVER_IP:8000/base_ui/` |
+| Internal listeners | Gateway `127.0.0.1:18000`; OmniRoute portal `127.0.0.1:8001` |
 | Administrator username | `admin` |
 | Initial password | `llm-admin` by default; OmniRoute generates a strong random value when omitted |
 | Routing | Equal-weight healthy workers with failover; LiteLLM uses `least-busy` |
@@ -86,7 +92,7 @@ The wizard offers four choices before image download. For unattended installs, u
 | Bifrost | Efficient forwarding, observability, and virtual-key governance | Generates eight vLLM keys, equal-weight routing, a virtual key, admin authentication, and PostgreSQL log storage |
 | OmniRoute | Local SQLite gateway plus a company account portal | Creates eight provider nodes and one equal-weight Combo; deploys a separate portal database, email registration, personal keys, recurring quotas, usage, and a model catalog |
 
-All four use `llm-router.service`, port `8000`, and an OpenAI-compatible `/v1`; the root-only maintenance key is stored in `GATEWAY_API_KEY`. New API, LiteLLM, and Bifrost use PostgreSQL through `llm-database.service`. OmniRoute uses its own SQLite database, does not start PostgreSQL, and adds `llm-account.service`. There is no online migration between gateway types: select one during a clean install after old service configuration has been removed. Existing model files and exact local Docker images are verified and reused. Review the upstream licenses for your distribution and modification model.
+All four use `llm-router.service`, but the actual gateway listens only on `127.0.0.1:18000`. Nginx publishes the consistent OpenAI-compatible `/v1/` and `/ui/` entry points on port `8000`; the root-only maintenance key is stored in `GATEWAY_API_KEY`. New API, LiteLLM, and Bifrost use PostgreSQL through `llm-database.service`. OmniRoute uses its own SQLite database, does not start PostgreSQL, and adds `llm-account.service` on loopback port `8001`. There is no online migration between gateway types: select one during a clean install after old service configuration has been removed. Existing model files and exact local Docker images are verified and reused. Review the upstream licenses for your distribution and modification model.
 
 ## Quick Start
 
@@ -100,13 +106,13 @@ sudo bash install-llm-cluster.sh
 The interactive workflow asks you to:
 
 1. Select 中文 or English. Chinese is the default; subsequent installer and catalog interaction uses the selection.
-2. Select New API (default), LiteLLM, Bifrost, or OmniRoute. OmniRoute then asks about company registration, email domains, and SMTP.
-3. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
-4. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
-5. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
-6. Review the detailed plan, itemized recommendation reasons, and warnings. Catalog candidates, validated profiles, and manually entered models all require confirmation. Press `Y` to accept, `b` to go back, `s` to search again, or `q` to quit.
-7. Select the model directory and review TP, sequences per replica, active replicas, and the host-planned startup parallelism.
-8. Enter a proxy IP and port only when international resources require one; the proxy may optionally be saved for maintenance.
+2. Immediately test international access against the Hugging Face model-catalog API. On failure, the installer explicitly offers proxy setup and retests it; unattended failure requires an explicit `--proxy`.
+3. Select New API (default), LiteLLM, Bifrost, or OmniRoute. OmniRoute then asks about company registration, email domains, and SMTP.
+4. Review the read-only OS, CPU, memory, GPU/driver, PCIe/topology/NUMA, and disk preflight.
+5. Search Hugging Face, ModelScope, both sources, or enter a model directly, then provide a term and task.
+6. Select a gated candidate. Enter `0`/`b` to go back or `q` to quit.
+7. Review the detailed plan, itemized recommendation reasons, and warnings. Catalog candidates, validated profiles, and manually entered models all require confirmation. Press `Y` to accept, `b` to go back, `s` to search again, or `q` to quit.
+8. Select the model directory and review TP, sequences per replica, active replicas, and the host-planned startup parallelism.
 
 The wizard language can also be selected directly:
 
@@ -167,6 +173,10 @@ Do not use `llmctl download` to switch directly to a different model. Different 
 
 ## Networking and Proxies
 
+Immediately after language selection—and before gateway or model selection—the installer requests the Hugging Face model-catalog API directly. If that fails it explains the loss of catalog coverage, offers proxy setup, and requires the proxy retest to pass. Declining is allowed with an explicit warning. `--yes` and `--non-interactive` never hang on hidden input; they require `--proxy http://IP:PORT` explicitly.
+
+`llmctl models search --source all|huggingface` performs the same preflight: direct access first, then a validated saved maintenance proxy, then a new prompt if needed. Health, status, and offline inference commands never prompt merely because international access is absent.
+
 A proxy is used only for installation, model downloads, or explicit maintenance commands. Before installation finishes, the script:
 
 1. Clears proxy variables from the current process.
@@ -211,6 +221,8 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `/usr/local/lib/llm-cluster/model_catalog.py` | Installed model catalog helper |
 | `/usr/local/lib/llm-cluster/gateway_config.py` | Gateway configuration and New API reconciliation helper |
 | `/usr/local/lib/llm-cluster/account_portal.py` | OmniRoute company account portal |
+| `/usr/local/lib/llm-cluster/account_portal_ui` | Built Vue 3 portal assets |
+| `/etc/nginx/conf.d/llm-cluster.conf` | Isolated LLMCtl Nginx front-door configuration |
 | `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute's SQLite database |
 | `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | Separate account-portal SQLite database |
@@ -220,10 +232,11 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `llm-router.service` | Selected New API, LiteLLM, Bifrost, or OmniRoute API and UI |
 | `llm-database.service` | PostgreSQL for non-OmniRoute gateways |
 | `llm-account.service` | Company account portal in OmniRoute mode only |
+| `nginx.service` | Public `/v1/`, `/ui/`, and optional `/base_ui/` front door |
 
 ## Security Notes
 
-- The API listens on `0.0.0.0:8000`; the OmniRoute account portal defaults to `0.0.0.0:8001`. Restrict both with the host firewall and terminate HTTPS at a reverse proxy in production. PostgreSQL listens only on `127.0.0.1`.
+- Nginx listens on `0.0.0.0:8000` by default; gateways, the portal, workers, and PostgreSQL bind only to loopback or the internal Docker network. Production deployments should still restrict the public listener with a firewall and configure HTTPS. The installer can reuse existing Nginx, but it does not issue TLS certificates.
 - Model revisions are recorded in the manifest. Hugging Face defaults to a pinned commit; ModelScope defaults to `master`. For reproducible deployments, explicitly provide a tag or commit hash.
 - `--trust-remote-code` is enabled only when the model configuration declares `auto_map`. This still executes repository code, so select only reviewed models at pinned revisions.
 - External image domains are denied by default. OCR examples use base64 `data:` URLs to reduce SSRF exposure.
@@ -235,6 +248,11 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 bash -n install-llm-cluster.sh llmctl.sh
 python3 -m py_compile lib/*.py
 python3 -m unittest discover -s tests -v
+cd portal-ui
+npm ci
+npm test
+npm run build
+npm audit --audit-level=high
 ```
 
 Before a real release, also perform a complete installation on the target server, run `llmctl smoke --full`, and execute `llmctl bench` with the actual request distribution. Targets such as 40 tokens/s, 25 concurrent requests, or a 256K context cannot be promised from VRAM estimates alone. They must be benchmarked with the actual model, input lengths, image counts, and output lengths.

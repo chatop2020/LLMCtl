@@ -7,6 +7,7 @@
 ```bash
 sudo llmctl status
 sudo llmctl health
+sudo llmctl info --redact
 sudo llmctl smoke --full
 sudo llmctl key show
 sudo llmctl admin show
@@ -19,7 +20,9 @@ sudo llmctl admin set-password
 sudo llmctl timezone set Asia/Shanghai
 ```
 
-Web 管理界面地址由接入层决定：New API、Bifrost 和 OmniRoute 为 `http://服务器IP:8000/`，LiteLLM 为 `http://服务器IP:8000/ui`。管理员用户名默认 `admin`。OmniRoute 未显式传入密码时生成强随机密码；其他接入层初始密码为 `llm-admin`。凭据写在 root-only 的 `/etc/llm-cluster/secrets.env`，也可用 `sudo llmctl admin show` 查看。
+Nginx 统一公开入口：API 为 `http://服务器IP:8000/v1/`，日常 Web 界面为 `http://服务器IP:8000/ui/`。OmniRoute 模式下企业门户占用 `/ui/`，原生 OmniRoute 界面保留在 `/base_ui/`；其他网关的 `/ui/` 指向各自原生界面。实际网关只监听 `127.0.0.1:18000`，企业门户只监听 `127.0.0.1:8001`，不需要向用户开放第二个端口。
+
+管理员用户名默认 `admin`。OmniRoute 未显式传入密码时生成强随机密码；其他接入层初始密码为 `llm-admin`。凭据写在 root-only 的 `/etc/llm-cluster/secrets.env`。`sudo llmctl admin show` 显示日常登录信息；`sudo llmctl info` 是维护兜底清单，默认在 root 终端显示全部明文密码、API key、数据库/SMTP 凭据、入口、内部地址、模型、服务、路径和 SQLite 检查结果，输出到工单前务必改用 `sudo llmctl info --redact`。
 
 全新安装时选择接入层；默认 New API，也可显式指定：
 
@@ -106,6 +109,8 @@ sudo llmctl database status
 
 `llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限；OmniRoute 自动创建每 Worker 一个 Provider 节点及一个等权 Combo，并同步模型元信息和维护 key。
 
+Nginx 由安装器自动安装，或发现已有安装时利旧。LLMCtl 只管理 `/etc/nginx/conf.d/llm-cluster.conf`，写入后必须通过 `nginx -t` 才 reload；失败会恢复修改前内容。若安装前同名配置已存在，卸载时恢复它；Nginx 软件包、其他虚拟主机和证书配置始终保留。推理路径 `/v1/` 关闭代理缓冲并直接到网关，不经过 Python 门户，因此流式响应和高并发不会增加门户中转开销。
+
 这些路由都不会直接读取单个请求将占用的 GPU 显存、KV Cache 或图片大小。长上下文和多图请求仍可能造成瞬时不均；用真实业务分布运行 `llmctl bench` 和 `llmctl optimize analyze` 后再调优。
 
 密钥与管理员维护：
@@ -122,14 +127,14 @@ New API 和 OmniRoute 的维护调用令牌由各自数据库生成，所以 `ke
 
 ### OmniRoute 企业账户门户
 
-OmniRoute 自身没有 SMTP 注册流程。LLMCtl 因此在它前面部署独立的 `llm-account.service`，调用 OmniRoute 的管理接口创建用户 key 和 token 限额。两者使用同一状态目录但绝不混表：
+OmniRoute 自身没有完整的企业注册和易用计费流程。LLMCtl 因此部署独立的 Vue 3 企业门户与轻量 `llm-account.service`。门户通过 OmniRoute HTTP API 管理模型映射、Combo 和用户 key 权限，但普通 `/v1` 调用仍由 Nginx 直达 OmniRoute。两者使用同一状态根目录但绝不混表：
 
 ```text
 /var/lib/llm-cluster/omniroute/gateway/storage.sqlite
 /var/lib/llm-cluster/omniroute/portal/account-portal.db
 ```
 
-第一项完全归 OmniRoute 管理，第二项只存门户用户、验证状态、额度策略、会话和门户审计。门户数据库不保存明文 API key；用户验证邮箱后只显示一次新 key，之后只能轮换。OmniRoute 继续记录实际请求和 token 用量，因此“账户操作审计”和“推理调用审计”分别在两个界面查看。
+第一项完全归 OmniRoute 管理；第二项保存门户用户/用户组、验证状态、会话、公开模型、授权、价格版本、金额流水、token 赠额、使用账本和门户审计。门户数据库不保存明文 API key；用户验证邮箱后只显示一次新 key，之后只能轮换。门户定期读取 OmniRoute 调用日志，以请求 ID 幂等结算；进行结算和权限变更时先停用用户 key，提交账本后再同步新权限，失败时保持关闭。
 
 默认关闭公开注册。启用时必须配置精确邮箱域名白名单、公开门户地址和外部 SMTP。例如：
 
@@ -151,7 +156,11 @@ sudo bash install-llm-cluster.sh \
   --smtp-from llm@example.com
 ```
 
-白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查。门户管理员可在设置页关闭/开启注册、调整白名单和新用户默认额度，也可为已有用户修改额度、重置周期或停用账户。支持 `daily`、`weekly`、`monthly` 周期，额度由 OmniRoute token-limit 执行和重置。
+白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查。门户管理员可在线配置并测试 SMTP、关闭/开启注册、调整白名单和新用户默认赠额，也可禁用用户、分组、增减金额余额、发放通用或指定模型的额外 token。赠额支持 `daily`、`weekly`、`monthly` 及指定重置时间；后台会独立执行到期重置，即使额度耗尽导致 key 已关闭也能按时恢复。
+
+模型管理页把公开 ID（例如 `gdn-inside`）通过 OmniRoute 原生 Combo mapping/model alias 映射到实际 `ornith-1.0-35b-fp8`。用户 key 只授权公开 ID，不授权底层模型或 Combo ID。管理员可为每个模型分别设置输入、输出、缓存读取和思考 token 的 `$/1M` 价格，并按“全体、多个用户组、多个指定用户”发布；token 赠额优先消耗，超出部分才扣金额余额。价格会按版本快照进账本，历史调用不会被新价格重算。
+
+免费资源页读取 OmniRoute 的免费目录和已配置/当前可用排名。一个资源只有在“已发现、Provider 已配置、当前可用、门户真实请求测试成功、管理员明确发布”全部满足后才能开放。门户每 15 分钟复测已发布免费模型；连续三次失败会先关闭用户 key、撤销 OmniRoute 映射，再从授权目录中下线，避免免费上游消失后继续暴露失效模型。
 
 ```bash
 sudo llmctl account status
@@ -160,9 +169,11 @@ sudo llmctl account restart
 sudo llmctl logs account -f
 ```
 
-门户默认是 `http://服务器IP:8001/`。用户登录后可查看当前用量和重置时间；模型页实时读取 OmniRoute `/v1/models`，显示并可复制模型 ID、具体 `/v1` 地址和可直接执行的 `curl` 示例。OCR/视觉/工具等标签来自安装时已核验的模型能力元数据，不改变 vLLM 的实际能力。
+门户公开地址是 `http://服务器IP:8000/ui/`，`8001` 只是回环内部监听。用户登录后可查看金额、token 赠额、逐请求用量和流水；模型广场只显示本人有效授权，提供价格/能力、可复制模型 ID、调用地址和 `curl` 示例。在线聊天窗口由浏览器直接调用公开 `/v1`，个人 key 只存在当前浏览器 sessionStorage，不经过门户后端。OCR/视觉/工具等标签来自安装时已核验或管理员确认的能力元数据，不改变 vLLM 的实际能力。
 
-生产环境应把端口 8001 和 8000 放在 HTTPS 反向代理之后；`--account-public-url` 与 `--account-api-public-url` 要填写用户真正访问的无路径 origin。SMTP 密码和管理 key 只存在 root-only 的 `secrets.env`，不要写入命令历史；无人值守部署更适合通过受限环境或临时参数文件注入。
+OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显示降级告警，并允许查看用户、SMTP、账本和审计；依赖网关的模型、Key、权限和实时对账操作会明确失败，不会伪装成功。`llmctl startup status` 会把这种状态标为 `degraded`，而完整启动验收仍要求门户 `/ready` 与 OmniRoute 一起恢复。
+
+生产环境只需保护公开 `8000`，并在现有 Nginx/TLS 站点或上游负载均衡器终止 HTTPS；不要公开回环 `8001/18000/810x`。`--account-public-url` 可使用公开 origin 或其 `/ui` 路径，`--account-api-public-url` 使用无路径 origin。SMTP 密码和管理 key 位于 root-only 配置；当前门户 SQLite 也会保存运行期 SMTP 设置，因此应按敏感文件备份和保护，不要把凭据写入命令历史。
 
 ## OpenAI 兼容 API
 
@@ -297,7 +308,9 @@ sudo llmctl models inspect modelscope Qwen/Qwen3-8B
 sudo llmctl models current
 ```
 
-安装向导会先做只读体检，再搜索模型。体检包括操作系统/架构、CPU/核/线程、内存/Swap、GPU/显存/驱动/计算能力、PCIe 当前与最大链路、GPU/NUMA/NVLink 拓扑和模型盘空间。PCIe/拓扑是能力快照，不是主动 NCCL 带宽测试。
+安装器选择语言后立即直连 `https://huggingface.co/api/models?limit=1` 做国际网络预检，早于网关和模型选择。失败时询问代理并在填写后复测；拒绝时明确提示 HF 候选可能缺失。`--yes`/`--non-interactive` 下不会等待输入，必须显式添加 `--proxy http://IP:PORT`。安装后的 `llmctl models search --source all|huggingface` 也会先验证直连或已保存代理；只搜 ModelScope、健康检查和离线推理不会弹出该问题。
+
+随后安装向导做只读体检，再搜索模型。体检包括操作系统/架构、CPU/核/线程、内存/Swap、GPU/显存/驱动/计算能力、PCIe 当前与最大链路、GPU/NUMA/NVLink 拓扑和模型盘空间。PCIe/拓扑是能力快照，不是主动 NCCL 带宽测试。
 
 目录会排除 Apple MLX 等平台专用转换权重；`mlx-community/*` 面向 MLX/Apple Silicon，不能作为 NVIDIA CUDA/vLLM 权重。选择候选后会展开显存预算、TP 链路、主机内存、磁盘、启动并行度和逐项推荐理由。此时可确认、返回候选列表或重新搜索。
 

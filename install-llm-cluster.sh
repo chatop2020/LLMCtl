@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.3.2"
+readonly INSTALLER_VERSION="2.4.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -63,8 +63,9 @@ ROUTING_STRATEGY="least-busy"
 WORKER_BASE_PORT=8100
 API_BIND="0.0.0.0"
 API_PORT=8000
+GATEWAY_INTERNAL_PORT=18000
 GATEWAY_DB_PORT=15432
-ACCOUNT_BIND="0.0.0.0"
+ACCOUNT_BIND="127.0.0.1"
 ACCOUNT_PORT=8001
 ACCOUNT_PUBLIC_URL=""
 ACCOUNT_API_PUBLIC_URL=""
@@ -93,6 +94,8 @@ SKIP_DOWNLOAD=0
 SKIP_PACKAGES=0
 FORCE_RECONFIGURE=0
 INSTALL_PROXY_APPLIED=0
+NETWORK_PROXY_DECLINED=0
+NETWORK_CHECK_COMPLETE=0
 MODEL_SELECTION_EXPLICIT=0
 MODEL_PLAN_APPLIED=0
 MODEL_ID_EXPLICIT=0
@@ -116,6 +119,7 @@ CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
+ACCOUNT_UI_SOURCE="${SCRIPT_DIR}/lib/account_portal_ui"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -172,7 +176,8 @@ Common unattended options:
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N     Default 8192
   --api-bind IP                  Default 0.0.0.0
-  --api-port PORT                Default 8000
+  --api-port PORT                Public Nginx port; default 8000
+  --gateway-internal-port PORT   Loopback gateway port; default 18000
   --worker-base-port PORT        Default 8100
   --gateway newapi|litellm|bifrost|omniroute
                                   API gateway; default and recommendation: newapi
@@ -180,8 +185,8 @@ Common unattended options:
   --ui-password PASSWORD         Initial gateway password; default llm-admin;
                                   OmniRoute generates a strong random value when omitted
   --database-port PORT           Gateway PostgreSQL port; default 15432
-  --account-port PORT            OmniRoute account portal port; default 8001
-  --account-public-url URL       Public portal URL used in verification email
+  --account-port PORT            OmniRoute portal loopback port; default 8001
+  --account-public-url URL       Public /ui URL used in verification email
   --account-api-public-url URL   Public OmniRoute URL shown in API examples
   --registration enabled|disabled
   --allowed-email-domains LIST   Exact comma-separated company email domains
@@ -245,7 +250,8 @@ EOF
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N       默认 8192
   --api-bind IP                   默认 0.0.0.0
-  --api-port PORT                 默认 8000
+  --api-port PORT                 Nginx 统一公开端口，默认 8000
+  --gateway-internal-port PORT    接入层回环端口，默认 18000
   --worker-base-port PORT         默认 8100
   --gateway newapi|litellm|bifrost|omniroute
                                    API 接入层，默认并推荐 newapi
@@ -253,8 +259,8 @@ EOF
   --ui-password PASSWORD          接入层初始密码，默认 llm-admin；OmniRoute 未指定时
                                   自动生成强随机密码
   --database-port PORT            接入层 PostgreSQL 本机端口，默认 15432
-  --account-port PORT             OmniRoute 账户门户端口，默认 8001
-  --account-public-url URL        验证邮件中的门户公开地址
+  --account-port PORT             OmniRoute 门户回环端口，默认 8001
+  --account-public-url URL        验证邮件中的公开 /ui 地址
   --account-api-public-url URL    调用示例中显示的 OmniRoute 公开地址
   --registration enabled|disabled 是否开放注册
   --allowed-email-domains LIST    允许注册的公司邮箱后缀，逗号分隔且精确匹配
@@ -335,6 +341,7 @@ parse_args() {
       --max-num-batched-tokens) need_value "$@"; MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
       --api-bind) need_value "$@"; API_BIND="$2"; shift 2 ;;
       --api-port) need_value "$@"; API_PORT="$2"; shift 2 ;;
+      --gateway-internal-port) need_value "$@"; GATEWAY_INTERNAL_PORT="$2"; shift 2 ;;
       --worker-base-port) need_value "$@"; WORKER_BASE_PORT="$2"; shift 2 ;;
       --gateway) need_value "$@"; GATEWAY_KIND="$2"; GATEWAY_EXPLICIT=1; shift 2 ;;
       --ui-username) need_value "$@"; UI_USERNAME="$2"; UI_USERNAME_EXPLICIT=1; shift 2 ;;
@@ -422,13 +429,13 @@ gateway_image() {
 }
 
 gateway_ui_path() {
-  [[ "${GATEWAY_KIND}" == litellm ]] && printf '/ui' || printf '/'
+  printf '/ui/'
 }
 
 account_portal_url() {
   local host="${API_BIND}"
   [[ "${host}" == 0.0.0.0 || "${host}" == :: ]] && host='<server-IP>'
-  [[ -n "${ACCOUNT_PUBLIC_URL}" ]] && printf '%s\n' "${ACCOUNT_PUBLIC_URL}" || printf 'http://%s:%s\n' "${host}" "${ACCOUNT_PORT}"
+  [[ -n "${ACCOUNT_PUBLIC_URL}" ]] && printf '%s\n' "${ACCOUNT_PUBLIC_URL}" || printf 'http://%s:%s/ui/\n' "${host}" "${API_PORT}"
 }
 
 gateway_routing_summary() {
@@ -490,8 +497,8 @@ configure_omniroute_portal_interactively() {
   ACCOUNT_REGISTRATION_ENABLED=1
   read -r -p "$(l10n '允许的邮箱后缀（逗号分隔，如 example.com）: ' 'Allowed email domains (comma-separated, e.g. example.com): ')" ACCOUNT_ALLOWED_EMAIL_DOMAINS
   suggested_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-  read -r -p "$(l10n "门户公开地址 [http://${suggested_ip:-服务器IP}:${ACCOUNT_PORT}]: " "Portal public URL [http://${suggested_ip:-server-IP}:${ACCOUNT_PORT}]: ")" ACCOUNT_PUBLIC_URL
-  ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-http://${suggested_ip:-127.0.0.1}:${ACCOUNT_PORT}}"
+  read -r -p "$(l10n "门户公开地址 [http://${suggested_ip:-服务器IP}:${API_PORT}/ui]: " "Portal public URL [http://${suggested_ip:-server-IP}:${API_PORT}/ui]: ")" ACCOUNT_PUBLIC_URL
+  ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-http://${suggested_ip:-127.0.0.1}:${API_PORT}/ui}"
   read -r -p "$(l10n 'SMTP 主机: ' 'SMTP host: ')" SMTP_HOST
   read -r -p "$(l10n 'SMTP 端口 [587]: ' 'SMTP port [587]: ')" answer; SMTP_PORT="${answer:-587}"
   read -r -p "$(l10n 'SMTP 安全协议 starttls/ssl/plain [starttls]: ' 'SMTP security starttls/ssl/plain [starttls]: ')" answer; SMTP_SECURITY="${answer:-starttls}"
@@ -521,8 +528,15 @@ confirm() {
     (( default_no == 0 ))
     return
   fi
-  read -r -p "${prompt}" answer
-  if (( default_no )); then [[ "${answer}" =~ ^[Yy]$ ]]; else [[ ! "${answer}" =~ ^[Nn]$ ]]; fi
+  while true; do
+    read -r -p "${prompt}" answer
+    case "${answer}" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO) return 1 ;;
+      "") (( default_no == 0 )); return ;;
+      *) warn "$(l10n '请输入 y 或 n。' 'Enter y or n.')" ;;
+    esac
+  done
 }
 
 select_model_interactively() {
@@ -708,6 +722,7 @@ run_catalog_with_retry() {
   local -a command=("$@")
   if python3 "${CATALOG_SOURCE}" --lang "${INTERFACE_LANGUAGE}" "${command[@]}"; then return 0; fi
   warn "$(l10n '模型目录请求失败；若当前网络没有国际出口，将请求临时代理后重试。' 'The model catalog request failed; if this host lacks international access, the installer will ask for a temporary proxy and retry.')"
+  NETWORK_CHECK_COMPLETE=0
   prompt_proxy_if_needed
   export_proxy
   python3 "${CATALOG_SOURCE}" --lang "${INTERFACE_LANGUAGE}" "${command[@]}"
@@ -971,9 +986,12 @@ validate_scalar_config() {
   awk -v v="${GPU_MEMORY_UTILIZATION}" 'BEGIN{exit !(v>=0.70 && v<=0.96)}' || die "$(l10n 'gpu-memory-utilization 范围 0.70-0.96' 'gpu-memory-utilization must be between 0.70 and 0.96')"
   [[ "${API_BIND}" =~ ^[0-9a-fA-F:.]+$ ]] || die "$(l10n 'api-bind 只能是 IP 地址' 'api-bind must be an IP address')"
   [[ "${API_PORT}" =~ ^[0-9]+$ ]] && (( API_PORT >= 1024 && API_PORT <= 65535 )) || die "$(l10n 'api-port 范围 1024-65535' 'api-port must be between 1024 and 65535')"
+  [[ "${GATEWAY_INTERNAL_PORT}" =~ ^[0-9]+$ ]] && (( GATEWAY_INTERNAL_PORT >= 1024 && GATEWAY_INTERNAL_PORT <= 65535 )) || die "$(l10n 'gateway-internal-port 范围 1024-65535' 'gateway-internal-port must be between 1024 and 65535')"
   [[ "${WORKER_BASE_PORT}" =~ ^[0-9]+$ ]] && (( WORKER_BASE_PORT >= 1024 && WORKER_BASE_PORT <= 65000 )) || die "$(l10n 'worker-base-port 范围 1024-65000' 'worker-base-port must be between 1024 and 65000')"
   [[ "${GATEWAY_DB_PORT}" =~ ^[0-9]+$ ]] && (( GATEWAY_DB_PORT >= 1024 && GATEWAY_DB_PORT <= 65535 )) || die "$(l10n 'database-port 范围 1024-65535' 'database-port must be between 1024 and 65535')"
+  (( API_PORT != GATEWAY_INTERNAL_PORT )) || die "$(l10n '公开 API 端口不能与接入层内部端口相同' 'The public API port cannot equal the internal gateway port')"
   (( API_PORT < WORKER_BASE_PORT || API_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'API 端口与 Worker 端口范围冲突' 'The API port conflicts with the worker port range')"
+  (( GATEWAY_INTERNAL_PORT < WORKER_BASE_PORT || GATEWAY_INTERNAL_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n '接入层内部端口与 Worker 端口范围冲突' 'The internal gateway port conflicts with the worker port range')"
   (( GATEWAY_DB_PORT != API_PORT )) || die "$(l10n 'database-port 不能与 API 端口相同' 'database-port cannot equal the API port')"
   (( GATEWAY_DB_PORT < WORKER_BASE_PORT || GATEWAY_DB_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'database-port 与 Worker 端口范围冲突' 'database-port conflicts with the worker port range')"
   [[ "${GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost|omniroute)$ ]] || die "$(l10n 'gateway 只能是 newapi、litellm、bifrost 或 omniroute' 'gateway must be newapi, litellm, bifrost, or omniroute')"
@@ -1002,7 +1020,7 @@ validate_scalar_config() {
     [[ "${ACCOUNT_QUOTA_RESET_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$(l10n '额度重置时间必须是 HH:MM' 'Quota reset time must be HH:MM')"
     [[ "${ACCOUNT_ADMIN_EMAIL}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || die "$(l10n '门户管理员邮箱格式无效' 'Invalid portal administrator email')"
     [[ -z "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" || "${ACCOUNT_ALLOWED_EMAIL_DOMAINS}" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || die "$(l10n '邮箱后缀只能是逗号分隔的域名' 'Email domains must be comma-separated domain names')"
-    [[ -z "${ACCOUNT_PUBLIC_URL}" || "${ACCOUNT_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+$ ]] || die "$(l10n 'account-public-url 必须是无路径的 http(s) URL' 'account-public-url must be an http(s) URL without a path')"
+    [[ -z "${ACCOUNT_PUBLIC_URL}" || "${ACCOUNT_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+(/ui/?)?$ ]] || die "$(l10n 'account-public-url 必须是 http(s) 地址，可带 /ui 路径' 'account-public-url must be an http(s) URL with an optional /ui path')"
     [[ -z "${ACCOUNT_API_PUBLIC_URL}" || "${ACCOUNT_API_PUBLIC_URL}" =~ ^https?://[][A-Za-z0-9.:-]+$ ]] || die "$(l10n 'account-api-public-url 必须是无路径的 http(s) URL' 'account-api-public-url must be an http(s) URL without a path')"
     [[ -z "${SMTP_HOST}" || "${SMTP_HOST}" =~ ^[A-Za-z0-9.:-]+$ ]] || die "$(l10n 'SMTP 主机格式无效' 'Invalid SMTP host')"
     [[ "${SMTP_PORT}" =~ ^[0-9]+$ ]] && (( SMTP_PORT >= 1 && SMTP_PORT <= 65535 )) || die "$(l10n 'SMTP 端口无效' 'Invalid SMTP port')"
@@ -1030,6 +1048,7 @@ check_discovery_host() {
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
+  [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -1057,6 +1076,7 @@ check_host() {
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
+  [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -1099,30 +1119,85 @@ check_host() {
 check_ports_available() {
   command -v ss >/dev/null 2>&1 || { warn "$(l10n '缺少 ss，跳过端口占用预检。' 'ss is unavailable; skipping the port-occupancy preflight.')"; return 0; }
   local port id
-  local -a ports=("${API_PORT}")
+  local -a ports=("${API_PORT}" "${GATEWAY_INTERNAL_PORT}")
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then ports+=("${ACCOUNT_PORT}"); else ports+=("${GATEWAY_DB_PORT}"); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do ports+=("$((WORKER_BASE_PORT + id))"); done
   for port in "${ports[@]}"; do
     if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+      if [[ "${port}" == "${API_PORT}" ]]; then
+        if [[ -f /etc/nginx/conf.d/llm-cluster.conf ]] || \
+          ss -H -ltnp "sport = :${port}" 2>/dev/null | grep -q 'nginx'; then
+          log "$(l10n "公开端口 ${port} 已由 Nginx 监听；将复用现有 Nginx 并通过独立配置接入。" "Public port ${port} is already owned by Nginx; the existing Nginx installation will be reused with an isolated LLMCtl configuration.")"
+          continue
+        fi
+      fi
       die "$(l10n "TCP 端口 ${port} 已被占用；请停止冲突服务或选择其他端口" "TCP port ${port} is in use; stop the conflicting service or choose another port")"
     fi
   done
 }
 
+network_probe() {
+  local mode="${1:?}" url="${2:?}"
+  if command -v curl >/dev/null 2>&1; then
+    local http_code
+    if [[ "${mode}" == direct ]]; then
+      http_code=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 10 \
+        -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null) || return 1
+    else
+      http_code=$(curl -sS --connect-timeout 8 --max-time 15 \
+        -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null) || return 1
+    fi
+    [[ "${http_code}" =~ ^[0-9]{3}$ ]] && (( 10#${http_code} >= 100 && 10#${http_code} < 500 ))
+    return
+  fi
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "${mode}" "${url}" <<'PY'
+import sys
+import urllib.error
+import urllib.request
+
+mode, url = sys.argv[1:]
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({} if mode == "direct" else None)
+)
+try:
+    with opener.open(
+        urllib.request.Request(url, headers={"User-Agent": "LLMCtl-network-preflight/1"}),
+        timeout=15,
+    ) as response:
+        raise SystemExit(0 if response.status < 500 else 1)
+except urllib.error.HTTPError as error:
+    # Authentication/rate-limit responses still prove that the international
+    # endpoint is reachable. Server errors do not.
+    raise SystemExit(0 if error.code < 500 else 1)
+except (OSError, urllib.error.URLError):
+    raise SystemExit(1)
+PY
+}
+
 internet_available() {
-  command -v curl >/dev/null 2>&1 || return 1
-  local url
-  for url in https://huggingface.co https://github.com https://ghcr.io/v2/ https://nvidia.github.io; do
-    curl --noproxy '*' -sS --connect-timeout 5 --max-time 8 -o /dev/null "${url}" || return 1
-  done
+  network_probe direct "https://huggingface.co/api/models?limit=1"
 }
 
 prompt_proxy_if_needed() {
-  internet_available && return 0
+  (( NETWORK_CHECK_COMPLETE == 0 )) || return 0
+  log "$(l10n '安装前国际网络测试：正在直连 Hugging Face...' 'Pre-install international connectivity test: connecting directly to Hugging Face...')"
+  if internet_available; then
+    NETWORK_CHECK_COMPLETE=1
+    log "$(l10n '国际网络测试通过：Hugging Face 可直连，模型搜索将包含其资源。' 'International connectivity passed: Hugging Face is directly reachable and will be included in model search.')"
+    return 0
+  fi
+  (( NETWORK_PROXY_DECLINED == 0 )) || return 0
   if [[ -z "${PROXY_URL}" ]]; then
-    (( NON_INTERACTIVE )) && die "$(l10n '需要国际出口；请加 --proxy http://IP:PORT' 'International network access is required; add --proxy http://IP:PORT')"
+    (( NON_INTERACTIVE || ASSUME_YES )) && die "$(l10n '需要国际出口；请加 --proxy http://IP:PORT' 'International network access is required; add --proxy http://IP:PORT')"
     local ip port scheme
-    printf '\n服务器当前无法直连国外资源；安装阶段需要局域网代理。\n' >&2
+    printf '\n%s\n' "$(l10n '国际网络检测失败：Hugging Face/GitHub 等资源可能无法搜索或下载。' 'International connectivity test failed; Hugging Face/GitHub resources may not be searchable or downloadable.')" >&2
+    if ! confirm "$(l10n '是否现在配置代理？[Y/n] ' 'Configure a proxy now? [Y/n] ')" 0; then
+      NETWORK_PROXY_DECLINED=1
+      NETWORK_CHECK_COMPLETE=1
+      warn "$(l10n '已跳过代理；模型目录可能只显示国内可达来源，后续镜像/权重下载也可能失败。' 'Proxy setup was skipped; model discovery may only show reachable domestic sources and later image/model downloads may fail.')"
+      return 0
+    fi
     read -r -p "$(l10n '代理 IP/主机名: ' 'Proxy IP/hostname: ')" ip
     read -r -p "$(l10n '代理端口: ' 'Proxy port: ')" port
     read -r -p "$(l10n '协议 [http]: ' 'Protocol [http]: ')" scheme
@@ -1131,6 +1206,13 @@ prompt_proxy_if_needed() {
     [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "$(l10n '代理端口无效' 'Invalid proxy port')"
     [[ "${scheme}" == http || "${scheme}" == https ]] || die "$(l10n '代理协议只能是 http 或 https' 'Proxy protocol must be http or https')"
     PROXY_URL="${scheme}://${ip}:${port}"
+  fi
+  export_proxy
+  if network_probe proxy "https://huggingface.co/api/models?limit=1"; then
+    NETWORK_CHECK_COMPLETE=1
+    log "$(l10n '代理后的 Hugging Face 网络测试通过。' 'Hugging Face connectivity through the proxy passed.')"
+  else
+    die "$(l10n '代理已填写，但 Hugging Face 复测失败；请检查代理地址、端口和协议' 'A proxy was supplied, but the Hugging Face retest failed; check its host, port, and protocol')"
   fi
   if (( ! ASSUME_YES && ! NON_INTERACTIVE && ! SAVE_PROXY )); then
     confirm '是否保存为以后 llmctl 维护时使用的代理？[y/N] ' 1 && SAVE_PROXY=1 || true
@@ -1190,7 +1272,7 @@ install_packages() {
   log "$(l10n '安装 Ubuntu 基础依赖与 Docker...' 'Installing Ubuntu prerequisites and Docker...')"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl gnupg jq openssl file tar python3 python3-venv util-linux
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg jq openssl file tar python3 python3-venv util-linux nginx
   if ! command -v docker >/dev/null 2>&1; then
     apt-get install -y --no-install-recommends docker.io
   fi
@@ -1217,6 +1299,7 @@ verify_container_runtime() {
     command -v "${tool_name}" >/dev/null 2>&1 || die "$(l10n "缺少运行依赖：${tool_name}" "Missing runtime dependency: ${tool_name}")"
   done
   command -v docker >/dev/null 2>&1 || die "$(l10n 'Docker 未安装' 'Docker is not installed')"
+  command -v nginx >/dev/null 2>&1 || die "$(l10n 'Nginx 未安装' 'Nginx is not installed')"
   command -v nvidia-ctk >/dev/null 2>&1 || die "$(l10n 'NVIDIA Container Toolkit 未安装' 'NVIDIA Container Toolkit is not installed')"
   docker info >/dev/null || die "$(l10n 'Docker daemon 不可用' 'The Docker daemon is unavailable')"
 }
@@ -1435,6 +1518,8 @@ ACTIVE_WORKERS=${active_workers}
 WORKER_BASE_PORT=${WORKER_BASE_PORT}
 API_BIND=${API_BIND}
 API_PORT=${API_PORT}
+GATEWAY_INTERNAL_PORT=${GATEWAY_INTERNAL_PORT}
+DOCKER_NETWORK=llm-cluster-net
 GATEWAY_DB_PORT=${GATEWAY_DB_PORT}
 ACCOUNT_BIND=${ACCOUNT_BIND}
 ACCOUNT_PORT=${ACCOUNT_PORT}
@@ -1527,8 +1612,8 @@ SMTP_FROM=${SMTP_FROM}
 POSTGRES_USER=${postgres_user}
 POSTGRES_PASSWORD=${postgres_password}
 POSTGRES_DB=${postgres_db}
-DATABASE_URL=postgresql://${postgres_user}:${postgres_password}@127.0.0.1:${GATEWAY_DB_PORT}/${postgres_db}
-SQL_DSN=postgresql://${postgres_user}:${postgres_password}@127.0.0.1:${GATEWAY_DB_PORT}/${postgres_db}
+DATABASE_URL=postgresql://${postgres_user}:${postgres_password}@llm-database:5432/${postgres_db}
+SQL_DSN=postgresql://${postgres_user}:${postgres_password}@llm-database:5432/${postgres_db}
 EOF
   chmod 600 "${SECRETS_ENV}"
   chown root:root "${SECRETS_ENV}"
@@ -1569,6 +1654,9 @@ install_manager() {
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
+  rm -rf /usr/local/lib/llm-cluster/account_portal_ui
+  cp -a "${ACCOUNT_UI_SOURCE}" /usr/local/lib/llm-cluster/account_portal_ui
+  chown -R root:root /usr/local/lib/llm-cluster/account_portal_ui
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
     getent group llm-account >/dev/null 2>&1 || groupadd --system llm-account
     id -u llm-account >/dev/null 2>&1 || useradd --system --gid llm-account --home-dir /nonexistent --shell /usr/sbin/nologin llm-account
@@ -1637,7 +1725,8 @@ EnvironmentFile=/etc/llm-cluster/cluster.env
 EnvironmentFile=/etc/llm-cluster/secrets.env
 ExecStartPre=-/usr/bin/docker rm -f llm-database
 ExecStartPre=/usr/bin/docker volume create llm-cluster-gateway-postgres
-ExecStart=/usr/bin/docker run --rm --name llm-database --network bridge --env-file /etc/llm-cluster/secrets.env -p 127.0.0.1:${GATEWAY_DB_PORT}:5432 -v llm-cluster-gateway-postgres:/var/lib/postgresql/data ${POSTGRES_IMAGE}
+ExecStartPre=/bin/bash -c '/usr/bin/docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || /usr/bin/docker network create "$DOCKER_NETWORK" >/dev/null 2>&1 || /usr/bin/docker network inspect "$DOCKER_NETWORK" >/dev/null'
+ExecStart=/usr/bin/docker run --rm --name llm-database --network ${DOCKER_NETWORK} --env-file /etc/llm-cluster/secrets.env -p 127.0.0.1:${GATEWAY_DB_PORT}:5432 -v llm-cluster-gateway-postgres:/var/lib/postgresql/data ${POSTGRES_IMAGE}
 ExecStop=-/usr/bin/docker stop --time 60 llm-database
 Restart=on-failure
 RestartSec=5
@@ -1678,9 +1767,9 @@ EOF
     cat >/etc/systemd/system/llm-cluster.service <<'EOF'
 [Unit]
 Description=Hardware-aware local LLM inference cluster
-After=docker.service network-online.target llm-database.service
+After=docker.service network-online.target nginx.service llm-database.service
 Requires=docker.service
-Wants=network-online.target llm-database.service
+Wants=network-online.target nginx.service llm-database.service
 
 [Service]
 Type=oneshot
@@ -1725,8 +1814,8 @@ EOF
 [Unit]
 Description=LLMCtl company account portal for OmniRoute
 After=network-online.target llm-router.service
-Requires=llm-router.service
-PartOf=llm-cluster.service llm-router.service
+Wants=llm-router.service
+PartOf=llm-cluster.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -1755,9 +1844,9 @@ EOF
     cat >/etc/systemd/system/llm-cluster.service <<'EOF'
 [Unit]
 Description=Hardware-aware local LLM inference cluster
-After=docker.service network-online.target
+After=docker.service network-online.target nginx.service
 Requires=docker.service
-Wants=network-online.target
+Wants=network-online.target nginx.service
 
 [Service]
 Type=oneshot
@@ -1928,6 +2017,10 @@ main() {
   preparse_language "$@"
   parse_args "$@"
   select_language_interactively
+  # Run this before gateway/model questions so an unreachable Hugging Face
+  # endpoint cannot silently shrink the later catalog result set.
+  prompt_proxy_if_needed
+  export_proxy
   select_gateway_interactively
   configure_omniroute_portal_interactively
   preflight_existing_install
@@ -1995,6 +2088,7 @@ EOF
   install_manager
   validate_account_portal_configuration
   prepare_worker_cache
+  /usr/local/sbin/llmctl _nginx-install
   write_systemd_units
 
   systemctl enable llm-cluster.service

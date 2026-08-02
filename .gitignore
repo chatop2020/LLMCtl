@@ -11,3 +11,4 @@ secrets.env
 proxy.env
 offline-bundle/
 work/
+node_modules/

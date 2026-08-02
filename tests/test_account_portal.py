@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import http.cookiejar
 import importlib.util
+import json
 import pathlib
 import sqlite3
 import sys
@@ -28,6 +29,10 @@ class FakeOmniRoute:
         self.limits = []
         self.deleted = []
         self.activated = []
+        self.permissions = []
+        self.deleted_aliases = []
+        self.logs = []
+        self.test_error = None
 
     def create_user_key(self, user_id, email):
         key_id = f"key-{len(self.created) + 1}"
@@ -66,6 +71,26 @@ class FakeOmniRoute:
             }
         ]
 
+    def combos(self):
+        return []
+
+    def patch_key_permissions(self, key_id, allowed_models, allowed_combos, active):
+        self.permissions.append((key_id, allowed_models, allowed_combos, active))
+
+    def call_logs(self, key_id, limit=200, offset=0):
+        return self.logs[offset : offset + limit]
+
+    def test_model(self, model_id):
+        if self.test_error:
+            raise RuntimeError(self.test_error)
+        return 12, "OK"
+
+    def delete_model_alias(self, public_id):
+        self.deleted_aliases.append(public_id)
+
+    def set_combo_mapping(self, pattern, combo_id, mapping_id="", enabled=True):
+        return mapping_id or "mapping-1"
+
 
 class PortalIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -99,6 +124,7 @@ class PortalIntegrationTests(unittest.TestCase):
         self.server = portal.PortalServer(self.config)
         self.fake_omni = FakeOmniRoute()
         self.server.omni = self.fake_omni
+        self.server.control.omni = self.fake_omni
         self.thread = threading.Thread(target=self.server.httpd.serve_forever, daemon=True)
         self.thread.start()
         port = self.server.httpd.server_address[1]
@@ -136,6 +162,22 @@ class PortalIntegrationTests(unittest.TestCase):
                 return response.status, response.read().decode(), response.headers
         except urllib.error.HTTPError as error:
             return error.code, error.read().decode(), error.headers
+
+    def json_post(self, client, jar, path, values):
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=json.dumps(values).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": self.cookie_value(jar, portal.CSRF_COOKIE),
+            },
+            method="POST",
+        )
+        try:
+            with client.open(request, timeout=5) as response:
+                return response.status, json.loads(response.read()), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read()), error.headers
 
     @staticmethod
     def cookie_value(jar, name):
@@ -245,6 +287,39 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertIn("Provisioning failed", body)
         self.assertFalse(self.fake_omni.created)
 
+    def test_vue_registration_throttles_repeated_verification_email(self):
+        client, jar = self.opener()
+        status, _, _ = self.get(client, "/portal-api/public")
+        self.assertEqual(status, 200)
+        payload = {
+            "email": "throttle@example.com",
+            "password": "a secure password 123",
+            "confirm": "a secure password 123",
+        }
+        captured = []
+        with mock.patch.object(
+            portal,
+            "send_verification_email",
+            side_effect=lambda config, recipient, token: captured.append((recipient, token)),
+        ):
+            first_status, first, _ = self.json_post(
+                client, jar, "/portal-api/auth/register", payload
+            )
+            second_status, second, _ = self.json_post(
+                client, jar, "/portal-api/auth/register", payload
+            )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(first["message"], "Verification email sent")
+        self.assertEqual(second_status, 200)
+        self.assertIn("If eligible", second["message"])
+        self.assertEqual(len(captured), 1)
+        with self.server.db.connect() as connection:
+            action = connection.execute(
+                "SELECT action FROM audit_events WHERE target=? ORDER BY id DESC LIMIT 1",
+                ("throttle@example.com",),
+            ).fetchone()["action"]
+        self.assertEqual(action, "register.throttled")
+
     def test_admin_page_uses_explicit_status_selection_and_separate_sqlite(self):
         self.assertEqual(self.db_path.name, "account-portal.db")
         self.assertNotEqual(self.db_path.name, "storage.sqlite")
@@ -285,6 +360,147 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertIn('<option value="disabled" >disabled</option>', body)
         self.assertIn("门户数据库与 OmniRoute 数据库完全分离", body)
 
+    def insert_control_user_and_model(self, *, paid=False, source_kind="combo", upstream_free=0):
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id,email,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "policy-user", "policy@example.com", portal.hash_password("a secure password 123"),
+                    "user", "active", "policy-key", 0, "monthly", "00:00", stamp, stamp,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,?,0,?)",
+                ("policy-user", 1_000_000, stamp),
+            )
+            connection.execute(
+                """INSERT INTO published_models(
+                     id,public_model_id,display_name,source_kind,source_ref,source_provider,
+                     source_model,capabilities_json,input_price_micros,output_price_micros,
+                     cached_price_micros,reasoning_price_micros,status,upstream_free,mapping_kind,
+                     mapping_id,health_status,health_failures,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "model-1", "gdn-inside", "GDN Inside", source_kind, "combo-internal",
+                    "local", "ornith-1.0-35b-fp8", '["chat"]',
+                    1_000_000 if paid else 0, 2_000_000 if paid else 0, 0, 0,
+                    "published", upstream_free, "combo" if source_kind == "combo" else "alias",
+                    "mapping-1" if source_kind == "combo" else "gdn-inside", "healthy", 0,
+                    stamp, stamp,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO model_access(model_id,subject_type,subject_id,created_at) VALUES('model-1','all','',?)",
+                (stamp,),
+            )
+
+    def test_permission_sync_exposes_only_public_model_id(self):
+        self.insert_control_user_and_model()
+        self.server.control.sync_user("policy-user")
+        self.assertEqual(
+            self.fake_omni.permissions[-1],
+            ("policy-key", [], ["gdn-inside"], True),
+        )
+        self.assertNotIn("ornith-1.0-35b-fp8", self.fake_omni.permissions[-1][2])
+        self.assertNotIn("combo-internal", self.fake_omni.permissions[-1][2])
+
+    def test_due_recurring_grant_reactivates_key_without_waiting_for_request(self):
+        self.insert_control_user_and_model(paid=True)
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute("UPDATE billing_accounts SET balance_micros=0 WHERE user_id='policy-user'")
+            connection.execute(
+                """INSERT INTO token_grants(
+                     id,user_id,label,tokens_initial,tokens_remaining,reset_interval,reset_time,
+                     reset_at,status,created_at,updated_at)
+                   VALUES('grant-1','policy-user','Monthly',5000,0,'daily','03:30',?,'active',?,?)""",
+                (stamp - 1, stamp, stamp),
+            )
+        self.assertEqual(self.server.control.reset_due_grants(), 1)
+        with self.server.db.connect() as connection:
+            grant = connection.execute(
+                "SELECT tokens_remaining,reset_at FROM token_grants WHERE id='grant-1'"
+            ).fetchone()
+        self.assertEqual(grant["tokens_remaining"], 5000)
+        self.assertGreater(grant["reset_at"], stamp)
+        self.assertEqual(self.fake_omni.permissions[-1], ("policy-key", [], ["gdn-inside"], True))
+
+    def test_usage_reconciliation_skips_in_memory_rows_and_is_idempotent(self):
+        self.insert_control_user_and_model(paid=True, source_kind="model")
+        stamp = portal.now()
+        self.fake_omni.logs = [
+            {
+                "id": "request-live", "status": 200, "active": False,
+                "detailState": "in-memory", "requestedModel": "gdn-inside",
+                "model": "ornith-1.0-35b-fp8", "tokens": {"in": 0, "out": 0},
+                "timestamp": stamp,
+            },
+            {
+                "id": "request-complete", "status": 200, "active": False,
+                "detailState": "persisted", "requestedModel": "gdn-inside",
+                "model": "ornith-1.0-35b-fp8", "provider": "local",
+                "tokens": {"in": 100, "out": 20, "cacheRead": 0, "reasoning": 0},
+                "timestamp": stamp - 1,
+            },
+        ]
+        first = self.server.control.reconcile_usage()
+        second = self.server.control.reconcile_usage()
+        with self.server.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT request_id,input_tokens,output_tokens FROM usage_ledger"
+            ).fetchall()
+        self.assertEqual(first["processed"], 1)
+        self.assertEqual(second["processed"], 0)
+        self.assertEqual([tuple(row) for row in rows], [("request-complete", 100, 20)])
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertTrue(self.fake_omni.permissions[-1][-1])
+
+    def test_admin_snapshot_remains_available_when_gateway_is_down(self):
+        def unavailable():
+            raise RuntimeError("gateway temporarily unavailable")
+
+        self.fake_omni.models = unavailable
+        snapshot = self.server.control.admin_snapshot()
+        self.assertEqual(snapshot["gateway_models"], [])
+        self.assertEqual(snapshot["combos"], [])
+        self.assertIn("temporarily unavailable", snapshot["gateway_error"])
+        self.assertIn("users", snapshot)
+        self.assertIn("settings", snapshot)
+
+    def test_invalid_group_is_rejected_before_user_key_is_disabled(self):
+        self.insert_control_user_and_model()
+        with self.assertRaisesRegex(ValueError, "group does not exist"):
+            self.server.control.update_user(
+                {
+                    "user_id": "policy-user",
+                    "status": "active",
+                    "group_ids": ["missing-group"],
+                    "balance_delta": "0",
+                    "grant_tokens": 0,
+                },
+                "admin@example.com",
+            )
+        self.assertNotIn(("policy-key", False), self.fake_omni.activated)
+
+    def test_failed_free_model_is_withdrawn_after_three_health_failures(self):
+        self.insert_control_user_and_model(source_kind="model", upstream_free=1)
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "UPDATE published_models SET health_failures=2 WHERE id='model-1'"
+            )
+        self.fake_omni.test_error = "free upstream unavailable"
+        with self.assertRaisesRegex(RuntimeError, "free upstream unavailable"):
+            self.server.control.test_published_model("model-1")
+        with self.server.db.connect() as connection:
+            model = connection.execute(
+                "SELECT status,health_status,health_failures FROM published_models WHERE id='model-1'"
+            ).fetchone()
+        self.assertEqual(tuple(model), ("error", "failed", 3))
+        self.assertEqual(self.fake_omni.deleted_aliases, ["gdn-inside"])
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertFalse(self.fake_omni.permissions[-1][-1])
+
 
 class PortalUnitTests(unittest.TestCase):
     def test_password_hash_is_salted_and_verifiable(self):
@@ -324,6 +540,44 @@ class PortalUnitTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(SystemExit, "must not be OmniRoute"):
                     portal.Config.from_env()
+
+    def test_public_portal_origin_is_canonicalized_to_ui_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                portal.os.environ,
+                {
+                    "ACCOUNT_PUBLIC_URL": "https://llm.example.com/",
+                    "ACCOUNT_API_PUBLIC_URL": "https://llm.example.com",
+                    "ACCOUNT_DB_PATH": str(pathlib.Path(directory) / "account.db"),
+                    "OMNIROUTE_DB_PATH": str(pathlib.Path(directory) / "omni.db"),
+                },
+                clear=True,
+            ):
+                config = portal.Config.from_env()
+        self.assertEqual(config.public_url, "https://llm.example.com/ui")
+        self.assertEqual(config.api_public_url, "https://llm.example.com")
+
+    def test_reset_boundaries_use_configured_wall_clock_and_timezone(self):
+        current = int(
+            portal.datetime.datetime(
+                2026, 8, 2, 4, 0, tzinfo=portal.ZoneInfo("Asia/Shanghai")
+            ).timestamp()
+        )
+        daily = portal.next_reset_at("daily", current, "03:30", "Asia/Shanghai")
+        weekly = portal.next_reset_at("weekly", current, "03:30", "Asia/Shanghai")
+        monthly = portal.next_reset_at("monthly", current, "03:30", "Asia/Shanghai")
+        self.assertEqual(
+            portal.datetime.datetime.fromtimestamp(daily, portal.ZoneInfo("Asia/Shanghai")),
+            portal.datetime.datetime(2026, 8, 3, 3, 30, tzinfo=portal.ZoneInfo("Asia/Shanghai")),
+        )
+        self.assertEqual(
+            portal.datetime.datetime.fromtimestamp(weekly, portal.ZoneInfo("Asia/Shanghai")),
+            portal.datetime.datetime(2026, 8, 3, 3, 30, tzinfo=portal.ZoneInfo("Asia/Shanghai")),
+        )
+        self.assertEqual(
+            portal.datetime.datetime.fromtimestamp(monthly, portal.ZoneInfo("Asia/Shanghai")),
+            portal.datetime.datetime(2026, 9, 1, 3, 30, tzinfo=portal.ZoneInfo("Asia/Shanghai")),
+        )
 
 
 if __name__ == "__main__":
