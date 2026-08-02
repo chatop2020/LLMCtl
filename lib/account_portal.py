@@ -41,7 +41,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -663,6 +663,9 @@ CREATE INDEX IF NOT EXISTS idx_free_status ON free_resources(available,test_stat
 CREATE INDEX IF NOT EXISTS idx_models_status ON published_models(status,public_model_id);
 CREATE INDEX IF NOT EXISTS idx_model_access_subject ON model_access(subject_type,subject_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_ledger(user_id,occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_user_time_v2 ON usage_ledger(user_id,occurred_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_ledger(occurred_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage_ledger(public_model_id,occurred_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_balance_user_time ON balance_transactions(user_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_grants_user_status ON token_grants(user_id,status);
 """
@@ -1430,7 +1433,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.serve_vue(parsed.path)
             return
         if parsed.path.startswith("/portal-api/"):
-            self.handle_api_get(parsed.path)
+            self.handle_api_get(parsed.path, parsed.query)
             return
         if parsed.path == "/health":
             try:
@@ -1509,7 +1512,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.response(404, page("Not found", '<div class="card"><h1>404</h1></div>'))
 
-    def handle_api_get(self, path: str) -> None:
+    def handle_api_get(self, path: str, query: str = "") -> None:
         if path == "/portal-api/public":
             settings = self.app.db.settings()
             self.json_response(
@@ -1533,6 +1536,24 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             user, _ = self.api_require()
             if user:
                 self.json_response(200, self.app.control.user_dashboard(user["id"]))
+            return
+        if path == "/portal-api/usage-page":
+            user, _ = self.api_require()
+            if user:
+                try:
+                    page, page_size = self.page_parameters(query)
+                    filters = self.usage_filter_parameters(query)
+                    self.json_response(
+                        200,
+                        self.app.control.usage_page(
+                            owner_user_id=user["id"],
+                            model_id=filters["model"],
+                            page=page,
+                            page_size=page_size,
+                        ),
+                    )
+                except ValueError as error:
+                    self.json_response(400, {"error": str(error)})
             return
         if path.startswith("/portal-api/usage/"):
             user, _ = self.api_require()
@@ -1570,6 +1591,24 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             )
             self.json_response(200, detail)
             return
+        if path == "/portal-api/admin/usage-page":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    page, page_size = self.page_parameters(query)
+                    filters = self.usage_filter_parameters(query)
+                    self.json_response(
+                        200,
+                        self.app.control.usage_page(
+                            filter_user_id=filters["user"],
+                            model_id=filters["model"],
+                            page=page,
+                            page_size=page_size,
+                        ),
+                    )
+                except ValueError as error:
+                    self.json_response(400, {"error": str(error)})
+            return
         if path == "/portal-api/admin":
             user, _ = self.api_require(admin=True)
             if user:
@@ -1579,6 +1618,29 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     self.json_response(502, {"error": str(error)})
             return
         self.json_response(404, {"error": "not found"})
+
+    @staticmethod
+    def page_parameters(query: str) -> tuple[int, int]:
+        values = urllib.parse.parse_qs(query, keep_blank_values=True)
+        try:
+            page = int(values.get("page", ["1"])[-1])
+            page_size = int(values.get("page_size", ["20"])[-1])
+        except ValueError as error:
+            raise ValueError("分页参数必须为整数") from error
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise ValueError("分页范围无效：page >= 1，page_size 为 1-100")
+        return page, page_size
+
+    @staticmethod
+    def usage_filter_parameters(query: str) -> dict[str, str]:
+        values = urllib.parse.parse_qs(query, keep_blank_values=True)
+        result = {
+            "user": values.get("user", [""])[-1].strip(),
+            "model": values.get("model", [""])[-1].strip(),
+        }
+        if any(len(value) > 200 for value in result.values()):
+            raise ValueError("筛选条件过长")
+        return result
 
     def handle_api_post(self, path: str, payload: dict[str, Any]) -> None:
         if path == "/portal-api/auth/login":
@@ -3357,8 +3419,8 @@ class PortalControlPlane:
         with self.db.connect() as connection:
             account = connection.execute("SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)).fetchone()
             grants = self.rows(connection.execute("SELECT * FROM token_grants WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall())
-            usage = self.rows(connection.execute("SELECT * FROM usage_ledger WHERE user_id=? ORDER BY occurred_at DESC LIMIT 200", (user_id,)).fetchall())
             transactions = self.rows(connection.execute("SELECT * FROM balance_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall())
+        usage_page = self.usage_page(owner_user_id=user_id)
         result_models = []
         for model in models:
             item = dict(model)
@@ -3372,9 +3434,65 @@ class PortalControlPlane:
             "suspended": bool(account["suspended"]) if account else False,
             "models": result_models,
             "grants": grants,
-            "usage": usage,
+            "usage": usage_page["items"],
+            "usage_pagination": {key: usage_page[key] for key in ("page", "page_size", "pages", "total")},
             "transactions": transactions,
             "api_base": self.db.settings().get("api_public_url", self.config.api_public_url).rstrip("/") + "/v1",
+        }
+
+    def usage_page(
+        self,
+        owner_user_id: str | None = None,
+        filter_user_id: str = "",
+        model_id: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise ValueError("invalid usage page")
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if owner_user_id:
+            conditions.append("l.user_id=?")
+            parameters.append(owner_user_id)
+        elif filter_user_id:
+            conditions.append("l.user_id=?")
+            parameters.append(filter_user_id)
+        if model_id:
+            conditions.append("l.public_model_id=?")
+            parameters.append(model_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.db.connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM usage_ledger l{where}", parameters
+                ).fetchone()[0]
+            )
+            pages = max(1, (total + page_size - 1) // page_size)
+            effective_page = min(page, pages)
+            offset = (effective_page - 1) * page_size
+            if owner_user_id:
+                query = (
+                    f"SELECT l.* FROM usage_ledger l{where} "
+                    "ORDER BY l.occurred_at DESC,l.id DESC LIMIT ? OFFSET ?"
+                )
+            else:
+                query = (
+                    "SELECT l.*,u.email user_email FROM usage_ledger l "
+                    f"JOIN users u ON u.id=l.user_id{where} "
+                    "ORDER BY l.occurred_at DESC,l.id DESC LIMIT ? OFFSET ?"
+                )
+            items = self.rows(
+                connection.execute(
+                    query, [*parameters, page_size, offset]
+                ).fetchall()
+            )
+        return {
+            "items": items,
+            "page": effective_page,
+            "page_size": page_size,
+            "pages": pages,
+            "total": total,
         }
 
     def user_request_detail(self, user_id: str, request_id: str) -> dict[str, Any]:
@@ -3428,14 +3546,8 @@ class PortalControlPlane:
             free = self.rows(connection.execute("SELECT * FROM free_resources ORDER BY available DESC,test_status,provider,model_id").fetchall())
             audits = self.rows(connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 300").fetchall())
             grants = self.rows(connection.execute("SELECT * FROM token_grants ORDER BY created_at DESC LIMIT 500").fetchall())
-            transactions = self.rows(connection.execute("SELECT * FROM balance_transactions ORDER BY id DESC LIMIT 500").fetchall())
-            usage = self.rows(
-                connection.execute(
-                    """SELECT l.*,u.email user_email
-                       FROM usage_ledger l JOIN users u ON u.id=l.user_id
-                       ORDER BY l.occurred_at DESC LIMIT 500"""
-                ).fetchall()
-            )
+            transactions = self.rows(connection.execute("SELECT t.*,u.email user_email FROM balance_transactions t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 500").fetchall())
+        usage_page = self.usage_page()
         for user in users:
             user["balance"] = micros_to_money(int(user.get("balance_micros") or 0))
             user.pop("password_hash", None)
@@ -3462,7 +3574,9 @@ class PortalControlPlane:
         return {
             "users": users, "groups": groups, "memberships": memberships, "models": models,
             "free_resources": free, "settings": settings, "audit": audits, "grants": grants,
-            "usage": usage, "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
+            "usage": usage_page["items"],
+            "usage_pagination": {key: usage_page[key] for key in ("page", "page_size", "pages", "total")},
+            "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
             "gateway_error": gateway_error,
         }
 

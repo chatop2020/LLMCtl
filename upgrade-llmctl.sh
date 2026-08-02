@@ -425,8 +425,8 @@ wait_for_account_portal() {
   local port="$1" elapsed=0
   while (( elapsed < 30 )); do
     if systemctl is-active --quiet "${ACCOUNT_SERVICE}" && \
-       curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:${port}/health" >/dev/null && \
-       curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:${port}/ui/" | grep -q LLMCtl; then return 0; fi
+       curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:${port}/health" >/dev/null 2>&1 && \
+       curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:${port}/ui/" 2>/dev/null | grep -q LLMCtl; then return 0; fi
     sleep 2
     elapsed=$((elapsed + 2))
     log "$(l10n "等待账户门户就绪：${elapsed}s/30s" "Waiting for the account portal: ${elapsed}s/30s")"

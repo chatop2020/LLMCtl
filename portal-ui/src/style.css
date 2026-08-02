@@ -933,6 +933,7 @@ dialog::backdrop {
 
 /* LLMCtl 2.6 — compact, high-readability operations console */
 :root {
+  font-size: 14px;
   color: #173c53;
   background: #f4f9fc;
   --bg: #f4f9fc;
@@ -1424,12 +1425,282 @@ dialog::backdrop {
   color: var(--muted);
   font-size: 11px;
 }
+
+/* LLMCtl typography scale — compact desktop console, readable without oversized copy */
+body {
+  font-size: 14px;
+  line-height: 1.5;
+}
+.topbar {
+  height: 58px;
+  padding: 0 22px;
+}
+.brand {
+  gap: 10px;
+}
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  font-size: 15px;
+  font-weight: 750;
+}
+.brand strong {
+  font-size: 14px;
+  font-weight: 680;
+}
+.brand small {
+  margin-top: 1px;
+  font-size: 11px;
+}
+.identity {
+  font-size: 12px;
+}
+.workspace {
+  grid-template-columns: 196px minmax(0, 1fr);
+  min-height: calc(100vh - 58px);
+}
+.sidebar {
+  padding: 17px 12px;
+}
+.role-pill {
+  padding: 7px 9px;
+  font-size: 11px;
+  font-weight: 650;
+}
+.sidebar nav button {
+  min-height: 38px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 450;
+}
+.sidebar nav button.active {
+  font-weight: 620;
+}
+.side-note {
+  padding: 11px;
+}
+.side-note strong {
+  font-size: 12px;
+}
+.side-note p {
+  font-size: 11px;
+  line-height: 1.45;
+}
+.content {
+  padding: 24px clamp(18px, 2.4vw, 34px);
+}
+.page-head {
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.page-head h1 {
+  margin: 0 0 3px;
+  font-size: 22px;
+  font-weight: 680;
+  line-height: 1.25;
+  letter-spacing: -0.018em;
+}
+.page-head p,
+.muted {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.primary,
+.ghost,
+.danger,
+.icon-button {
+  min-height: 34px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.25;
+}
+.panel,
+.model-card,
+.resource {
+  padding: 15px;
+}
+.panel h2 {
+  margin-bottom: 12px;
+  font-size: 15px;
+  font-weight: 670;
+}
+.metrics article {
+  padding: 14px;
+}
+.metrics span {
+  font-size: 11px;
+}
+.metrics strong {
+  margin: 5px 0 1px;
+  font-size: 20px;
+  font-weight: 680;
+}
+.metrics small,
+.panel small,
+td small {
+  font-size: 11px;
+}
+label {
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 620;
+}
+input,
+select,
+textarea {
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+th {
+  font-size: 11px;
+}
+th,
+td {
+  padding: 10px 12px;
+  font-size: 13px;
+}
+.chat-layout {
+  grid-template-columns: minmax(280px, 390px) minmax(0, 1fr);
+  gap: 14px;
+}
+.form-stack {
+  gap: 10px;
+}
+.playground-options {
+  gap: 7px;
+}
+.stream-metrics {
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.stream-metrics article {
+  min-height: 70px;
+  padding: 10px 11px;
+  border-radius: 10px;
+}
+.stream-metrics span {
+  font-size: 10px;
+  font-weight: 560;
+  letter-spacing: 0.01em;
+}
+.stream-metrics strong {
+  margin-top: 4px;
+  font-size: 14px;
+  font-weight: 650;
+}
+.answer-head .eyebrow {
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: 0.02em;
+}
+.answer-head > span:last-child {
+  font-size: 10px;
+}
+.answer pre,
+.reasoning-panel pre {
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.65;
+}
+.reasoning-panel pre {
+  min-height: 74px;
+}
+.status {
+  padding: 4px 8px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.key-panel {
+  max-width: 720px;
+}
+.list-filter {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) repeat(2, minmax(140px, 200px)) auto;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 12px;
+  padding: 10px;
+  background: #f8fbfc;
+  border: 1px solid #d9e6ec;
+  border-radius: 10px;
+}
+.filter-count {
+  min-width: 48px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+.refresh-indicator {
+  position: fixed;
+  top: 66px;
+  right: 22px;
+  z-index: 35;
+  padding: 6px 10px;
+  color: #23637f;
+  background: #eef8fcf2;
+  border: 1px solid #a8d4e4;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px #194d6518;
+  font-size: 11px;
+}
+.choice-group {
+  display: grid;
+  gap: 7px;
+  max-height: 210px;
+  margin: 0;
+  padding: 11px;
+  overflow: auto;
+  background: #f8fbfc;
+  border: 1px solid #cbdce4;
+  border-radius: 10px;
+}
+.choice-group legend {
+  padding: 0 4px;
+  color: #46677a;
+  font-size: 11px;
+  font-weight: 650;
+}
+.choice-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px 9px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid #d8e5ea;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.choice-option:hover {
+  border-color: #79b8d1;
+}
+.choice-option input {
+  width: auto;
+  margin-top: 3px;
+}
+.choice-option span {
+  display: grid;
+  gap: 2px;
+}
+.choice-option strong {
+  font-size: 12px;
+}
+.choice-option small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+}
 @media (max-width: 700px) {
   .topbar {
-    height: 60px;
+    height: 54px;
   }
   .sidebar {
-    top: 60px;
+    top: 54px;
     background: #fff;
   }
   .content {
@@ -1442,5 +1713,11 @@ dialog::backdrop {
   .dialog-footer {
     align-items: stretch;
     flex-direction: column;
+  }
+  .list-filter {
+    grid-template-columns: 1fr;
+  }
+  .filter-count {
+    text-align: left;
   }
 }

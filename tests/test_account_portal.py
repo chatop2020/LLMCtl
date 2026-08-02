@@ -535,6 +535,61 @@ class PortalIntegrationTests(unittest.TestCase):
             }.issubset(columns)
         )
 
+    def test_usage_ledger_has_query_indexes_and_server_side_filters(self):
+        self.insert_control_user_and_model()
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            for index in range(25):
+                public_model = "gdn-inside" if index % 2 == 0 else "other-model"
+                connection.execute(
+                    """INSERT INTO usage_ledger(
+                         request_id,user_id,api_key_id,model_id,public_model_id,
+                         provider,resolved_model,input_tokens,output_tokens,cached_tokens,
+                         reasoning_tokens,granted_tokens,amount_micros,price_snapshot_json,
+                         occurred_at,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"request-page-{index}",
+                        "policy-user",
+                        "policy-key",
+                        "model-1" if public_model == "gdn-inside" else None,
+                        public_model,
+                        "local",
+                        public_model,
+                        index,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        "{}",
+                        stamp - index,
+                        stamp,
+                    ),
+                )
+            indexes = {
+                row["name"] for row in connection.execute("PRAGMA index_list('usage_ledger')")
+            }
+        self.assertTrue(
+            {"idx_usage_user_time_v2", "idx_usage_time", "idx_usage_model_time"}.issubset(
+                indexes
+            )
+        )
+        result = self.server.control.usage_page(
+            owner_user_id="policy-user",
+            model_id="gdn-inside",
+            page=2,
+            page_size=5,
+        )
+        self.assertEqual(result["total"], 13)
+        self.assertEqual(result["page"], 2)
+        self.assertEqual(len(result["items"]), 5)
+        self.assertEqual({row["public_model_id"] for row in result["items"]}, {"gdn-inside"})
+        self.assertEqual(
+            self.server.control.usage_page(owner_user_id="missing-user")["total"],
+            0,
+        )
+
     def test_combo_metadata_uses_conservative_limits_and_syncs_every_target(self):
         self.fake_omni.combo_items = [
             {

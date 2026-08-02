@@ -1,10 +1,11 @@
 <script setup>
-import { computed, h, onMounted, reactive, ref } from "vue";
+import { computed, h, nextTick, onMounted, reactive, ref, watch } from "vue";
 import {
   chunkParts,
   consumeChatResponse,
   splitThinkingMarkup,
 } from "./chatStream.js";
+import { writeClipboardText } from "./clipboard.js";
 
 const session = ref(null);
 const publicConfig = ref({ registration_enabled: false, allowed_domains: [] });
@@ -12,8 +13,10 @@ const dashboard = ref(null);
 const admin = ref(null);
 const busy = ref(false);
 const operation = ref("");
+const workspaceRefreshing = ref(false);
 const toast = reactive({ text: "", kind: "ok" });
 let toastTimer = null;
+let workspaceLoadVersion = 0;
 const authMode = ref(
   location.hash.startsWith("#/register")
     ? "register"
@@ -57,6 +60,7 @@ let chatController = null;
 let chatTimer = null;
 const keyOnce = ref(sessionStorage.getItem("llmctl_api_key") || "");
 const showApiKey = ref(false);
+const apiKeyField = ref(null);
 const userEdit = reactive({
   user_id: "",
   status: "active",
@@ -103,6 +107,69 @@ const settings = reactive({});
 const PAGE_SIZE = 20;
 const pages = reactive({});
 const requestDetails = reactive({});
+const listFilters = reactive(
+  Object.fromEntries(
+    [
+      "user-models",
+      "user-grants",
+      "user-billing",
+      "admin-models",
+      "admin-free",
+      "admin-users",
+      "admin-groups",
+      "admin-billing",
+      "admin-audit",
+    ].map((key) => [key, { query: "", status: "all", category: "all" }]),
+  ),
+);
+const usageFilters = reactive({ user: "", model: "" });
+const statusOptions = [
+  { value: "active", label: "正常" },
+  { value: "published", label: "已发布" },
+  { value: "disabled", label: "已停用" },
+  { value: "draft", label: "草稿" },
+  { value: "healthy", label: "测试通过" },
+  { value: "failed", label: "测试失败" },
+  { value: "untested", label: "未测试" },
+  { value: "unconfigured", label: "未配置" },
+  { value: "success", label: "成功" },
+];
+const kindOptions = [
+  { value: "credit", label: "入账" },
+  { value: "debit", label: "扣费" },
+  { value: "adjustment", label: "调整" },
+  { value: "refund", label: "退款" },
+];
+const resetOptions = [
+  { value: "none", label: "仅本次" },
+  { value: "daily", label: "每日" },
+  { value: "weekly", label: "每周" },
+  { value: "monthly", label: "每月" },
+];
+const filterFields = {
+  "user-models": ["public_model_id", "display_name", "description"],
+  "user-grants": ["label", "model_id", "reset_interval"],
+  "user-billing": ["kind", "note"],
+  "admin-models": [
+    "public_model_id",
+    "display_name",
+    "description",
+    "source_kind",
+    "source_provider",
+    "source_model",
+  ],
+  "admin-free": [
+    "display_name",
+    "provider",
+    "model_id",
+    "free_type",
+    "test_error",
+  ],
+  "admin-users": ["email", "status", "permission_status"],
+  "admin-groups": ["name", "description", "status"],
+  "admin-billing": ["user_email", "user_id", "kind", "note"],
+  "admin-audit": ["actor", "action", "target", "status", "detail"],
+};
 const PaginationBar = (props, { emit }) =>
   props.total <= PAGE_SIZE
     ? null
@@ -155,7 +222,69 @@ const PaginationBar = (props, { emit }) =>
 PaginationBar.props = { page: Number, pages: Number, total: Number };
 PaginationBar.emits = ["previous", "next"];
 
+const ListFilterBar = (props, { emit }) =>
+  h("div", { class: "list-filter", role: "search" }, [
+    h("input", {
+      type: "search",
+      value: props.modelValue,
+      placeholder: props.placeholder || "搜索当前列表",
+      "aria-label": props.placeholder || "搜索当前列表",
+      onInput: (event) => emit("update:modelValue", event.target.value),
+    }),
+    props.statusOptions?.length
+      ? h(
+          "select",
+          {
+            value: props.status,
+            "aria-label": props.statusLabel || "状态筛选",
+            onChange: (event) => emit("update:status", event.target.value),
+          },
+          [
+            h("option", { value: "all" }, props.statusLabel || "全部状态"),
+            ...props.statusOptions.map((option) =>
+              h("option", { value: option.value }, option.label),
+            ),
+          ],
+        )
+      : null,
+    props.categoryOptions?.length
+      ? h(
+          "select",
+          {
+            value: props.category,
+            "aria-label": props.categoryLabel || "分类筛选",
+            onChange: (event) => emit("update:category", event.target.value),
+          },
+          [
+            h("option", { value: "all" }, props.categoryLabel || "全部分类"),
+            ...props.categoryOptions.map((option) =>
+              h("option", { value: option.value }, option.label),
+            ),
+          ],
+        )
+      : null,
+    h("span", { class: "filter-count" }, `${props.count || 0} 条`),
+  ]);
+ListFilterBar.props = {
+  modelValue: String,
+  status: String,
+  statusLabel: String,
+  statusOptions: Array,
+  category: String,
+  categoryLabel: String,
+  categoryOptions: Array,
+  placeholder: String,
+  count: Number,
+};
+ListFilterBar.emits = ["update:modelValue", "update:status", "update:category"];
+
 const isAdmin = computed(() => session.value?.user?.role === "admin");
+const freeProviderOptions = computed(() =>
+  [...new Set((admin.value?.free_resources || []).map((row) => row.provider))]
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b))
+    .map((value) => ({ value, label: value })),
+);
 const nav = computed(() =>
   isAdmin.value
     ? [
@@ -227,31 +356,68 @@ async function load() {
   publicConfig.value = await api("public");
   session.value = await api("session");
   if (!session.value.authenticated) return;
-  if (isAdmin.value) {
-    admin.value = await api("admin");
-    Object.assign(settings, admin.value.settings);
-    const currentOrigin = location.origin;
-    const currentIsRemote =
-      !/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(
-        currentOrigin,
-      );
-    const savedPortalIsLocal =
-      /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(
-        settings.public_url || "",
-      );
-    const savedApiIsLocal =
-      /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(
-        settings.api_public_url || "",
-      );
-    if (!settings.public_url || (currentIsRemote && savedPortalIsLocal))
-      settings.public_url = `${currentOrigin}/ui`;
-    if (!settings.api_public_url || (currentIsRemote && savedApiIsLocal))
-      settings.api_public_url = currentOrigin;
-  } else {
-    dashboard.value = await api("dashboard");
-    if (!chat.model)
-      chat.model = dashboard.value.models[0]?.public_model_id || "";
+  await refreshWorkspace();
+}
+
+function applyAdminSnapshot(snapshot) {
+  admin.value = snapshot;
+  Object.assign(settings, snapshot.settings);
+  const currentOrigin = location.origin;
+  const currentIsRemote =
+    !/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(
+      currentOrigin,
+    );
+  const savedPortalIsLocal =
+    /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+      settings.public_url || "",
+    );
+  const savedApiIsLocal =
+    /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+      settings.api_public_url || "",
+    );
+  if (!settings.public_url || (currentIsRemote && savedPortalIsLocal))
+    settings.public_url = `${currentOrigin}/ui`;
+  if (!settings.api_public_url || (currentIsRemote && savedApiIsLocal))
+    settings.api_public_url = currentOrigin;
+}
+
+async function refreshWorkspace() {
+  if (!session.value?.authenticated) return;
+  const version = ++workspaceLoadVersion;
+  workspaceRefreshing.value = true;
+  try {
+    const snapshot = await api(isAdmin.value ? "admin" : "dashboard");
+    if (version !== workspaceLoadVersion) return;
+    if (isAdmin.value) applyAdminSnapshot(snapshot);
+    else {
+      dashboard.value = snapshot;
+      if (
+        !chat.model ||
+        !snapshot.models.some((model) => model.public_model_id === chat.model)
+      )
+        chat.model = snapshot.models[0]?.public_model_id || "";
+    }
+    if (
+      section.value === "billing" &&
+      (usageFilters.user || usageFilters.model)
+    )
+      await loadUsagePage(1);
+  } finally {
+    if (version === workspaceLoadVersion) workspaceRefreshing.value = false;
   }
+}
+
+async function selectSection(nextSection) {
+  section.value = nextSection;
+  try {
+    await refreshWorkspace();
+  } catch (error) {
+    notify(`页面数据更新失败：${error.message}`, "bad");
+  }
+}
+
+async function goToSection(nextSection) {
+  await selectSection(nextSection);
 }
 
 async function action(fn, success = "操作成功", options = {}) {
@@ -335,13 +501,150 @@ async function rotateKey() {
   }
 }
 
-function copy(value) {
-  navigator.clipboard.writeText(value);
-  notify("已复制到剪贴板");
+async function copy(value, options = {}) {
+  const result = await writeClipboardText(value);
+  if (result.copied) {
+    notify("已复制到剪贴板");
+    return true;
+  }
+  if (options.revealOnFailure) {
+    showApiKey.value = true;
+    await nextTick();
+    apiKeyField.value?.focus();
+    apiKeyField.value?.select();
+    apiKeyField.value?.setSelectionRange?.(0, String(value || "").length);
+    notify("浏览器禁止自动复制；Key 已显示并选中，请按 Ctrl+C。", "bad");
+  } else {
+    notify("浏览器禁止自动复制，请手工选中文本后复制。", "bad");
+  }
+  return false;
 }
 
 function money(micros) {
   return `$${(Number(micros || 0) / 1_000_000).toFixed(4)}`;
+}
+function statusLabel(value) {
+  return (
+    {
+      active: "正常",
+      published: "已发布",
+      disabled: "已停用",
+      draft: "草稿",
+      healthy: "测试通过",
+      failed: "失败",
+      untested: "未测试",
+      pending: "待同步",
+      synced: "已同步",
+      success: "成功",
+      expired: "已过期",
+    }[value] ||
+    value ||
+    "未知"
+  );
+}
+function kindLabel(value) {
+  return (
+    {
+      credit: "入账",
+      debit: "扣费",
+      adjustment: "调整",
+      refund: "退款",
+    }[value] ||
+    value ||
+    "—"
+  );
+}
+function resetLabel(value) {
+  return (
+    { none: "仅本次", daily: "每日", weekly: "每周", monthly: "每月" }[value] ||
+    value
+  );
+}
+function rowStatus(key, row) {
+  if (key === "admin-free")
+    return row.configured ? row.test_status : "unconfigured";
+  if (key === "admin-models") return row.status;
+  return row.status || row.permission_status || "";
+}
+function rowCategory(key, row) {
+  if (key === "admin-free") return row.provider;
+  if (key.endsWith("billing")) return row.kind;
+  if (key === "user-grants") return row.reset_interval;
+  if (key === "admin-models") return row.source_kind;
+  return "";
+}
+function filteredRows(key, rows) {
+  const filter = listFilters[key];
+  if (!filter) return rows || [];
+  const query = filter.query.trim().toLocaleLowerCase();
+  return (rows || []).filter((row) => {
+    if (
+      query &&
+      !(filterFields[key] || []).some((field) =>
+        String(row[field] ?? "")
+          .toLocaleLowerCase()
+          .includes(query),
+      )
+    )
+      return false;
+    if (filter.status !== "all" && rowStatus(key, row) !== filter.status)
+      return false;
+    if (filter.category !== "all" && rowCategory(key, row) !== filter.category)
+      return false;
+    return true;
+  });
+}
+
+watch(
+  listFilters,
+  () => {
+    for (const key of Object.keys(listFilters)) pages[key] = 1;
+  },
+  { deep: true },
+);
+
+async function loadUsagePage(nextPage = 1) {
+  const parameters = new URLSearchParams({
+    page: String(nextPage),
+    page_size: String(PAGE_SIZE),
+  });
+  if (usageFilters.model) parameters.set("model", usageFilters.model);
+  if (isAdmin.value && usageFilters.user)
+    parameters.set("user", usageFilters.user);
+  const result = await api(
+    `${isAdmin.value ? "admin/" : ""}usage-page?${parameters}`,
+  );
+  const target = isAdmin.value ? admin.value : dashboard.value;
+  target.usage = result.items;
+  target.usage_pagination = {
+    page: result.page,
+    page_size: result.page_size,
+    pages: result.pages,
+    total: result.total,
+  };
+}
+
+async function applyUsageFilters() {
+  try {
+    await loadUsagePage(1);
+  } catch (error) {
+    notify(`筛选用量失败：${error.message}`, "bad");
+  }
+}
+
+async function changeUsagePage(delta) {
+  const target = isAdmin.value ? admin.value : dashboard.value;
+  const pagination = target?.usage_pagination || {
+    page: 1,
+    pages: 1,
+  };
+  const next = Math.min(pagination.pages, Math.max(1, pagination.page + delta));
+  if (next === pagination.page) return;
+  try {
+    await loadUsagePage(next);
+  } catch (error) {
+    notify(`读取用量分页失败：${error.message}`, "bad");
+  }
 }
 function date(value) {
   return value
@@ -632,6 +935,16 @@ function editModel(model = {}) {
   if (model.source_model) inspectModel(false);
 }
 function publishFree(resource) {
+  if (!resource.configured)
+    return notify(
+      `尚未检测到供应商 ${resource.provider} 的可用配置。请先在 AI 接入层配置凭据，再重新发现资源。`,
+      "bad",
+    );
+  if (!resource.available || resource.test_status !== "healthy")
+    return notify(
+      "请先完成实时测试；只有测试通过的资源才能开放给用户。",
+      "bad",
+    );
   editModel({
     source_kind: "free",
     source_ref: resource.resource_key,
@@ -645,7 +958,10 @@ function publishFree(resource) {
 }
 async function testFreeResource(resource) {
   if (!resource.configured)
-    return notify(`请先配置并启用供应商：${resource.provider}`, "bad");
+    return notify(
+      `尚未检测到供应商 ${resource.provider} 的可用配置。请先在 AI 接入层配置凭据，再重新发现资源。`,
+      "bad",
+    );
   await action(
     () =>
       api("admin/free/test", {
@@ -857,7 +1173,7 @@ onMounted(async () => {
         <span class="brand-mark">L</span>
         <div>
           <strong>LLMCtl 模型服务门户</strong
-          ><small>模型访问、API Key、额度与用量</small>
+          ><small>模型访问 · API Key · 额度与用量</small>
         </div>
       </div>
       <div class="top-actions" v-if="session?.authenticated">
@@ -963,7 +1279,7 @@ onMounted(async () => {
             v-for="item in nav"
             :key="item[0]"
             :class="{ active: section === item[0] }"
-            @click="section = item[0]"
+            @click="selectSection(item[0])"
           >
             <span class="nav-dot"></span>{{ item[1] }}
           </button>
@@ -974,6 +1290,9 @@ onMounted(async () => {
         </div>
       </aside>
       <main class="content">
+        <div v-if="workspaceRefreshing" class="refresh-indicator" role="status">
+          正在更新数据…
+        </div>
         <div v-if="isAdmin && admin?.gateway_error" class="warning">
           <strong>AI 接入层当前不可用。</strong
           >用户、SMTP、账本和审计仍可查看；涉及模型、Key
@@ -1011,7 +1330,7 @@ onMounted(async () => {
               </article>
               <article>
                 <span>已记录请求</span
-                ><strong>{{ dashboard.usage.length }}</strong
+                ><strong>{{ dashboard.usage_pagination?.total || 0 }}</strong
                 ><small>LLMCtl 用量账本</small>
               </article>
             </div>
@@ -1129,36 +1448,48 @@ onMounted(async () => {
               </div>
               <div class="catalog-key-input">
                 <input
+                  ref="apiKeyField"
                   v-model="keyOnce"
                   :type="showApiKey ? 'text' : 'password'"
                   placeholder="尚未保存，请输入或前往 API Key 页面轮换"
                   autocomplete="off"
                   @input="sessionStorage.setItem('llmctl_api_key', keyOnce)"
                 /><button
+                  type="button"
                   class="ghost"
                   :disabled="!keyOnce"
                   @click="showApiKey = !showApiKey"
                 >
                   {{ showApiKey ? "隐藏" : "显示" }}</button
                 ><button
+                  type="button"
                   class="ghost"
                   :disabled="!keyOnce"
-                  @click="copy(keyOnce)"
+                  @click="copy(keyOnce, { revealOnFailure: true })"
                 >
                   复制 Key</button
                 ><button
+                  type="button"
                   class="ghost"
                   v-if="!keyOnce"
-                  @click="section = 'keys'"
+                  @click="goToSection('keys')"
                 >
                   前往 API Key
                 </button>
               </div>
             </section>
+            <ListFilterBar
+              v-model="listFilters['user-models'].query"
+              :count="filteredRows('user-models', dashboard.models).length"
+              placeholder="搜索模型 ID、名称或描述"
+            />
             <div class="model-grid">
               <article
                 class="model-card"
-                v-for="model in pageRows('user-models', dashboard.models)"
+                v-for="model in pageRows(
+                  'user-models',
+                  filteredRows('user-models', dashboard.models),
+                )"
                 :key="model.id"
               >
                 <div class="model-title">
@@ -1168,6 +1499,7 @@ onMounted(async () => {
                     <code>{{ model.public_model_id }}</code>
                   </div>
                   <button
+                    type="button"
                     class="icon-button"
                     @click="copy(model.public_model_id)"
                   >
@@ -1204,18 +1536,39 @@ onMounted(async () => {
                 <details>
                   <summary>查看 curl 示例</summary>
                   <pre>{{ curlFor(model) }}</pre>
-                  <button class="ghost" @click="copy(curlFor(model))">
+                  <button
+                    type="button"
+                    class="ghost"
+                    @click="copy(curlFor(model))"
+                  >
                     复制完整示例
                   </button>
                 </details>
               </article>
             </div>
             <PaginationBar
-              :page="pageNumber('user-models', dashboard.models)"
-              :pages="pageCount(dashboard.models)"
-              :total="dashboard.models.length"
-              @previous="changePage('user-models', dashboard.models, -1)"
-              @next="changePage('user-models', dashboard.models, 1)"
+              :page="
+                pageNumber(
+                  'user-models',
+                  filteredRows('user-models', dashboard.models),
+                )
+              "
+              :pages="pageCount(filteredRows('user-models', dashboard.models))"
+              :total="filteredRows('user-models', dashboard.models).length"
+              @previous="
+                changePage(
+                  'user-models',
+                  filteredRows('user-models', dashboard.models),
+                  -1,
+                )
+              "
+              @next="
+                changePage(
+                  'user-models',
+                  filteredRows('user-models', dashboard.models),
+                  1,
+                )
+              "
             />
           </section>
 
@@ -1224,10 +1577,7 @@ onMounted(async () => {
               <div>
                 <span class="eyebrow">PLAYGROUND</span>
                 <h1>在线测试</h1>
-                <p>
-                  浏览器以流式方式直接调用 /v1；个人 Key
-                  仅保存在当前浏览器会话。
-                </p>
+                <p>浏览器流式调用 /v1；API Key 仅保存在本次会话。</p>
               </div>
               <span
                 class="status"
@@ -1319,7 +1669,7 @@ onMounted(async () => {
               <section class="playground-output">
                 <div class="stream-metrics">
                   <article>
-                    <span>首 Token</span
+                    <span>首字延迟</span
                     ><strong>{{
                       chat.ttftMs === null
                         ? "—"
@@ -1343,7 +1693,7 @@ onMounted(async () => {
                     }}</strong>
                   </article>
                   <article>
-                    <span>Token（入 / 出 / 总）</span
+                    <span>Token 用量</span
                     ><strong
                       >{{ chat.inputTokens === null ? "—" : chat.inputTokens }}
                       /
@@ -1365,7 +1715,7 @@ onMounted(async () => {
                   "
                 >
                   <div class="answer-head">
-                    <span class="eyebrow">REASONING · 思考过程</span
+                    <span class="eyebrow">思考过程</span
                     ><span v-if="chat.reasoningTokens !== null"
                       >{{ chat.reasoningTokens }} tokens</span
                     >
@@ -1379,7 +1729,7 @@ onMounted(async () => {
                 </section>
                 <section class="panel answer">
                   <div class="answer-head">
-                    <span class="eyebrow">RESPONSE · 最终回答</span
+                    <span class="eyebrow">最终回答</span
                     ><span v-if="chat.responseModel">{{
                       chat.responseModel
                     }}</span>
@@ -1416,16 +1766,34 @@ onMounted(async () => {
             </div>
             <section class="panel">
               <h2>Token 赠额</h2>
+              <ListFilterBar
+                v-model="listFilters['user-grants'].query"
+                v-model:status="listFilters['user-grants'].status"
+                v-model:category="listFilters['user-grants'].category"
+                :status-options="[
+                  { value: 'active', label: '有效' },
+                  { value: 'disabled', label: '已停用' },
+                  { value: 'expired', label: '已过期' },
+                ]"
+                status-label="全部状态"
+                :category-options="resetOptions"
+                category-label="全部重置周期"
+                :count="filteredRows('user-grants', dashboard.grants).length"
+                placeholder="搜索赠额名称或模型"
+              />
               <div class="grant-list">
                 <div
-                  v-for="grant in pageRows('user-grants', dashboard.grants)"
+                  v-for="grant in pageRows(
+                    'user-grants',
+                    filteredRows('user-grants', dashboard.grants),
+                  )"
                   :key="grant.id"
                 >
                   <div>
                     <strong>{{ grant.label }}</strong
                     ><small
                       >{{ grant.model_id ? "指定模型" : "所有模型" }} ·
-                      {{ grant.reset_interval }}</small
+                      {{ resetLabel(grant.reset_interval) }}</small
                     >
                   </div>
                   <div class="grant-number">
@@ -1435,15 +1803,53 @@ onMounted(async () => {
                 </div>
               </div>
               <PaginationBar
-                :page="pageNumber('user-grants', dashboard.grants)"
-                :pages="pageCount(dashboard.grants)"
-                :total="dashboard.grants.length"
-                @previous="changePage('user-grants', dashboard.grants, -1)"
-                @next="changePage('user-grants', dashboard.grants, 1)"
+                :page="
+                  pageNumber(
+                    'user-grants',
+                    filteredRows('user-grants', dashboard.grants),
+                  )
+                "
+                :pages="
+                  pageCount(filteredRows('user-grants', dashboard.grants))
+                "
+                :total="filteredRows('user-grants', dashboard.grants).length"
+                @previous="
+                  changePage(
+                    'user-grants',
+                    filteredRows('user-grants', dashboard.grants),
+                    -1,
+                  )
+                "
+                @next="
+                  changePage(
+                    'user-grants',
+                    filteredRows('user-grants', dashboard.grants),
+                    1,
+                  )
+                "
               />
             </section>
             <section class="panel">
               <h2>请求用量</h2>
+              <div class="list-filter" role="search">
+                <select
+                  v-model="usageFilters.model"
+                  aria-label="按模型筛选请求用量"
+                  @change="applyUsageFilters"
+                >
+                  <option value="">全部模型</option>
+                  <option
+                    v-for="model in dashboard.models"
+                    :key="model.id"
+                    :value="model.public_model_id"
+                  >
+                    {{ model.public_model_id }}
+                  </option>
+                </select>
+                <span class="filter-count"
+                  >{{ dashboard.usage_pagination?.total || 0 }} 条</span
+                >
+              </div>
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -1457,9 +1863,7 @@ onMounted(async () => {
                     </tr>
                   </thead>
                   <tbody>
-                    <template
-                      v-for="row in pageRows('user-usage', dashboard.usage)"
-                      :key="row.id"
+                    <template v-for="row in dashboard.usage" :key="row.id"
                       ><tr>
                         <td>{{ date(row.occurred_at) }}</td>
                         <td>
@@ -1536,11 +1940,11 @@ onMounted(async () => {
                 </table>
               </div>
               <PaginationBar
-                :page="pageNumber('user-usage', dashboard.usage)"
-                :pages="pageCount(dashboard.usage)"
-                :total="dashboard.usage.length"
-                @previous="changePage('user-usage', dashboard.usage, -1)"
-                @next="changePage('user-usage', dashboard.usage, 1)"
+                :page="dashboard.usage_pagination?.page || 1"
+                :pages="dashboard.usage_pagination?.pages || 1"
+                :total="dashboard.usage_pagination?.total || 0"
+                @previous="changeUsagePage(-1)"
+                @next="changeUsagePage(1)"
               />
             </section>
             <section class="panel">
@@ -1549,6 +1953,16 @@ onMounted(async () => {
                 只有充值、余额调整或赠送 Token
                 不足而实际扣减金额时，才会产生金额流水。
               </p>
+              <ListFilterBar
+                v-model="listFilters['user-billing'].query"
+                v-model:category="listFilters['user-billing'].category"
+                :category-options="kindOptions"
+                category-label="全部流水类型"
+                :count="
+                  filteredRows('user-billing', dashboard.transactions).length
+                "
+                placeholder="搜索类型或备注"
+              />
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -1564,12 +1978,12 @@ onMounted(async () => {
                     <tr
                       v-for="row in pageRows(
                         'user-billing',
-                        dashboard.transactions,
+                        filteredRows('user-billing', dashboard.transactions),
                       )"
                       :key="row.id"
                     >
                       <td>{{ date(row.created_at) }}</td>
-                      <td>{{ row.kind }}</td>
+                      <td>{{ kindLabel(row.kind) }}</td>
                       <td>{{ money(row.amount_micros) }}</td>
                       <td>{{ money(row.balance_after_micros) }}</td>
                       <td>{{ row.note }}</td>
@@ -1584,13 +1998,34 @@ onMounted(async () => {
                 </table>
               </div>
               <PaginationBar
-                :page="pageNumber('user-billing', dashboard.transactions)"
-                :pages="pageCount(dashboard.transactions)"
-                :total="dashboard.transactions.length"
-                @previous="
-                  changePage('user-billing', dashboard.transactions, -1)
+                :page="
+                  pageNumber(
+                    'user-billing',
+                    filteredRows('user-billing', dashboard.transactions),
+                  )
                 "
-                @next="changePage('user-billing', dashboard.transactions, 1)"
+                :pages="
+                  pageCount(
+                    filteredRows('user-billing', dashboard.transactions),
+                  )
+                "
+                :total="
+                  filteredRows('user-billing', dashboard.transactions).length
+                "
+                @previous="
+                  changePage(
+                    'user-billing',
+                    filteredRows('user-billing', dashboard.transactions),
+                    -1,
+                  )
+                "
+                @next="
+                  changePage(
+                    'user-billing',
+                    filteredRows('user-billing', dashboard.transactions),
+                    1,
+                  )
+                "
               />
             </section>
           </section>
@@ -1606,8 +2041,9 @@ onMounted(async () => {
             <section class="panel key-panel">
               <label
                 >当前浏览器会话中的 Key<input
+                  ref="apiKeyField"
                   v-model="keyOnce"
-                  type="password"
+                  :type="showApiKey ? 'text' : 'password'"
                   @change="sessionStorage.setItem('llmctl_api_key', keyOnce)"
                   placeholder="未保存；可手工输入或轮换"
               /></label>
@@ -1615,10 +2051,23 @@ onMounted(async () => {
                 <button
                   class="ghost"
                   :disabled="!keyOnce"
-                  @click="copy(keyOnce)"
+                  type="button"
+                  @click="copy(keyOnce, { revealOnFailure: true })"
                 >
                   复制</button
-                ><button class="danger" :disabled="busy" @click="rotateKey">
+                ><button
+                  class="ghost"
+                  type="button"
+                  :disabled="!keyOnce"
+                  @click="showApiKey = !showApiKey"
+                >
+                  {{ showApiKey ? "隐藏" : "显示" }}</button
+                ><button
+                  class="danger"
+                  type="button"
+                  :disabled="busy"
+                  @click="rotateKey"
+                >
                   轮换并撤销旧 Key
                 </button>
               </div>
@@ -1750,6 +2199,18 @@ onMounted(async () => {
                 发布模型
               </button>
             </div>
+            <ListFilterBar
+              v-model="listFilters['admin-models'].query"
+              v-model:status="listFilters['admin-models'].status"
+              :status-options="[
+                { value: 'published', label: '已发布' },
+                { value: 'draft', label: '草稿' },
+                { value: 'disabled', label: '已停用' },
+              ]"
+              status-label="全部发布状态"
+              :count="filteredRows('admin-models', admin.models).length"
+              placeholder="搜索模型、来源或描述"
+            />
             <div class="table-wrap panel">
               <table>
                 <thead>
@@ -1765,7 +2226,10 @@ onMounted(async () => {
                 </thead>
                 <tbody>
                   <tr
-                    v-for="model in pageRows('admin-models', admin.models)"
+                    v-for="model in pageRows(
+                      'admin-models',
+                      filteredRows('admin-models', admin.models),
+                    )"
                     :key="model.id"
                   >
                     <td class="model-summary">
@@ -1807,7 +2271,7 @@ onMounted(async () => {
                         :class="
                           model.health_status === 'healthy' ? 'ok' : 'warn'
                         "
-                        >{{ model.health_status }}</span
+                        >{{ statusLabel(model.health_status) }}</span
                       ><small
                         >参数
                         {{ model.metadata_sync_status || "unknown" }}</small
@@ -1842,11 +2306,28 @@ onMounted(async () => {
               </table>
             </div>
             <PaginationBar
-              :page="pageNumber('admin-models', admin.models)"
-              :pages="pageCount(admin.models)"
-              :total="admin.models.length"
-              @previous="changePage('admin-models', admin.models, -1)"
-              @next="changePage('admin-models', admin.models, 1)"
+              :page="
+                pageNumber(
+                  'admin-models',
+                  filteredRows('admin-models', admin.models),
+                )
+              "
+              :pages="pageCount(filteredRows('admin-models', admin.models))"
+              :total="filteredRows('admin-models', admin.models).length"
+              @previous="
+                changePage(
+                  'admin-models',
+                  filteredRows('admin-models', admin.models),
+                  -1,
+                )
+              "
+              @next="
+                changePage(
+                  'admin-models',
+                  filteredRows('admin-models', admin.models),
+                  1,
+                )
+              "
             />
           </section>
 
@@ -1872,13 +2353,27 @@ onMounted(async () => {
                   )
                 "
               >
-                发现资源
+                重新发现
               </button>
             </div>
+            <ListFilterBar
+              v-model="listFilters['admin-free'].query"
+              v-model:status="listFilters['admin-free'].status"
+              v-model:category="listFilters['admin-free'].category"
+              :status-options="statusOptions.slice(4, 8)"
+              status-label="全部可用状态"
+              :category-options="freeProviderOptions"
+              category-label="全部供应商"
+              :count="filteredRows('admin-free', admin.free_resources).length"
+              placeholder="搜索模型或供应商"
+            />
             <div class="resource-grid">
               <article
                 class="resource"
-                v-for="item in pageRows('admin-free', admin.free_resources)"
+                v-for="item in pageRows(
+                  'admin-free',
+                  filteredRows('admin-free', admin.free_resources),
+                )"
                 :key="item.resource_key"
               >
                 <div class="resource-head">
@@ -1895,7 +2390,9 @@ onMounted(async () => {
                           ? 'bad'
                           : 'warn'
                     "
-                    >{{ item.test_status }}</span
+                    >{{
+                      item.configured ? statusLabel(item.test_status) : "未配置"
+                    }}</span
                   >
                 </div>
                 <div class="resource-meta">
@@ -1912,8 +2409,9 @@ onMounted(async () => {
                 </p>
                 <div class="button-row">
                   <button
+                    type="button"
                     class="ghost"
-                    :disabled="busy || !item.configured"
+                    :disabled="busy"
                     :title="
                       item.configured
                         ? '使用供应商限定的模型 ID 测试'
@@ -1927,12 +2425,9 @@ onMounted(async () => {
                         : "实时测试"
                     }}</button
                   ><button
+                    type="button"
                     class="primary"
-                    :disabled="
-                      !item.configured ||
-                      !item.available ||
-                      item.test_status !== 'healthy'
-                    "
+                    :disabled="busy"
                     @click="publishFree(item)"
                   >
                     开放给用户
@@ -1941,11 +2436,30 @@ onMounted(async () => {
               </article>
             </div>
             <PaginationBar
-              :page="pageNumber('admin-free', admin.free_resources)"
-              :pages="pageCount(admin.free_resources)"
-              :total="admin.free_resources.length"
-              @previous="changePage('admin-free', admin.free_resources, -1)"
-              @next="changePage('admin-free', admin.free_resources, 1)"
+              :page="
+                pageNumber(
+                  'admin-free',
+                  filteredRows('admin-free', admin.free_resources),
+                )
+              "
+              :pages="
+                pageCount(filteredRows('admin-free', admin.free_resources))
+              "
+              :total="filteredRows('admin-free', admin.free_resources).length"
+              @previous="
+                changePage(
+                  'admin-free',
+                  filteredRows('admin-free', admin.free_resources),
+                  -1,
+                )
+              "
+              @next="
+                changePage(
+                  'admin-free',
+                  filteredRows('admin-free', admin.free_resources),
+                  1,
+                )
+              "
             />
           </section>
 
@@ -1957,6 +2471,21 @@ onMounted(async () => {
                 <p>禁用、分组、金额调整与额外 Token 赠送集中完成。</p>
               </div>
             </div>
+            <ListFilterBar
+              v-model="listFilters['admin-users'].query"
+              v-model:status="listFilters['admin-users'].status"
+              :status-options="
+                statusOptions.slice(0, 1).concat(statusOptions.slice(2, 3))
+              "
+              status-label="全部账户状态"
+              :count="
+                filteredRows(
+                  'admin-users',
+                  admin.users.filter((user) => user.role === 'user'),
+                ).length
+              "
+              placeholder="搜索邮箱或同步状态"
+            />
             <div class="table-wrap panel">
               <table>
                 <thead>
@@ -1972,7 +2501,10 @@ onMounted(async () => {
                   <tr
                     v-for="user in pageRows(
                       'admin-users',
-                      admin.users.filter((u) => u.role === 'user'),
+                      filteredRows(
+                        'admin-users',
+                        admin.users.filter((u) => u.role === 'user'),
+                      ),
                     )"
                     :key="user.id"
                   >
@@ -1984,7 +2516,7 @@ onMounted(async () => {
                       <span
                         class="status"
                         :class="user.status === 'active' ? 'ok' : 'bad'"
-                        >{{ user.status }}</span
+                        >{{ statusLabel(user.status) }}</span
                       >
                     </td>
                     <td>${{ user.balance }}</td>
@@ -1994,7 +2526,9 @@ onMounted(async () => {
                         :class="
                           user.permission_status === 'synced' ? 'ok' : 'warn'
                         "
-                        >{{ user.permission_status || "pending" }}</span
+                        >{{
+                          statusLabel(user.permission_status || "pending")
+                        }}</span
                       ><small v-if="user.permission_error">{{
                         user.permission_error
                       }}</small>
@@ -2012,22 +2546,43 @@ onMounted(async () => {
               :page="
                 pageNumber(
                   'admin-users',
-                  admin.users.filter((u) => u.role === 'user'),
+                  filteredRows(
+                    'admin-users',
+                    admin.users.filter((u) => u.role === 'user'),
+                  ),
                 )
               "
-              :pages="pageCount(admin.users.filter((u) => u.role === 'user'))"
-              :total="admin.users.filter((u) => u.role === 'user').length"
+              :pages="
+                pageCount(
+                  filteredRows(
+                    'admin-users',
+                    admin.users.filter((u) => u.role === 'user'),
+                  ),
+                )
+              "
+              :total="
+                filteredRows(
+                  'admin-users',
+                  admin.users.filter((u) => u.role === 'user'),
+                ).length
+              "
               @previous="
                 changePage(
                   'admin-users',
-                  admin.users.filter((u) => u.role === 'user'),
+                  filteredRows(
+                    'admin-users',
+                    admin.users.filter((u) => u.role === 'user'),
+                  ),
                   -1,
                 )
               "
               @next="
                 changePage(
                   'admin-users',
-                  admin.users.filter((u) => u.role === 'user'),
+                  filteredRows(
+                    'admin-users',
+                    admin.users.filter((u) => u.role === 'user'),
+                  ),
                   1,
                 )
               "
@@ -2045,10 +2600,23 @@ onMounted(async () => {
               </div>
               <button class="primary" @click="editGroup()">新建用户组</button>
             </div>
+            <ListFilterBar
+              v-model="listFilters['admin-groups'].query"
+              v-model:status="listFilters['admin-groups'].status"
+              :status-options="
+                statusOptions.slice(0, 1).concat(statusOptions.slice(2, 3))
+              "
+              status-label="全部状态"
+              :count="filteredRows('admin-groups', admin.groups).length"
+              placeholder="搜索组名或描述"
+            />
             <div class="group-grid">
               <article
                 class="panel"
-                v-for="group in pageRows('admin-groups', admin.groups)"
+                v-for="group in pageRows(
+                  'admin-groups',
+                  filteredRows('admin-groups', admin.groups),
+                )"
                 :key="group.id"
               >
                 <div class="panel-head">
@@ -2056,7 +2624,7 @@ onMounted(async () => {
                   <span
                     class="status"
                     :class="group.status === 'active' ? 'ok' : 'bad'"
-                    >{{ group.status }}</span
+                    >{{ statusLabel(group.status) }}</span
                   >
                 </div>
                 <p>{{ group.description || "暂无描述" }}</p>
@@ -2065,11 +2633,28 @@ onMounted(async () => {
               </article>
             </div>
             <PaginationBar
-              :page="pageNumber('admin-groups', admin.groups)"
-              :pages="pageCount(admin.groups)"
-              :total="admin.groups.length"
-              @previous="changePage('admin-groups', admin.groups, -1)"
-              @next="changePage('admin-groups', admin.groups, 1)"
+              :page="
+                pageNumber(
+                  'admin-groups',
+                  filteredRows('admin-groups', admin.groups),
+                )
+              "
+              :pages="pageCount(filteredRows('admin-groups', admin.groups))"
+              :total="filteredRows('admin-groups', admin.groups).length"
+              @previous="
+                changePage(
+                  'admin-groups',
+                  filteredRows('admin-groups', admin.groups),
+                  -1,
+                )
+              "
+              @next="
+                changePage(
+                  'admin-groups',
+                  filteredRows('admin-groups', admin.groups),
+                  1,
+                )
+              "
             />
           </section>
 
@@ -2103,6 +2688,41 @@ onMounted(async () => {
                   <p>包含赠额抵扣与实际金额扣费。</p>
                 </div>
               </div>
+              <div class="list-filter" role="search">
+                <select
+                  v-model="usageFilters.user"
+                  aria-label="按用户筛选请求用量"
+                  @change="applyUsageFilters"
+                >
+                  <option value="">全部用户</option>
+                  <option
+                    v-for="user in admin.users.filter(
+                      (item) => item.role === 'user',
+                    )"
+                    :key="user.id"
+                    :value="user.id"
+                  >
+                    {{ user.email }}
+                  </option>
+                </select>
+                <select
+                  v-model="usageFilters.model"
+                  aria-label="按模型筛选请求用量"
+                  @change="applyUsageFilters"
+                >
+                  <option value="">全部模型</option>
+                  <option
+                    v-for="model in admin.models"
+                    :key="model.id"
+                    :value="model.public_model_id"
+                  >
+                    {{ model.public_model_id }}
+                  </option>
+                </select>
+                <span class="filter-count"
+                  >{{ admin.usage_pagination?.total || 0 }} 条</span
+                >
+              </div>
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -2117,9 +2737,7 @@ onMounted(async () => {
                     </tr>
                   </thead>
                   <tbody>
-                    <template
-                      v-for="row in pageRows('admin-usage', admin.usage)"
-                      :key="row.id"
+                    <template v-for="row in admin.usage" :key="row.id"
                       ><tr>
                         <td>{{ date(row.occurred_at) }}</td>
                         <td>{{ row.user_email }}</td>
@@ -2194,11 +2812,11 @@ onMounted(async () => {
                 </table>
               </div>
               <PaginationBar
-                :page="pageNumber('admin-usage', admin.usage)"
-                :pages="pageCount(admin.usage)"
-                :total="admin.usage.length"
-                @previous="changePage('admin-usage', admin.usage, -1)"
-                @next="changePage('admin-usage', admin.usage, 1)"
+                :page="admin.usage_pagination?.page || 1"
+                :pages="admin.usage_pagination?.pages || 1"
+                :total="admin.usage_pagination?.total || 0"
+                @previous="changeUsagePage(-1)"
+                @next="changeUsagePage(1)"
               />
             </section>
             <section class="panel">
@@ -2208,6 +2826,16 @@ onMounted(async () => {
                   <p>仅在充值、余额调整或赠额不足产生实际扣费时出现。</p>
                 </div>
               </div>
+              <ListFilterBar
+                v-model="listFilters['admin-billing'].query"
+                v-model:category="listFilters['admin-billing'].category"
+                :category-options="kindOptions"
+                category-label="全部流水类型"
+                :count="
+                  filteredRows('admin-billing', admin.transactions).length
+                "
+                placeholder="搜索用户、类型或备注"
+              />
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -2224,15 +2852,15 @@ onMounted(async () => {
                     <tr
                       v-for="row in pageRows(
                         'admin-billing',
-                        admin.transactions,
+                        filteredRows('admin-billing', admin.transactions),
                       )"
                       :key="row.id"
                     >
                       <td>{{ date(row.created_at) }}</td>
                       <td>
-                        <code>{{ row.user_id.slice(0, 8) }}</code>
+                        {{ row.user_email || row.user_id.slice(0, 8) }}
                       </td>
-                      <td>{{ row.kind }}</td>
+                      <td>{{ kindLabel(row.kind) }}</td>
                       <td>{{ money(row.amount_micros) }}</td>
                       <td>{{ money(row.balance_after_micros) }}</td>
                       <td>{{ row.note }}</td>
@@ -2246,11 +2874,32 @@ onMounted(async () => {
                 </table>
               </div>
               <PaginationBar
-                :page="pageNumber('admin-billing', admin.transactions)"
-                :pages="pageCount(admin.transactions)"
-                :total="admin.transactions.length"
-                @previous="changePage('admin-billing', admin.transactions, -1)"
-                @next="changePage('admin-billing', admin.transactions, 1)"
+                :page="
+                  pageNumber(
+                    'admin-billing',
+                    filteredRows('admin-billing', admin.transactions),
+                  )
+                "
+                :pages="
+                  pageCount(filteredRows('admin-billing', admin.transactions))
+                "
+                :total="
+                  filteredRows('admin-billing', admin.transactions).length
+                "
+                @previous="
+                  changePage(
+                    'admin-billing',
+                    filteredRows('admin-billing', admin.transactions),
+                    -1,
+                  )
+                "
+                @next="
+                  changePage(
+                    'admin-billing',
+                    filteredRows('admin-billing', admin.transactions),
+                    1,
+                  )
+                "
               />
             </section>
           </section>
@@ -2288,9 +2937,9 @@ onMounted(async () => {
                     type="number" /></label
                 ><label
                   >重置周期<select v-model="settings.default_quota_reset">
-                    <option>daily</option>
-                    <option>weekly</option>
-                    <option>monthly</option>
+                    <option value="daily">每日</option>
+                    <option value="weekly">每周</option>
+                    <option value="monthly">每月</option>
                   </select></label
                 ><label
                   >重置时间<input
@@ -2377,6 +3026,17 @@ onMounted(async () => {
                 <p>LLMCtl 持久记录管理操作、失败结果与操作者。</p>
               </div>
             </div>
+            <ListFilterBar
+              v-model="listFilters['admin-audit'].query"
+              v-model:status="listFilters['admin-audit'].status"
+              :status-options="[
+                { value: 'success', label: '成功' },
+                { value: 'failed', label: '失败' },
+              ]"
+              status-label="全部结果"
+              :count="filteredRows('admin-audit', admin.audit).length"
+              placeholder="搜索操作者、动作、目标或详情"
+            />
             <div class="table-wrap panel">
               <table>
                 <thead>
@@ -2391,7 +3051,10 @@ onMounted(async () => {
                 </thead>
                 <tbody>
                   <tr
-                    v-for="row in pageRows('admin-audit', admin.audit)"
+                    v-for="row in pageRows(
+                      'admin-audit',
+                      filteredRows('admin-audit', admin.audit),
+                    )"
                     :key="row.id"
                   >
                     <td>{{ date(row.created_at) }}</td>
@@ -2404,7 +3067,7 @@ onMounted(async () => {
                       <span
                         class="status"
                         :class="row.status === 'success' ? 'ok' : 'bad'"
-                        >{{ row.status }}</span
+                        >{{ statusLabel(row.status) }}</span
                       >
                     </td>
                     <td class="detail">{{ row.detail }}</td>
@@ -2413,11 +3076,28 @@ onMounted(async () => {
               </table>
             </div>
             <PaginationBar
-              :page="pageNumber('admin-audit', admin.audit)"
-              :pages="pageCount(admin.audit)"
-              :total="admin.audit.length"
-              @previous="changePage('admin-audit', admin.audit, -1)"
-              @next="changePage('admin-audit', admin.audit, 1)"
+              :page="
+                pageNumber(
+                  'admin-audit',
+                  filteredRows('admin-audit', admin.audit),
+                )
+              "
+              :pages="pageCount(filteredRows('admin-audit', admin.audit))"
+              :total="filteredRows('admin-audit', admin.audit).length"
+              @previous="
+                changePage(
+                  'admin-audit',
+                  filteredRows('admin-audit', admin.audit),
+                  -1,
+                )
+              "
+              @next="
+                changePage(
+                  'admin-audit',
+                  filteredRows('admin-audit', admin.audit),
+                  1,
+                )
+              "
             />
           </section>
         </template>
@@ -2432,16 +3112,37 @@ onMounted(async () => {
       <div class="form-stack">
         <label
           >状态<select v-model="userEdit.status">
-            <option>active</option>
-            <option>disabled</option>
+            <option value="active">正常</option>
+            <option value="disabled">已禁用</option>
           </select></label
-        ><label
-          >用户组<select v-model="userEdit.group_ids" multiple>
-            <option v-for="group in admin?.groups" :value="group.id">
-              {{ group.name }}
-            </option>
-          </select></label
-        ><label
+        >
+        <fieldset class="choice-group">
+          <legend>所属用户组</legend>
+          <label
+            v-for="group in admin?.groups.filter(
+              (item) => item.status === 'active',
+            )"
+            :key="group.id"
+            class="choice-option"
+          >
+            <input
+              v-model="userEdit.group_ids"
+              type="checkbox"
+              :value="group.id"
+            />
+            <span
+              ><strong>{{ group.name }}</strong
+              ><small>{{ group.description || "未填写说明" }}</small></span
+            >
+          </label>
+          <p
+            v-if="!admin?.groups.some((item) => item.status === 'active')"
+            class="muted"
+          >
+            尚无可用用户组
+          </p>
+        </fieldset>
+        <label
           >金额调整（可为负数）<input v-model="userEdit.balance_delta" /></label
         ><label
           >赠送 Token<input
@@ -2456,10 +3157,10 @@ onMounted(async () => {
           </select></label
         ><label
           >赠额重置<select v-model="userEdit.grant_reset">
-            <option>none</option>
-            <option>daily</option>
-            <option>weekly</option>
-            <option>monthly</option>
+            <option value="none">仅本次</option>
+            <option value="daily">每日重置</option>
+            <option value="weekly">每周重置</option>
+            <option value="monthly">每月重置</option>
           </select></label
         ><label v-if="userEdit.grant_reset !== 'none'"
           >重置时间<input
@@ -2489,8 +3190,8 @@ onMounted(async () => {
         <label>描述<textarea v-model="groupEdit.description"></textarea></label
         ><label
           >状态<select v-model="groupEdit.status">
-            <option>active</option>
-            <option>disabled</option>
+            <option value="active">正常</option>
+            <option value="disabled">已停用</option>
           </select></label
         ><button
           type="button"

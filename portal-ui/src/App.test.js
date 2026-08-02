@@ -44,24 +44,43 @@ describe("LLMCtl portal contracts", () => {
     expect(style).not.toMatch(/\.toast\s*\{[\s\S]{0,120}top:\s*92px/);
   });
 
-  it("paginates every growing catalog and ledger", () => {
+  it("copies keys through a tested browser fallback and never claims success early", () => {
+    expect(source).toContain("writeClipboardText");
+    expect(source).toContain("result.copied");
+    expect(source).toContain("revealOnFailure");
+    expect(source).not.toContain("navigator.clipboard.writeText(value)");
+  });
+
+  it("filters and paginates every growing catalog and ledger", () => {
     for (const key of [
       "user-models",
       "user-grants",
-      "user-usage",
       "user-billing",
       "admin-models",
       "admin-free",
       "admin-users",
       "admin-groups",
-      "admin-usage",
       "admin-billing",
       "admin-audit",
-    ])
+    ]) {
       expect(source).toMatch(new RegExp(`pageRows\\(\\s*["']${key}["']`));
+      expect(source).toContain(`listFilters['${key}']`);
+    }
+    expect(source).toContain("usage-page?");
+    expect(source).toContain("usage_pagination?.total");
+    expect(source).toContain("applyUsageFilters");
     expect(source).toContain(
       "第 ${props.page} / ${props.pages} 页 · 共 ${props.total} 条",
     );
+  });
+
+  it("refreshes role data on navigation and humanizes account editing", () => {
+    expect(source).toContain('@click="selectSection(item[0])"');
+    expect(source).toContain("workspaceLoadVersion");
+    expect(source).toContain("workspaceRefreshing");
+    expect(source).toContain('class="choice-group"');
+    expect(source).toContain('<option value="active">正常</option>');
+    expect(source).toContain('<option value="none">仅本次</option>');
   });
 
   it("shows user and administrator request contents and honest empty ledgers", () => {
