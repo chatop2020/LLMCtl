@@ -27,6 +27,16 @@ MANAGED_TAG = "llmctl-managed"
 MANAGED_TOKEN = "llmctl-default"
 OMNIROUTE_MANAGED_KEY = "llmctl-management"
 OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually."
+# Keep OmniRoute in the routing plane and leave request scheduling to vLLM.  The
+# upstream default queues behind a saturated Combo member for 30 seconds before
+# trying the next member.  That produces a deterministic 30-second stall for
+# multimodal requests even while another worker is idle.  OmniRoute currently
+# accepts at most 20 in-flight requests per target and a minimum queue timeout of
+# one second, so use those explicit bounds for every LLMCtl-owned connection and
+# Combo.  vLLM's MAX_NUM_SEQS remains the active-sequence limit; extra in-flight
+# requests wait in vLLM's scheduler instead of OmniRoute's opaque semaphore.
+OMNIROUTE_INFLIGHT_PER_WORKER = 20
+OMNIROUTE_QUEUE_TIMEOUT_MS = 1000
 
 
 def worker_origin(worker_id: int) -> str:
@@ -241,7 +251,10 @@ def omniroute_plan(worker_ids: Iterable[int]) -> str:
     """Persist the desired OmniRoute graph without embedding credentials."""
     model = required_env("SERVED_MODEL_NAME")
     base_port = int(required_env("WORKER_BASE_PORT"))
-    concurrency_per_worker = max(1, min(int(required_env("MAX_NUM_SEQS")), 20))
+    # MAX_NUM_SEQS limits active vLLM sequences, not HTTP requests admitted by
+    # the gateway.  Capping OmniRoute at MAX_NUM_SEQS makes its own semaphore
+    # queue first and invokes the upstream 30-second failover timeout.
+    concurrency_per_worker = OMNIROUTE_INFLIGHT_PER_WORKER
     data = {
         "gateway": "omniroute",
         "managed_tag": MANAGED_TAG,
@@ -253,6 +266,7 @@ def omniroute_plan(worker_ids: Iterable[int]) -> str:
         # the first target before rotation advances.
         "sticky_round_robin_limit": 1,
         "concurrency_per_worker": concurrency_per_worker,
+        "queue_timeout_ms": OMNIROUTE_QUEUE_TIMEOUT_MS,
         "supports_vision": os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1",
         "workers": [
             {
@@ -458,7 +472,7 @@ def reconcile_omniroute(
     base_port = int(required_env("WORKER_BASE_PORT"))
     backend_key = required_env("BACKEND_API_KEY")
     supports_vision = os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
-    concurrency_per_worker = max(1, min(int(required_env("MAX_NUM_SEQS")), 20))
+    concurrency_per_worker = OMNIROUTE_INFLIGHT_PER_WORKER
 
     nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
     connections = response_list(client.request("GET", "/api/providers?limit=1000"), "connections")
@@ -518,6 +532,7 @@ def reconcile_omniroute(
                     "name": name,
                     "apiKey": backend_key,
                     "priority": 1,
+                    "maxConcurrent": concurrency_per_worker,
                     "defaultModel": model,
                     "isActive": True,
                     "testStatus": "success",
@@ -537,6 +552,7 @@ def reconcile_omniroute(
                     "apiKey": backend_key,
                     "name": name,
                     "priority": 1,
+                    "maxConcurrent": concurrency_per_worker,
                     "testStatus": "success",
                     "defaultModel": model,
                 },
@@ -606,6 +622,10 @@ def reconcile_omniroute(
             # eager rotation across every healthy LLMCtl worker.
             "stickyRoundRobinLimit": 1,
             "concurrencyPerModel": concurrency_per_worker,
+            # OmniRoute 3.8.x defaults to 30 seconds.  Its API strips the old
+            # queueDepth field on update, but queueTimeoutMs is supported and
+            # keeps a saturated target from hiding an idle fallback worker.
+            "queueTimeoutMs": OMNIROUTE_QUEUE_TIMEOUT_MS,
             "healthCheckEnabled": True,
             "maxRetries": 1,
             "failoverBeforeRetry": True,
