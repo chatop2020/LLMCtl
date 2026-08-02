@@ -203,7 +203,7 @@ Private or gated Hugging Face models require `HF_TOKEN` when the installer runs,
 sudo llmctl upgrade
 ```
 
-The command first asks whether to fetch the latest `chatop2020/LLMCtl` `main` from GitHub, then pins the download to one exact commit. If GitHub is not directly reachable, it validates the saved maintenance proxy first and asks for a new proxy only when necessary. The proxy is limited to this maintenance operation and may optionally be saved; it is never injected into inference services. The entire old control plane is backed up before replacement. If the account portal is running, only that service is stopped briefly for health acceptance, with automatic rollback on failure.
+The command first asks whether to fetch the latest `chatop2020/LLMCtl` `main` from GitHub, then pins the download to one exact commit. Its preflight checks both the GitHub API and the archive download host. Even after preflight succeeds, a real metadata or ZIP transfer failure triggers the saved maintenance proxy and then an interactive new-proxy prompt before retrying. The proxy is limited to this maintenance operation and may optionally be saved; it is never injected into inference services. The entire old control plane is backed up before replacement. If the account portal is running, only that service is stopped briefly for health acceptance, with automatic rollback on failure.
 
 For a fully offline server, upload a repository ZIP and run:
 
@@ -266,7 +266,7 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 - The model editor reads context windows, maximum output limits, and detectable capabilities from the active AI gateway. For a multi-target routing combo, the portal shows the conservative usable value and lists every resolved target.
 - When an administrator changes the context or output limit, LLMCtl writes it through the gateway's native API for every resolvable target. Partial failures remain visible, name the failed targets, and are audited; they are never presented as a successful sync.
 - Model descriptions, OCR labels, and access scopes are LLMCtl publication metadata. They appear in the administration list and user catalog but are not misrepresented as gateway-native parameters.
-- Billing separates request usage from monetary balance transactions. An empty money ledger is expected when grants cover all requests; token, model, user, and retained request-text records remain visible.
+- Billing separates request usage from monetary balance transactions. An empty money ledger is expected when grants cover all requests. Users can inspect only their own request input; administrators can additionally inspect the final model output retained by the gateway, with an explicit notice when response retention is unavailable.
 - `llmctl upgrade` upgrades only the LLMCtl control plane, portal assets, and maintenance scripts, applying in-place database migrations. It does not rebuild or replace existing workers or model weights.
 
 ## Security Notes

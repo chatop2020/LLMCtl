@@ -1,5 +1,14 @@
 <script setup>
-import { computed, h, nextTick, onMounted, reactive, ref, watch } from "vue";
+import {
+  computed,
+  h,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+} from "vue";
 import {
   chunkParts,
   consumeChatResponse,
@@ -14,9 +23,11 @@ const admin = ref(null);
 const busy = ref(false);
 const operation = ref("");
 const workspaceRefreshing = ref(false);
+const usageRefreshing = ref(false);
 const toast = reactive({ text: "", kind: "ok" });
 let toastTimer = null;
 let workspaceLoadVersion = 0;
+let usageRefreshTimer = null;
 const authMode = ref(
   location.hash.startsWith("#/register")
     ? "register"
@@ -355,8 +366,25 @@ function dismissToast() {
 async function load() {
   publicConfig.value = await api("public");
   session.value = await api("session");
-  if (!session.value.authenticated) return;
+  if (!session.value.authenticated) {
+    clearAuthenticatedClientState();
+    return;
+  }
   await refreshWorkspace();
+}
+
+function clearAuthenticatedClientState() {
+  sessionStorage.removeItem("llmctl_api_key");
+  keyOnce.value = "";
+  showApiKey.value = false;
+  dashboard.value = null;
+  admin.value = null;
+  section.value = "overview";
+  usageFilters.user = "";
+  usageFilters.model = "";
+  for (const key of Object.keys(requestDetails)) delete requestDetails[key];
+  resetChatResult();
+  chat.status = "idle";
 }
 
 function applyAdminSnapshot(snapshot) {
@@ -407,10 +435,44 @@ async function refreshWorkspace() {
   }
 }
 
+async function syncUsageAndRefresh(options = {}) {
+  const {
+    reconcile = true,
+    announce = false,
+    preservePage = true,
+    silent = false,
+  } = options;
+  if (!session.value?.authenticated || usageRefreshing.value) return;
+  const target = isAdmin.value ? admin.value : dashboard.value;
+  const previousPage = preservePage
+    ? target?.usage_pagination?.page || 1
+    : 1;
+  usageRefreshing.value = true;
+  try {
+    if (reconcile) {
+      await api(isAdmin.value ? "admin/billing/reconcile" : "usage/reconcile", {
+        method: "POST",
+        body: "{}",
+      });
+    }
+    await refreshWorkspace();
+    if (section.value === "billing") await loadUsagePage(previousPage);
+    if (announce) notify("用量数据已更新");
+  } catch (error) {
+    if (!silent) notify(`用量更新失败：${error.message}`, "bad");
+  } finally {
+    usageRefreshing.value = false;
+  }
+}
+
 async function selectSection(nextSection) {
   section.value = nextSection;
   try {
-    await refreshWorkspace();
+    if (nextSection === "billing") {
+      await syncUsageAndRefresh({ preservePage: false });
+    } else {
+      await refreshWorkspace();
+    }
   } catch (error) {
     notify(`页面数据更新失败：${error.message}`, "bad");
   }
@@ -450,6 +512,8 @@ async function action(fn, success = "操作成功", options = {}) {
 async function login() {
   await action(async () => {
     await api("auth/login", { method: "POST", body: JSON.stringify(auth) });
+    auth.password = "";
+    auth.confirm = "";
   }, "登录成功");
 }
 
@@ -483,10 +547,9 @@ async function verify() {
 
 async function logout() {
   await api("auth/logout", { method: "POST", body: "{}" });
-  sessionStorage.removeItem("llmctl_api_key");
-  keyOnce.value = "";
-  dashboard.value = null;
-  admin.value = null;
+  clearAuthenticatedClientState();
+  auth.password = "";
+  auth.confirm = "";
   await load();
 }
 
@@ -1160,9 +1223,29 @@ async function testSmtp() {
 onMounted(async () => {
   try {
     await load();
+    usageRefreshTimer = window.setInterval(() => {
+      if (
+        section.value !== "billing" ||
+        document.hidden ||
+        busy.value ||
+        usageRefreshing.value
+      )
+        return;
+      syncUsageAndRefresh({
+        reconcile: !isAdmin.value,
+        preservePage: true,
+        silent: true,
+      });
+    }, 15_000);
   } catch (error) {
     notify(error.message, "bad");
   }
+});
+
+onBeforeUnmount(() => {
+  if (usageRefreshTimer) window.clearInterval(usageRefreshTimer);
+  if (chatTimer) window.clearInterval(chatTimer);
+  if (toastTimer) window.clearTimeout(toastTimer);
 });
 </script>
 
@@ -1763,6 +1846,19 @@ onMounted(async () => {
                 <h1>用量与账单</h1>
                 <p>赠送 Token 先消耗，超出部分按模型价格扣减金额余额。</p>
               </div>
+              <button
+                class="ghost"
+                type="button"
+                :disabled="usageRefreshing"
+                @click="
+                  syncUsageAndRefresh({
+                    announce: true,
+                    preservePage: false,
+                  })
+                "
+              >
+                {{ usageRefreshing ? "更新中…" : "刷新用量" }}
+              </button>
             </div>
             <section class="panel">
               <h2>Token 赠额</h2>
@@ -2231,10 +2327,18 @@ onMounted(async () => {
                       filteredRows('admin-models', admin.models),
                     )"
                     :key="model.id"
+                    :class="{ 'model-row-disabled': model.status === 'disabled' }"
                   >
                     <td class="model-summary">
-                      <strong>{{ model.display_name }}</strong
-                      ><code>{{ model.public_model_id }}</code
+                      <div class="model-name-line">
+                        <strong>{{ model.display_name }}</strong>
+                        <span
+                          v-if="model.status === 'disabled'"
+                          class="status bad"
+                          >已停用</span
+                        >
+                      </div>
+                      <code>{{ model.public_model_id }}</code
                       ><small>{{
                         model.description || "未填写模型描述"
                       }}</small>
@@ -2269,12 +2373,16 @@ onMounted(async () => {
                       <span
                         class="status"
                         :class="
-                          model.health_status === 'healthy' ? 'ok' : 'warn'
+                          model.status === 'published'
+                            ? 'ok'
+                            : model.status === 'disabled' ||
+                                model.status === 'error'
+                              ? 'bad'
+                              : 'warn'
                         "
-                        >{{ statusLabel(model.health_status) }}</span
-                      ><small
-                        >参数
-                        {{ model.metadata_sync_status || "unknown" }}</small
+                        >{{ statusLabel(model.status) }}</span
+                      ><small>最近测试：{{ statusLabel(model.health_status) }}</small
+                      ><small>参数：{{ statusLabel(model.metadata_sync_status) }}</small
                       >
                     </td>
                     <td class="row-actions">
@@ -2666,19 +2774,15 @@ onMounted(async () => {
               </div>
               <button
                 class="primary"
-                :disabled="busy"
+                :disabled="usageRefreshing"
                 @click="
-                  action(
-                    () =>
-                      api('admin/billing/reconcile', {
-                        method: 'POST',
-                        body: '{}',
-                      }),
-                    '用量已结算',
-                  )
+                  syncUsageAndRefresh({
+                    announce: true,
+                    preservePage: false,
+                  })
                 "
               >
-                {{ operation === "general" ? "同步中…" : "同步用量" }}
+                {{ usageRefreshing ? "同步中…" : "同步用量" }}
               </button>
             </div>
             <section class="panel">
@@ -2781,24 +2885,50 @@ onMounted(async () => {
                           >
                             正在读取请求内容…
                           </div>
-                          <div
-                            v-else-if="
-                              !requestDetails[row.request_id].available
-                            "
-                            class="empty"
-                          >
-                            该请求未保留可显示的文本内容。
-                          </div>
-                          <div v-else class="request-messages">
-                            <article
-                              v-for="(message, index) in requestDetails[
-                                row.request_id
-                              ].messages"
-                              :key="index"
-                            >
-                              <strong>{{ message.role }}</strong>
-                              <pre>{{ message.content }}</pre>
-                            </article>
+                          <div v-else class="request-detail-sections">
+                            <section>
+                              <h3>请求输入</h3>
+                              <div
+                                v-if="requestDetails[row.request_id].available"
+                                class="request-messages"
+                              >
+                                <article
+                                  v-for="(message, index) in requestDetails[
+                                    row.request_id
+                                  ].messages"
+                                  :key="`request-${index}`"
+                                >
+                                  <strong>{{ message.role }}</strong>
+                                  <pre>{{ message.content }}</pre>
+                                </article>
+                              </div>
+                              <p v-else class="muted">
+                                该请求未保留可显示的输入内容。
+                              </p>
+                            </section>
+                            <section class="admin-response-detail">
+                              <h3>模型输出 <small>仅管理员可见</small></h3>
+                              <div
+                                v-if="
+                                  requestDetails[row.request_id]
+                                    .response_available
+                                "
+                                class="request-messages"
+                              >
+                                <article
+                                  v-for="(message, index) in requestDetails[
+                                    row.request_id
+                                  ].response_messages"
+                                  :key="`response-${index}`"
+                                >
+                                  <strong>{{ message.role }}</strong>
+                                  <pre>{{ message.content }}</pre>
+                                </article>
+                              </div>
+                              <p v-else class="muted">
+                                当前接入层没有保留可显示的最终响应；请检查请求日志保留设置。
+                              </p>
+                            </section>
                           </div>
                         </td>
                       </tr></template

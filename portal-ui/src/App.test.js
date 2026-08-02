@@ -81,6 +81,22 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain('class="choice-group"');
     expect(source).toContain('<option value="active">正常</option>');
     expect(source).toContain('<option value="none">仅本次</option>');
+    expect(source).toContain('api(isAdmin.value ? "admin/billing/reconcile" : "usage/reconcile"');
+    expect(source).toContain("usageRefreshTimer = window.setInterval");
+    expect(source).toContain("reconcile: !isAdmin.value");
+    expect(source).toContain("clearAuthenticatedClientState()");
+    expect(source).toContain(
+      "for (const key of Object.keys(requestDetails)) delete requestDetails[key]",
+    );
+  });
+
+  it("marks disabled models and keeps compact status badges readable", () => {
+    expect(source).toContain("'model-row-disabled': model.status === 'disabled'");
+    expect(source).toContain('v-if="model.status === \'disabled\'"');
+    expect(source).toContain("最近测试：{{ statusLabel(model.health_status) }}");
+    expect(style).toMatch(/\.status\s*\{[\s\S]*?white-space:\s*nowrap/);
+    expect(style).toContain(".resource-head > div");
+    expect(style).toContain("text-overflow: ellipsis");
   });
 
   it("shows user and administrator request contents and honest empty ledgers", () => {
@@ -88,6 +104,9 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain('`${isAdmin.value ? "admin/" : ""}usage/');
     expect(source).toContain("暂无金额流水；现有请求可能全部由赠送 Token 抵扣");
     expect(source).toContain("尚无请求用量；点击“同步用量”");
+    expect(source).toContain("模型输出 <small>仅管理员可见</small>");
+    expect(source).toContain("response_messages");
+    expect(source).toContain("该请求没有保留可显示的文本内容");
   });
 
   it("keeps local administration visible when the AI gateway is degraded", () => {

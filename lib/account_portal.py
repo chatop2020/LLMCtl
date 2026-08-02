@@ -41,7 +41,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.6.2"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -223,6 +223,142 @@ def request_content_summary(request_body: Any, max_characters: int = 20_000) -> 
         result.append({"role": message["role"][:32], "content": content})
         remaining -= len(content)
     return {"available": bool(result), "messages": result, "truncated": truncated}
+
+
+def response_content_summary(response_body: Any, max_characters: int = 40_000) -> dict[str, Any]:
+    """Extract final model text from retained OpenAI-compatible response artifacts."""
+    if isinstance(response_body, str):
+        stripped = response_body.strip()
+        if stripped.startswith("data:"):
+            chunks: list[dict[str, Any]] = []
+            for line in stripped.splitlines():
+                line = line.strip()
+                if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(chunk, dict):
+                    chunks.append(chunk)
+            response_body = {"chunks": chunks}
+        else:
+            try:
+                response_body = json.loads(stripped)
+            except json.JSONDecodeError:
+                response_body = {"content": stripped}
+    if not isinstance(response_body, (dict, list)):
+        return {"available": False, "messages": [], "truncated": False}
+
+    messages: list[dict[str, str]] = []
+
+    def add(role: str, value: Any) -> None:
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, list):
+            parts: list[str] = []
+            for block in value:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    for key in ("text", "output_text", "content"):
+                        if isinstance(block.get(key), str):
+                            parts.append(str(block[key]))
+                            break
+            text = "\n".join(parts)
+        else:
+            text = ""
+        if text:
+            messages.append({"role": role, "content": text})
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in ("reasoning_content", "reasoning_text", "reasoning"):
+            if isinstance(value.get(key), (str, list)):
+                add("reasoning", value[key])
+        for key in ("output_text", "text"):
+            if isinstance(value.get(key), str):
+                add("assistant", value[key])
+        if isinstance(value.get("content"), (str, list)):
+            add(str(value.get("role") or "assistant"), value["content"])
+        for key in (
+            "message",
+            "delta",
+            "choices",
+            "output",
+            "candidates",
+            "chunks",
+            "response",
+            "body",
+            "data",
+        ):
+            if key in value:
+                visit(value[key], depth + 1)
+
+    visit(response_body)
+    compact: list[dict[str, str]] = []
+    for message in messages:
+        if compact and compact[-1]["role"] == message["role"]:
+            compact[-1]["content"] += message["content"]
+        else:
+            compact.append(dict(message))
+    remaining = max_characters
+    truncated = False
+    result: list[dict[str, str]] = []
+    for message in compact:
+        if remaining <= 0:
+            truncated = True
+            break
+        content = message["content"]
+        if len(content) > remaining:
+            content = content[:remaining] + "…"
+            truncated = True
+        result.append({"role": message["role"][:32], "content": content})
+        remaining -= len(content)
+    return {"available": bool(result), "messages": result, "truncated": truncated}
+
+
+def retained_response_summary(detail: dict[str, Any]) -> dict[str, Any]:
+    """Find the final client response artifact across OmniRoute schema versions."""
+    preferred_keys = (
+        "finalClientResponse",
+        "finalClientResponseBody",
+        "clientResponse",
+        "clientResponseBody",
+        "responseBody",
+        "finalResponse",
+        "providerResponseBody",
+        "providerResponse",
+    )
+
+    def find(value: Any, depth: int = 0) -> Any:
+        if depth > 4 or not isinstance(value, dict):
+            return None
+        for key in preferred_keys:
+            if key in value and value[key] not in (None, "", {}, []):
+                return value[key]
+        for key, nested in value.items():
+            if key in {"requestBody", "providerRequestBody", "translatedRequest"}:
+                continue
+            found = find(nested, depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    payload = find(detail)
+    summary = response_content_summary(payload)
+    summary["retained"] = payload is not None or any(
+        bool(detail.get(key))
+        for key in ("hasResponseBody", "hasClientResponse", "hasProviderResponse")
+    )
+    return summary
 
 
 def now() -> int:
@@ -666,6 +802,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_ledger(user_id,occurred_
 CREATE INDEX IF NOT EXISTS idx_usage_user_time_v2 ON usage_ledger(user_id,occurred_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_ledger(occurred_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage_ledger(public_model_id,occurred_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_model_fk ON usage_ledger(model_id,id);
 CREATE INDEX IF NOT EXISTS idx_balance_user_time ON balance_transactions(user_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_grants_user_status ON token_grants(user_id,status);
 """
@@ -1695,6 +1832,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = {"id": self.app.control.save_group(payload)}
             elif path == "/portal-api/admin/permissions/reconcile":
                 result = self.app.control.sync_all_users()
+            elif path == "/portal-api/usage/reconcile":
+                if user["role"] != "user":
+                    raise ValueError("only a user account can refresh its own usage")
+                result = self.app.control.reconcile_usage(
+                    user_id=str(user["id"]), min_interval=10
+                )
             elif path == "/portal-api/admin/billing/reconcile":
                 result = self.app.control.reconcile_usage()
             elif path == "/portal-api/admin/settings":
@@ -2458,6 +2601,7 @@ class PortalControlPlane:
     def __init__(self, config: Config, db: Database, omni: OmniRouteClient):
         self.config, self.db, self.omni = config, db, omni
         self.lock = threading.RLock()
+        self.usage_reconciled_at: dict[str, int] = {}
 
     @staticmethod
     def rows(rows: Any) -> list[dict[str, Any]]:
@@ -3213,20 +3357,156 @@ class PortalControlPlane:
                 )
         return len(due)
 
-    def reconcile_usage(self) -> dict[str, int]:
+    def reconcile_usage(
+        self, user_id: str | None = None, min_interval: int = 0
+    ) -> dict[str, int]:
         # Admin-triggered reconciliation and the maintenance thread may run at
         # the same time. Serialize the complete fetch/ledger/key-sync cycle.
         with self.lock:
-            return self._reconcile_usage()
+            throttle_key = user_id or "*"
+            stamp = now()
+            if min_interval > 0 and stamp - self.usage_reconciled_at.get(
+                throttle_key, 0
+            ) < min_interval:
+                return {
+                    "processed": 0,
+                    "skipped": 0,
+                    "users": 0,
+                    "sync_failed": 0,
+                    "relabeled": 0,
+                    "throttled": 1,
+                }
+            result = self._reconcile_usage(user_id=user_id)
+            self.usage_reconciled_at[throttle_key] = now()
+            return result
 
-    def _reconcile_usage(self) -> dict[str, int]:
+    @staticmethod
+    def _usage_model_identities(item: dict[str, Any]) -> list[str]:
+        identities: list[str] = []
+        for key in (
+            "comboName",
+            "combo",
+            "requestedModel",
+            "requested_model",
+            "model",
+        ):
+            value = str(item.get(key, "") or "").strip()
+            if value and value not in identities:
+                identities.append(value)
+        return identities
+
+    def _resolve_usage_model(
+        self,
+        connection: sqlite3.Connection,
+        user_id: str,
+        item: dict[str, Any],
+    ) -> sqlite3.Row | None:
+        """Resolve a gateway log to the public model the user was allowed to call."""
+        identities = self._usage_model_identities(item)
+        if not identities:
+            return None
+        eligible = connection.execute(
+            """SELECT DISTINCT p.* FROM published_models p
+               JOIN model_access a ON a.model_id=p.id
+               WHERE p.status='published' AND (
+                 a.subject_type='all' OR
+                 (a.subject_type='user' AND a.subject_id=?) OR
+                 (a.subject_type='group' AND a.subject_id IN
+                   (SELECT m.group_id FROM user_group_members m
+                    JOIN user_groups g ON g.id=m.group_id
+                    WHERE m.user_id=? AND g.status='active'))
+               ) ORDER BY p.public_model_id""",
+            (user_id, user_id),
+        ).fetchall()
+        for identity in identities:
+            exact = [row for row in eligible if row["public_model_id"] == identity]
+            if len(exact) == 1:
+                return exact[0]
+        for identity in identities:
+            mapped = [
+                row
+                for row in eligible
+                if identity in {str(row["mapping_id"] or ""), str(row["source_ref"] or "")}
+            ]
+            if len(mapped) == 1:
+                return mapped[0]
+        for identity in identities:
+            sourced = [
+                row for row in eligible if str(row["source_model"] or "") == identity
+            ]
+            if len(sourced) == 1:
+                return sourced[0]
+        # Legacy rows may refer to a model that has since been disabled and has
+        # no active replacement. Keep that exact historical identity rather
+        # than inventing a public alias.
+        for identity in identities:
+            exact = connection.execute(
+                "SELECT * FROM published_models WHERE public_model_id=? LIMIT 1",
+                (identity,),
+            ).fetchone()
+            if exact:
+                return exact
+        return None
+
+    def _repair_usage_model_ids(
+        self, connection: sqlite3.Connection, user_id: str | None = None
+    ) -> int:
+        parameters: list[Any] = []
+        user_clause = ""
+        if user_id:
+            user_clause = " AND l.user_id=?"
+            parameters.append(user_id)
+        rows = connection.execute(
+            """SELECT l.* FROM usage_ledger l
+               LEFT JOIN published_models current ON current.id=l.model_id
+               WHERE (current.id IS NULL OR current.status!='published')"""
+            + user_clause
+            + " ORDER BY l.id",
+            parameters,
+        ).fetchall()
+        repaired = 0
+        for row in rows:
+            resolved = self._resolve_usage_model(
+                connection,
+                str(row["user_id"]),
+                {
+                    "requestedModel": row["public_model_id"],
+                    "model": row["resolved_model"],
+                },
+            )
+            if (
+                resolved
+                and resolved["status"] == "published"
+                and int(resolved["created_at"] or 0) <= int(row["occurred_at"] or 0)
+                and (
+                    resolved["id"] != row["model_id"]
+                    or resolved["public_model_id"] != row["public_model_id"]
+                )
+            ):
+                # Financial amounts and the immutable price snapshot are never
+                # repriced; this only repairs the public model attribution.
+                connection.execute(
+                    "UPDATE usage_ledger SET model_id=?,public_model_id=? WHERE id=?",
+                    (resolved["id"], resolved["public_model_id"], row["id"]),
+                )
+                repaired += 1
+        return repaired
+
+    def _reconcile_usage(self, user_id: str | None = None) -> dict[str, int]:
         self.reset_due_grants()
         processed = skipped = 0
         changed_users: set[str] = set()
         with self.db.connect() as connection:
-            users = connection.execute(
-                "SELECT id,api_key_id FROM users WHERE role='user' AND api_key_id IS NOT NULL"
-            ).fetchall()
+            if user_id:
+                users = connection.execute(
+                    "SELECT id,api_key_id FROM users WHERE id=? AND role='user' AND api_key_id IS NOT NULL",
+                    (user_id,),
+                ).fetchall()
+            else:
+                users = connection.execute(
+                    "SELECT id,api_key_id FROM users WHERE role='user' AND api_key_id IS NOT NULL"
+                ).fetchall()
+            relabeled = self._repair_usage_model_ids(connection, user_id=user_id)
         for user in users:
             logs: list[dict[str, Any]] = []
             reached_checkpoint = False
@@ -3290,25 +3570,14 @@ class PortalControlPlane:
                 cached_tokens = int(tokens.get("cacheRead", 0) or 0)
                 reasoning_tokens = int(tokens.get("reasoning", 0) or 0)
                 occurred = self.parse_timestamp(item.get("timestamp"))
-                candidates = [
-                    str(item.get("requestedModel", "")), str(item.get("comboName", "")),
-                    str(item.get("model", "")),
-                ]
                 with self.db.connect() as connection:
                     if connection.execute(
                         "SELECT 1 FROM usage_ledger WHERE request_id=?", (request_id,)
                     ).fetchone():
                         continue
-                    model = None
-                    for candidate in candidates:
-                        if not candidate:
-                            continue
-                        model = connection.execute(
-                            "SELECT * FROM published_models WHERE public_model_id=? OR source_model=? ORDER BY public_model_id=? DESC LIMIT 1",
-                            (candidate, candidate, candidate),
-                        ).fetchone()
-                        if model:
-                            break
+                    model = self._resolve_usage_model(
+                        connection, str(user["id"]), item
+                    )
                     if not model:
                         skipped += 1
                         continue
@@ -3411,6 +3680,8 @@ class PortalControlPlane:
             "skipped": skipped,
             "users": len(changed_users),
             "sync_failed": sync_failed,
+            "relabeled": relabeled,
+            "throttled": 0,
         }
 
     def user_dashboard(self, user_id: str) -> dict[str, Any]:
@@ -3527,11 +3798,16 @@ class PortalControlPlane:
             raise ValueError("请求记录不存在")
         detail = self.omni.call_log(request_id)
         summary = request_content_summary(detail.get("requestBody"))
+        response_summary = retained_response_summary(detail)
         summary.update(
             {
                 "request_id": request_id,
                 "detail_state": str(detail.get("detailState", "")),
                 "retained": bool(detail.get("hasRequestBody")) or summary["available"],
+                "response_available": response_summary["available"],
+                "response_messages": response_summary["messages"],
+                "response_truncated": response_summary["truncated"],
+                "response_retained": response_summary["retained"],
             }
         )
         return summary

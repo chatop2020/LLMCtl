@@ -334,7 +334,7 @@ Upgrade the LLMCtl control plane itself without reinstalling or restarting worke
 sudo llmctl upgrade
 ```
 
-The command asks whether to fetch the latest `main` commit from GitHub. If direct access fails, it tries the saved maintenance proxy and then offers a new proxy; download starts only after the proxy retest succeeds. The upgrade is limited to `llmctl` and control-plane programs declared under `/usr/local/lib/llm-cluster/`. Models, workers, gateway runtime data, configuration, secrets, databases, and Nginx are preserved. A running account portal is stopped briefly for acceptance and automatically restored from `/var/backups/llmctl/` on failure.
+The command asks whether to fetch the latest `main` commit from GitHub. It preflights both the GitHub API and the ZIP archive host. If a real transfer still fails after preflight, it tries the saved maintenance proxy and then offers a new proxy before retrying. The upgrade is limited to `llmctl` and control-plane programs declared under `/usr/local/lib/llm-cluster/`. Models, workers, gateway runtime data, configuration, secrets, databases, and Nginx are preserved. A running account portal is stopped briefly for acceptance and automatically restored from `/var/backups/llmctl/` on failure.
 
 ```bash
 sudo llmctl upgrade --proxy http://192.168.9.104:1082 --save-proxy
@@ -389,7 +389,7 @@ Common interpretations:
 sudo llmctl upgrade
 ```
 
-After confirmation, LLMCtl downloads the latest project content from GitHub. If international access is unavailable, it offers temporary or persistent proxy configuration. The command updates `llmctl`, installer-maintenance scripts, the account-portal backend, and Vue assets, then applies backward-compatible SQLite migrations. Existing vLLM workers, model directories, routing combos, users, and ledgers are not reinstalled.
+After confirmation, LLMCtl downloads the latest project content from GitHub. A failure in either API preflight or the real ZIP transfer offers temporary or persistent proxy configuration and retries safely. The command updates `llmctl`, installer-maintenance scripts, the account-portal backend, and Vue assets, then applies backward-compatible SQLite migrations. Existing vLLM workers, model directories, routing combos, users, and ledgers are not reinstalled.
 
 After the upgrade, run:
 

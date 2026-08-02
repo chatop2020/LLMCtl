@@ -9,6 +9,7 @@ readonly PROGRAM_NAME="$(basename "$0")"
 readonly GITHUB_REPOSITORY="chatop2020/LLMCtl"
 readonly GITHUB_BRANCH="main"
 readonly GITHUB_API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+readonly GITHUB_WEB="https://github.com/${GITHUB_REPOSITORY}"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly PROXY_ENV="${CONFIG_DIR}/proxy.env"
 readonly CLUSTER_ENV="${CONFIG_DIR}/cluster.env"
@@ -183,13 +184,17 @@ curl_maintenance() {
 
 probe_direct() {
   curl_direct -fsS --connect-timeout 5 --max-time 12 -o /dev/null \
-    -H "User-Agent: LLMCtl-upgrader" "${GITHUB_API}/commits/${GITHUB_BRANCH}" >/dev/null 2>&1
+    -H "User-Agent: LLMCtl-upgrader" "${GITHUB_API}/commits/${GITHUB_BRANCH}" >/dev/null 2>&1 && \
+  curl_direct -fsSIL --connect-timeout 5 --max-time 12 -o /dev/null \
+    -H "User-Agent: LLMCtl-upgrader" "${GITHUB_WEB}" >/dev/null 2>&1
 }
 
 probe_proxy() {
   validate_proxy_url "${PROXY_URL}" || return 1
   curl_maintenance -fsS --connect-timeout 5 --max-time 15 -o /dev/null \
-    -H "User-Agent: LLMCtl-upgrader" "${GITHUB_API}/commits/${GITHUB_BRANCH}" >/dev/null 2>&1
+    -H "User-Agent: LLMCtl-upgrader" "${GITHUB_API}/commits/${GITHUB_BRANCH}" >/dev/null 2>&1 && \
+  curl_maintenance -fsSIL --connect-timeout 5 --max-time 15 -o /dev/null \
+    -H "User-Agent: LLMCtl-upgrader" "${GITHUB_WEB}" >/dev/null 2>&1
 }
 
 load_saved_proxy() {
@@ -215,8 +220,13 @@ save_proxy() {
 }
 
 prompt_new_proxy() {
-  local host port scheme
-  confirm "$(l10n 'GitHub 无法直连，是否现在设置代理？[Y/n] ' 'GitHub is not directly reachable. Configure a proxy now? [Y/n] ')" 1 || \
+  local reason="${1:-direct}" host port scheme prompt
+  if [[ "${reason}" == "transfer" ]]; then
+    prompt="$(l10n 'GitHub 实际下载失败，是否现在设置代理并重试？[Y/n] ' 'The GitHub transfer failed. Configure a proxy and retry now? [Y/n] ')"
+  else
+    prompt="$(l10n 'GitHub 无法直连，是否现在设置代理？[Y/n] ' 'GitHub is not directly reachable. Configure a proxy now? [Y/n] ')"
+  fi
+  confirm "${prompt}" 1 || \
     die "$(l10n '未配置代理，升级尚未下载或修改任何文件。' 'No proxy was configured; the upgrade has not downloaded or modified files.')"
   read -r -p "$(l10n '代理 IP/主机名: ' 'Proxy IP/hostname: ')" host
   read -r -p "$(l10n '代理端口: ' 'Proxy port: ')" port
@@ -259,6 +269,53 @@ network_preflight() {
   prompt_new_proxy
 }
 
+github_curl() {
+  if [[ -n "${PROXY_URL}" ]]; then curl_maintenance "$@"; else curl_direct "$@"; fi
+}
+
+recover_transfer_with_proxy() {
+  local label="$1" curl_status="$2" failed_proxy="${PROXY_URL}"
+  if [[ -n "${failed_proxy}" ]]; then
+    warn "$(l10n "${label}通过当前代理失败（curl=${curl_status}）：${failed_proxy}" "${label} failed through the current proxy (curl=${curl_status}): ${failed_proxy}")"
+    PROXY_URL=""
+  else
+    warn "$(l10n "${label}直连失败（curl=${curl_status}），正在检查已保存的维护代理。" "${label} failed directly (curl=${curl_status}); checking the saved maintenance proxy.")"
+    load_saved_proxy
+    if [[ -n "${PROXY_URL}" ]]; then
+      if probe_proxy; then
+        log "$(l10n "已保存代理可用，将用它重试下载：${PROXY_URL}" "The saved proxy is usable; retrying the transfer through ${PROXY_URL}")"
+        return 0
+      fi
+      warn "$(l10n '已保存代理无法同时访问 GitHub API 与下载站点。' 'The saved proxy cannot reach both the GitHub API and download host.')"
+      PROXY_URL=""
+    fi
+  fi
+  (( NON_INTERACTIVE == 0 )) || \
+    die "$(l10n "${label}失败；无人值守升级请通过 --proxy http://主机:端口 提供可用代理。现有部署未修改。" "${label} failed; provide a usable --proxy http://HOST:PORT for a non-interactive upgrade. The existing deployment was not modified.")"
+  prompt_new_proxy transfer
+}
+
+fetch_github_file() {
+  local label="$1" output="$2" first_status retry_status
+  shift 2
+  rm -f -- "${output}"
+  if github_curl "$@" -o "${output}"; then
+    return 0
+  else
+    first_status=$?
+  fi
+  rm -f -- "${output}"
+  recover_transfer_with_proxy "${label}" "${first_status}"
+  log "$(l10n "正在通过代理重试${label}…" "Retrying ${label} through the proxy…")"
+  if github_curl "$@" -o "${output}"; then
+    return 0
+  else
+    retry_status=$?
+  fi
+  rm -f -- "${output}"
+  die "$(l10n "${label}通过代理重试仍然失败（curl=${retry_status}）；现有控制面、Worker、模型和数据库均未修改。" "${label} still failed through the proxy (curl=${retry_status}); the existing control plane, workers, models, and databases were not modified.")"
+}
+
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   else shasum -a 256 "$1" | awk '{print $1}'; fi
@@ -281,15 +338,10 @@ download_github_archive() {
   network_preflight
   WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/llmctl-upgrade.XXXXXX")
   local commit_json="${WORK_DIR}/commit.json" archive_url existing
-  if [[ -n "${PROXY_URL}" ]]; then
-    curl_maintenance -fL --retry 2 --connect-timeout 10 --max-time 60 \
-      -H "Accept: application/vnd.github+json" -H "User-Agent: LLMCtl-upgrader" \
-      -o "${commit_json}" "${GITHUB_API}/commits/${GITHUB_BRANCH}"
-  else
-    curl_direct -fL --retry 2 --connect-timeout 10 --max-time 60 \
-      -H "Accept: application/vnd.github+json" -H "User-Agent: LLMCtl-upgrader" \
-      -o "${commit_json}" "${GITHUB_API}/commits/${GITHUB_BRANCH}"
-  fi
+  fetch_github_file "$(l10n 'GitHub 提交信息下载' 'GitHub commit metadata download')" "${commit_json}" \
+    -fL --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 60 \
+    -H "Accept: application/vnd.github+json" -H "User-Agent: LLMCtl-upgrader" \
+    "${GITHUB_API}/commits/${GITHUB_BRANCH}"
   SOURCE_COMMIT=$(python3 - "${commit_json}" <<'PY'
 import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -308,11 +360,8 @@ PY
   ARCHIVE_PATH="${WORK_DIR}/llmctl-${SOURCE_COMMIT}.zip"
   archive_url="https://github.com/${GITHUB_REPOSITORY}/archive/${SOURCE_COMMIT}.zip"
   log "$(l10n "下载并锁定提交 ${SOURCE_COMMIT:0:12}…" "Downloading pinned commit ${SOURCE_COMMIT:0:12}…")"
-  if [[ -n "${PROXY_URL}" ]]; then
-    curl_maintenance -fL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 -o "${ARCHIVE_PATH}" "${archive_url}"
-  else
-    curl_direct -fL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 -o "${ARCHIVE_PATH}" "${archive_url}"
-  fi
+  fetch_github_file "$(l10n 'GitHub 升级包下载' 'GitHub upgrade archive download')" "${ARCHIVE_PATH}" \
+    -fL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "${archive_url}"
 }
 
 use_local_archive() {

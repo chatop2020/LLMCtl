@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import textwrap
 import unittest
 import zipfile
 from pathlib import Path
@@ -130,6 +131,74 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsafe ZIP path", result.stderr)
+
+    def test_real_archive_timeout_prompts_for_proxy_and_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            archive = temporary_path / "LLMCtl-main.zip"
+            self.build_archive(archive)
+            fake_bin = temporary_path / "bin"
+            fake_bin.mkdir()
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -eu
+                    output=""
+                    url=""
+                    while (( $# )); do
+                      case "$1" in
+                        -o) output="$2"; shift 2 ;;
+                        http://*|https://*) url="$1"; shift ;;
+                        *) shift ;;
+                      esac
+                    done
+                    if [[ "${url}" == *api.github.com* ]]; then
+                      if [[ -n "${output}" && "${output}" != "/dev/null" ]]; then
+                        printf '{"sha":"1111111111111111111111111111111111111111"}\n' >"${output}"
+                      fi
+                      exit 0
+                    fi
+                    if [[ "${url}" == */archive/*.zip ]]; then
+                      if [[ -z "${HTTPS_PROXY:-${https_proxy:-}}" ]]; then exit 28; fi
+                      cp "${FAKE_ARCHIVE_SOURCE}" "${output}"
+                      exit 0
+                    fi
+                    exit 0
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            environment = {
+                **dict(__import__("os").environ),
+                "PATH": f"{fake_bin}:{__import__('os').environ['PATH']}",
+                "FAKE_ARCHIVE_SOURCE": str(archive),
+            }
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(UPGRADER),
+                    "--check",
+                    "--yes",
+                    "--lang",
+                    "zh",
+                ],
+                cwd=ROOT,
+                env=environment,
+                input="192.168.9.104\n1082\nhttp\n",
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        combined = result.stdout + result.stderr
+        self.assertIn("GitHub 升级包下载直连失败（curl=28）", combined)
+        self.assertIn("代理后的 GitHub 网络测试通过", combined)
+        self.assertIn("正在通过代理重试GitHub 升级包下载", combined)
+        self.assertIn("预检完成：没有修改现有控制面或服务", combined)
 
 
 if __name__ == "__main__":

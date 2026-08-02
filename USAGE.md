@@ -334,7 +334,7 @@ sudo bash install-llm-cluster.sh --force-reconfigure
 sudo llmctl upgrade
 ```
 
-命令会询问是否从 GitHub 获取 `main` 最新提交。直连失败时依次尝试已保存维护代理和新输入的代理，代理复测成功后才会下载。升级内容限于 `llmctl` 与 `/usr/local/lib/llm-cluster/` 下由升级清单声明的控制面程序；当前模型、Worker、网关运行数据、配置、密钥、数据库和 Nginx 均保留。账户门户正在运行时会短暂停止并验收，失败自动从 `/var/backups/llmctl/` 回滚。
+命令会询问是否从 GitHub 获取 `main` 最新提交。它同时预检 GitHub API 和 ZIP 归档下载站点；预检后真实下载仍可能失败，此时会自动检查已保存维护代理，仍不可用就询问新的代理并重试。升级内容限于 `llmctl` 与 `/usr/local/lib/llm-cluster/` 下由升级清单声明的控制面程序；当前模型、Worker、网关运行数据、配置、密钥、数据库和 Nginx 均保留。账户门户正在运行时会短暂停止并验收，失败自动从 `/var/backups/llmctl/` 回滚。
 
 ```bash
 sudo llmctl upgrade --proxy http://192.168.9.104:1082 --save-proxy
@@ -389,7 +389,7 @@ journalctl -u llm-cluster.service -n 300 --no-pager
 sudo llmctl upgrade
 ```
 
-确认后，LLMCtl 从 GitHub 获取最新项目内容；网络不可达时会引导配置临时或持久代理。升级会更新 `llmctl`、安装维护脚本、账户门户后端和 Vue 静态资源，并对门户 SQLite 执行向后兼容的原地迁移。现有 vLLM Worker、模型目录、路由组合、用户和账本不会被重装。
+确认后，LLMCtl 从 GitHub 获取最新项目内容；API 预检或实际 ZIP 下载任一步失败都会引导配置临时或持久代理并重试。升级会更新 `llmctl`、安装维护脚本、账户门户后端和 Vue 静态资源，并对门户 SQLite 执行向后兼容的原地迁移。现有 vLLM Worker、模型目录、路由组合、用户和账本不会被重装。
 
 升级完成后建议执行：
 

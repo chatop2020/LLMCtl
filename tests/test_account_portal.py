@@ -518,6 +518,24 @@ class PortalIntegrationTests(unittest.TestCase):
                 (stamp,),
             )
 
+    def insert_disabled_underlying_model(self, created_at=None):
+        stamp = created_at or portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO published_models(
+                     id,public_model_id,display_name,source_kind,source_ref,source_provider,
+                     source_model,capabilities_json,input_price_micros,output_price_micros,
+                     cached_price_micros,reasoning_price_micros,status,upstream_free,mapping_kind,
+                     mapping_id,health_status,health_failures,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "model-underlying", "ornith-1.0-35b-fp8", "Underlying model",
+                    "model", "ornith-1.0-35b-fp8", "local", "ornith-1.0-35b-fp8",
+                    '["chat"]', 0, 0, 0, 0, "disabled", 0, "alias",
+                    "ornith-1.0-35b-fp8", "healthy", 0, stamp, stamp,
+                ),
+            )
+
     def test_existing_database_gains_model_metadata_columns_without_reinstall(self):
         with self.server.db.connect() as connection:
             columns = {
@@ -571,7 +589,12 @@ class PortalIntegrationTests(unittest.TestCase):
                 row["name"] for row in connection.execute("PRAGMA index_list('usage_ledger')")
             }
         self.assertTrue(
-            {"idx_usage_user_time_v2", "idx_usage_time", "idx_usage_model_time"}.issubset(
+            {
+                "idx_usage_user_time_v2",
+                "idx_usage_time",
+                "idx_usage_model_time",
+                "idx_usage_model_fk",
+            }.issubset(
                 indexes
             )
         )
@@ -680,6 +703,7 @@ class PortalIntegrationTests(unittest.TestCase):
     def test_usage_reconciliation_skips_in_memory_rows_and_is_idempotent(self):
         self.insert_control_user_and_model(paid=True, source_kind="model")
         stamp = portal.now()
+        self.insert_disabled_underlying_model(stamp - 100)
         self.fake_omni.logs = [
             {
                 "id": "request-live", "status": 200, "active": False,
@@ -689,7 +713,7 @@ class PortalIntegrationTests(unittest.TestCase):
             },
             {
                 "id": "request-complete", "status": 200, "active": False,
-                "detailState": "persisted", "requestedModel": "gdn-inside",
+                "detailState": "persisted", "requestedModel": "ornith-1.0-35b-fp8",
                 "model": "ornith-1.0-35b-fp8", "provider": "local",
                 "tokens": {"in": 100, "out": 20, "cacheRead": 0, "reasoning": 0},
                 "timestamp": stamp - 1,
@@ -699,11 +723,14 @@ class PortalIntegrationTests(unittest.TestCase):
         second = self.server.control.reconcile_usage()
         with self.server.db.connect() as connection:
             rows = connection.execute(
-                "SELECT request_id,input_tokens,output_tokens FROM usage_ledger"
+                "SELECT request_id,public_model_id,input_tokens,output_tokens FROM usage_ledger"
             ).fetchall()
         self.assertEqual(first["processed"], 1)
         self.assertEqual(second["processed"], 0)
-        self.assertEqual([tuple(row) for row in rows], [("request-complete", 100, 20)])
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [("request-complete", "gdn-inside", 100, 20)],
+        )
         self.assertIn(("policy-key", False), self.fake_omni.activated)
         self.assertTrue(self.fake_omni.permissions[-1][-1])
 
@@ -716,19 +743,66 @@ class PortalIntegrationTests(unittest.TestCase):
                     {"role": "user", "content": "请求内容可以显示吗？"},
                 ]
             },
+            "finalClientResponse": {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "可以，输出只向管理员显示。",
+                        }
+                    }
+                ]
+            },
         }
         detail = self.server.control.user_request_detail(
             "policy-user", "request-complete"
         )
         self.assertTrue(detail["available"])
         self.assertEqual(detail["messages"][-1]["content"], "请求内容可以显示吗？")
+        self.assertNotIn("response_messages", detail)
         admin_detail = self.server.control.admin_request_detail("request-complete")
         self.assertEqual(admin_detail["messages"][0]["content"], "回答要简洁")
+        self.assertTrue(admin_detail["response_available"])
+        self.assertEqual(
+            admin_detail["response_messages"][-1]["content"],
+            "可以，输出只向管理员显示。",
+        )
         snapshot = self.server.control.admin_snapshot()
         self.assertEqual(snapshot["usage"][0]["request_id"], "request-complete")
         self.assertEqual(snapshot["usage"][0]["user_email"], "policy@example.com")
         with self.assertRaisesRegex(ValueError, "请求记录不存在"):
             self.server.control.user_request_detail("another-user", "request-complete")
+
+    def test_usage_reconciliation_repairs_disabled_underlying_model_attribution(self):
+        self.insert_control_user_and_model(paid=True, source_kind="model")
+        stamp = portal.now()
+        self.insert_disabled_underlying_model(stamp - 100)
+        with self.server.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO usage_ledger(
+                     request_id,user_id,api_key_id,model_id,public_model_id,
+                     provider,resolved_model,input_tokens,output_tokens,cached_tokens,
+                     reasoning_tokens,granted_tokens,amount_micros,price_snapshot_json,
+                     occurred_at,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "request-underlying", "policy-user", "policy-key",
+                    "model-underlying", "ornith-1.0-35b-fp8", "local",
+                    "ornith-1.0-35b-fp8", 12, 34, 0, 0, 46, 1234,
+                    '{"input_price_micros":1000000}', stamp + 1, stamp + 1,
+                ),
+            )
+        result = self.server.control.reconcile_usage(user_id="policy-user")
+        with self.server.db.connect() as connection:
+            row = connection.execute(
+                "SELECT model_id,public_model_id,amount_micros,price_snapshot_json "
+                "FROM usage_ledger WHERE request_id='request-underlying'"
+            ).fetchone()
+        self.assertEqual(result["relabeled"], 1)
+        self.assertEqual(row["model_id"], "model-1")
+        self.assertEqual(row["public_model_id"], "gdn-inside")
+        self.assertEqual(row["amount_micros"], 1234)
+        self.assertEqual(row["price_snapshot_json"], '{"input_price_micros":1000000}')
 
     def test_admin_snapshot_remains_available_when_gateway_is_down(self):
         def unavailable():
