@@ -241,11 +241,18 @@ def omniroute_plan(worker_ids: Iterable[int]) -> str:
     """Persist the desired OmniRoute graph without embedding credentials."""
     model = required_env("SERVED_MODEL_NAME")
     base_port = int(required_env("WORKER_BASE_PORT"))
+    concurrency_per_worker = max(1, min(int(required_env("MAX_NUM_SEQS")), 20))
     data = {
         "gateway": "omniroute",
         "managed_tag": MANAGED_TAG,
         "model": model,
         "strategy": "round-robin",
+        # OmniRoute has a separate sticky round-robin batch setting whose
+        # global default is greater than one.  It must be explicitly disabled
+        # for independent vLLM replicas or a simultaneous burst will queue on
+        # the first target before rotation advances.
+        "sticky_round_robin_limit": 1,
+        "concurrency_per_worker": concurrency_per_worker,
         "supports_vision": os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1",
         "workers": [
             {
@@ -451,6 +458,7 @@ def reconcile_omniroute(
     base_port = int(required_env("WORKER_BASE_PORT"))
     backend_key = required_env("BACKEND_API_KEY")
     supports_vision = os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
+    concurrency_per_worker = max(1, min(int(required_env("MAX_NUM_SEQS")), 20))
 
     nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
     connections = response_list(client.request("GET", "/api/providers?limit=1000"), "connections")
@@ -590,6 +598,14 @@ def reconcile_omniroute(
         "strategy": "round-robin",
         "config": {
             "disableSessionStickiness": True,
+            # This is distinct from conversation/session stickiness.  The
+            # OmniRoute global default batches several successful requests on
+            # one target.  Under a simultaneous benchmark burst that leaves
+            # the RR counter unchanged until responses finish, concentrating
+            # work on one or two GPUs.  One request per target restores true
+            # eager rotation across every healthy LLMCtl worker.
+            "stickyRoundRobinLimit": 1,
+            "concurrencyPerModel": concurrency_per_worker,
             "healthCheckEnabled": True,
             "maxRetries": 1,
             "failoverBeforeRetry": True,

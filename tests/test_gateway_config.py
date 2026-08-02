@@ -190,6 +190,8 @@ class GatewayConfigTests(unittest.TestCase):
             plan = json.loads(gateway.omniroute_plan([0, 7]))
         self.assertEqual(plan["gateway"], "omniroute")
         self.assertEqual(plan["strategy"], "round-robin")
+        self.assertEqual(plan["sticky_round_robin_limit"], 1)
+        self.assertEqual(plan["concurrency_per_worker"], 7)
         self.assertTrue(plan["supports_vision"])
         self.assertEqual(plan["workers"][1]["base_url"], "http://127.0.0.1:8107/v1")
         self.assertNotIn("sk-backend-secret", json.dumps(plan))
@@ -221,6 +223,8 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertEqual(update_connection[2]["apiKey"], "sk-backend-secret")
         self.assertEqual(client.combo["strategy"], "round-robin")
         self.assertTrue(client.combo["config"]["disableSessionStickiness"])
+        self.assertEqual(client.combo["config"]["stickyRoundRobinLimit"], 1)
+        self.assertEqual(client.combo["config"]["concurrencyPerModel"], 7)
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

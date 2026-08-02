@@ -124,6 +124,13 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain('api("admin/stress/start"');
     expect(source).toContain('api("admin/stress/cancel"');
     expect(source).toContain("后台执行真实流式请求");
+    expect(source).toContain("路由分布");
+    expect(source).toContain("GPU 并行负载");
+    expect(source).toContain("peak_concurrent_active_gpu_count");
+    expect(source).toContain("item.route_target");
+    expect(source).toContain("的新计划尚未启动");
+    expect(source).toContain("selectedStressRun.request_multiplier");
+    expect(source).not.toContain("每个并发 Worker");
     expect(source).not.toContain("Promise.all(Array(stressPlan.concurrency)");
   });
 

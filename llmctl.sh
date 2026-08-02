@@ -300,7 +300,7 @@ usage() {
   llmctl deactivate <0,1,...|all>             移出负载均衡 + stop + disable
   llmctl scale <1-N>                          持久调整集群为前 N 个实例
   llmctl autostart <enable|disable|status>     管理整个集群的开机自启
-  llmctl router <start|stop|restart|status>    管理所选接入层（含 OmniRoute）
+  llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
   llmctl timezone show|set [时区]              查看或设置系统时区（默认 Asia/Shanghai）
@@ -642,7 +642,7 @@ render_router_config() {
   chown root:root "${output}"
   chmod 640 "${output}"
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-    log "OmniRoute 期望状态已生成，健康后端：${worker_ids}；策略：round-robin（关闭会话粘性）。"
+    log "OmniRoute 期望状态已生成，健康后端：${worker_ids}；策略：逐请求 round-robin（关闭会话粘性及粘性轮转批量）。"
   else
     log "$(gateway_display_name) 配置已生成，健康后端：${worker_ids}；策略：${ROUTING_STRATEGY}。"
   fi
@@ -1553,9 +1553,19 @@ cmd_router() {
   case "${1:-status}" in
     start)   refresh_router ;;
     restart) refresh_router ;;
+    reconcile)
+      local healthy
+      healthy=$(healthy_worker_ids)
+      [[ -n "${healthy}" ]] || die "没有健康 Worker，无法同步接入层。"
+      gateway_process_health || die "$(gateway_display_name) 当前不可用，无法在线同步。"
+      render_router_config "${healthy}"
+      reconcile_gateway "${healthy}"
+      wait_router
+      log "接入层已在线同步 ${healthy} 个健康 Worker；Router 和 Worker 均未重启。"
+      ;;
     stop)    systemctl stop llm-router.service ;;
     status)  systemctl status llm-router.service --no-pager || true ;;
-    *) die "router 子命令必须是 start|stop|restart|status" ;;
+    *) die "router 子命令必须是 start|stop|restart|reconcile|status" ;;
   esac
 }
 

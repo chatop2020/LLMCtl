@@ -4149,6 +4149,88 @@ class PortalControlPlane:
             pathlib.Path(value).name == "llm_benchmark.py" for value in decoded
         )
 
+    def stress_route_map(self, published: sqlite3.Row) -> dict[str, str]:
+        """Resolve OmniRoute response identifiers to human-readable Worker names.
+
+        Route metadata is emitted by OmniRoute, while the labels live on the
+        combo targets that LLMCtl manages.  Keep this lookup best-effort so an
+        unavailable builder-options endpoint never prevents a benchmark from
+        running; the raw provider/connection identifier remains observable.
+        """
+        if str(published["source_kind"] or "") != "combo":
+            return {}
+        source_ref = str(published["source_ref"] or "").strip()
+        source_model = str(published["source_model"] or "").strip()
+        try:
+            combos = self.omni.combos()
+        except RuntimeError:
+            return {}
+        combo = next(
+            (
+                item
+                for item in combos
+                if source_ref in {str(item.get("id", "")), str(item.get("name", ""))}
+                or source_model == str(item.get("name", ""))
+            ),
+            None,
+        )
+        if not combo:
+            return {}
+        models = combo.get("models", [])
+        if not isinstance(models, list):
+            return {}
+
+        route_map: dict[str, str] = {}
+        target_provider_labels: dict[str, set[str]] = {}
+        target_connection_labels: dict[str, str] = {}
+        for index, target in enumerate(models):
+            if not isinstance(target, dict):
+                continue
+            label = str(target.get("label") or f"Worker {index}").strip()
+            provider = str(target.get("providerId") or target.get("provider") or "").strip()
+            connection = str(target.get("connectionId") or "").strip()
+            if provider:
+                target_provider_labels.setdefault(provider, set()).add(label)
+            if connection:
+                target_connection_labels[connection] = label
+                route_map[connection] = label
+
+        # A provider identifier is safe to label only when it identifies one
+        # combo target.  Shared providers must be distinguished by connection.
+        for provider, labels in target_provider_labels.items():
+            if len(labels) == 1:
+                route_map[provider] = next(iter(labels))
+
+        try:
+            options = self.omni.combo_builder_options()
+        except RuntimeError:
+            options = {}
+        providers = options.get("providers", []) if isinstance(options, dict) else []
+        if isinstance(providers, list):
+            for provider in providers:
+                if not isinstance(provider, dict):
+                    continue
+                provider_id = str(
+                    provider.get("providerId") or provider.get("id") or ""
+                ).strip()
+                labels = target_provider_labels.get(provider_id, set())
+                if len(labels) == 1:
+                    label = next(iter(labels))
+                    for key in ("providerId", "id", "alias", "prefix"):
+                        value = str(provider.get(key) or "").strip()
+                        if value:
+                            route_map[value] = label
+                connections = provider.get("connections", [])
+                if not isinstance(connections, list):
+                    continue
+                for connection in connections:
+                    if not isinstance(connection, dict):
+                        continue
+                    connection_id = str(connection.get("id") or "").strip()
+                    if connection_id in target_connection_labels:
+                        route_map[connection_id] = target_connection_labels[connection_id]
+        return route_map
+
     def sync_stress_run(self, run_id: str) -> dict[str, Any]:
         with self.db.connect() as connection:
             row = connection.execute(
@@ -4213,6 +4295,8 @@ class PortalControlPlane:
         result["metrics"] = json.loads(result.pop("metrics_json") or "{}")
         result["progress"] = float(status_document.get("progress", 0) or 0)
         result["elapsed_seconds"] = float(status_document.get("elapsed_seconds", 0) or 0)
+        gpu = status_document.get("gpu", {})
+        result["gpu"] = gpu if isinstance(gpu, dict) else {}
         event_path = pathlib.Path(result["result_dir"]) / "events.jsonl"
         events: list[dict[str, Any]] = []
         if event_path.is_file():
@@ -4255,14 +4339,14 @@ class PortalControlPlane:
         if output_tokens not in STRESS_OUTPUT_TOKEN_CHOICES:
             raise ValueError("不支持该最大输出 Token 档位")
         if request_multiplier not in STRESS_REQUEST_MULTIPLIER_CHOICES:
-            raise ValueError("每并发请求轮次必须为 1-4")
+            raise ValueError("每个并发槽位的请求数必须为 1-4")
         if (concurrency >= 20 or input_tokens >= 8000) and payload.get("risk_confirmed") is not True:
             raise ValueError("高负载压测必须确认风险")
         model = str(payload.get("model", "")).strip()
         with self.lock:
             with self.db.connect() as connection:
                 published = connection.execute(
-                    "SELECT 1 FROM published_models WHERE public_model_id=? AND status='published'",
+                    "SELECT * FROM published_models WHERE public_model_id=? AND status='published'",
                     (model,),
                 ).fetchone()
                 active = connection.execute(
@@ -4281,6 +4365,16 @@ class PortalControlPlane:
             run_dir = self.stress_root / run_id
             run_dir.mkdir(parents=True, exist_ok=False)
             os.chmod(run_dir, 0o700)
+            route_map_path = run_dir / "route-map.json"
+            route_map_path.write_text(
+                json.dumps(
+                    self.stress_route_map(published),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(route_map_path, 0o600)
             command = [
                 sys.executable,
                 str(runner),
@@ -4292,6 +4386,7 @@ class PortalControlPlane:
                 "--output-tokens", str(output_tokens),
                 "--request-multiplier", str(request_multiplier),
                 "--result-dir", str(run_dir),
+                "--route-map", str(route_map_path),
             ]
             environment = os.environ.copy()
             environment["LLMCTL_BENCHMARK_API_KEY"] = self.config.gateway_manage_key

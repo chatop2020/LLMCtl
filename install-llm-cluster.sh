@@ -446,7 +446,7 @@ gateway_routing_summary() {
     newapi) printf '%s' "$(l10n '同优先级渠道按权重随机，失败时切换渠道' 'weighted channels at equal priority with channel failover')" ;;
     litellm) printf 'LiteLLM %s' "${ROUTING_STRATEGY}" ;;
     bifrost) printf '%s' "$(l10n 'vLLM keys 等权轮转并自动回退' 'equally weighted vLLM keys with automatic fallback')" ;;
-    omniroute) printf '%s' "$(l10n 'Combo 对健康 Worker 做无会话粘性的 round-robin，并自动回退' 'non-sticky round-robin Combo across healthy workers with automatic fallback')" ;;
+    omniroute) printf '%s' "$(l10n 'Combo 对健康 Worker 做逐请求 round-robin（关闭会话粘性及粘性轮转批量），并自动回退' 'per-request round-robin Combo across healthy workers with session and sticky-batch routing disabled, plus automatic fallback')" ;;
   esac
 }
 

@@ -965,6 +965,19 @@ class PortalIntegrationTests(unittest.TestCase):
 
     def test_stress_run_is_backend_owned_and_keeps_key_out_of_arguments(self):
         self.insert_control_user_and_model()
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-internal",
+                "name": "ornith-cluster",
+                "models": [
+                    {
+                        "providerId": "local-a",
+                        "connectionId": "conn-worker-0",
+                        "label": "LLMCtl worker 0",
+                    }
+                ],
+            }
+        ]
         with self.assertRaisesRegex(ValueError, "高负载压测必须确认风险"):
             self.server.control.start_stress_run(
                 {
@@ -1001,12 +1014,21 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(run["status"], "starting")
         self.assertEqual(run["request_count"], 2)
         self.assertIn("llm_benchmark.py", " ".join(command))
+        self.assertIn("--route-map", command)
         self.assertNotIn("sk-management-test", " ".join(command))
         self.assertEqual(
             environment["LLMCTL_BENCHMARK_API_KEY"], "sk-management-test"
         )
         self.assertEqual(popen.call_args.kwargs["stderr"], portal.subprocess.STDOUT)
         self.assertTrue(popen.call_args.kwargs["stdout"].closed)
+        route_map_path = pathlib.Path(command[command.index("--route-map") + 1])
+        self.assertEqual(
+            json.loads(route_map_path.read_text(encoding="utf-8")),
+            {
+                "conn-worker-0": "LLMCtl worker 0",
+                "local-a": "LLMCtl worker 0",
+            },
+        )
 
         with self.server.db.connect() as connection:
             indexes = {
@@ -1024,12 +1046,23 @@ class PortalIntegrationTests(unittest.TestCase):
                 "UPDATE stress_runs SET status='canceling' WHERE id=?", (run["id"],)
             )
         pathlib.Path(stored["result_dir"], "status.json").write_text(
-            json.dumps({"status": "running", "metrics": {"completed": 1}}),
+            json.dumps(
+                {
+                    "status": "running",
+                    "metrics": {"completed": 1},
+                    "gpu": {
+                        "available": True,
+                        "peak_concurrent_active_gpu_count": 2,
+                        "gpus": [{"index": 0}, {"index": 1}],
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         with mock.patch.object(self.server.control, "process_alive", return_value=True):
             canceling = self.server.control.sync_stress_run(run["id"])
         self.assertEqual(canceling["status"], "canceling")
+        self.assertEqual(canceling["gpu"]["peak_concurrent_active_gpu_count"], 2)
         with mock.patch.object(self.server.control, "process_alive", return_value=False):
             canceled = self.server.control.sync_stress_run(run["id"])
         self.assertEqual(canceled["status"], "canceled")

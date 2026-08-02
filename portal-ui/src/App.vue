@@ -154,6 +154,33 @@ const selectedStressRun = computed(() =>
   stressRuns.value[0] ||
   null,
 );
+const stressRouteTargets = computed(() =>
+  Object.entries(selectedStressRun.value?.metrics?.routing?.targets || {}).sort(
+    (left, right) => right[1] - left[1],
+  ),
+);
+const stressGpuImbalanced = computed(() => {
+  const run = selectedStressRun.value;
+  const gpu = run?.gpu;
+  const total = gpu?.gpus?.length || 0;
+  return (
+    total > 1 &&
+    gpu.sample_count >= 3 &&
+    run.concurrency >= total &&
+    gpu.peak_concurrent_active_gpu_count < total
+  );
+});
+const stressPlanDiffersFromSelected = computed(() => {
+  const run = selectedStressRun.value;
+  if (!run || activeStressRun.value) return false;
+  return (
+    stressPlan.model !== run.public_model_id ||
+    stressPlan.concurrency !== run.concurrency ||
+    stressPlan.input_tokens !== run.target_input_tokens ||
+    stressPlan.output_tokens !== run.max_output_tokens ||
+    stressPlan.request_multiplier !== run.request_multiplier
+  );
+});
 const stressIsHighRisk = computed(
   () => stressPlan.concurrency >= 20 || stressPlan.input_tokens >= 8000,
 );
@@ -3398,7 +3425,7 @@ onBeforeUnmount(() => {
                 <div class="panel-head">
                   <div>
                     <h2>测试计划</h2>
-                    <p>每个并发 Worker 顺序执行所选轮次，总请求数会自动计算。</p>
+                    <p>每个并发槽位顺序执行所选轮次；请求由 AI 接入层分配给后端 Worker。</p>
                   </div>
                 </div>
                 <label>公开模型 ID<select v-model="stressPlan.model" :disabled="!!activeStressRun">
@@ -3418,14 +3445,14 @@ onBeforeUnmount(() => {
                   <label>最大输出 Token<select v-model.number="stressPlan.output_tokens" :disabled="!!activeStressRun">
                     <option v-for="value in [64,128,256,512,1024]" :key="value" :value="value">{{ value }}</option>
                   </select></label>
-                  <label>每并发轮次<select v-model.number="stressPlan.request_multiplier" :disabled="!!activeStressRun">
-                    <option v-for="value in [1,2,3,4]" :key="value" :value="value">{{ value }} 轮</option>
+                  <label>每槽位请求数<select v-model.number="stressPlan.request_multiplier" :disabled="!!activeStressRun">
+                    <option v-for="value in [1,2,3,4]" :key="value" :value="value">{{ value }} 次</option>
                   </select></label>
                 </div>
                 <div class="stress-request-total">
                   <span>计划请求</span>
                   <strong>{{ stressPlan.concurrency * stressPlan.request_multiplier }}</strong>
-                  <small>并发 {{ stressPlan.concurrency }} × {{ stressPlan.request_multiplier }} 轮</small>
+                  <small>{{ stressPlan.concurrency }} 个并发槽位 × 每槽 {{ stressPlan.request_multiplier }} 次</small>
                 </div>
                 <label v-if="stressIsHighRisk" class="risk-confirmation">
                   <input v-model="stressPlan.risk_confirmed" type="checkbox" />
@@ -3454,12 +3481,20 @@ onBeforeUnmount(() => {
                 <div class="panel-head">
                   <div>
                     <h2>实时结果</h2>
-                    <p><code>{{ selectedStressRun.public_model_id }}</code> · 并发 {{ selectedStressRun.concurrency }} · 目标输入 {{ compactTokens(selectedStressRun.target_input_tokens) }}</p>
+                    <p>
+                      <code>{{ selectedStressRun.public_model_id }}</code>
+                      · 并发 {{ selectedStressRun.concurrency }} × {{ selectedStressRun.request_multiplier }} 轮
+                      = {{ selectedStressRun.request_count }} 请求
+                      · 目标输入 {{ compactTokens(selectedStressRun.target_input_tokens) }}
+                    </p>
                   </div>
                   <span
                     class="status"
                     :class="selectedStressRun.status === 'completed' ? 'ok' : selectedStressRun.status === 'failed' ? 'bad' : 'warn'"
                   >{{ statusLabel(selectedStressRun.status) }}</span>
+                </div>
+                <div v-if="stressPlanDiffersFromSelected" class="inline-alert info">
+                  右侧是上一轮任务结果（{{ selectedStressRun.concurrency }} × {{ selectedStressRun.request_multiplier }} = {{ selectedStressRun.request_count }} 请求）；左侧 {{ stressPlan.concurrency }} × {{ stressPlan.request_multiplier }} = {{ stressPlan.concurrency * stressPlan.request_multiplier }} 请求的新计划尚未启动。
                 </div>
                 <div class="stress-progress" role="progressbar" :aria-valuenow="selectedStressRun.progress || 0" aria-valuemin="0" aria-valuemax="100">
                   <i :style="{ width: `${selectedStressRun.progress || 0}%` }"></i>
@@ -3481,6 +3516,49 @@ onBeforeUnmount(() => {
                   <div><strong>首 Token 延迟（TTFT）</strong><span>平均 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'average'), 0) }} ms</span><span>P50 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'p50'), 0) }} ms</span><span>P95 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'p95'), 0) }} ms</span><span>P99 {{ metricNumber(metric(selectedStressRun, 'ttft_ms', 'p99'), 0) }} ms</span></div>
                   <div><strong>端到端延迟</strong><span>平均 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'average'), 0) }} ms</span><span>P50 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'p50'), 0) }} ms</span><span>P95 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'p95'), 0) }} ms</span><span>P99 {{ metricNumber(metric(selectedStressRun, 'latency_ms', 'p99'), 0) }} ms</span></div>
                 </div>
+                <div class="stress-evidence-grid">
+                  <section class="stress-evidence-card">
+                    <div class="stress-evidence-head">
+                      <div><h3>路由分布</h3><p>当前 AI 接入层为已完成请求返回的实际命中目标。</p></div>
+                      <strong>{{ selectedStressRun.metrics?.routing?.observed_target_count || 0 }} 个目标</strong>
+                    </div>
+                    <div v-if="stressRouteTargets.length" class="route-distribution">
+                      <div v-for="([target, count]) in stressRouteTargets" :key="target">
+                        <span><code>{{ target }}</code><b>{{ count }} 请求</b></span>
+                        <i><em :style="{ width: `${Math.max(2, count * 100 / Math.max(1, selectedStressRun.metrics?.successful || 0))}%` }"></em></i>
+                      </div>
+                    </div>
+                    <p v-else class="empty compact-empty">
+                      暂未收到路由元数据；已完成 {{ selectedStressRun.metrics?.routing?.unknown_requests || 0 }} 个无法归属目标的请求。
+                    </p>
+                  </section>
+                  <section class="stress-evidence-card gpu-evidence">
+                    <div class="stress-evidence-head">
+                      <div><h3>GPU 并行负载</h3><p>后台每秒采样利用率、显存和功耗。</p></div>
+                      <strong v-if="selectedStressRun.gpu?.available">
+                        峰值并行 {{ selectedStressRun.gpu.peak_concurrent_active_gpu_count || 0 }}/{{ selectedStressRun.gpu.gpus.length }}
+                      </strong>
+                    </div>
+                    <div v-if="stressGpuImbalanced" class="inline-alert bad">
+                      负载偏斜：采样期间最多只有 {{ selectedStressRun.gpu.peak_concurrent_active_gpu_count }} / {{ selectedStressRun.gpu.gpus.length }} 张 GPU 同时计算。
+                    </div>
+                    <div v-if="selectedStressRun.gpu?.available" class="table-wrap compact-table">
+                      <table>
+                        <thead><tr><th>GPU</th><th>平均 / 峰值利用率</th><th>活跃采样</th><th>峰值显存</th><th>平均 / 峰值功耗</th></tr></thead>
+                        <tbody><tr v-for="gpu in selectedStressRun.gpu.gpus" :key="gpu.index">
+                          <td><strong>GPU {{ gpu.index }}</strong></td>
+                          <td>{{ metricNumber(gpu.utilization_average, 1) }}% / {{ metricNumber(gpu.utilization_peak, 1) }}%</td>
+                          <td>{{ metricNumber(gpu.active_sample_percent, 1) }}%</td>
+                          <td>{{ Math.round(gpu.memory_used_peak_mib || 0).toLocaleString() }} MiB</td>
+                          <td>{{ metricNumber(gpu.power_average_watts, 0) }} / {{ metricNumber(gpu.power_peak_watts, 0) }} W</td>
+                        </tr></tbody>
+                      </table>
+                    </div>
+                    <p v-else class="empty compact-empty">
+                      GPU 采样不可用：{{ selectedStressRun.gpu?.error || '尚未取得 nvidia-smi 数据' }}
+                    </p>
+                  </section>
+                </div>
                 <p class="error-text" v-if="selectedStressRun.error">{{ selectedStressRun.error }}</p>
                 <details v-if="Object.keys(selectedStressRun.metrics?.errors || {}).length" class="stress-errors">
                   <summary>错误分类</summary>
@@ -3493,9 +3571,9 @@ onBeforeUnmount(() => {
               <div class="panel-head"><div><h2>最近完成的请求</h2><p>后台 JSONL 事件的最近 20 条，不包含提示词或模型输出正文。</p></div></div>
               <div class="table-wrap">
                 <table>
-                  <thead><tr><th>#</th><th>结果</th><th>TTFT</th><th>总延迟</th><th>输入 / 输出</th><th>tok/s</th><th>错误</th></tr></thead>
+                  <thead><tr><th>#</th><th>结果</th><th>命中 Worker</th><th>TTFT</th><th>总延迟</th><th>输入 / 输出</th><th>tok/s</th><th>错误</th></tr></thead>
                   <tbody><tr v-for="item in [...selectedStressRun.recent_requests].reverse()" :key="item.index">
-                    <td>{{ item.index + 1 }}</td><td><span class="status" :class="item.ok ? 'ok' : 'bad'">{{ item.ok ? '成功' : '失败' }}</span></td><td>{{ metricNumber(item.ttft_ms, 0) }} ms</td><td>{{ metricNumber(item.latency_ms, 0) }} ms</td><td>{{ item.input_tokens || 0 }} / {{ item.output_tokens || 0 }}</td><td>{{ metricNumber(item.tokens_per_second, 1) }}</td><td class="detail">{{ item.error_kind || '—' }}</td>
+                    <td>{{ item.index + 1 }}</td><td><span class="status" :class="item.ok ? 'ok' : 'bad'">{{ item.ok ? '成功' : '失败' }}</span></td><td><code>{{ item.route_target || item.route_provider || '—' }}</code></td><td>{{ metricNumber(item.ttft_ms, 0) }} ms</td><td>{{ metricNumber(item.latency_ms, 0) }} ms</td><td>{{ item.input_tokens || 0 }} / {{ item.output_tokens || 0 }}</td><td>{{ metricNumber(item.tokens_per_second, 1) }}</td><td class="detail">{{ item.error_kind || '—' }}</td>
                   </tr></tbody>
                 </table>
               </div>

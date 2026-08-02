@@ -107,7 +107,9 @@ sudo llmctl router restart
 sudo llmctl database status
 ```
 
-`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限；OmniRoute 自动创建每 Worker 一个 Provider 节点及一个等权 Combo，并同步模型元信息和维护 key。
+`llmctl router restart` 会重新探测健康 Worker、生成所选接入层配置、重启并等待进程健康，然后才验证带密钥的 `/v1/models`。New API 自动初始化管理员、为每个健康 Worker 创建等权渠道并生成受管令牌；Bifrost 自动生成等权 vLLM keys、虚拟密钥和 PostgreSQL 日志存储；LiteLLM 使用 `least-busy` 与每 Worker 并发上限；OmniRoute 自动创建每 Worker 一个 Provider 节点及一个等权 Combo，并同步模型元信息和维护 key。LLMCtl 将 OmniRoute 的会话粘性和独立的粘性轮转批量分别关闭（`disableSessionStickiness=true`、`stickyRoundRobinLimit=1`），同时把单目标并发上限设为 `MAX_NUM_SEQS`（不超过 OmniRoute 允许的 20）；突发请求会逐个推进到下一健康 Worker，而不是等待前一批请求完成后才轮转。
+
+只需把升级后的受管渠道/Combo 配置写入正在运行的接入层时，使用 `llmctl router reconcile`。它会重新探测健康 Worker、在线同步配置并验证 `/v1/models`，不会重启 Router 或 GPU Worker。
 
 Nginx 由安装器自动安装，或发现已有安装时利旧。LLMCtl 只管理 `/etc/nginx/conf.d/llm-cluster.conf`，写入后必须通过 `nginx -t` 才 reload；失败会恢复修改前内容。若安装前同名配置已存在，卸载时恢复它；Nginx 软件包、其他虚拟主机和证书配置始终保留。推理路径 `/v1/` 关闭代理缓冲并直接到网关，不经过 Python 门户，因此流式响应和高并发不会增加门户中转开销。
 
@@ -177,7 +179,7 @@ sudo llmctl logs account -f
 
 门户公开地址是 `http://服务器IP:8000/ui/`，`8001` 只是回环内部监听。用户登录后可查看金额、token 赠额、逐请求用量和流水；模型广场只显示本人有效授权，提供价格/能力、可复制模型 ID、调用地址和 `curl` 示例。在线聊天窗口由浏览器直接调用公开 `/v1`，个人 key 只存在当前浏览器 sessionStorage，不经过门户后端。它支持图片、PDF、TXT、Markdown、CSV 和 JSON 附件：图片以 data URL 发给具备视觉能力的模型，PDF 最多取前 8 页在本地渲染为 JPEG，多余或超限文件会在发送前明确拒绝；附件不会保存进门户数据库。OCR/视觉/工具等标签来自安装时已核验或管理员确认的能力元数据，不改变 vLLM 的实际能力。
 
-管理端“性能压测”由服务器上的 `llm_benchmark.py` 执行，页面不会自行创建并发请求。可选并发为 1–100 的预设档位，目标输入为 50–30K Token；执行器生成可复现且有语义的企业场景文本，通过公开模型 ID 发起真实流式请求，并以网关 `usage` 返回值作为实际 Token 统计。页面每两秒读取任务状态，展示成功率、总/成功 RPS、聚合输出 tok/s、单请求 tok/s、TTFT 与端到端延迟分位数、实际输入/输出 Token 和错误分类。并发不少于 20 或输入不少于 8K 时必须确认对在线用户和 GPU 的影响；同一时间只允许一个任务，API key 只通过进程环境传递，不写入命令行或结果文件。
+管理端“性能压测”由服务器上的 `llm_benchmark.py` 执行，页面不会自行创建并发请求。可选并发为 1–100 的预设档位，目标输入为 50–30K Token；执行器生成可复现且有语义的企业场景文本，通过公开模型 ID 发起真实流式请求，并以网关 `usage` 返回值作为实际 Token 统计。页面每两秒读取任务状态，展示成功率、总/成功 RPS、聚合输出 tok/s、单请求 tok/s、TTFT 与端到端延迟分位数、实际输入/输出 Token 和错误分类。每条结果还记录 OmniRoute 实际选择的 Worker；后台每秒运行一次固定的 `nvidia-smi` 查询，展示各卡平均/峰值利用率、活跃采样占比、峰值显存、平均/峰值功耗，以及同一采样时刻的峰值并行 GPU 数。这样可以区分“请求最终轮过所有卡”和“任何时刻只让两张卡工作”这两种完全不同的状态。采样不可用时压测继续运行并明确显示原因。并发不少于 20 或输入不少于 8K 时必须确认对在线用户和 GPU 的影响；同一时间只允许一个任务，API key 只通过进程环境传递，不写入命令行或结果文件。
 
 OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显示降级告警，并允许查看用户、SMTP、账本和审计；依赖网关的模型、Key、权限和实时对账操作会明确失败，不会伪装成功。`llmctl startup status` 会把这种状态标为 `degraded`，而完整启动验收仍要求门户 `/ready` 与 OmniRoute 一起恢复。
 

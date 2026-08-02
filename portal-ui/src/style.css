@@ -1049,6 +1049,108 @@ dialog::backdrop {
   color: var(--muted);
   font-size: 10px;
 }
+.stress-evidence-grid {
+  display: grid;
+  grid-template-columns: minmax(230px, 0.72fr) minmax(0, 1.5fr);
+  gap: 10px;
+  margin-top: 10px;
+}
+.stress-evidence-card {
+  min-width: 0;
+  padding: 12px;
+  background: #f7fafb;
+  border: 1px solid #dbe6eb;
+  border-radius: 9px;
+}
+.stress-evidence-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.stress-evidence-head h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 680;
+}
+.stress-evidence-head p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+.stress-evidence-head > strong {
+  color: #137da8;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.route-distribution {
+  display: grid;
+  gap: 9px;
+}
+.route-distribution > div > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 10px;
+}
+.route-distribution code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.route-distribution b {
+  color: var(--muted);
+  font-weight: 560;
+  white-space: nowrap;
+}
+.route-distribution i {
+  display: block;
+  height: 5px;
+  overflow: hidden;
+  background: #e2edf1;
+  border-radius: 99px;
+}
+.route-distribution em {
+  display: block;
+  height: 100%;
+  background: #168fc1;
+  border-radius: inherit;
+}
+.compact-empty {
+  margin: 8px 0 0;
+  padding: 10px;
+  font-size: 10px;
+}
+.inline-alert {
+  margin: 0 0 9px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.inline-alert.bad {
+  color: #983447;
+  background: #fff3f5;
+  border: 1px solid #efbdc6;
+}
+.inline-alert.info {
+  color: #245d75;
+  background: #eef8fc;
+  border: 1px solid #c8e2ec;
+}
+.compact-table table {
+  min-width: 620px;
+}
+.compact-table th,
+.compact-table td {
+  padding: 7px 8px;
+  font-size: 9px;
+}
+.compact-table td strong {
+  font-size: 10px;
+}
 .stress-errors {
   margin-top: 10px;
   color: #9b3446;
@@ -2022,7 +2124,8 @@ td {
     text-align: left;
   }
   .stress-plan-layout,
-  .latency-grid {
+  .latency-grid,
+  .stress-evidence-grid {
     grid-template-columns: 1fr;
   }
   .stress-metrics,

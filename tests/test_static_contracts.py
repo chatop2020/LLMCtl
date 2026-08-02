@@ -106,6 +106,14 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("GATEWAY_API_KEY", MANAGER)
         self.assertIn("-e ALLOW_API_KEY_REVEAL=true", MANAGER)
 
+    def test_router_can_reconcile_live_without_restarting_workers(self):
+        router = MANAGER.split("cmd_router() {", 1)[1].split("cmd_database() {", 1)[0]
+        self.assertIn("start|stop|restart|reconcile|status", MANAGER)
+        self.assertIn("reconcile)", router)
+        self.assertIn('reconcile_gateway "${healthy}"', router)
+        self.assertIn("Router 和 Worker 均未重启", router)
+        self.assertNotIn("refresh_router", router.split("reconcile)", 1)[1].split(";;", 1)[0])
+
     def test_gateway_versions_are_pinned_and_only_selected_image_is_pulled(self):
         self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)
         self.assertIn("ghcr.io/berriai/litellm:v1.94.0", INSTALLER)

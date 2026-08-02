@@ -34,10 +34,15 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
         body = (
             'data: {"id":"req-1","model":"gdn-inside","choices":[{"delta":{"content":"OK"}}]}\n\n'
             'data: {"choices":[],"usage":{"prompt_tokens":52,"completion_tokens":4,"total_tokens":56}}\n\n'
+            ': x-omniroute-provider=llmctl-w0\n'
             "data: [DONE]\n\n"
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        self.send_header("X-OmniRoute-Selected-Connection-Id", "conn-0")
+        self.send_header(
+            "X-OmniRoute-Decision", "strategy=round-robin; provider=llmctl-w0"
+        )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -63,6 +68,10 @@ class BenchmarkTests(unittest.TestCase):
                 benchmark.os.environ,
                 {"LLMCTL_BENCHMARK_API_KEY": "sk-test"},
             ):
+                route_map = pathlib.Path(directory) / "route-map.json"
+                route_map.write_text(
+                    json.dumps({"conn-0": "LLMCtl worker 0"}), encoding="utf-8"
+                )
                 arguments = argparse.Namespace(
                     run_id="run-1",
                     base_url=f"http://127.0.0.1:{server.server_address[1]}",
@@ -73,8 +82,10 @@ class BenchmarkTests(unittest.TestCase):
                     request_multiplier=1,
                     timeout=5,
                     result_dir=directory,
+                    route_map=str(route_map),
                 )
-                self.assertEqual(benchmark.execute(arguments), 0)
+                with mock.patch.object(benchmark.shutil, "which", return_value=None):
+                    self.assertEqual(benchmark.execute(arguments), 0)
                 status = json.loads(
                     (pathlib.Path(directory) / "status.json").read_text()
                 )
@@ -89,7 +100,30 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(status["metrics"]["output_tokens"], 8)
         self.assertIn("request_rps", status["metrics"])
         self.assertIn("p95", status["metrics"]["ttft_ms"])
+        self.assertEqual(
+            status["metrics"]["routing"]["targets"], {"LLMCtl worker 0": 2}
+        )
+        self.assertFalse(status["gpu"]["available"])
         self.assertEqual(len(events), 2)
+        self.assertTrue(
+            all(json.loads(event)["route_target"] == "LLMCtl worker 0" for event in events)
+        )
+
+    def test_gpu_sampler_reports_peak_concurrent_activity(self):
+        parsed = benchmark.GpuSampler.parse_output(
+            "0, 100, 77561, 224.0\n1, 100, 77711, 236.0\n2, 0, 77469, 77.0\n"
+        )
+        self.assertEqual(parsed[1]["utilization_percent"], 100)
+        sampler = benchmark.GpuSampler()
+        sampler.samples = {
+            0: [parsed[0], {**parsed[0], "utilization_percent": 0}],
+            1: [parsed[1], {**parsed[1], "utilization_percent": 100}],
+            2: [parsed[2], {**parsed[2], "utilization_percent": 100}],
+        }
+        snapshot = sampler.snapshot()
+        self.assertEqual(snapshot["peak_concurrent_active_gpu_count"], 2)
+        self.assertEqual(snapshot["current_active_gpu_count"], 2)
+        self.assertEqual(snapshot["sample_count"], 2)
 
 
 if __name__ == "__main__":
