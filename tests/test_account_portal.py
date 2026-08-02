@@ -208,6 +208,20 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(captured[0][0], email)
         return captured[0][1]
 
+    def login_admin_api(self):
+        client, jar = self.opener()
+        status, _, _ = self.get(client, "/portal-api/public")
+        self.assertEqual(status, 200)
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/auth/login",
+            {"email": "admin@example.com", "password": "correct horse battery staple"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["user"]["role"], "admin")
+        return client, jar
+
     def test_verified_user_gets_one_time_key_quota_usage_models_and_curl(self):
         client, jar = self.opener()
         token = self.register(client, jar)
@@ -254,7 +268,7 @@ class PortalIntegrationTests(unittest.TestCase):
             connection.execute("UPDATE users SET status='disabled' WHERE email='alice@example.com'")
         status, body, _ = self.get(client, "/")
         self.assertEqual(status, 200)
-        self.assertIn("Company LLM API portal", body)
+        self.assertIn("LLMCtl model service portal", body)
         self.assertNotIn("Available models", body)
 
     def test_domain_is_checked_at_registration_and_again_at_verification(self):
@@ -358,7 +372,55 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertNotIn("保存并设为", body)
         self.assertIn('<option value="active" selected>active</option>', body)
         self.assertIn('<option value="disabled" >disabled</option>', body)
-        self.assertIn("门户数据库与 OmniRoute 数据库完全分离", body)
+        self.assertIn("账户策略由 LLMCtl 统一管理", body)
+
+    def test_smtp_can_be_saved_and_tested_without_validating_registration_urls(self):
+        client, jar = self.login_admin_api()
+        with self.server.db.connect() as connection:
+            connection.execute("UPDATE settings SET value='' WHERE key='public_url'")
+        smtp = {
+            "scope": "smtp",
+            "smtp_host": "mail.example.com",
+            "smtp_port": 587,
+            "smtp_security": "starttls",
+            "smtp_username": "admin@example.com",
+            "smtp_password": "new-app-password",
+            "smtp_from": "admin@example.com",
+        }
+        status, body, _ = self.json_post(
+            client, jar, "/portal-api/admin/settings", smtp
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["scope"], "smtp")
+        with self.server.db.connect() as connection:
+            saved = dict(
+                connection.execute(
+                    "SELECT key,value FROM settings WHERE key IN ('public_url','smtp_host','smtp_username','smtp_password','smtp_from')"
+                ).fetchall()
+            )
+        self.assertEqual(saved["public_url"], "")
+        self.assertEqual(saved["smtp_host"], "mail.example.com")
+        self.assertEqual(saved["smtp_password"], "new-app-password")
+
+        captured = []
+        current_form = smtp | {
+            "smtp_host": "preview.example.com",
+            "smtp_password": "preview-password",
+            "recipient": "admin@example.com",
+        }
+        with mock.patch.object(
+            portal,
+            "send_test_email",
+            side_effect=lambda config, recipient: captured.append((config, recipient)),
+        ):
+            status, body, _ = self.json_post(
+                client, jar, "/portal-api/admin/smtp/test", current_form
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(captured[0][0].smtp_host, "preview.example.com")
+        self.assertEqual(captured[0][0].smtp_password, "preview-password")
+        self.assertEqual(captured[0][1], "admin@example.com")
 
     def insert_control_user_and_model(self, *, paid=False, source_kind="combo", upstream_free=0):
         stamp = portal.now()
@@ -503,6 +565,42 @@ class PortalIntegrationTests(unittest.TestCase):
 
 
 class PortalUnitTests(unittest.TestCase):
+    def test_model_health_check_disables_thinking_and_has_a_bounded_timeout(self):
+        request_state = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"choices":[{"message":{"content":"OK"}}]}'
+
+        class Opener:
+            @staticmethod
+            def open(request, timeout):
+                request_state["payload"] = json.loads(request.data)
+                request_state["timeout"] = timeout
+                return Response()
+
+        config = mock.Mock(
+            gateway_manage_key="sk-management-test",
+            gateway_url="http://127.0.0.1:18000",
+        )
+        client = portal.OmniRouteClient(config)
+        client.opener = Opener()
+        _, content = client.test_model("gdn-inside")
+        self.assertEqual(content, "OK")
+        self.assertEqual(request_state["timeout"], 60)
+        self.assertFalse(request_state["payload"]["stream"])
+        self.assertEqual(request_state["payload"]["reasoning_effort"], "none")
+        self.assertEqual(
+            request_state["payload"]["chat_template_kwargs"], {"enable_thinking": False}
+        )
+
     def test_password_hash_is_salted_and_verifiable(self):
         first = portal.hash_password("a secure password 123")
         second = portal.hash_password("a secure password 123")

@@ -61,7 +61,7 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn('elif account_portal_health; then', MANAGER)
         self.assertIn('portal_state=degraded', MANAGER)
         account_unit = INSTALLER.split(
-            "Description=LLMCtl company account portal for OmniRoute", 1
+            "Description=LLMCtl account portal", 1
         )[1].split("EOF", 1)[0]
         self.assertIn("Wants=llm-router.service", account_unit)
         self.assertIn("PartOf=llm-cluster.service", account_unit)

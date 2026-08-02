@@ -156,8 +156,9 @@ class InstallerInteractionTests(unittest.TestCase):
                 "bash",
                 "-c",
                 installer_script(
+                    "hostname() { printf '192.0.2.10\\n'; }; "
                     "GATEWAY_KIND=omniroute; ASSUME_YES=1; configure_omniroute_portal_interactively; "
-                    "printf 'password=%s registration=%s\\n' \"$UI_PASSWORD\" \"$ACCOUNT_REGISTRATION_ENABLED\""
+                    "printf 'password=%s registration=%s portal=%s api=%s\\n' \"$UI_PASSWORD\" \"$ACCOUNT_REGISTRATION_ENABLED\" \"$ACCOUNT_PUBLIC_URL\" \"$ACCOUNT_API_PUBLIC_URL\""
                 ),
             ],
             text=True,
@@ -168,6 +169,8 @@ class InstallerInteractionTests(unittest.TestCase):
         password = values[0].split("=", 1)[1]
         self.assertGreaterEqual(len(password), 12)
         self.assertIn("registration=0", completed.stdout)
+        self.assertIn("portal=http://192.0.2.10:8000/ui", completed.stdout)
+        self.assertIn("api=http://192.0.2.10:8000", completed.stdout)
 
     def test_account_public_origin_validation_accepts_normal_hosts_and_rejects_paths(self):
         installer = INSTALLER.read_text(encoding="utf-8")

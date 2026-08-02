@@ -227,8 +227,9 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        public_url = os.environ.get(
-            "ACCOUNT_PUBLIC_URL", f"http://127.0.0.1:{env_int('API_PORT', 8000)}/ui"
+        public_url = (
+            os.environ.get("ACCOUNT_PUBLIC_URL", "").strip()
+            or f"http://127.0.0.1:{env_int('API_PORT', 8000)}/ui"
         ).rstrip("/")
         api_public = os.environ.get("ACCOUNT_API_PUBLIC_URL", "").rstrip("/")
         for name, value, allowed_paths in (
@@ -589,6 +590,14 @@ class Database:
                     "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                     (key, value, now()),
                 )
+            # Older installs created blank public origins whenever registration
+            # started disabled. Repair those values so SMTP and later
+            # registration changes are not blocked by unrelated empty fields.
+            for key in ("public_url", "api_public_url"):
+                connection.execute(
+                    "UPDATE settings SET value=?,updated_at=? WHERE key=? AND TRIM(value)=''",
+                    (defaults[key], now(), key),
+                )
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(published_models)")
             }
@@ -626,8 +635,12 @@ class Database:
                 )
             stamp = now()
             connection.execute(
-                "INSERT OR IGNORE INTO user_groups(id,name,description,status,created_at,updated_at) VALUES('default','default','Default company users','active',?,?)",
+                "INSERT OR IGNORE INTO user_groups(id,name,description,status,created_at,updated_at) VALUES('default','default','Default LLMCtl users','active',?,?)",
                 (stamp, stamp),
+            )
+            connection.execute(
+                "UPDATE user_groups SET description=?,updated_at=? WHERE id='default' AND description='Default company users'",
+                ("Default LLMCtl users", stamp),
             )
             connection.execute(
                 "INSERT OR IGNORE INTO billing_accounts(user_id,balance_micros,suspended,updated_at) SELECT id,0,0,? FROM users",
@@ -923,7 +936,13 @@ class OmniRouteClient:
         payload = {
             "model": model_id,
             "stream": False,
-            "max_tokens": 8,
+            "max_tokens": 32,
+            "temperature": 0,
+            # Thinking-only output can look empty to an OpenAI-compatible
+            # gateway. Health checks need a short final answer, not a reasoning
+            # trace, so explicitly use both supported thinking-off controls.
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "user", "content": "Reply with exactly OK"}],
         }
         started = time.monotonic()
@@ -939,7 +958,7 @@ class OmniRouteClient:
             method="POST",
         )
         try:
-            with self.opener.open(request, timeout=90) as response:
+            with self.opener.open(request, timeout=60) as response:
                 raw = response.read().decode(errors="replace")
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:500]
@@ -1056,7 +1075,7 @@ def page(title: str, body: str, user: sqlite3.Row | None = None, lang: str = "zh
         )
     else:
         auth = '<a href="/login">登录 / Sign in</a>'
-    return f"""<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)} · LLMCtl</title><style>{STYLE}</style></head><body><main class="shell"><nav class="nav"><div><a class="brand" href="/">LLMCtl Account Portal</a><div class="sub">OmniRoute account control plane</div></div><div class="row">{auth}</div></nav>{body}</main><script>function cp(id){{navigator.clipboard.writeText(document.getElementById(id).innerText).then(()=>{{const b=document.querySelector('[data-copy="'+id+'"]');if(b)b.innerText='已复制 / Copied'}})}}document.querySelectorAll('[data-copy]').forEach(b=>b.onclick=()=>cp(b.dataset.copy));</script></body></html>"""
+    return f"""<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)} · LLMCtl</title><style>{STYLE}</style></head><body><main class="shell"><nav class="nav"><div><a class="brand" href="/">LLMCtl Model Service Portal</a><div class="sub">Models, API keys, quotas, and usage</div></div><div class="row">{auth}</div></nav>{body}</main><script>function cp(id){{navigator.clipboard.writeText(document.getElementById(id).innerText).then(()=>{{const b=document.querySelector('[data-copy="'+id+'"]');if(b)b.innerText='已复制 / Copied'}})}}document.querySelectorAll('[data-copy]').forEach(b=>b.onclick=()=>cp(b.dataset.copy));</script></body></html>"""
 
 
 class PortalHandler(http.server.BaseHTTPRequestHandler):
@@ -1408,7 +1427,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/portal-api/admin/settings":
                 result = self.api_update_settings(payload)
             elif path == "/portal-api/admin/smtp/test":
-                config = effective_mail_config(self.app.config, self.app.db.settings())
+                config = self.smtp_config_from_payload(payload)
                 send_test_email(config, str(payload.get("recipient", user["email"])))
                 result = {"ok": True}
             else:
@@ -1645,35 +1664,88 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             raise
         return {"ok": True, "api_key": raw_key}
 
-    def api_update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        enabled = bool(payload.get("registration_enabled", False))
-        domains = normalize_domains(str(payload.get("allowed_domains", "")))
-        public_url = str(payload.get("public_url", "")).rstrip("/")
-        api_url = str(payload.get("api_public_url", "")).rstrip("/")
-        smtp_security = str(payload.get("smtp_security", "starttls"))
-        smtp_port = int(payload.get("smtp_port", 587))
-        quota = int(payload.get("default_quota_tokens", 1000000))
-        reset = str(payload.get("default_quota_reset", "monthly"))
-        reset_time = str(payload.get("default_quota_reset_time", "00:00"))
-        currency = str(payload.get("currency", "USD")).strip().upper()
-        if enabled and not domains:
-            raise ValueError("registration requires at least one allowed email domain")
-        if not 1 <= quota <= 10**12:
-            raise ValueError("default token quota must be 1-1000000000000")
-        if reset not in {"daily", "weekly", "monthly"}:
-            raise ValueError("invalid quota reset interval")
-        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
-            raise ValueError("invalid quota reset time")
-        if not re.fullmatch(r"[A-Z]{3}", currency):
-            raise ValueError("currency must be a three-letter code")
+    def smtp_config_from_payload(self, payload: dict[str, Any]) -> Config:
+        current = effective_mail_config(self.app.config, self.app.db.settings())
+        try:
+            smtp_port = int(payload.get("smtp_port", current.smtp_port))
+        except (TypeError, ValueError) as error:
+            raise ValueError("SMTP 端口必须是 1-65535 之间的整数") from error
+        smtp_security = str(payload.get("smtp_security", current.smtp_security)).strip().lower()
+        smtp_host = str(payload.get("smtp_host", current.smtp_host)).strip()
+        smtp_from = str(payload.get("smtp_from", current.smtp_from)).strip()
+        smtp_username = str(payload.get("smtp_username", current.smtp_username)).strip()
+        smtp_password = str(payload.get("smtp_password", "")) or current.smtp_password
         if smtp_security not in {"starttls", "ssl", "plain"} or not 1 <= smtp_port <= 65535:
-            raise ValueError("invalid SMTP configuration")
-        for label, url, allow_ui in (("public_url", public_url, True), ("api_public_url", api_url, False)):
+            raise ValueError("SMTP 安全协议或端口无效")
+        if not smtp_host or len(smtp_host) > 253 or re.search(r"\s", smtp_host):
+            raise ValueError("SMTP 主机无效")
+        if not smtp_from:
+            raise ValueError("请填写 SMTP 发件人")
+        normalize_email(smtp_from)
+        return dataclasses.replace(
+            current,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_security=smtp_security,
+            smtp_username=smtp_username,
+            smtp_password=smtp_password,
+            smtp_from=smtp_from,
+        )
+
+    def api_update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        scope = str(payload.get("scope", "all")).strip().lower()
+        if scope not in {"all", "registration", "smtp"}:
+            raise ValueError("invalid settings scope")
+        current = self.app.db.settings()
+        smtp_values: dict[str, str] = {}
+        if scope in {"all", "smtp"}:
+            smtp = self.smtp_config_from_payload(payload)
+            smtp_values = {
+                "smtp_host": smtp.smtp_host,
+                "smtp_port": str(smtp.smtp_port),
+                "smtp_security": smtp.smtp_security,
+                "smtp_username": smtp.smtp_username,
+                "smtp_password": smtp.smtp_password,
+                "smtp_from": smtp.smtp_from,
+            }
+            if scope == "smtp":
+                self.app.db.update_settings(smtp_values)
+                return {"ok": True, "scope": scope}
+
+        enabled_value = payload.get(
+            "registration_enabled", current.get("registration_enabled", "0")
+        )
+        enabled = enabled_value is True or str(enabled_value).strip().lower() in {"1", "true", "yes", "on"}
+        domains = normalize_domains(str(payload.get("allowed_domains", current.get("allowed_domains", ""))))
+        public_url = str(
+            payload.get("public_url", current.get("public_url") or self.app.config.public_url)
+        ).rstrip("/")
+        api_url = str(
+            payload.get("api_public_url", current.get("api_public_url") or self.app.config.api_public_url)
+        ).rstrip("/")
+        try:
+            quota = int(payload.get("default_quota_tokens", current.get("default_quota_tokens", "1000000")))
+        except (TypeError, ValueError) as error:
+            raise ValueError("默认 Token 额度必须是整数") from error
+        reset = str(payload.get("default_quota_reset", current.get("default_quota_reset", "monthly")))
+        reset_time = str(payload.get("default_quota_reset_time", current.get("default_quota_reset_time", "00:00")))
+        currency = str(payload.get("currency", current.get("currency", "USD"))).strip().upper()
+        if enabled and not domains:
+            raise ValueError("开放注册前请至少配置一个允许的邮箱域名")
+        if not 1 <= quota <= 10**12:
+            raise ValueError("默认 Token 额度必须在 1-1000000000000 之间")
+        if reset not in {"daily", "weekly", "monthly"}:
+            raise ValueError("额度重置周期无效")
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
+            raise ValueError("额度重置时间必须使用 HH:MM 格式")
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("货币代码必须是三个大写字母")
+        for label, url, allow_ui in (("门户公开 URL", public_url, True), ("API 公开 URL", api_url, False)):
             try:
                 parsed = urllib.parse.urlsplit(url)
                 parsed.port
             except ValueError as error:
-                raise ValueError(f"invalid {label}") from error
+                raise ValueError(f"{label} 无效") from error
             if (
                 parsed.scheme not in {"http", "https"}
                 or not parsed.hostname
@@ -1682,42 +1754,33 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 or parsed.query
                 or parsed.fragment
             ):
-                raise ValueError(f"invalid {label}")
+                raise ValueError(f"{label} 无效")
             if (allow_ui and parsed.path.rstrip("/") not in {"", "/ui"}) or (not allow_ui and parsed.path.rstrip("/")):
-                raise ValueError(f"invalid {label} path")
+                raise ValueError(f"{label} 路径无效")
         public_url = portal_ui_url(public_url)
-        current = self.app.db.settings()
-        smtp_password = str(payload.get("smtp_password", "")) or current.get("smtp_password", "")
-        values = {
-            "registration_enabled": "1" if enabled else "0",
-            "allowed_domains": ",".join(domains),
-            "default_quota_tokens": str(quota),
-            "default_quota_reset": reset,
-            "default_quota_reset_time": reset_time,
-            "public_url": public_url,
-            "api_public_url": api_url,
-            "smtp_host": str(payload.get("smtp_host", "")),
-            "smtp_port": str(smtp_port),
-            "smtp_security": smtp_security,
-            "smtp_username": str(payload.get("smtp_username", "")),
-            "smtp_password": smtp_password,
-            "smtp_from": str(payload.get("smtp_from", "")),
-            "currency": currency,
-        }
-        if values["smtp_host"] and (len(values["smtp_host"]) > 253 or re.search(r"\s", values["smtp_host"])):
-            raise ValueError("invalid SMTP host")
-        if values["smtp_from"]:
-            normalize_email(values["smtp_from"])
-        if enabled and (not values["public_url"] or not values["smtp_host"] or not values["smtp_from"]):
-            raise ValueError("registration requires public URL, SMTP host and from address")
-        self.app.db.update_settings(values)
-        return {"ok": True}
+        mail = smtp if scope == "all" else effective_mail_config(self.app.config, self.app.db.settings())
+        if enabled and (not public_url or not mail.smtp_host or not mail.smtp_from):
+            raise ValueError("开放注册前必须配置门户公开 URL、SMTP 主机和发件人")
+        self.app.db.update_settings(
+            smtp_values
+            | {
+                "registration_enabled": "1" if enabled else "0",
+                "allowed_domains": ",".join(domains),
+                "default_quota_tokens": str(quota),
+                "default_quota_reset": reset,
+                "default_quota_reset_time": reset_time,
+                "public_url": public_url,
+                "api_public_url": api_url,
+                "currency": currency,
+            }
+        )
+        return {"ok": True, "scope": scope}
 
     def show_landing(self) -> None:
         settings = self.app.db.settings()
         registration = settings.get("registration_enabled") == "1"
         register = '<a class="button" href="/register">注册 / Register</a>' if registration else '<span class="muted">注册已关闭 / Registration is closed</span>'
-        body = f'<section class="card"><h1>公司 LLM API 门户</h1><p class="muted">Company LLM API portal · OmniRoute</p><p>验证公司邮箱后获得个人 API Key、周期额度、用量和可调用模型。</p><div class="row"><a class="button" href="/login">登录 / Sign in</a>{register}</div></section>'
+        body = f'<section class="card"><h1>LLMCtl 模型服务门户</h1><p class="muted">LLMCtl model service portal</p><p>验证允许的邮箱后获得个人 API Key、周期额度、用量和可调用模型。</p><div class="row"><a class="button" href="/login">登录 / Sign in</a>{register}</div></section>'
         self.response(200, page("Account portal", body))
 
     def show_login(self, message: str = "", error: bool = False) -> None:
@@ -1732,7 +1795,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         domains = settings.get("allowed_domains", "")
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<section class="card" style="max-width:560px;margin:auto"><h1>注册 / Register</h1><p class="muted">仅允许：{html.escape(domains)}</p><form method="post" action="/register"><input type="hidden" name="csrf" value="__CSRF__"><label>公司邮箱 / Company email</label><input name="email" type="email" required><label>密码 / Password</label><input name="password" type="password" minlength="12" maxlength="200" required><label>确认密码 / Confirm</label><input name="confirm" type="password" minlength="12" maxlength="200" required><p class="small muted">至少 12 个字符；API Key 不会通过邮件发送。</p><button>发送验证邮件 / Send verification</button></form></section>'''
+        body = f'''{flash}<section class="card" style="max-width:560px;margin:auto"><h1>注册 / Register</h1><p class="muted">仅允许：{html.escape(domains)}</p><form method="post" action="/register"><input type="hidden" name="csrf" value="__CSRF__"><label>邮箱 / Email</label><input name="email" type="email" required><label>密码 / Password</label><input name="password" type="password" minlength="12" maxlength="200" required><label>确认密码 / Confirm</label><input name="confirm" type="password" minlength="12" maxlength="200" required><p class="small muted">至少 12 个字符；API Key 不会通过邮件发送。</p><button>发送验证邮件 / Send verification</button></form></section>'''
         self.response(200, page("Register", body))
 
     def show_verify(self, raw_token: str) -> None:
@@ -1775,7 +1838,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             model_id = str(model.get("id", ""))
             if not model_id:
                 continue
-            owned = str(model.get("owned_by", model.get("provider", "OmniRoute")))
+            owned = str(model.get("owned_by", model.get("provider", "LLMCtl")))
             capabilities = model.get("capabilities", model.get("input_modalities", []))
             caps = json.dumps(capabilities, ensure_ascii=False) if capabilities else "chat"
             if self.app.config.supports_ocr and model_id == os.environ.get("SERVED_MODEL_NAME", ""):
@@ -1798,8 +1861,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
   -H 'Content-Type: application/json' \\
   -d {shlex.quote(sample_payload)}'''
         flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
-        error = f'<div class="flash error">OmniRoute: {html.escape(gateway_error)}</div>' if gateway_error else ""
-        body = f'''{flash}{error}<div class="grid">{key_box}<section class="card"><h2>本周期用量 / Usage</h2><div class="stat">{used:,} / {total:,}</div><p class="muted">剩余 {remaining:,} tokens · 下次重置 / next reset: {html.escape(reset_label)}</p></section><section class="card"><h2>API 地址 / Endpoint</h2><div id="api-base" class="key">{html.escape(self.app.config.api_public_url)}/v1</div><p><button class="secondary" data-copy="api-base">复制 / Copy</button></p></section><section class="card wide"><h2>调用示例 / curl demo</h2><pre id="curl-demo">{html.escape(curl)}</pre><button class="secondary" data-copy="curl-demo">复制示例 / Copy demo</button></section><section class="card wide"><div class="row"><h2>开放模型 / Available models</h2><span class="spacer"></span><span class="muted">{len(model_rows)} models</span></div><div class="models">{''.join(model_rows) or '<p class="muted">No models exposed by OmniRoute.</p>'}</div></section><section class="card wide"><h2>密钥安全 / Key security</h2><p class="muted">轮换会先创建并验证新 Key，再停用旧 Key。新 Key 仍只显示一次。</p><form method="post" action="/rotate-key"><input type="hidden" name="csrf" value="__CSRF__"><button class="danger">轮换 API Key / Rotate key</button></form></section></div>'''
+        error = '<div class="flash error">AI gateway unavailable; see LLMCtl account logs.</div>' if gateway_error else ""
+        body = f'''{flash}{error}<div class="grid">{key_box}<section class="card"><h2>本周期用量 / Usage</h2><div class="stat">{used:,} / {total:,}</div><p class="muted">剩余 {remaining:,} tokens · 下次重置 / next reset: {html.escape(reset_label)}</p></section><section class="card"><h2>API 地址 / Endpoint</h2><div id="api-base" class="key">{html.escape(self.app.config.api_public_url)}/v1</div><p><button class="secondary" data-copy="api-base">复制 / Copy</button></p></section><section class="card wide"><h2>调用示例 / curl demo</h2><pre id="curl-demo">{html.escape(curl)}</pre><button class="secondary" data-copy="curl-demo">复制示例 / Copy demo</button></section><section class="card wide"><div class="row"><h2>开放模型 / Available models</h2><span class="spacer"></span><span class="muted">{len(model_rows)} models</span></div><div class="models">{''.join(model_rows) or '<p class="muted">No models are currently available.</p>'}</div></section><section class="card wide"><h2>密钥安全 / Key security</h2><p class="muted">轮换会先创建并验证新 Key，再停用旧 Key。新 Key 仍只显示一次。</p><form method="post" action="/rotate-key"><input type="hidden" name="csrf" value="__CSRF__"><button class="danger">轮换 API Key / Rotate key</button></form></section></div>'''
         self.response(200, page("Dashboard", body, user), user)
 
     def show_admin(self, message: str = "", error: bool = False) -> None:
@@ -1826,7 +1889,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         audit_rows = "".join(f'<tr><td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["created_at"]))}</td><td>{html.escape(a["actor"])}</td><td>{html.escape(a["action"])}</td><td>{html.escape(a["status"])}</td><td>{html.escape(a["detail"])}</td></tr>' for a in audits)
         checked = "checked" if settings.get("registration_enabled") == "1" else ""
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">开启注册要求安装时已配置 SMTP；域名在验证时会再次检查。</p></section><section class="card"><h2>服务入口</h2><p>OmniRoute: <a href="{html.escape(self.app.config.api_public_url)}">{html.escape(self.app.config.api_public_url)}</a></p><p>Portal: {html.escape(self.app.config.public_url)}</p><p class="muted">门户数据库与 OmniRoute 数据库完全分离。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
+        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">开启注册要求安装时已配置 SMTP；域名在验证时会再次检查。</p></section><section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(self.app.config.api_public_url)}">{html.escape(self.app.config.api_public_url)}</a></p><p>LLMCtl: {html.escape(self.app.config.public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
         self.response(200, page("Admin", body, user), user)
 
     def handle_login(self, form: dict[str, str]) -> None:

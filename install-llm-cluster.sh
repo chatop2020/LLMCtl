@@ -263,7 +263,7 @@ EOF
   --account-public-url URL        验证邮件中的公开 /ui 地址
   --account-api-public-url URL    调用示例中显示的 OmniRoute 公开地址
   --registration enabled|disabled 是否开放注册
-  --allowed-email-domains LIST    允许注册的公司邮箱后缀，逗号分隔且精确匹配
+  --allowed-email-domains LIST    允许注册的邮箱域名后缀，逗号分隔且精确匹配
   --account-default-quota N       默认周期 Token 额度，默认 1000000
   --account-quota-reset daily|weekly|monthly
   --account-quota-reset-time HH:MM
@@ -458,7 +458,7 @@ Choose an API gateway:
   1) New API (recommended/default) — Chinese-friendly admin UI, channels, keys and usage
   2) LiteLLM — broad provider compatibility and the legacy LLMCtl integration
   3) Bifrost — efficient gateway with per-worker weighted routing and observability
-  4) OmniRoute — routing/observability plus LLMCtl company account portal
+  4) OmniRoute — routing/observability plus the LLMCtl account portal
   0) Cancel installation
 EOF
     else
@@ -468,7 +468,7 @@ EOF
   1) New API（推荐/默认）— 中文管理界面友好，提供渠道、令牌和用量管理
   2) LiteLLM — 供应商兼容面广，也是 LLMCtl 原有接入层
   3) Bifrost — 高效网关，支持按 Worker 加权路由与可观测性
-  4) OmniRoute — 路由与可观测性，并配套 LLMCtl 公司账户门户
+  4) OmniRoute — 路由与可观测性，并配套 LLMCtl 账户门户
   0) 退出安装
 EOF
     fi
@@ -486,17 +486,19 @@ EOF
 
 configure_omniroute_portal_interactively() {
   [[ "${GATEWAY_KIND}" == omniroute ]] || return 0
+  local answer suggested_ip smtp_password
+  suggested_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-http://${suggested_ip:-127.0.0.1}:${API_PORT}/ui}"
+  ACCOUNT_API_PUBLIC_URL="${ACCOUNT_API_PUBLIC_URL:-http://${suggested_ip:-127.0.0.1}:${API_PORT}}"
   if (( ! UI_PASSWORD_EXPLICIT )); then
     command -v openssl >/dev/null 2>&1 || die "$(l10n 'OmniRoute 需要 openssl 生成初始强密码' 'OmniRoute requires openssl to generate its initial strong password')"
     UI_PASSWORD="llm-$(openssl rand -hex 10)"
   fi
   (( ASSUME_YES || NON_INTERACTIVE || REGISTRATION_EXPLICIT )) && return 0
-  local answer suggested_ip smtp_password
-  read -r -p "$(l10n '是否立即开放公司邮箱注册？[y/N] ' 'Enable company-email registration now? [y/N] ')" answer
+  read -r -p "$(l10n '是否立即开放邮箱注册？[y/N] ' 'Enable email registration now? [y/N] ')" answer
   [[ "${answer}" =~ ^[Yy]$ ]] || { ACCOUNT_REGISTRATION_ENABLED=0; return 0; }
   ACCOUNT_REGISTRATION_ENABLED=1
   read -r -p "$(l10n '允许的邮箱后缀（逗号分隔，如 example.com）: ' 'Allowed email domains (comma-separated, e.g. example.com): ')" ACCOUNT_ALLOWED_EMAIL_DOMAINS
-  suggested_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   read -r -p "$(l10n "门户公开地址 [http://${suggested_ip:-服务器IP}:${API_PORT}/ui]: " "Portal public URL [http://${suggested_ip:-server-IP}:${API_PORT}/ui]: ")" ACCOUNT_PUBLIC_URL
   ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-http://${suggested_ip:-127.0.0.1}:${API_PORT}/ui}"
   read -r -p "$(l10n 'SMTP 主机: ' 'SMTP host: ')" SMTP_HOST
@@ -1812,7 +1814,7 @@ EOF
 
     cat >/etc/systemd/system/llm-account.service <<'EOF'
 [Unit]
-Description=LLMCtl company account portal for OmniRoute
+Description=LLMCtl account portal
 After=network-online.target llm-router.service
 Wants=llm-router.service
 PartOf=llm-cluster.service
