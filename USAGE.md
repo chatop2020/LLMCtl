@@ -383,6 +383,23 @@ journalctl -u llm-cluster.service -n 300 --no-pager
 - 接入层不健康但 Worker 健康：检查 `llm-router` 和 `llm-database` 日志。New API 自动配置失败时，Router 日志之后还会在 `llm-cluster.service` 日志中显示具体的 setup/login/channel/token 错误。
 - OmniRoute 健康但门户不可用：运行 `llmctl account status`、`llmctl logs account`。邮件收不到时重点检查 SMTP 主机、TLS 模式、发件地址和垃圾邮件策略；门户不会绕过邮箱验证直接发 key。
 
+## 原地升级门户与控制面
+
+```bash
+sudo llmctl upgrade
+```
+
+确认后，LLMCtl 从 GitHub 获取最新项目内容；网络不可达时会引导配置临时或持久代理。升级会更新 `llmctl`、安装维护脚本、账户门户后端和 Vue 静态资源，并对门户 SQLite 执行向后兼容的原地迁移。现有 vLLM Worker、模型目录、路由组合、用户和账本不会被重装。
+
+升级完成后建议执行：
+
+```bash
+sudo llmctl health
+sudo llmctl info
+```
+
+模型编辑页面的“重新读取”用于从当前 AI 接入层刷新上下文和最大输出；只有管理员实际修改相应字段时才会写回底层目标。参数同步状态会显示为 `read`、`synced`、`partial` 或 `failed`。
+
 ## 卸载
 
 默认保留模型、接入层 PostgreSQL/SQLite 本地状态和 root-only 恢复凭据：

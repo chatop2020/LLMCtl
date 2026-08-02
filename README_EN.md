@@ -261,9 +261,17 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `llm-account.service` | Company account portal in OmniRoute mode only |
 | `nginx.service` | Public `/v1/`, `/ui/`, and optional `/base_ui/` front door |
 
+## Portal Model Metadata and Ledgers
+
+- The model editor reads context windows, maximum output limits, and detectable capabilities from the active AI gateway. For a multi-target routing combo, the portal shows the conservative usable value and lists every resolved target.
+- When an administrator changes the context or output limit, LLMCtl writes it through the gateway's native API for every resolvable target. Partial failures remain visible, name the failed targets, and are audited; they are never presented as a successful sync.
+- Model descriptions, OCR labels, and access scopes are LLMCtl publication metadata. They appear in the administration list and user catalog but are not misrepresented as gateway-native parameters.
+- Billing separates request usage from monetary balance transactions. An empty money ledger is expected when grants cover all requests; token, model, user, and retained request-text records remain visible.
+- `llmctl upgrade` upgrades only the LLMCtl control plane, portal assets, and maintenance scripts, applying in-place database migrations. It does not rebuild or replace existing workers or model weights.
+
 ## Security Notes
 
-- Nginx listens on `0.0.0.0:8000` by default; gateways, the portal, workers, and PostgreSQL bind only to loopback or the internal Docker network. Production deployments should still restrict the public listener with a firewall and configure HTTPS. The installer can reuse existing Nginx, but it does not issue TLS certificates.
+- Nginx listens on `0.0.0.0:8000` by default; gateways, the portal, workers, and PostgreSQL are constrained to loopback or the internal Docker network, and the account portal rejects any bind address other than `127.0.0.1`. A service may listen on `0.0.0.0` inside its container, but its host publication remains fixed to `127.0.0.1` and is not directly exposed. Production deployments should still restrict the public listener with a firewall and configure HTTPS. The installer can reuse existing Nginx, but it does not issue TLS certificates.
 - Model revisions are recorded in the manifest. Hugging Face defaults to a pinned commit; ModelScope defaults to `master`. For reproducible deployments, explicitly provide a tag or commit hash.
 - `--trust-remote-code` is enabled only when the model configuration declares `auto_map`. This still executes repository code, so select only reviewed models at pinned revisions.
 - External image domains are denied by default. OCR examples use base64 `data:` URLs to reduce SSRF exposure.

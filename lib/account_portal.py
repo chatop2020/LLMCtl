@@ -31,6 +31,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,7 +41,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.6.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -96,9 +97,15 @@ def normalize_email(value: str) -> tuple[str, str]:
     return f"{local}@{domain}", domain
 
 
+def validate_password(password: str) -> None:
+    if not 8 <= len(password) <= 200:
+        raise ValueError("密码必须为 8-200 个字符")
+    if password.strip().isdecimal():
+        raise ValueError("密码不能全部由数字组成")
+
+
 def hash_password(password: str, salt: bytes | None = None) -> str:
-    if not 12 <= len(password) <= 200:
-        raise ValueError("password length must be 12-200")
+    validate_password(password)
     salt = salt or secrets.token_bytes(16)
     iterations = 600_000
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations, dklen=32)
@@ -125,6 +132,97 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def token_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def normalize_group_name(value: str) -> str:
+    """Return a canonical, visible Unicode group name suitable for display."""
+    normalized = unicodedata.normalize("NFKC", str(value))
+    visible: list[str] = []
+    for character in normalized:
+        category = unicodedata.category(character)
+        if category.startswith("C") or category in {"Zl", "Zp"}:
+            raise ValueError("用户组名称不能包含控制字符或不可见字符")
+        visible.append(" " if character.isspace() else character)
+    result = re.sub(r" +", " ", "".join(visible)).strip()
+    if not 1 <= len(result) <= 80:
+        raise ValueError("用户组名称必须为 1-80 个可见字符，支持中文")
+    return result
+
+
+def request_content_summary(request_body: Any, max_characters: int = 20_000) -> dict[str, Any]:
+    """Extract displayable request text without returning arbitrary request metadata."""
+    if isinstance(request_body, str):
+        try:
+            request_body = json.loads(request_body)
+        except json.JSONDecodeError:
+            request_body = {"prompt": request_body}
+    if not isinstance(request_body, dict):
+        return {"available": False, "messages": [], "truncated": False}
+
+    def content_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if not isinstance(value, list):
+            return ""
+        parts: list[str] = []
+        for block in value:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).lower()
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+            elif isinstance(block.get("content"), str):
+                parts.append(str(block["content"]))
+            elif "image" in block_type:
+                parts.append("[图像内容]")
+            elif "audio" in block_type:
+                parts.append("[音频内容]")
+            elif "file" in block_type:
+                parts.append("[文件内容]")
+        return "\n".join(part for part in parts if part)
+
+    messages: list[dict[str, str]] = []
+    raw_messages = request_body.get("messages")
+    if not isinstance(raw_messages, list):
+        raw_messages = request_body.get("input") if isinstance(request_body.get("input"), list) else []
+    for item in raw_messages:
+        if isinstance(item, str):
+            messages.append({"role": "input", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = content_text(item.get("content"))
+        if not text and isinstance(item.get("text"), str):
+            text = str(item["text"])
+        if text:
+            messages.append({"role": str(item.get("role", item.get("type", "input"))), "content": text})
+    system = content_text(request_body.get("system"))
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
+    if not messages:
+        prompt = request_body.get("prompt", request_body.get("input"))
+        text = content_text(prompt) if isinstance(prompt, list) else str(prompt or "")
+        if text:
+            messages.append({"role": "input", "content": text})
+
+    remaining = max_characters
+    truncated = False
+    result: list[dict[str, str]] = []
+    for message in messages:
+        content = message["content"]
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(content) > remaining:
+            content = content[:remaining] + "…"
+            truncated = True
+        result.append({"role": message["role"][:32], "content": content})
+        remaining -= len(content)
+    return {"available": bool(result), "messages": result, "truncated": truncated}
 
 
 def now() -> int:
@@ -190,6 +288,19 @@ def micros_to_money(value: int) -> str:
     return f"{sign}{value // 1_000_000}.{value % 1_000_000:06d}".rstrip("0").rstrip(".")
 
 
+def positive_int_or_none(value: Any, label: str, maximum: int = 10_000_000) -> int | None:
+    """Parse an optional positive model limit without silently accepting bad input."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        result = int(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} 必须为正整数") from error
+    if result <= 0 or result > maximum:
+        raise ValueError(f"{label} 必须在 1-{maximum:,} 之间")
+    return result
+
+
 def portal_ui_url(value: str) -> str:
     """Canonicalize a public portal origin to the Nginx /ui entry point."""
     value = value.rstrip("/")
@@ -227,6 +338,11 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        bind = os.environ.get("ACCOUNT_BIND", "127.0.0.1").strip()
+        if bind != "127.0.0.1":
+            raise SystemExit(
+                "ACCOUNT_BIND must be 127.0.0.1; publish the portal through Nginx"
+            )
         public_url = (
             os.environ.get("ACCOUNT_PUBLIC_URL", "").strip()
             or f"http://127.0.0.1:{env_int('API_PORT', 8000)}/ui"
@@ -312,7 +428,7 @@ class Config:
         if db_path.resolve(strict=False) == gateway_db_path.resolve(strict=False):
             raise SystemExit("ACCOUNT_DB_PATH must not be OmniRoute's storage.sqlite")
         return cls(
-            bind=os.environ.get("ACCOUNT_BIND", "127.0.0.1"),
+            bind=bind,
             port=port,
             db_path=db_path,
             gateway_url=os.environ.get(
@@ -446,6 +562,12 @@ CREATE TABLE IF NOT EXISTS published_models (
   source_provider TEXT NOT NULL DEFAULT '',
   source_model TEXT NOT NULL,
   capabilities_json TEXT NOT NULL DEFAULT '[]',
+  context_window_tokens INTEGER,
+  max_output_tokens INTEGER,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  metadata_sync_status TEXT NOT NULL DEFAULT 'unknown',
+  metadata_sync_error TEXT NOT NULL DEFAULT '',
+  metadata_synced_at INTEGER,
   input_price_micros INTEGER NOT NULL DEFAULT 0,
   output_price_micros INTEGER NOT NULL DEFAULT 0,
   cached_price_micros INTEGER NOT NULL DEFAULT 0,
@@ -605,6 +727,19 @@ class Database:
                 connection.execute(
                     "ALTER TABLE published_models ADD COLUMN health_failures INTEGER NOT NULL DEFAULT 0"
                 )
+            model_columns = {
+                "context_window_tokens": "INTEGER",
+                "max_output_tokens": "INTEGER",
+                "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                "metadata_sync_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "metadata_sync_error": "TEXT NOT NULL DEFAULT ''",
+                "metadata_synced_at": "INTEGER",
+            }
+            for name, declaration in model_columns.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE published_models ADD COLUMN {name} {declaration}"
+                    )
             grant_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(token_grants)")
             }
@@ -865,6 +1000,36 @@ class OmniRouteClient:
     def combos(self) -> list[dict[str, Any]]:
         return self.items(self.request("GET", "/api/combos?limit=1000"), "combos")
 
+    def combo_builder_options(self) -> dict[str, Any]:
+        response = self.request("GET", "/api/combos/builder/options")
+        return response if isinstance(response, dict) else {}
+
+    def alias_metadata(self, alias: str) -> dict[str, Any]:
+        response = self.request(
+            "GET", f"/api/models/alias?{urllib.parse.urlencode({'alias': alias})}"
+        )
+        return response if isinstance(response, dict) else {}
+
+    def set_context_window_override(
+        self, provider: str, model_id: str, value: int
+    ) -> None:
+        self.request(
+            "PUT",
+            "/api/provider-models",
+            {
+                "provider": provider,
+                "modelId": model_id,
+                "contextWindowOverride": value,
+            },
+        )
+
+    def set_max_output_override(self, provider: str, model_id: str, value: int) -> None:
+        self.request(
+            "PATCH",
+            "/api/model-capability-overrides",
+            {"target": f"{provider}/{model_id}", "key": "max_token", "value": value},
+        )
+
     def free_models(self) -> list[dict[str, Any]]:
         return self.items(self.request("GET", "/api/free-models"), "models")
 
@@ -881,6 +1046,14 @@ class OmniRouteClient:
     def call_logs(self, key_id: str, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
         query = urllib.parse.urlencode({"apiKey": key_id, "limit": limit, "offset": offset})
         return self.items(self.request("GET", f"/api/usage/call-logs?{query}"), "logs")
+
+    def call_log(self, request_id: str) -> dict[str, Any]:
+        response = self.request(
+            "GET", f"/api/usage/call-logs/{urllib.parse.quote(request_id, safe='')}"
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("OmniRoute returned an invalid call-log detail")
+        return response
 
     def patch_key_permissions(
         self, key_id: str, allowed_models: list[str], allowed_combos: list[str], active: bool
@@ -1361,6 +1534,42 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             if user:
                 self.json_response(200, self.app.control.user_dashboard(user["id"]))
             return
+        if path.startswith("/portal-api/usage/"):
+            user, _ = self.api_require()
+            if not user:
+                return
+            request_id = urllib.parse.unquote(path.removeprefix("/portal-api/usage/"))
+            try:
+                detail = self.app.control.user_request_detail(user["id"], request_id)
+            except ValueError as error:
+                self.json_response(404, {"error": str(error)})
+                return
+            except RuntimeError as error:
+                self.json_response(502, {"error": str(error)})
+                return
+            self.app.db.audit(user["email"], "usage.detail.view", request_id, "success", self.remote_addr())
+            self.json_response(200, detail)
+            return
+        if path.startswith("/portal-api/admin/usage/"):
+            user, _ = self.api_require(admin=True)
+            if not user:
+                return
+            request_id = urllib.parse.unquote(
+                path.removeprefix("/portal-api/admin/usage/")
+            )
+            try:
+                detail = self.app.control.admin_request_detail(request_id)
+            except ValueError as error:
+                self.json_response(404, {"error": str(error)})
+                return
+            except RuntimeError as error:
+                self.json_response(502, {"error": str(error)})
+                return
+            self.app.db.audit(
+                user["email"], "admin.usage.detail.view", request_id, "success", self.remote_addr()
+            )
+            self.json_response(200, detail)
+            return
         if path == "/portal-api/admin":
             user, _ = self.api_require(admin=True)
             if user:
@@ -1411,6 +1620,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.control.test_free_resource(str(payload.get("resource_key", "")))
             elif path == "/portal-api/admin/models/save":
                 result = self.app.control.save_model(payload, user["email"])
+            elif path == "/portal-api/admin/models/inspect":
+                result = self.app.control.inspect_model(payload)
             elif path == "/portal-api/admin/models/test":
                 result = self.app.control.test_published_model(str(payload.get("model_id", "")))
             elif path == "/portal-api/admin/users/update":
@@ -1795,7 +2006,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         domains = settings.get("allowed_domains", "")
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<section class="card" style="max-width:560px;margin:auto"><h1>注册 / Register</h1><p class="muted">仅允许：{html.escape(domains)}</p><form method="post" action="/register"><input type="hidden" name="csrf" value="__CSRF__"><label>邮箱 / Email</label><input name="email" type="email" required><label>密码 / Password</label><input name="password" type="password" minlength="12" maxlength="200" required><label>确认密码 / Confirm</label><input name="confirm" type="password" minlength="12" maxlength="200" required><p class="small muted">至少 12 个字符；API Key 不会通过邮件发送。</p><button>发送验证邮件 / Send verification</button></form></section>'''
+        body = f'''{flash}<section class="card" style="max-width:560px;margin:auto"><h1>注册 / Register</h1><p class="muted">仅允许：{html.escape(domains)}</p><form method="post" action="/register"><input type="hidden" name="csrf" value="__CSRF__"><label>邮箱 / Email</label><input name="email" type="email" required><label>密码 / Password</label><input name="password" type="password" minlength="8" maxlength="200" required><label>确认密码 / Confirm</label><input name="confirm" type="password" minlength="8" maxlength="200" required><p class="small muted">8-200 个字符，不能为纯数字；收到邮件后请点击其中的验证链接。</p><button>发送验证邮件 / Send verification</button></form></section>'''
         self.response(200, page("Register", body))
 
     def show_verify(self, raw_token: str) -> None:
@@ -2012,7 +2223,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.show_register("验证邮件发送失败，请联系管理员 / Email delivery failed", True)
             return
         self.app.db.audit("anonymous", "register.email", email, "success", remote)
-        self.show_register("验证邮件已发送，请查收 / Verification email sent")
+        self.show_register("验证邮件已发送，请点击邮件中的链接完成验证 / Open the link in the email to verify")
 
     def handle_verify(self, form: dict[str, str]) -> None:
         if not self.verify_csrf(form):
@@ -2189,6 +2400,211 @@ class PortalControlPlane:
     @staticmethod
     def rows(rows: Any) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _qualified_target(value: str, provider: str = "") -> tuple[str, str]:
+        value, provider = str(value).strip(), str(provider).strip()
+        if provider and value.startswith(provider + "/"):
+            value = value[len(provider) + 1 :]
+        if not provider and "/" in value:
+            provider, value = value.split("/", 1)
+        return provider, value
+
+    def _resolve_model_targets(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        source_kind = str(payload.get("source_kind", "model"))
+        source_ref = str(payload.get("source_ref", ""))
+        source_provider = str(payload.get("source_provider", ""))
+        source_model = str(payload.get("source_model", ""))
+        if source_kind != "combo":
+            provider, model = self._qualified_target(source_model, source_provider)
+            return [{"provider": provider, "model": model}] if model else []
+
+        combos = self.omni.combos()
+        by_id = {str(item.get("id", "")): item for item in combos}
+        by_name = {str(item.get("name", "")): item for item in combos}
+        selected = by_id.get(source_ref) or by_name.get(source_model)
+        if not selected:
+            return []
+        targets: list[dict[str, str]] = []
+        visiting: set[str] = set()
+
+        def visit(combo: dict[str, Any]) -> None:
+            combo_id = str(combo.get("id", combo.get("name", "")))
+            if combo_id in visiting:
+                return
+            visiting.add(combo_id)
+            members = combo.get("models", combo.get("targets", []))
+            if not isinstance(members, list):
+                return
+            for member in members:
+                if isinstance(member, str):
+                    provider, model = self._qualified_target(member)
+                elif isinstance(member, dict):
+                    kind = str(member.get("kind", ""))
+                    if kind in {"combo", "combo-ref", "combo_ref"}:
+                        nested_id = str(
+                            member.get("comboId", member.get("combo_id", member.get("id", "")))
+                        )
+                        nested = by_id.get(nested_id) or by_name.get(nested_id)
+                        if nested:
+                            visit(nested)
+                        continue
+                    provider = str(member.get("provider", member.get("providerId", "")))
+                    model_value = str(
+                        member.get(
+                            "model",
+                            member.get(
+                                "modelId", member.get("qualifiedModel", member.get("id", ""))
+                            ),
+                        )
+                    )
+                    provider, model = self._qualified_target(model_value, provider)
+                else:
+                    continue
+                if model and {"provider": provider, "model": model} not in targets:
+                    targets.append({"provider": provider, "model": model})
+
+        visit(selected)
+        return targets
+
+    def inspect_model(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Read gateway-native metadata for every concrete target behind a publication."""
+        if payload.get("id") and not payload.get("source_model"):
+            with self.db.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM published_models WHERE id=?", (str(payload["id"]),)
+                ).fetchone()
+            if not row:
+                raise ValueError("model not found")
+            payload = dict(row)
+        targets = self._resolve_model_targets(payload)
+        if not targets:
+            raise ValueError("无法从当前接入层解析底层模型，请检查来源模型或路由组合")
+
+        options = self.omni.combo_builder_options()
+        providers = options.get("providers", []) if isinstance(options, dict) else []
+        lookup: dict[tuple[str, str], dict[str, Any]] = {}
+        if isinstance(providers, list):
+            for provider_entry in providers:
+                if not isinstance(provider_entry, dict):
+                    continue
+                provider_id = str(
+                    provider_entry.get("providerId", provider_entry.get("id", ""))
+                )
+                for model_entry in provider_entry.get("models", []) or []:
+                    if not isinstance(model_entry, dict):
+                        continue
+                    model_id = str(model_entry.get("id", model_entry.get("model", "")))
+                    qualified = str(model_entry.get("qualifiedModel", ""))
+                    q_provider, q_model = self._qualified_target(qualified, provider_id)
+                    lookup[(q_provider or provider_id, q_model or model_id)] = model_entry
+
+        enriched: list[dict[str, Any]] = []
+        capabilities: set[str] = set()
+        for target in targets:
+            provider, model_id = target["provider"], target["model"]
+            option = lookup.get((provider, model_id), {})
+            qualified = f"{provider}/{model_id}" if provider else model_id
+            alias: dict[str, Any] = {}
+            with contextlib.suppress(RuntimeError):
+                alias = self.omni.alias_metadata(qualified)
+            resolved = alias.get("resolved", {}) if isinstance(alias, dict) else {}
+            if isinstance(resolved, dict):
+                provider = str(
+                    resolved.get("provider", resolved.get("providerAlias", provider))
+                )
+                model_id = str(resolved.get("model", model_id))
+                qualified = str(
+                    resolved.get(
+                        "qualifiedId", f"{provider}/{model_id}" if provider else model_id
+                    )
+                )
+            native = alias.get("metadata", {}) if isinstance(alias.get("metadata"), dict) else {}
+            limits = native.get("limits", {}) if isinstance(native.get("limits"), dict) else {}
+            native_caps = (
+                native.get("capabilities", {})
+                if isinstance(native.get("capabilities"), dict)
+                else {}
+            )
+            context_window = option.get(
+                "contextLength", limits.get("contextWindow", limits.get("maxInputTokens"))
+            )
+            max_output = option.get("outputTokenLimit", limits.get("maxOutputTokens"))
+            for key, portal_cap in {
+                "vision": "vision",
+                "toolCalling": "tools",
+                "supportsTools": "tools",
+                "reasoning": "reasoning",
+                "supportsThinking": "reasoning",
+            }.items():
+                if native_caps.get(key):
+                    capabilities.add(portal_cap)
+            capabilities.add("chat")
+            enriched.append(
+                {
+                    "provider": provider,
+                    "model": model_id,
+                    "qualified_id": qualified,
+                    "context_window_tokens": int(context_window) if context_window else None,
+                    "max_output_tokens": int(max_output) if max_output else None,
+                    "family": str(
+                        (native.get("metadata") or {}).get("family", "")
+                        if isinstance(native.get("metadata"), dict)
+                        else ""
+                    ),
+                    "modalities": native.get("modalities", {}),
+                    "capabilities": native_caps,
+                }
+            )
+        contexts = [item["context_window_tokens"] for item in enriched if item["context_window_tokens"]]
+        outputs = [item["max_output_tokens"] for item in enriched if item["max_output_tokens"]]
+        return {
+            "targets": enriched,
+            "target_count": len(enriched),
+            "context_known_count": len(contexts),
+            "output_known_count": len(outputs),
+            "context_window_tokens": min(contexts) if contexts else None,
+            "max_output_tokens": min(outputs) if outputs else None,
+            "capabilities": sorted(capabilities),
+            "native_sync_supported": all(item["provider"] for item in enriched),
+            "read_at": now(),
+        }
+
+    def _sync_model_limits(
+        self,
+        metadata: dict[str, Any],
+        context_window: int | None,
+        max_output: int | None,
+        sync_context: bool,
+        sync_output: bool,
+    ) -> tuple[str, str]:
+        errors: list[str] = []
+        attempted = 0
+        for target in metadata.get("targets", []):
+            provider, model = str(target.get("provider", "")), str(target.get("model", ""))
+            if not provider or not model:
+                if sync_context or sync_output:
+                    errors.append(f"{target.get('qualified_id', model)} 缺少供应商标识")
+                continue
+            if sync_context and context_window:
+                attempted += 1
+                try:
+                    self.omni.set_context_window_override(provider, model, context_window)
+                except Exception as error:
+                    errors.append(f"{provider}/{model} 上下文：{error}")
+            if sync_output and max_output:
+                attempted += 1
+                try:
+                    self.omni.set_max_output_override(provider, model, max_output)
+                except Exception as error:
+                    errors.append(f"{provider}/{model} 最大输出：{error}")
+        if not attempted and not errors:
+            return "read", ""
+        if errors and attempted > len(errors):
+            return "partial", "; ".join(errors)[:2000]
+        if errors:
+            return "failed", "; ".join(errors)[:2000]
+        return "synced", ""
 
     def seed_managed_model(self) -> None:
         model_name = os.environ.get("SERVED_MODEL_NAME", "").strip()
@@ -2397,8 +2813,17 @@ class PortalControlPlane:
             ).fetchone()
         if not resource:
             raise ValueError("free resource not found")
+        if not resource["configured"]:
+            error = f"请先配置并启用该免费资源对应的供应商：{resource['provider']}"
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE free_resources SET test_status='failed',test_error=?,available=0,last_tested_at=?,updated_at=? WHERE resource_key=?",
+                    (error, now(), now(), resource_key),
+                )
+            raise ValueError(error)
+        qualified_model_id = f"{resource['provider']}/{resource['model_id']}"
         try:
-            latency, content = self.omni.test_model(resource["model_id"])
+            latency, content = self.omni.test_model(qualified_model_id)
             status, available, error = "healthy", 1, ""
         except Exception as exc:
             latency, content, status, available, error = None, "", "failed", 0, str(exc)[:500]
@@ -2441,6 +2866,14 @@ class PortalControlPlane:
         }
         if any(value < 0 for value in prices.values()):
             raise ValueError("model prices cannot be negative")
+        requested_context = positive_int_or_none(
+            payload.get("context_window_tokens"), "最大上下文"
+        )
+        requested_output = positive_int_or_none(
+            payload.get("max_output_tokens"), "最大输出 Token"
+        )
+        sync_context = bool(payload.get("sync_context_window"))
+        sync_output = bool(payload.get("sync_max_output_tokens"))
         if source_kind == "free":
             with self.db.connect() as connection:
                 free = connection.execute(
@@ -2490,6 +2923,34 @@ class PortalControlPlane:
                 latency, _ = self.omni.test_model(public_id)
             else:
                 latency = None
+            inspect_payload = dict(payload)
+            inspect_payload.update(
+                {
+                    "source_kind": source_kind,
+                    "source_ref": source_ref,
+                    "source_model": source_model,
+                }
+            )
+            metadata: dict[str, Any]
+            metadata_error = ""
+            try:
+                metadata = self.inspect_model(inspect_payload)
+            except Exception as error:
+                metadata = {"targets": [], "read_at": now()}
+                metadata_error = str(error)[:2000]
+            context_window = requested_context or metadata.get("context_window_tokens")
+            max_output = requested_output or metadata.get("max_output_tokens")
+            if (sync_context or sync_output) and metadata_error:
+                metadata_status = "failed"
+            else:
+                metadata_status, sync_error = self._sync_model_limits(
+                    metadata,
+                    context_window,
+                    max_output,
+                    sync_context,
+                    sync_output,
+                )
+                metadata_error = sync_error or metadata_error
             stamp = now()
             model_id = str(existing["id"]) if existing else str(uuid.uuid4())
             with self.db.connect() as connection:
@@ -2511,6 +2972,22 @@ class PortalControlPlane:
                         1 if source_kind == "free" else 0, mapping_kind, mapping_id,
                         "healthy" if status == "published" else "unknown", latency, stamp if latency else None,
                         0, int(existing["created_at"]) if existing else stamp, stamp,
+                    ),
+                )
+                connection.execute(
+                    """UPDATE published_models
+                       SET context_window_tokens=?,max_output_tokens=?,metadata_json=?,
+                           metadata_sync_status=?,metadata_sync_error=?,metadata_synced_at=?,updated_at=?
+                       WHERE id=?""",
+                    (
+                        context_window,
+                        max_output,
+                        json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                        metadata_status,
+                        metadata_error,
+                        stamp,
+                        stamp,
+                        model_id,
                     ),
                 )
                 connection.execute("DELETE FROM model_access WHERE model_id=?", (model_id,))
@@ -2559,6 +3036,11 @@ class PortalControlPlane:
                 "public_model_id": public_id,
                 "latency_ms": latency,
                 "permission_sync": permission_sync,
+                "metadata_sync": {
+                    "status": metadata_status,
+                    "error": metadata_error,
+                    "targets": len(metadata.get("targets", [])),
+                },
             }
         except Exception:
             if created_mapping:
@@ -2881,6 +3363,7 @@ class PortalControlPlane:
         for model in models:
             item = dict(model)
             item["capabilities"] = json.loads(item.pop("capabilities_json") or "[]")
+            item["metadata"] = json.loads(item.pop("metadata_json", "{}") or "{}")
             for key in ("input", "output", "cached", "reasoning"):
                 item[f"{key}_price"] = micros_to_money(item[f"{key}_price_micros"])
             result_models.append(item)
@@ -2894,6 +3377,47 @@ class PortalControlPlane:
             "api_base": self.db.settings().get("api_public_url", self.config.api_public_url).rstrip("/") + "/v1",
         }
 
+    def user_request_detail(self, user_id: str, request_id: str) -> dict[str, Any]:
+        if not request_id or len(request_id) > 200:
+            raise ValueError("请求记录不存在")
+        with self.db.connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM usage_ledger WHERE request_id=? AND user_id=?",
+                (request_id, user_id),
+            ).fetchone()
+        if not owned:
+            raise ValueError("请求记录不存在")
+        detail = self.omni.call_log(request_id)
+        summary = request_content_summary(detail.get("requestBody"))
+        summary.update(
+            {
+                "request_id": request_id,
+                "detail_state": str(detail.get("detailState", "")),
+                "retained": bool(detail.get("hasRequestBody")) or summary["available"],
+            }
+        )
+        return summary
+
+    def admin_request_detail(self, request_id: str) -> dict[str, Any]:
+        if not request_id or len(request_id) > 200:
+            raise ValueError("请求记录不存在")
+        with self.db.connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM usage_ledger WHERE request_id=?", (request_id,)
+            ).fetchone()
+        if not exists:
+            raise ValueError("请求记录不存在")
+        detail = self.omni.call_log(request_id)
+        summary = request_content_summary(detail.get("requestBody"))
+        summary.update(
+            {
+                "request_id": request_id,
+                "detail_state": str(detail.get("detailState", "")),
+                "retained": bool(detail.get("hasRequestBody")) or summary["available"],
+            }
+        )
+        return summary
+
     def admin_snapshot(self) -> dict[str, Any]:
         with self.db.connect() as connection:
             users = self.rows(connection.execute("SELECT u.*,b.balance_micros,b.suspended,p.status permission_status,p.error permission_error FROM users u LEFT JOIN billing_accounts b ON b.user_id=u.id LEFT JOIN permission_sync p ON p.user_id=u.id ORDER BY u.created_at DESC").fetchall())
@@ -2905,11 +3429,19 @@ class PortalControlPlane:
             audits = self.rows(connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 300").fetchall())
             grants = self.rows(connection.execute("SELECT * FROM token_grants ORDER BY created_at DESC LIMIT 500").fetchall())
             transactions = self.rows(connection.execute("SELECT * FROM balance_transactions ORDER BY id DESC LIMIT 500").fetchall())
+            usage = self.rows(
+                connection.execute(
+                    """SELECT l.*,u.email user_email
+                       FROM usage_ledger l JOIN users u ON u.id=l.user_id
+                       ORDER BY l.occurred_at DESC LIMIT 500"""
+                ).fetchall()
+            )
         for user in users:
             user["balance"] = micros_to_money(int(user.get("balance_micros") or 0))
             user.pop("password_hash", None)
         for model in models:
             model["capabilities"] = json.loads(model.pop("capabilities_json") or "[]")
+            model["metadata"] = json.loads(model.pop("metadata_json", "{}") or "{}")
             model["access"] = [item for item in access if item["model_id"] == model["id"]]
             for key in ("input", "output", "cached", "reasoning"):
                 model[f"{key}_price"] = micros_to_money(model[f"{key}_price_micros"])
@@ -2930,7 +3462,7 @@ class PortalControlPlane:
         return {
             "users": users, "groups": groups, "memberships": memberships, "models": models,
             "free_resources": free, "settings": settings, "audit": audits, "grants": grants,
-            "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
+            "usage": usage, "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
             "gateway_error": gateway_error,
         }
 
@@ -3019,12 +3551,16 @@ class PortalControlPlane:
 
     def save_group(self, payload: dict[str, Any]) -> str:
         group_id = str(payload.get("id", "")).strip() or str(uuid.uuid4())
-        name = str(payload.get("name", "")).strip()
-        if not re.fullmatch(r"[A-Za-z0-9_. -]{1,80}", name):
-            raise ValueError("invalid group name")
+        name = normalize_group_name(str(payload.get("name", "")))
         status = str(payload.get("status", "active"))
         if status not in {"active", "disabled"}:
             raise ValueError("invalid group status")
+        with self.db.connect() as connection:
+            existing = connection.execute(
+                "SELECT id,name FROM user_groups WHERE id<>?", (group_id,)
+            ).fetchall()
+        if any(normalize_group_name(row["name"]).casefold() == name.casefold() for row in existing):
+            raise ValueError("用户组名称已存在")
         stamp = now()
         self.quiesce_all_users()
         try:
@@ -3033,6 +3569,12 @@ class PortalControlPlane:
                     "INSERT INTO user_groups(id,name,description,status,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,status=excluded.status,updated_at=excluded.updated_at",
                     (group_id, name, str(payload.get("description", "")), status, stamp, stamp),
                 )
+        except sqlite3.IntegrityError as error:
+            with contextlib.suppress(Exception):
+                self.sync_all_users()
+            if "user_groups.name" in str(error):
+                raise ValueError("用户组名称已存在") from error
+            raise
         except Exception:
             with contextlib.suppress(Exception):
                 self.sync_all_users()

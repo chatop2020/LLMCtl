@@ -33,6 +33,12 @@ class FakeOmniRoute:
         self.deleted_aliases = []
         self.logs = []
         self.test_error = None
+        self.tested_models = []
+        self.call_log_details = {}
+        self.combo_items = []
+        self.context_updates = []
+        self.output_updates = []
+        self.aliases = []
 
     def create_user_key(self, user_id, email):
         key_id = f"key-{len(self.created) + 1}"
@@ -72,7 +78,44 @@ class FakeOmniRoute:
         ]
 
     def combos(self):
-        return []
+        return self.combo_items
+
+    def combo_builder_options(self):
+        return {
+            "providers": [
+                {
+                    "providerId": "local-a",
+                    "models": [
+                        {
+                            "id": "ornith-a",
+                            "qualifiedModel": "local-a/ornith-a",
+                            "contextLength": 262144,
+                            "outputTokenLimit": 32768,
+                        }
+                    ],
+                },
+                {
+                    "providerId": "local-b",
+                    "models": [
+                        {
+                            "id": "ornith-b",
+                            "qualifiedModel": "local-b/ornith-b",
+                            "contextLength": 131072,
+                            "outputTokenLimit": 16384,
+                        }
+                    ],
+                },
+            ]
+        }
+
+    def alias_metadata(self, alias):
+        return {"metadata": {"capabilities": {"vision": True, "reasoning": True}}}
+
+    def set_context_window_override(self, provider, model_id, value):
+        self.context_updates.append((provider, model_id, value))
+
+    def set_max_output_override(self, provider, model_id, value):
+        self.output_updates.append((provider, model_id, value))
 
     def patch_key_permissions(self, key_id, allowed_models, allowed_combos, active):
         self.permissions.append((key_id, allowed_models, allowed_combos, active))
@@ -81,15 +124,33 @@ class FakeOmniRoute:
         return self.logs[offset : offset + limit]
 
     def test_model(self, model_id):
+        self.tested_models.append(model_id)
         if self.test_error:
             raise RuntimeError(self.test_error)
         return 12, "OK"
+
+    def call_log(self, request_id):
+        return self.call_log_details.get(
+            request_id,
+            {
+                "id": request_id,
+                "detailState": "ready",
+                "hasRequestBody": True,
+                "requestBody": {
+                    "messages": [{"role": "user", "content": "默认请求内容"}]
+                },
+            },
+        )
 
     def delete_model_alias(self, public_id):
         self.deleted_aliases.append(public_id)
 
     def set_combo_mapping(self, pattern, combo_id, mapping_id="", enabled=True):
         return mapping_id or "mapping-1"
+
+    def set_model_alias(self, public_id, source_model):
+        self.aliases.append((public_id, source_model))
+        return public_id
 
 
 class PortalIntegrationTests(unittest.TestCase):
@@ -204,7 +265,7 @@ class PortalIntegrationTests(unittest.TestCase):
                 },
             )
         self.assertEqual(status, 200)
-        self.assertIn("Verification email sent", body)
+        self.assertIn("验证邮件已发送", body)
         self.assertEqual(captured[0][0], email)
         return captured[0][1]
 
@@ -457,6 +518,79 @@ class PortalIntegrationTests(unittest.TestCase):
                 (stamp,),
             )
 
+    def test_existing_database_gains_model_metadata_columns_without_reinstall(self):
+        with self.server.db.connect() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(published_models)")
+            }
+        self.assertTrue(
+            {
+                "context_window_tokens",
+                "max_output_tokens",
+                "metadata_json",
+                "metadata_sync_status",
+                "metadata_sync_error",
+                "metadata_synced_at",
+            }.issubset(columns)
+        )
+
+    def test_combo_metadata_uses_conservative_limits_and_syncs_every_target(self):
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-1",
+                "name": "ornith-cluster",
+                "models": [
+                    {"kind": "model", "providerId": "local-a", "modelId": "ornith-a"},
+                    {"kind": "model", "providerId": "local-b", "modelId": "ornith-b"},
+                ],
+            }
+        ]
+        inspected = self.server.control.inspect_model(
+            {
+                "source_kind": "combo",
+                "source_ref": "combo-1",
+                "source_model": "ornith-cluster",
+            }
+        )
+        self.assertEqual(inspected["target_count"], 2)
+        self.assertEqual(inspected["context_window_tokens"], 131072)
+        self.assertEqual(inspected["max_output_tokens"], 16384)
+        self.assertIn("vision", inspected["capabilities"])
+
+        result = self.server.control.save_model(
+            {
+                "public_model_id": "gdn-inside",
+                "display_name": "GDN Inside",
+                "description": "公司内部模型",
+                "source_kind": "combo",
+                "source_ref": "combo-1",
+                "source_model": "ornith-cluster",
+                "capabilities": ["chat", "vision", "ocr"],
+                "context_window_tokens": 200000,
+                "max_output_tokens": 24000,
+                "sync_context_window": True,
+                "sync_max_output_tokens": True,
+                "status": "draft",
+                "access": [{"type": "all", "id": ""}],
+            },
+            "admin@example.com",
+        )
+        self.assertEqual(result["metadata_sync"]["status"], "synced")
+        self.assertEqual(
+            self.fake_omni.context_updates,
+            [("local-a", "ornith-a", 200000), ("local-b", "ornith-b", 200000)],
+        )
+        self.assertEqual(
+            self.fake_omni.output_updates,
+            [("local-a", "ornith-a", 24000), ("local-b", "ornith-b", 24000)],
+        )
+        snapshot = self.server.control.admin_snapshot()
+        model = next(item for item in snapshot["models"] if item["public_model_id"] == "gdn-inside")
+        self.assertEqual(model["description"], "公司内部模型")
+        self.assertEqual(model["context_window_tokens"], 200000)
+        self.assertEqual(model["metadata_sync_status"], "synced")
+
     def test_permission_sync_exposes_only_public_model_id(self):
         self.insert_control_user_and_model()
         self.server.control.sync_user("policy-user")
@@ -518,6 +652,29 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertIn(("policy-key", False), self.fake_omni.activated)
         self.assertTrue(self.fake_omni.permissions[-1][-1])
 
+        self.fake_omni.call_log_details["request-complete"] = {
+            "detailState": "ready",
+            "hasRequestBody": True,
+            "requestBody": {
+                "messages": [
+                    {"role": "system", "content": "回答要简洁"},
+                    {"role": "user", "content": "请求内容可以显示吗？"},
+                ]
+            },
+        }
+        detail = self.server.control.user_request_detail(
+            "policy-user", "request-complete"
+        )
+        self.assertTrue(detail["available"])
+        self.assertEqual(detail["messages"][-1]["content"], "请求内容可以显示吗？")
+        admin_detail = self.server.control.admin_request_detail("request-complete")
+        self.assertEqual(admin_detail["messages"][0]["content"], "回答要简洁")
+        snapshot = self.server.control.admin_snapshot()
+        self.assertEqual(snapshot["usage"][0]["request_id"], "request-complete")
+        self.assertEqual(snapshot["usage"][0]["user_email"], "policy@example.com")
+        with self.assertRaisesRegex(ValueError, "请求记录不存在"):
+            self.server.control.user_request_detail("another-user", "request-complete")
+
     def test_admin_snapshot_remains_available_when_gateway_is_down(self):
         def unavailable():
             raise RuntimeError("gateway temporarily unavailable")
@@ -544,6 +701,55 @@ class PortalIntegrationTests(unittest.TestCase):
                 "admin@example.com",
             )
         self.assertNotIn(("policy-key", False), self.fake_omni.activated)
+
+    def test_chinese_group_name_is_normalized_and_duplicate_is_actionable(self):
+        group_id = self.server.control.save_group(
+            {"name": "  研发Ａ组  ", "description": "研发成员", "status": "active"}
+        )
+        with self.server.db.connect() as connection:
+            name = connection.execute(
+                "SELECT name FROM user_groups WHERE id=?", (group_id,)
+            ).fetchone()["name"]
+        self.assertEqual(name, "研发A组")
+        with self.assertRaisesRegex(ValueError, "用户组名称已存在"):
+            self.server.control.save_group(
+                {"name": "研发A组", "description": "重复", "status": "active"}
+            )
+
+    def insert_free_resource(self, configured):
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO free_resources(
+                     resource_key,provider,model_id,display_name,free_type,monthly_tokens,
+                     credit_tokens,terms_status,configured,available,source_json,
+                     discovered_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "agentrouter:claude-haiku-4-5-20251001", "agentrouter",
+                    "claude-haiku-4-5-20251001", "Claude Haiku", "one-time-initial",
+                    None, None, "", configured, 0, "{}", stamp, stamp,
+                ),
+            )
+
+    def test_free_resource_requires_provider_configuration_before_live_test(self):
+        self.insert_free_resource(0)
+        with self.assertRaisesRegex(ValueError, "请先配置并启用"):
+            self.server.control.test_free_resource(
+                "agentrouter:claude-haiku-4-5-20251001"
+            )
+        self.assertEqual(self.fake_omni.tested_models, [])
+
+    def test_free_resource_test_uses_provider_qualified_model_id(self):
+        self.insert_free_resource(1)
+        result = self.server.control.test_free_resource(
+            "agentrouter:claude-haiku-4-5-20251001"
+        )
+        self.assertEqual(result["status"], "healthy")
+        self.assertEqual(
+            self.fake_omni.tested_models[-1],
+            "agentrouter/claude-haiku-4-5-20251001",
+        )
 
     def test_failed_free_model_is_withdrawn_after_three_health_failures(self):
         self.insert_control_user_and_model(source_kind="model", upstream_free=1)
@@ -608,6 +814,43 @@ class PortalUnitTests(unittest.TestCase):
         self.assertTrue(portal.verify_password("a secure password 123", first))
         self.assertFalse(portal.verify_password("wrong password", first))
 
+    def test_password_accepts_eight_characters_but_rejects_numeric_only(self):
+        encoded = portal.hash_password("abc12345")
+        self.assertTrue(portal.verify_password("abc12345", encoded))
+        with self.assertRaisesRegex(ValueError, "不能全部由数字"):
+            portal.hash_password("12345678")
+        with self.assertRaisesRegex(ValueError, "8-200"):
+            portal.hash_password("abc1234")
+
+    def test_group_names_support_unicode_but_reject_invisible_controls(self):
+        self.assertEqual(portal.normalize_group_name("  中文　小组  "), "中文 小组")
+        with self.assertRaisesRegex(ValueError, "不可见字符"):
+            portal.normalize_group_name("研发\u200b组")
+
+    def test_request_content_summary_keeps_text_and_hides_binary_payloads(self):
+        summary = portal.request_content_summary(
+            {
+                "messages": [
+                    {"role": "system", "content": "系统提示"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "识别这张图片"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,secret"},
+                            },
+                        ],
+                    },
+                ],
+                "authorization": "must-not-be-returned",
+            }
+        )
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["messages"][0]["content"], "系统提示")
+        self.assertIn("[图像内容]", summary["messages"][1]["content"])
+        self.assertNotIn("base64", json.dumps(summary, ensure_ascii=False))
+
     def test_email_domains_are_exact_and_idna_normalized(self):
         self.assertEqual(portal.normalize_domains("Example.COM,example.com"), ["example.com"])
         self.assertEqual(portal.normalize_email("USER@Example.com"), ("user@example.com", "example.com"))
@@ -615,6 +858,13 @@ class PortalUnitTests(unittest.TestCase):
             portal.normalize_domain(".example.com")
 
     def test_invalid_origin_and_integer_configuration_fail_cleanly(self):
+        with mock.patch.dict(
+            portal.os.environ,
+            {"ACCOUNT_BIND": "0.0.0.0", "ACCOUNT_REGISTRATION_ENABLED": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(SystemExit, "must be 127.0.0.1"):
+                portal.Config.from_env()
         with mock.patch.dict(
             portal.os.environ,
             {"ACCOUNT_PUBLIC_URL": "http://[broken", "ACCOUNT_REGISTRATION_ENABLED": "0"},

@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.4.0"
+readonly INSTALLER_VERSION="2.6.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -176,7 +176,7 @@ Common unattended options:
   --max-model-len N              Planned from native context and VRAM by default
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N     Default 8192
-  --api-bind IP                  Default 0.0.0.0
+  --api-bind IP                  Public Nginx bind; default 0.0.0.0
   --api-port PORT                Public Nginx port; default 8000
   --gateway-internal-port PORT   Loopback gateway port; default 18000
   --worker-base-port PORT        Default 8100
@@ -250,7 +250,7 @@ EOF
   --max-model-len N               默认按模型原生长度与显存规划
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N       默认 8192
-  --api-bind IP                   默认 0.0.0.0
+  --api-bind IP                   Nginx 公开监听地址，默认 0.0.0.0
   --api-port PORT                 Nginx 统一公开端口，默认 8000
   --gateway-internal-port PORT    接入层回环端口，默认 18000
   --worker-base-port PORT         默认 8100
@@ -998,9 +998,6 @@ validate_scalar_config() {
   (( GATEWAY_DB_PORT != API_PORT )) || die "$(l10n 'database-port 不能与 API 端口相同' 'database-port cannot equal the API port')"
   (( GATEWAY_DB_PORT < WORKER_BASE_PORT || GATEWAY_DB_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'database-port 与 Worker 端口范围冲突' 'database-port conflicts with the worker port range')"
   [[ "${GATEWAY_KIND}" =~ ^(newapi|litellm|bifrost|omniroute)$ ]] || die "$(l10n 'gateway 只能是 newapi、litellm、bifrost 或 omniroute' 'gateway must be newapi, litellm, bifrost, or omniroute')"
-  if [[ "${GATEWAY_KIND}" =~ ^(newapi|omniroute)$ && "${API_BIND}" != 0.0.0.0 && "${API_BIND}" != :: ]]; then
-    die "$(l10n '所选镜像不能单独指定监听 IP；请使用默认 --api-bind 0.0.0.0，并通过防火墙限制访问' 'The selected image cannot bind a specific IP; use the default --api-bind 0.0.0.0 and restrict access with the firewall')"
-  fi
   [[ "${UI_USERNAME}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "$(l10n 'ui-username 只允许字母、数字、点、下划线、@ 和连字符' 'ui-username may contain only letters, digits, dots, underscores, @, and hyphens')"
   [[ "${GATEWAY_KIND}" != newapi || ${#UI_USERNAME} -le 12 ]] || die "$(l10n 'New API 管理员用户名不能超过 12 个字符' 'The New API administrator username cannot exceed 12 characters')"
   [[ "${UI_PASSWORD}" =~ ^[A-Za-z0-9._@-]{8,128}$ ]] || die "$(l10n 'ui-password 需 8-128 位，且只允许字母、数字、点、下划线、@ 和连字符' 'ui-password must be 8-128 characters using letters, digits, dots, underscores, @, and hyphens')"
@@ -1013,7 +1010,7 @@ validate_scalar_config() {
   [[ "${OMNIROUTE_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'OmniRoute 镜像名格式无效' 'Invalid OmniRoute image name')"
   [[ "${POSTGRES_IMAGE}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "$(l10n 'PostgreSQL 镜像名格式无效' 'Invalid PostgreSQL image name')"
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-    [[ "${ACCOUNT_BIND}" =~ ^[0-9a-fA-F:.]+$ ]] || die "$(l10n 'account-bind 只能是 IP 地址' 'account-bind must be an IP address')"
+    [[ "${ACCOUNT_BIND}" == 127.0.0.1 ]] || die "$(l10n '企业门户必须只监听 127.0.0.1；公开访问统一经过 Nginx' 'The account portal must listen only on 127.0.0.1; all public access goes through Nginx')"
     [[ "${ACCOUNT_PORT}" =~ ^[0-9]+$ ]] && (( ACCOUNT_PORT >= 1024 && ACCOUNT_PORT <= 65535 )) || die "$(l10n 'account-port 范围 1024-65535' 'account-port must be between 1024 and 65535')"
     (( ACCOUNT_PORT != API_PORT )) || die "$(l10n 'account-port 不能与 API 端口相同' 'account-port cannot equal the API port')"
     (( ACCOUNT_PORT < WORKER_BASE_PORT || ACCOUNT_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'account-port 与 Worker 端口范围冲突' 'account-port conflicts with the worker port range')"

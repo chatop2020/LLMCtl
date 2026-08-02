@@ -51,6 +51,26 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("已恢复安装前同名 Nginx 配置", nginx)
         self.assertIn("现有 Nginx 软件包和其他站点均保留", nginx)
 
+    def test_only_nginx_has_a_public_host_listener(self):
+        gateway_start = MANAGER.split("cmd_gateway_start() {", 1)[1].split(
+            "cmd_worker_start() {", 1
+        )[0]
+        worker_start = MANAGER.split("cmd_worker_start() {", 1)[1].split(
+            "worker_port() {", 1
+        )[0]
+        database_unit = INSTALLER.split(
+            "Description=PostgreSQL database for the LLMCtl API gateway", 1
+        )[1].split("EOF", 1)[0]
+        self.assertEqual(
+            gateway_start.count('-p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}"'),
+            4,
+        )
+        self.assertIn('-p "127.0.0.1:${WORKER_PORT}:${WORKER_PORT}"', worker_start)
+        self.assertIn("-p 127.0.0.1:${GATEWAY_DB_PORT}:5432", database_unit)
+        self.assertIn('[[ "${ACCOUNT_BIND}" == 127.0.0.1 ]]', INSTALLER)
+        self.assertIn('bind != "127.0.0.1"', ACCOUNT)
+        self.assertIn("listen ${listen_address}", MANAGER)
+
     def test_portal_health_distinguishes_local_liveness_from_gateway_readiness(self):
         health = MANAGER.split("account_portal_health() {", 1)[1].split(
             "account_local_base_url() {", 1

@@ -383,6 +383,23 @@ Common interpretations:
 - If the gateway is unhealthy while workers are healthy, inspect the `llm-router` and `llm-database` logs. For New API reconciliation failures, the `llm-cluster.service` log also reports the exact setup, login, channel, or token error after the router log.
 - If OmniRoute is healthy but the portal is not, run `llmctl account status` and `llmctl logs account`. For missing mail, check the SMTP host, TLS mode, sender, and spam policy; the portal never bypasses verification to issue a key.
 
+## In-place Control-plane and Portal Upgrade
+
+```bash
+sudo llmctl upgrade
+```
+
+After confirmation, LLMCtl downloads the latest project content from GitHub. If international access is unavailable, it offers temporary or persistent proxy configuration. The command updates `llmctl`, installer-maintenance scripts, the account-portal backend, and Vue assets, then applies backward-compatible SQLite migrations. Existing vLLM workers, model directories, routing combos, users, and ledgers are not reinstalled.
+
+After the upgrade, run:
+
+```bash
+sudo llmctl health
+sudo llmctl info
+```
+
+Use **Read again** in the model editor to refresh context and maximum-output metadata from the active AI gateway. LLMCtl writes limits back only after an administrator changes the corresponding field. Sync states are `read`, `synced`, `partial`, or `failed`.
+
 ## Uninstall
 
 By default, uninstall retains the models, gateway PostgreSQL/SQLite state, and root-only recovery credentials:
