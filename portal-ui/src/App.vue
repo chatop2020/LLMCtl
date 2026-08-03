@@ -1506,9 +1506,9 @@ async function savePublishing() {
         body: JSON.stringify(publishingPayload()),
       }),
     settings.published_origin
-      ? "对外发布地址已启用"
+      ? "公开基准地址已保存"
       : "已恢复自动使用当前访问地址",
-    { key: "publishing-save", pending: "正在验证并保存对外发布地址…" },
+    { key: "publishing-save", pending: "正在验证并保存公开基准地址…" },
   );
 }
 
@@ -3667,10 +3667,10 @@ onBeforeUnmount(() => {
               <section class="panel form-stack settings-publish">
                 <div class="panel-head">
                   <div>
-                    <h2>对外发布地址</h2>
+                    <h2>公开基准地址</h2>
                     <p class="muted setting-note">
-                      配置后，门户链接、邮箱验证链接、API 地址和 curl
-                      示例统一使用该地址；留空则继续使用当前访问地址或安装时地址。
+                      仅用于生成门户链接、邮箱验证链接、API 地址和 curl
+                      示例；不会绑定域名、配置端口或启用 TLS。留空则继续使用当前访问地址或安装时地址。
                     </p>
                   </div>
                   <span
@@ -3685,8 +3685,8 @@ onBeforeUnmount(() => {
                     >{{
                       settings.published_origin
                         ? settings.published_origin.startsWith("https://")
-                          ? "HTTPS 已启用"
-                          : "建议改用 HTTPS"
+                          ? "HTTPS 地址"
+                          : "HTTP 地址"
                         : "自动"
                     }}</span
                   >
@@ -3703,7 +3703,7 @@ onBeforeUnmount(() => {
                   用于登录页、页眉和浏览器标题；默认值为 LLMCtl。
                 </p>
                 <label
-                  >公开访问源（可选）<input
+                  >公开基准地址（可选，仅生成链接）<input
                     v-model.trim="settings.published_origin"
                     type="url"
                     inputmode="url"
@@ -3754,7 +3754,7 @@ onBeforeUnmount(() => {
                   {{
                     operation === "publishing-save"
                       ? "保存中…"
-                      : "保存发布地址"
+                      : "保存基准地址"
                   }}
                 </button>
               </section>

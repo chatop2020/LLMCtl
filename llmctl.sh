@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.8.0"
+readonly CTL_VERSION="2.8.1"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -977,7 +977,7 @@ cmd_nginx_install() {
   else
     systemctl start nginx.service
   fi
-  log "Nginx 统一入口已配置：$(public_local_base_url)/ui/ 与 $(public_local_base_url)/v1/"
+  log "Nginx 本机统一入口已配置：$(public_local_base_url)/ui/ 与 $(public_local_base_url)/v1/；域名、80/443 和 TLS 仍由外部出口管理。"
 }
 
 cmd_nginx() {

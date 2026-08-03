@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024

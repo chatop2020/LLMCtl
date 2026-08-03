@@ -102,7 +102,7 @@ All four use `llm-router.service`, but the actual gateway listens only on `127.0
 Your existing edge Nginx, load balancer, or firewall remains responsible for the public domain, certificate, and port mapping. In OmniRoute mode, the portal administrator can configure these fields under **Publishing, registration & SMTP**:
 
 - **Portal brand name** replaces `LLMCtl` in the header, sign-in hero, and browser title. The default remains `LLMCtl`.
-- **Published origin**, for example `https://llm.zjguardian.com`, becomes the canonical verification-mail, portal, API, curl-demo, and `llmctl key show` origin. Leaving it blank preserves the installed fallback address.
+- **Published base URL**, for example `https://llm.zjguardian.com`, is metadata used only to generate verification-mail, portal, API, curl-demo, and `llmctl key show` links. It does not make LLMCtl bind the domain, listen on 80/443, obtain certificates, or configure TLS. Leaving it blank preserves the installed fallback address.
 
 Expose only the Nginx front door. Never publish `8001`, `18000`, or `8100-8107`. Control-plane upgrades deliberately preserve Nginx; apply this release's authentication throttling, forwarded-header cleanup, and security response headers explicitly:
 
