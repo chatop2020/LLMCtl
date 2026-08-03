@@ -88,6 +88,28 @@ sudo llmctl autostart disable
 - `scale N`：持久设置为前 N 个实例。
 - `all` 对 `start/restart` 表示持久激活列表；`stop all` 会停止所有可能实例。
 
+### 启动预热与周期保活
+
+vLLM 正常空闲时不会自行卸载显存中的模型（除非显式启用了 sleep mode）；但进程刚启动后的 CUDA/编译/图捕获热身，以及 GPU 长时间空闲后的低功耗状态，仍可能使首个真实请求明显变慢。LLMCtl 可直接向每个激活 Worker 发送 1-token 推理，绕过 OmniRoute/New API/LiteLLM/Bifrost，因此不占用户额度、不计费、也不进入用户审计记录。
+
+全新安装默认启用，间隔 300 秒；老版本执行 `llmctl upgrade` 后默认关闭，需明确开启：
+
+```bash
+sudo llmctl keepwarm enable 300       # 启用并立即预热全部激活 Worker
+sudo llmctl keepwarm status           # 查看配置和逐 Worker 最近结果
+sudo llmctl keepwarm run all          # 立即手工预热
+sudo llmctl keepwarm interval 600     # 在线调整为 10 分钟
+sudo llmctl keepwarm disable          # 关闭定时器，不停止 Worker
+```
+
+定时器每分钟醒来检查配置间隔，不会每分钟都推理。单次运行并发探测所有激活 Worker，默认单 Worker 超时 90 秒；状态保存在 `/var/lib/llm-cluster/keepwarm/last-run.json`，日志可用下面的命令查看：
+
+```bash
+sudo journalctl -u llm-keepwarm.service -u llm-keepwarm.timer -f
+```
+
+间隔越短，空闲后的首请求通常越稳定，但待机功耗越高。已被 `deactivate` 或未列入激活清单的 Worker 不会被定时器启动或保活。
+
 并行启动数量：
 
 ```bash

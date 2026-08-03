@@ -9,6 +9,8 @@ MANAGER = (ROOT / "llmctl.sh").read_text(encoding="utf-8")
 OPTIMIZER = (ROOT / "lib" / "runtime_optimizer.py").read_text(encoding="utf-8")
 GATEWAY = (ROOT / "lib" / "gateway_config.py").read_text(encoding="utf-8")
 ACCOUNT = (ROOT / "lib" / "account_portal.py").read_text(encoding="utf-8")
+UPGRADER = (ROOT / "upgrade-llmctl.sh").read_text(encoding="utf-8")
+MANIFEST = (ROOT / "upgrade-manifest.tsv").read_text(encoding="utf-8")
 
 
 class StaticDeploymentContracts(unittest.TestCase):
@@ -140,6 +142,30 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("SUPPORTS_TOOL_CALLING == 1", MANAGER)
         self.assertIn("SUPPORTS_REASONING == 1", MANAGER)
 
+    def test_worker_keepwarm_is_direct_bounded_observable_and_upgrade_safe(self):
+        keepwarm = MANAGER.split("keepwarm_one_worker() {", 1)[1].split(
+            "gpu_memory_snapshot() {", 1
+        )[0]
+        startup = MANAGER.split("start_worker_ids_batched() {", 1)[1].split(
+            "start_ids() {", 1
+        )[0]
+        self.assertIn('http://127.0.0.1:${port}/v1/chat/completions', keepwarm)
+        self.assertIn('Authorization: Bearer ${BACKEND_API_KEY}', keepwarm)
+        self.assertIn("stream:false", keepwarm)
+        self.assertIn("max_tokens:1", keepwarm)
+        self.assertNotIn("gateway_base_url", keepwarm)
+        self.assertIn('keepwarm_run_ids "${ids}" startup', startup)
+        self.assertIn("KEEPWARM_ENABLED=1", INSTALLER)
+        self.assertIn('KEEPWARM_ENABLED="${KEEPWARM_ENABLED:-0}"', MANAGER)
+        self.assertIn("systemd/llm-keepwarm.service", MANIFEST)
+        self.assertIn("systemd/llm-keepwarm.timer", MANIFEST)
+        self.assertIn("configure_keepwarm_timer", UPGRADER)
+        service = (ROOT / "systemd" / "llm-keepwarm.service").read_text(encoding="utf-8")
+        timer = (ROOT / "systemd" / "llm-keepwarm.timer").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/usr/local/sbin/llmctl _keepwarm-tick", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("OnUnitActiveSec=60s", timer)
+
     def test_smoke_diagnostics_and_default_aggregate_logs_are_operational(self):
         smoke = MANAGER.split("smoke_endpoint() {", 1)[1].split("cmd_smoke() {", 1)[0]
         logs = MANAGER.split("cmd_logs() {", 1)[1].split("api_post() {", 1)[0]
@@ -216,6 +242,21 @@ class StaticDeploymentContracts(unittest.TestCase):
             self.assertIn(command, english)
         self.assertIn('"stream":false', chinese)
         self.assertIn('"stream":false', english)
+
+    def test_bilingual_docs_cover_worker_keepwarm_behavior_and_tradeoff(self):
+        for chinese_name, english_name in (("README.md", "README_EN.md"), ("USAGE.md", "USAGE_EN.md")):
+            chinese = (ROOT / chinese_name).read_text(encoding="utf-8")
+            english = (ROOT / english_name).read_text(encoding="utf-8")
+            for command in (
+                "llmctl keepwarm enable 300",
+                "llmctl keepwarm status",
+                "llmctl keepwarm run all",
+                "llmctl keepwarm disable",
+            ):
+                self.assertIn(command, chinese)
+                self.assertIn(command, english)
+            self.assertIn("不占用户额度", chinese)
+            self.assertIn("standby power", english)
 
     def test_bilingual_docs_cover_all_gateway_choices_and_clean_install_semantics(self):
         for chinese_name, english_name in (("README.md", "README_EN.md"), ("USAGE.md", "USAGE_EN.md")):

@@ -88,6 +88,28 @@ sudo llmctl autostart disable
 - `scale N`: persistently select the first N instances.
 - For `start/restart`, `all` means the persistently active list. `stop all` stops every possible instance.
 
+### Startup warm-up and periodic keep-warm
+
+vLLM does not normally unload a model from VRAM while idle unless sleep mode is explicitly enabled. However, CUDA, compilation, and graph warm-up after process startup, plus a lower GPU power state after a long idle period, can still make the first real request noticeably slower. LLMCtl can send a direct 1-token inference request to every active Worker. It bypasses OmniRoute, New API, LiteLLM, and Bifrost, so it does not consume user quota, create charges, or enter user audit records.
+
+Fresh installations enable this at a 300-second interval. Existing installations upgraded with `llmctl upgrade` keep it disabled until explicitly enabled:
+
+```bash
+sudo llmctl keepwarm enable 300       # Enable and immediately warm all active Workers
+sudo llmctl keepwarm status           # Show configuration and per-Worker results
+sudo llmctl keepwarm run all          # Run an immediate manual warm-up
+sudo llmctl keepwarm interval 600     # Change online to ten minutes
+sudo llmctl keepwarm disable          # Disable the timer without stopping Workers
+```
+
+The timer wakes once per minute to check the configured interval; it does not infer once per minute. A run probes all active Workers concurrently and defaults to a 90-second per-Worker timeout. State is stored in `/var/lib/llm-cluster/keepwarm/last-run.json`, and logs are available with:
+
+```bash
+sudo journalctl -u llm-keepwarm.service -u llm-keepwarm.timer -f
+```
+
+Shorter intervals usually make the first request after idleness more consistent, but increase standby power. Workers that are deactivated or absent from the active set are neither started nor probed by the timer.
+
 Configure startup parallelism:
 
 ```bash

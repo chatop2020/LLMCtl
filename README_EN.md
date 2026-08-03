@@ -77,12 +77,34 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | Initial password | `llm-admin` by default; OmniRoute generates a strong random value when omitted |
 | Routing | Equal-weight healthy workers with failover; LiteLLM uses `least-busy` |
 | GPU memory utilization | `0.92` |
+| Worker keep-warm | Enabled by default for new installs; one direct 1-token inference per active Worker every 300 seconds |
 
 The initial shared password for New API, LiteLLM, and Bifrost is intentionally simple as requested. Change it immediately. OmniRoute generates a strong random password by default, which should still be managed and rotated carefully:
 
 ```bash
 sudo llmctl admin set-password
 ```
+
+### Worker startup warm-up and periodic keep-warm
+
+Normal idleness does not make vLLM unload model weights already resident in VRAM; memory is released only by an explicitly enabled mechanism such as vLLM sleep mode. The first real request can still be slower after process startup because of CUDA, compilation, and graph warm-up, and after a long idle period because the GPU can enter a lower power state.
+
+After Worker health checks pass, LLMCtl concurrently performs a startup warm-up and can periodically send a 1-token Chat Completions request directly to every active Worker. This path bypasses the AI gateway, user quotas, billing, and user audit records. Fresh installations run it every 300 seconds by default. In-place upgrades from an older version leave it disabled until explicitly enabled, avoiding an unapproved increase in idle power use:
+
+```bash
+sudo llmctl keepwarm enable 300
+sudo llmctl keepwarm status
+```
+
+The interval can be changed online, or keep-warm can be disabled, without restarting model processes:
+
+```bash
+sudo llmctl keepwarm interval 600
+sudo llmctl keepwarm run all
+sudo llmctl keepwarm disable
+```
+
+Results record success, time to first byte, and total duration for every Worker in the root-only `/var/lib/llm-cluster/keepwarm/last-run.json`. Shorter intervals generally make the first request after idleness more consistent, at the cost of higher standby power.
 
 ### Gateway Selection
 

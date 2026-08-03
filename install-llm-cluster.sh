@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="3.1.0"
+readonly INSTALLER_VERSION="3.2.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -53,6 +53,9 @@ PHYSICAL_GPU_COUNT=0
 INSTANCE_COUNT=0
 ACTIVE_INSTANCE_COUNT=0
 STARTUP_PARALLELISM=0
+KEEPWARM_ENABLED=1
+KEEPWARM_INTERVAL_SECONDS=300
+KEEPWARM_TIMEOUT_SECONDS=90
 MAX_MODEL_LEN=0
 MAX_NUM_SEQS=7
 ESTIMATED_MAX_NUM_SEQS=7
@@ -124,6 +127,8 @@ ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
 BENCHMARK_SOURCE="${SCRIPT_DIR}/lib/llm_benchmark.py"
 ACCOUNT_UI_SOURCE="${SCRIPT_DIR}/lib/account_portal_ui"
 UPGRADER_SOURCE="${SCRIPT_DIR}/upgrade-llmctl.sh"
+KEEPWARM_SERVICE_SOURCE="${SCRIPT_DIR}/systemd/llm-keepwarm.service"
+KEEPWARM_TIMER_SOURCE="${SCRIPT_DIR}/systemd/llm-keepwarm.timer"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -176,6 +181,9 @@ Common unattended options:
   --max-num-seqs N               Estimated from KV-cache capacity by default
   --active-instances N           Activate the first N replicas after install and at boot
   --startup-parallelism N        Concurrent worker loads; defaults to the host plan
+  --keepwarm enabled|disabled    Startup warm-up and periodic direct Worker probes; default enabled
+  --keepwarm-interval SECONDS    Periodic interval, 60-86400; default 300
+  --keepwarm-timeout SECONDS     Per-Worker probe timeout, 5-300; default 90
   --max-model-len N              Planned from native context and VRAM by default
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N     Default 8192
@@ -248,6 +256,9 @@ EOF
   --max-num-seqs N                默认由 KV Cache 估算
   --active-instances N            安装后及开机激活前 N 个实例
   --startup-parallelism N         每批并行启动 Worker 数，默认使用本机规划值
+  --keepwarm enabled|disabled     启动预热与周期直连保活，默认启用
+  --keepwarm-interval 秒数        周期间隔 60-86400，默认 300
+  --keepwarm-timeout 秒数         单 Worker 超时 5-300，默认 90
   --max-model-len N               默认按模型原生长度与显存规划
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N       默认 8192
@@ -336,6 +347,12 @@ parse_args() {
       --max-num-seqs) need_value "$@"; MAX_NUM_SEQS="$2"; SEQS_EXPLICIT=1; shift 2 ;;
       --active-instances) need_value "$@"; ACTIVE_INSTANCE_COUNT="$2"; ACTIVE_COUNT_EXPLICIT=1; shift 2 ;;
       --startup-parallelism) need_value "$@"; STARTUP_PARALLELISM="$2"; STARTUP_PARALLELISM_EXPLICIT=1; shift 2 ;;
+      --keepwarm)
+        need_value "$@"
+        case "$2" in enabled) KEEPWARM_ENABLED=1 ;; disabled) KEEPWARM_ENABLED=0 ;; *) die "$(l10n '--keepwarm 只能是 enabled 或 disabled' '--keepwarm must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --keepwarm-interval) need_value "$@"; KEEPWARM_INTERVAL_SECONDS="$2"; shift 2 ;;
+      --keepwarm-timeout) need_value "$@"; KEEPWARM_TIMEOUT_SECONDS="$2"; shift 2 ;;
       --max-model-len) need_value "$@"; MAX_MODEL_LEN="$2"; MAX_LEN_EXPLICIT=1; shift 2 ;;
       --gpu-memory-utilization) need_value "$@"; GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
       --max-num-batched-tokens) need_value "$@"; MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
@@ -988,6 +1005,9 @@ validate_scalar_config() {
   if (( STARTUP_PARALLELISM_EXPLICIT )); then
     [[ "${STARTUP_PARALLELISM}" =~ ^[0-9]+$ ]] && (( STARTUP_PARALLELISM >= 1 && STARTUP_PARALLELISM <= 8 )) || die "$(l10n 'startup-parallelism 范围 1-8' 'startup-parallelism must be between 1 and 8')"
   fi
+  [[ "${KEEPWARM_ENABLED}" =~ ^[01]$ ]] || die "$(l10n 'keepwarm 必须是 enabled 或 disabled' 'keepwarm must be enabled or disabled')"
+  [[ "${KEEPWARM_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_INTERVAL_SECONDS >= 60 && KEEPWARM_INTERVAL_SECONDS <= 86400 )) || die "$(l10n 'keepwarm-interval 范围 60-86400 秒' 'keepwarm-interval must be between 60 and 86400 seconds')"
+  [[ "${KEEPWARM_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_TIMEOUT_SECONDS >= 5 && KEEPWARM_TIMEOUT_SECONDS <= 300 )) || die "$(l10n 'keepwarm-timeout 范围 5-300 秒' 'keepwarm-timeout must be between 5 and 300 seconds')"
   awk -v v="${GPU_MEMORY_UTILIZATION}" 'BEGIN{exit !(v>=0.70 && v<=0.96)}' || die "$(l10n 'gpu-memory-utilization 范围 0.70-0.96' 'gpu-memory-utilization must be between 0.70 and 0.96')"
   [[ "${API_BIND}" =~ ^[0-9a-fA-F:.]+$ ]] || die "$(l10n 'api-bind 只能是 IP 地址' 'api-bind must be an IP address')"
   [[ "${API_PORT}" =~ ^[0-9]+$ ]] && (( API_PORT >= 1024 && API_PORT <= 65535 )) || die "$(l10n 'api-port 范围 1024-65535' 'api-port must be between 1024 and 65535')"
@@ -1059,6 +1079,7 @@ check_discovery_host() {
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
   [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
+  [[ -r "${KEEPWARM_SERVICE_SOURCE}" && -r "${KEEPWARM_TIMER_SOURCE}" ]] || die "$(l10n '缺少 Worker 保活 systemd 单元' 'Worker keep-warm systemd units are missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -1089,6 +1110,7 @@ check_host() {
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -d "${ACCOUNT_UI_SOURCE}" ]] || die "$(l10n '缺少已构建的 Vue 门户资源 lib/account_portal_ui' 'Built Vue portal assets are missing from lib/account_portal_ui')"
   [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
+  [[ -r "${KEEPWARM_SERVICE_SOURCE}" && -r "${KEEPWARM_TIMER_SOURCE}" ]] || die "$(l10n '缺少 Worker 保活 systemd 单元' 'Worker keep-warm systemd units are missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -1557,6 +1579,9 @@ MM_LIMIT='${MM_LIMIT}'
 ROUTING_STRATEGY=${ROUTING_STRATEGY}
 START_TIMEOUT=${START_TIMEOUT}
 STARTUP_PARALLELISM=${STARTUP_PARALLELISM}
+KEEPWARM_ENABLED=${KEEPWARM_ENABLED}
+KEEPWARM_INTERVAL_SECONDS=${KEEPWARM_INTERVAL_SECONDS}
+KEEPWARM_TIMEOUT_SECONDS=${KEEPWARM_TIMEOUT_SECONDS}
 INTERFACE_LANGUAGE=${INTERFACE_LANGUAGE}
 EOF
   chmod 640 "${CLUSTER_ENV}"
@@ -1706,6 +1731,8 @@ validate_account_portal_configuration() {
 }
 
 write_systemd_units() {
+  install -m 0644 "${KEEPWARM_SERVICE_SOURCE}" /etc/systemd/system/llm-keepwarm.service
+  install -m 0644 "${KEEPWARM_TIMER_SOURCE}" /etc/systemd/system/llm-keepwarm.timer
   cat >/etc/systemd/system/llm-worker@.service <<'EOF'
 [Unit]
 Description=vLLM model worker instance %i
@@ -1887,11 +1914,15 @@ EOF
   chmod 644 /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-cluster.service
   [[ ! -e /etc/systemd/system/llm-database.service ]] || chmod 644 /etc/systemd/system/llm-database.service
   [[ ! -e /etc/systemd/system/llm-account.service ]] || chmod 644 /etc/systemd/system/llm-account.service
+  chmod 644 /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer
   systemctl daemon-reload
 }
 
 prepare_worker_cache() {
   install -d -m 755 "${STATE_DIR}/cache/shared"
+  # llm-keepwarm.service uses ProtectSystem=strict and can write only here.
+  # Create the path before enabling its timer, including --no-start installs.
+  install -d -m 700 "${STATE_DIR}/keepwarm"
 }
 
 start_cluster_with_progress() {
@@ -1937,6 +1968,7 @@ Tool calling:      $([[ ${SUPPORTS_TOOL_CALLING} -eq 1 ]] && printf 'supported (
 Reasoning parser:  $([[ ${SUPPORTS_REASONING} -eq 1 ]] && printf 'supported (parser=%s)' "${REASONING_PARSER}" || printf 'disabled')
 Boot activation:   first ${ACTIVE_INSTANCE_COUNT} replicas
 Startup parallel:  up to ${STARTUP_PARALLELISM} workers per batch
+Worker keep-warm:  $([[ ${KEEPWARM_ENABLED} -eq 1 ]] && printf 'enabled, every %ss' "${KEEPWARM_INTERVAL_SECONDS}" || printf disabled)
 API gateway:       $(gateway_display_name) (${GATEWAY_KIND})
 Load balancing:    $(gateway_routing_summary)
 API:               http://${host_for_url}:${API_PORT}/v1
@@ -1950,6 +1982,7 @@ API key:           ${GATEWAY_API_KEY}
 Common commands:
   sudo llmctl status
   sudo llmctl health
+  sudo llmctl keepwarm status
   sudo llmctl logs worker 0 -f
   sudo llmctl smoke --full
   sudo llmctl restart all
@@ -1983,6 +2016,7 @@ EOF
 思考解析：   $([[ ${SUPPORTS_REASONING} -eq 1 ]] && printf '支持（parser=%s）' "${REASONING_PARSER}" || printf '未启用')
 开机激活：   前 ${ACTIVE_INSTANCE_COUNT} 个实例
 启动并行度： 每批 ${STARTUP_PARALLELISM} 个 Worker
+Worker 保活：  $([[ ${KEEPWARM_ENABLED} -eq 1 ]] && printf '已启用，每 %s 秒' "${KEEPWARM_INTERVAL_SECONDS}" || printf 已关闭)
 API 接入层：  $(gateway_display_name)（${GATEWAY_KIND}）
 负载均衡：   $(gateway_routing_summary)
 API：        http://${host_for_url}:${API_PORT}/v1
@@ -1996,6 +2030,7 @@ API key：    ${GATEWAY_API_KEY}
 常用命令：
   sudo llmctl status
   sudo llmctl health
+  sudo llmctl keepwarm status
   sudo llmctl logs worker 0 -f
   sudo llmctl smoke --full
   sudo llmctl restart all
@@ -2116,6 +2151,11 @@ EOF
   write_systemd_units
 
   systemctl enable llm-cluster.service
+  if (( KEEPWARM_ENABLED == 1 )); then
+    systemctl enable --now llm-keepwarm.timer
+  else
+    systemctl disable --now llm-keepwarm.timer 2>/dev/null || true
+  fi
   if (( NO_START )); then
     log "$(l10n '按 --no-start 未启动；稍后运行 sudo systemctl start llm-cluster。' 'Services were not started because of --no-start; run sudo systemctl start llm-cluster later.')"
   else

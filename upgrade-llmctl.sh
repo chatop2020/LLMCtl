@@ -141,6 +141,8 @@ restore_control_plane() {
       fi
     done <"${BACKUP_DIR}/manifest.tsv"
   fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  configure_keepwarm_timer >/dev/null 2>&1 || true
   if [[ -e "${BACKUP_DIR}/control-plane-version.env" ]]; then
     install -d -m 0755 "$(dirname "${RELEASE_ENV}")"
     cp -a "${BACKUP_DIR}/control-plane-version.env" "${RELEASE_ENV}"
@@ -431,11 +433,11 @@ validate_manifest() {
     [[ "${entry_type}" == "file" || "${entry_type}" == "dir" ]] || die "$(l10n "升级清单类型无效：${entry_type}" "Invalid manifest type: ${entry_type}")"
     [[ "${source}" != /* && "${source}" != *..* ]] || die "$(l10n "升级清单源路径不安全：${source}" "Unsafe manifest source path: ${source}")"
     case "${destination}" in
-      /usr/local/sbin/llmctl|/usr/local/lib/llm-cluster/*) ;;
+      /usr/local/sbin/llmctl|/usr/local/lib/llm-cluster/*|/etc/systemd/system/llm-keepwarm.service|/etc/systemd/system/llm-keepwarm.timer) ;;
       *) die "$(l10n "升级清单目标不在 LLMCtl 控制面范围：${destination}" "Manifest destination is outside the LLMCtl control-plane scope: ${destination}")" ;;
     esac
     [[ "${mode}" =~ ^0[0-7]{3}$ ]] || die "$(l10n "升级清单权限无效：${mode}" "Invalid manifest mode: ${mode}")"
-    [[ "${restart}" == "none" || "${restart}" == "account" ]] || die "$(l10n "升级清单重启范围无效：${restart}" "Invalid manifest restart scope: ${restart}")"
+    [[ "${restart}" == "none" || "${restart}" == "account" || "${restart}" == "systemd" ]] || die "$(l10n "升级清单重启范围无效：${restart}" "Invalid manifest restart scope: ${restart}")"
     source_path="${SOURCE_ROOT}/${source}"
     if [[ "${entry_type}" == "file" ]]; then [[ -f "${source_path}" ]] || die "$(l10n "升级包缺少文件：${source}" "Upgrade archive is missing file: ${source}")"
     else [[ -d "${source_path}" ]] || die "$(l10n "升级包缺少目录：${source}" "Upgrade archive is missing directory: ${source}")"; fi
@@ -447,6 +449,8 @@ validate_manifest() {
 validate_source() {
   validate_manifest
   bash -n "${SOURCE_ROOT}/llmctl.sh" "${SOURCE_ROOT}/upgrade-llmctl.sh"
+  grep -q '^ExecStart=/usr/local/sbin/llmctl _keepwarm-tick$' "${SOURCE_ROOT}/systemd/llm-keepwarm.service" || die "$(l10n '保活 service 单元无效' 'Invalid keep-warm service unit')"
+  grep -q '^Unit=llm-keepwarm.service$' "${SOURCE_ROOT}/systemd/llm-keepwarm.timer" || die "$(l10n '保活 timer 单元无效' 'Invalid keep-warm timer unit')"
   python3 -m py_compile \
     "${SOURCE_ROOT}/lib/model_catalog.py" \
     "${SOURCE_ROOT}/lib/runtime_optimizer.py" \
@@ -472,6 +476,18 @@ read_cluster_value() {
   local key="$1" default_value="$2" value=""
   if [[ -r "${CLUSTER_ENV}" ]]; then value=$(awk -F= -v key="${key}" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "${CLUSTER_ENV}"); fi
   printf '%s\n' "${value:-${default_value}}"
+}
+
+configure_keepwarm_timer() {
+  local enabled
+  systemctl daemon-reload
+  enabled=$(read_cluster_value KEEPWARM_ENABLED 0)
+  if [[ "${enabled}" == 1 ]]; then
+    install -d -m 0700 /var/lib/llm-cluster/keepwarm
+    systemctl enable --now llm-keepwarm.timer
+  else
+    systemctl disable --now llm-keepwarm.timer >/dev/null 2>&1 || true
+  fi
 }
 
 wait_for_account_portal() {
@@ -529,7 +545,7 @@ install_control_plane() {
   [[ -r "${CLUSTER_ENV}" ]] || die "$(l10n '未检测到现有 LLMCtl 部署' 'No existing LLMCtl deployment was detected')"
   backup_control_plane
   local router_before router_after workers_before workers_after account_port
-  local entry_type source destination mode restart source_path restart_account=0
+  local entry_type source destination mode restart source_path restart_account=0 restart_systemd=0
   router_before=$(systemctl is-active llm-router.service 2>/dev/null || true)
   workers_before=$(systemctl list-units 'llm-worker@*.service' --state=running --no-legend 2>/dev/null | wc -l | tr -d ' ')
   systemctl is-active --quiet "${ACCOUNT_SERVICE}" && ACCOUNT_WAS_ACTIVE=1 || ACCOUNT_WAS_ACTIVE=0
@@ -548,9 +564,13 @@ install_control_plane() {
     if [[ "${entry_type}" == "file" ]]; then install -m "${mode}" "${source_path}" "${destination}"
     else cp -a "${source_path}" "${destination}"; chmod "${mode}" "${destination}"; fi
     [[ "${restart}" != "account" ]] || restart_account=1
+    [[ "${restart}" != "systemd" ]] || restart_systemd=1
   done <"${SOURCE_ROOT}/upgrade-manifest.tsv"
 
   /usr/local/sbin/llmctl version >/dev/null
+  if (( restart_systemd )); then
+    configure_keepwarm_timer
+  fi
   if (( ACCOUNT_WAS_ACTIVE && restart_account )); then
     systemctl start "${ACCOUNT_SERVICE}"
     account_port=$(read_cluster_value ACCOUNT_PORT 8001)

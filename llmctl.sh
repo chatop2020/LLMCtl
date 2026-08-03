@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.1.0"
+readonly CTL_VERSION="3.2.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -31,6 +31,9 @@ readonly OPTIMIZATION_DIR="${STATE_DIR}/optimization"
 readonly SMOKE_DIAGNOSTIC_DIR="${STATE_DIR}/diagnostics/smoke"
 readonly NGINX_CONFIG="/etc/nginx/conf.d/llm-cluster.conf"
 readonly NGINX_STATE_DIR="${STATE_DIR}/nginx"
+readonly KEEPWARM_STATE_DIR="${STATE_DIR}/keepwarm"
+readonly KEEPWARM_STATE_FILE="${KEEPWARM_STATE_DIR}/last-run.json"
+readonly KEEPWARM_LOCK_FILE="${KEEPWARM_STATE_DIR}/run.lock"
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
@@ -70,6 +73,10 @@ load_config() {
 
   # Backward compatibility for the previous Ornith-only release.
   STARTUP_PARALLELISM="${STARTUP_PARALLELISM:-1}"
+  # Upgraded deployments opt in explicitly. Fresh 3.2+ installations write 1.
+  KEEPWARM_ENABLED="${KEEPWARM_ENABLED:-0}"
+  KEEPWARM_INTERVAL_SECONDS="${KEEPWARM_INTERVAL_SECONDS:-300}"
+  KEEPWARM_TIMEOUT_SECONDS="${KEEPWARM_TIMEOUT_SECONDS:-90}"
   MODEL_HUB="${MODEL_HUB:-huggingface}"
   MODEL_ARCHITECTURE="${MODEL_ARCHITECTURE:-Qwen3_5MoeForConditionalGeneration}"
   MODEL_TASK="${MODEL_TASK:-vision}"
@@ -170,6 +177,9 @@ load_config() {
     : "${ACCOUNT_ADMIN_PASSWORD:?ACCOUNT_ADMIN_PASSWORD missing}"
   fi
   [[ "${STARTUP_PARALLELISM}" =~ ^[0-9]+$ ]] && (( STARTUP_PARALLELISM >= 1 && STARTUP_PARALLELISM <= INSTANCE_COUNT )) || die "STARTUP_PARALLELISM 必须在 1-${INSTANCE_COUNT}"
+  [[ "${KEEPWARM_ENABLED}" == 0 || "${KEEPWARM_ENABLED}" == 1 ]] || die "KEEPWARM_ENABLED 必须是 0 或 1"
+  [[ "${KEEPWARM_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_INTERVAL_SECONDS >= 60 && KEEPWARM_INTERVAL_SECONDS <= 86400 )) || die "KEEPWARM_INTERVAL_SECONDS 范围 60-86400"
+  [[ "${KEEPWARM_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_TIMEOUT_SECONDS >= 5 && KEEPWARM_TIMEOUT_SECONDS <= 300 )) || die "KEEPWARM_TIMEOUT_SECONDS 范围 5-300"
 }
 
 cmd_gateway_start() {
@@ -303,6 +313,11 @@ usage() {
   llmctl deactivate <0,1,...|all>             移出负载均衡 + stop + disable
   llmctl scale <1-N>                          持久调整集群为前 N 个实例
   llmctl autostart <enable|disable|status>     管理整个集群的开机自启
+  llmctl keepwarm status                       查看周期保活配置与逐 Worker 最近结果
+  llmctl keepwarm run [all|0,1,...]            立即直连指定 Worker 执行 1-token 预热
+  llmctl keepwarm enable [间隔秒数]             启用周期保活（60-86400 秒）并立即预热
+  llmctl keepwarm disable                      关闭周期保活，不停止 Worker
+  llmctl keepwarm interval <秒数>               在线修改保活间隔，无需重启 Worker
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
@@ -331,7 +346,7 @@ usage() {
   llmctl tune set <键> <值>                   修改参数（修改后需重启 Worker）
     可修改键：max-model-len, gpu-memory-utilization, max-num-seqs,
               max-num-batched-tokens, max-images, routing-strategy,
-              api-bind, api-port, startup-parallelism
+              api-bind, api-port, startup-parallelism, keepwarm-interval-seconds
 
   llmctl key show                             显示调用地址、模型名和 API key
   llmctl key rotate [新KEY]                   轮换入口 key（New API 不接受自定义 KEY）
@@ -476,6 +491,166 @@ worker_health_fast() {
   curl --noproxy '*' -fsS --max-time 1 \
     -H "Authorization: Bearer ${BACKEND_API_KEY}" \
     "http://127.0.0.1:${port}/health" >/dev/null 2>&1
+}
+
+keepwarm_one_worker() {
+  local id="${1:?}" result_file="${2:?}" port payload response metrics="" curl_status=0
+  local http_code=000 ttft=0 total=0 status=failed error="" started_at finished_at
+  port=$(worker_port "${id}")
+  response=$(mktemp "${KEEPWARM_STATE_DIR}/response-${id}.XXXXXX")
+  started_at=$(date -u +%FT%TZ)
+  if (( SUPPORTS_THINKING_TOGGLE == 1 )); then
+    payload=$(jq -cn --arg model "${SERVED_MODEL_NAME}" '{model:$model,stream:false,max_tokens:1,temperature:0,chat_template_kwargs:{enable_thinking:false},messages:[{role:"user",content:"Reply OK."}]}')
+  else
+    payload=$(jq -cn --arg model "${SERVED_MODEL_NAME}" '{model:$model,stream:false,max_tokens:1,temperature:0,messages:[{role:"user",content:"Reply OK."}]}')
+  fi
+  if metrics=$(curl --noproxy '*' -sS -o "${response}" \
+      -w $'%{http_code}\t%{time_starttransfer}\t%{time_total}' \
+      --connect-timeout 3 --max-time "${KEEPWARM_TIMEOUT_SECONDS}" \
+      -H "Authorization: Bearer ${BACKEND_API_KEY}" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json' \
+      --data-binary "${payload}" "http://127.0.0.1:${port}/v1/chat/completions"); then
+    IFS=$'\t' read -r http_code ttft total <<<"${metrics}"
+    if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]] && jq -e '.choices | type == "array" and length > 0' "${response}" >/dev/null 2>&1; then
+      status=ok
+    else
+      error=$(jq -r '.error.message // .detail // .message // empty' "${response}" 2>/dev/null | head -c 300 || true)
+      [[ -n "${error}" ]] || error="HTTP ${http_code} or invalid Chat Completions response"
+    fi
+  else
+    curl_status=$?
+    error="curl exit ${curl_status}"
+  fi
+  finished_at=$(date -u +%FT%TZ)
+  jq -cn \
+    --argjson worker "${id}" --arg gpus "$(worker_devices "${id}")" --argjson port "${port}" \
+    --arg status "${status}" --arg http_code "${http_code}" --arg ttft "${ttft}" --arg total "${total}" \
+    --arg error "${error}" --arg started_at "${started_at}" --arg finished_at "${finished_at}" \
+    '{worker:$worker,gpus:$gpus,port:$port,status:$status,http_code:$http_code,
+      ttft_seconds:($ttft|tonumber? // 0),total_seconds:($total|tonumber? // 0),
+      error:(if $error=="" then null else $error end),started_at:$started_at,finished_at:$finished_at}' >"${result_file}"
+  rm -f -- "${response}"
+  [[ "${status}" == ok ]]
+}
+
+keepwarm_run_ids() {
+  local ids="${1:?}" reason="${2:-manual}" id result_file failures=0 started_at finished_at started_epoch finished_epoch
+  local lock_fd results_dir summary_file ok_count failed_count total_count
+  install -d -m 0700 "${KEEPWARM_STATE_DIR}"
+  exec {lock_fd}>"${KEEPWARM_LOCK_FILE}"
+  if ! flock -w 5 "${lock_fd}"; then
+    warn "$(ctl_l10n '已有 Worker 保活任务在运行，本次跳过。' 'A Worker keep-warm run is already active; this run was skipped.')"
+    return 0
+  fi
+  results_dir=$(mktemp -d "${KEEPWARM_STATE_DIR}/run.XXXXXX")
+  summary_file="${KEEPWARM_STATE_FILE}.new.$$"
+  started_at=$(date -u +%FT%TZ)
+  started_epoch=$(date +%s)
+  log "$(ctl_l10n "并发预热 Worker [${ids}]：直接请求各 vLLM 实例，不经过接入层、用户额度或计费。" "Warming Workers [${ids}] concurrently with direct vLLM requests that bypass the gateway, user quotas, and billing.")"
+  IFS=',' read -r -a keepwarm_id_list <<<"${ids}"
+  for id in "${keepwarm_id_list[@]}"; do
+    result_file="${results_dir}/${id}.json"
+    keepwarm_one_worker "${id}" "${result_file}" &
+  done
+  wait || failures=1
+  finished_at=$(date -u +%FT%TZ)
+  finished_epoch=$(date +%s)
+  total_count=${#keepwarm_id_list[@]}
+  # A killed shell, full filesystem, or unexpected helper failure must not
+  # make the aggregate disappear. Preserve one explicit result per requested
+  # Worker so status output can identify exactly which probe was lost.
+  for id in "${keepwarm_id_list[@]}"; do
+    result_file="${results_dir}/${id}.json"
+    if [[ ! -s "${result_file}" ]] || ! jq -e 'type == "object" and has("status")' "${result_file}" >/dev/null 2>&1; then
+      failures=1
+      jq -cn \
+        --argjson worker "${id}" --arg gpus "$(worker_devices "${id}")" \
+        --argjson port "$(worker_port "${id}")" --arg finished_at "${finished_at}" \
+        '{worker:$worker,gpus:$gpus,port:$port,status:"failed",http_code:"000",
+          ttft_seconds:0,total_seconds:0,error:"probe exited without a valid result",
+          started_at:null,finished_at:$finished_at}' >"${result_file}"
+    fi
+  done
+  ok_count=$(jq -s '[.[] | select(.status=="ok")] | length' "${results_dir}"/*.json 2>/dev/null || printf 0)
+  failed_count=$((total_count - ok_count))
+  jq -s \
+    --arg reason "${reason}" --arg started_at "${started_at}" --arg finished_at "${finished_at}" \
+    --argjson started_epoch "${started_epoch}" --argjson finished_epoch "${finished_epoch}" \
+    --argjson requested "${total_count}" --argjson succeeded "${ok_count}" --argjson failed "${failed_count}" \
+    '{reason:$reason,started_at:$started_at,finished_at:$finished_at,started_epoch:$started_epoch,
+      finished_epoch:$finished_epoch,summary:{requested:$requested,succeeded:$succeeded,failed:$failed},results:.}' \
+    "${results_dir}"/*.json >"${summary_file}"
+  chmod 0600 "${summary_file}"
+  mv -f "${summary_file}" "${KEEPWARM_STATE_FILE}"
+  while IFS= read -r result_file; do
+    if [[ "$(jq -r '.status' "${result_file}")" == ok ]]; then
+      log "$(ctl_l10n "Worker $(jq -r '.worker' "${result_file}") 保活成功：TTFT=$(jq -r '.ttft_seconds' "${result_file}")s，总耗时=$(jq -r '.total_seconds' "${result_file}")s。" "Worker $(jq -r '.worker' "${result_file}") keep-warm succeeded: TTFT=$(jq -r '.ttft_seconds' "${result_file}")s, total=$(jq -r '.total_seconds' "${result_file}")s.")"
+    else
+      warn "$(ctl_l10n "Worker $(jq -r '.worker' "${result_file}") 保活失败：$(jq -r '.error' "${result_file}")" "Worker $(jq -r '.worker' "${result_file}") keep-warm failed: $(jq -r '.error' "${result_file}")")"
+    fi
+  done < <(find "${results_dir}" -type f -name '*.json' -print | sort -V)
+  rm -rf -- "${results_dir}"
+  (( failed_count == 0 && failures == 0 ))
+}
+
+keepwarm_last_finished_epoch() {
+  [[ -r "${KEEPWARM_STATE_FILE}" ]] || { printf '0\n'; return; }
+  jq -r '.finished_epoch // 0' "${KEEPWARM_STATE_FILE}" 2>/dev/null || printf '0\n'
+}
+
+cmd_keepwarm_tick() {
+  require_root; load_config
+  (( KEEPWARM_ENABLED == 1 )) || return 0
+  systemctl is-active --quiet llm-cluster.service || return 0
+  local now last
+  now=$(date +%s)
+  last=$(keepwarm_last_finished_epoch)
+  [[ "${last}" =~ ^[0-9]+$ ]] || last=0
+  (( now - last >= KEEPWARM_INTERVAL_SECONDS )) || return 0
+  keepwarm_run_ids "${ACTIVE_WORKERS}" timer || true
+}
+
+cmd_keepwarm() {
+  require_root; load_config
+  local action="${1:-status}" value="${2:-}" ids timer_active timer_enabled
+  case "${action}" in
+    status)
+      timer_active=$(systemctl is-active llm-keepwarm.timer 2>/dev/null || true)
+      timer_enabled=$(systemctl is-enabled llm-keepwarm.timer 2>/dev/null || true)
+      printf 'enabled=%s\ninterval-seconds=%s\ntimeout-seconds=%s\ntimer-active=%s\ntimer-enabled=%s\nstate=%s\n' \
+        "${KEEPWARM_ENABLED}" "${KEEPWARM_INTERVAL_SECONDS}" "${KEEPWARM_TIMEOUT_SECONDS}" \
+        "${timer_active:-unknown}" "${timer_enabled:-unknown}" "${KEEPWARM_STATE_FILE}"
+      if [[ -r "${KEEPWARM_STATE_FILE}" ]]; then jq . "${KEEPWARM_STATE_FILE}"; else printf 'last-run=never\n'; fi
+      ;;
+    run)
+      ids=$(resolve_ids "${value:-all}")
+      keepwarm_run_ids "${ids}" manual
+      ;;
+    enable)
+      if [[ -n "${value}" ]]; then
+        [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 60 && value <= 86400 )) || die "保活间隔范围 60-86400 秒"
+        set_env_value "${CLUSTER_ENV}" KEEPWARM_INTERVAL_SECONDS "${value}"
+      fi
+      set_env_value "${CLUSTER_ENV}" KEEPWARM_ENABLED 1
+      install -d -m 0700 "${KEEPWARM_STATE_DIR}"
+      systemctl daemon-reload
+      systemctl enable --now llm-keepwarm.timer
+      load_config
+      keepwarm_run_ids "${ACTIVE_WORKERS}" enable || warn "部分 Worker 首次保活失败；定时器仍已启用，请运行 llmctl keepwarm status 查看详情。"
+      ;;
+    disable)
+      set_env_value "${CLUSTER_ENV}" KEEPWARM_ENABLED 0
+      systemctl disable --now llm-keepwarm.timer 2>/dev/null || true
+      systemctl stop llm-keepwarm.service 2>/dev/null || true
+      log "$(ctl_l10n 'Worker 周期保活已关闭；模型进程和现有请求不受影响。' 'Periodic Worker keep-warm is disabled; model processes and existing requests are unaffected.')"
+      ;;
+    interval)
+      [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 60 && value <= 86400 )) || die "保活间隔范围 60-86400 秒"
+      set_env_value "${CLUSTER_ENV}" KEEPWARM_INTERVAL_SECONDS "${value}"
+      log "$(ctl_l10n "保活间隔已改为 ${value} 秒；无需重启 Worker。" "Keep-warm interval changed to ${value} seconds; no Worker restart is required.")"
+      ;;
+    *) die "keepwarm 子命令必须是 status|run|enable|disable|interval" ;;
+  esac
 }
 
 gpu_memory_snapshot() {
@@ -1114,6 +1289,10 @@ start_worker_ids_batched() {
     fi
   done
   if [[ -n "${batch}" ]]; then start_worker_batch "${batch}" || failed=1; fi
+  if (( KEEPWARM_ENABLED == 1 )); then
+    keepwarm_run_ids "${ids}" startup || \
+      warn "$(ctl_l10n '至少一个 Worker 启动预热失败；健康检查已完成，服务继续启动。运行 llmctl keepwarm status 查看详情。' 'At least one Worker startup warm-up failed. Health checks completed and startup will continue; run llmctl keepwarm status for details.')"
+  fi
   return "${failed}"
 }
 
@@ -1396,6 +1575,12 @@ cmd_info() {
     "$(systemctl is-active llm-cluster.service 2>/dev/null || printf unknown)" \
     "$(systemctl is-enabled llm-cluster.service 2>/dev/null || printf unknown)" \
     "$(systemctl is-active llm-router.service 2>/dev/null || printf unknown)"
+  printf 'Worker 保活: enabled=%s；interval=%ss；timeout=%ss；timer=%s/%s\n最近保活: %s；状态文件: %s\n' \
+    "${KEEPWARM_ENABLED}" "${KEEPWARM_INTERVAL_SECONDS}" "${KEEPWARM_TIMEOUT_SECONDS}" \
+    "$(systemctl is-active llm-keepwarm.timer 2>/dev/null || printf unknown)" \
+    "$(systemctl is-enabled llm-keepwarm.timer 2>/dev/null || printf unknown)" \
+    "$([[ -r "${KEEPWARM_STATE_FILE}" ]] && jq -r '"\(.finished_at) requested=\(.summary.requested) succeeded=\(.summary.succeeded) failed=\(.summary.failed)"' "${KEEPWARM_STATE_FILE}" 2>/dev/null || printf never)" \
+    "${KEEPWARM_STATE_FILE}"
   [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemctl is-active llm-account.service 2>/dev/null || printf unknown)"
   [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemctl is-active llm-database.service 2>/dev/null || printf unknown)"
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
@@ -1409,7 +1594,7 @@ cmd_info() {
   printf '模型当前链接: %s/current -> %s\n门户程序: %s\n门户静态资源: %s\nNginx 配置备份目录: %s\n' \
     "${MODEL_ROOT}" "$(readlink -f "${MODEL_ROOT}/current" 2>/dev/null || printf missing)" "${ACCOUNT_HELPER}" "${ACCOUNT_STATIC_DIR:-/usr/local/lib/llm-cluster/account_portal_ui}" "${NGINX_STATE_DIR}"
   printf 'systemd 单元: %s\nDocker 网络: %s\nDocker 数据卷: %s\n' \
-    "$(find /etc/systemd/system -maxdepth 1 -type f -name 'llm-*.service' -printf '%f ' 2>/dev/null || printf unavailable)" \
+    "$(find /etc/systemd/system -maxdepth 1 -type f \( -name 'llm-*.service' -o -name 'llm-*.timer' \) -printf '%f ' 2>/dev/null || printf unavailable)" \
     "${DOCKER_NETWORK}" "$(docker volume ls --format '{{.Name}}' 2>/dev/null | awk '/^llm-cluster-/{printf "%s ",$0}' || printf unavailable)"
   printf 'systemd 日志: journalctl -u llm-cluster -u llm-router\n完整健康检查: llmctl health\n完整状态: llmctl status\n'
   printf '===========================================================\n'
@@ -2507,6 +2692,8 @@ cmd_tune() {
       printf 'max-num-batched-tokens=%s\n' "${MAX_NUM_BATCHED_TOKENS}"
       if [[ "${GATEWAY_KIND}" == omniroute ]]; then printf 'routing-strategy=round-robin (OmniRoute managed Combo)\n'; else printf 'routing-strategy=%s\n' "${ROUTING_STRATEGY}"; fi
       printf 'startup-parallelism=%s\n' "${STARTUP_PARALLELISM}"
+      printf 'keepwarm-enabled=%s\nkeepwarm-interval-seconds=%s\nkeepwarm-timeout-seconds=%s\n' \
+        "${KEEPWARM_ENABLED}" "${KEEPWARM_INTERVAL_SECONDS}" "${KEEPWARM_TIMEOUT_SECONDS}"
       printf 'api-bind=%s\napi-port=%s\n' "${API_BIND}" "${API_PORT}"
       printf 'mm-limit=%s\n' "${MM_LIMIT}"
       ;;
@@ -2544,6 +2731,9 @@ cmd_tune() {
         startup-parallelism)
           [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= INSTANCE_COUNT )) || die "范围 1-${INSTANCE_COUNT}"
           env_key=STARTUP_PARALLELISM; restart_workers=0 ;;
+        keepwarm-interval-seconds)
+          [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 60 && value <= 86400 )) || die "范围 60-86400"
+          env_key=KEEPWARM_INTERVAL_SECONDS; restart_workers=0 ;;
         *) die "不可修改的键：${key}" ;;
       esac
       set_env_value "${CLUSTER_ENV}" "${env_key}" "${value}"
@@ -3290,6 +3480,10 @@ cmd_uninstall() {
     [[ "${answer}" =~ ^[Yy]$ ]] || { log "已取消。"; return 0; }
   fi
   log "卸载 1/4：禁用开机自启。"
+  # Only remove boot activation here. Stopping is deliberately delegated to
+  # the bounded, visible, concurrent lifecycle below so uninstall cannot
+  # become silent while systemd waits for a probe or container.
+  systemctl disable llm-keepwarm.timer 2>/dev/null || true
   systemctl disable llm-cluster.service 2>/dev/null || true
   log "卸载 2/4：并发停止 Router、数据库和 ${INSTANCE_COUNT} 个 Worker。"
   stop_managed_services_with_progress 180 || \
@@ -3297,7 +3491,7 @@ cmd_uninstall() {
   log "卸载 3/4：删除 systemd 单元和可再生成数据；配置保留到最后一步。"
   remove_nginx_config
   remove_tree_with_progress "${NGINX_STATE_DIR}" "可再生成的 Nginx 回滚缓存" 2
-  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service
+  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
   clear_temporary_proxy
@@ -3316,6 +3510,8 @@ cmd_uninstall() {
   fi
   [[ "${CACHE_DIR}" == /var/lib/llm-cluster/cache ]] || die "缓存路径安全检查失败"
   remove_tree_with_progress "${CACHE_DIR}" "可再生成编译缓存" 5
+  [[ "${KEEPWARM_STATE_DIR}" == /var/lib/llm-cluster/keepwarm ]] || die "保活状态路径安全检查失败"
+  remove_tree_with_progress "${KEEPWARM_STATE_DIR}" "可再生成保活状态" 2
   if (( purge_images )); then
     log "删除锁定的 LLM 容器镜像。"
     if [[ "${GATEWAY_KIND}" == omniroute ]]; then
@@ -3409,7 +3605,7 @@ running_managed_containers() {
 
 active_managed_units() {
   local unit state out=""
-  local -a units=(llm-cluster.service llm-router.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
@@ -3439,7 +3635,7 @@ wait_managed_services_stopped() {
 
 force_stop_managed_services() {
   local names name
-  local -a units=(llm-cluster.service llm-router.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
@@ -3454,7 +3650,7 @@ force_stop_managed_services() {
 
 stop_managed_services_with_progress() {
   local timeout="${1:-180}" id
-  local -a units=(llm-cluster.service llm-router.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
   systemctl stop --no-block "${units[@]}" 2>/dev/null || true
@@ -3530,6 +3726,7 @@ main() {
     deactivate) cmd_deactivate "$@" ;;
     scale) cmd_scale "$@" ;;
     autostart) cmd_autostart "$@" ;;
+    keepwarm) cmd_keepwarm "$@" ;;
     router) cmd_router "$@" ;;
     database) cmd_database "$@" ;;
     account) cmd_account "$@" ;;
@@ -3553,6 +3750,7 @@ main() {
     _worker-start) cmd_worker_start "$@" ;;
     _gateway-start) cmd_gateway_start "$@" ;;
     _nginx-install) cmd_nginx_install "$@" ;;
+    _keepwarm-tick) cmd_keepwarm_tick "$@" ;;
     _boot-start) cmd_boot_start "$@" ;;
     _boot-stop) cmd_boot_stop "$@" ;;
     *) die "未知命令：${command}。运行 llmctl help 查看帮助。" ;;

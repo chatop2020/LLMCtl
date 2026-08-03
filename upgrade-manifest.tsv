@@ -7,3 +7,5 @@ file    lib/account_portal.py          /usr/local/lib/llm-cluster/account_portal
 file    lib/llm_benchmark.py           /usr/local/lib/llm-cluster/llm_benchmark.py              0755  account
 dir     lib/account_portal_ui          /usr/local/lib/llm-cluster/account_portal_ui             0755  account
 file    upgrade-llmctl.sh              /usr/local/lib/llm-cluster/upgrade-llmctl.sh             0755  none
+file    systemd/llm-keepwarm.service   /etc/systemd/system/llm-keepwarm.service                 0644  systemd
+file    systemd/llm-keepwarm.timer     /etc/systemd/system/llm-keepwarm.timer                   0644  systemd

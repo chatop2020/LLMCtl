@@ -24,6 +24,8 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/gateway_config.py",
             "lib/account_portal.py",
             "lib/llm_benchmark.py",
+            "systemd/llm-keepwarm.service",
+            "systemd/llm-keepwarm.timer",
         ]
         files.extend(
             str(path.relative_to(ROOT))
@@ -53,11 +55,14 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             self.assertTrue(
                 destination == "/usr/local/sbin/llmctl"
                 or destination.startswith("/usr/local/lib/llm-cluster/")
+                or destination in {
+                    "/etc/systemd/system/llm-keepwarm.service",
+                    "/etc/systemd/system/llm-keepwarm.timer",
+                }
             )
-            self.assertNotIn("worker", destination.lower())
-            self.assertNotIn("/etc/", destination)
+            self.assertNotIn("llm-worker@", destination.lower())
             self.assertRegex(mode, r"^0[0-7]{3}$")
-            self.assertIn(restart, {"none", "account"})
+            self.assertIn(restart, {"none", "account", "systemd"})
 
     def test_llmctl_delegates_upgrade_and_installer_installs_helper(self):
         self.assertIn("cmd_upgrade() {", MANAGER)

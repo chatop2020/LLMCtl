@@ -77,12 +77,34 @@
 | 初始密码 | 默认 `llm-admin`；OmniRoute 未指定时生成强随机值 |
 | 路由 | 8 个健康 Worker 等权分发并故障切换；LiteLLM 使用 `least-busy` |
 | GPU 显存利用率 | `0.92` |
+| Worker 保活 | 新安装默认启用；每 300 秒直连每个激活 Worker 执行一次 1-token 推理 |
 
 New API、LiteLLM 和 Bifrost 的初始 Web 密码按你的要求保留为通用值。它不是安全密码，安装后应立即运行；OmniRoute 默认已生成强随机密码，也建议妥善轮换：
 
 ```bash
 sudo llmctl admin set-password
 ```
+
+### Worker 启动预热与周期保活
+
+普通空闲不会让 vLLM 自动卸载已经驻留显存的模型；只有显式启用 vLLM sleep mode 等机制时才会释放模型内存。但进程刚启动后的 CUDA/编译/图捕获热身，以及长时间空闲后的 GPU 功耗状态变化，仍可能让第一次真实推理更慢。
+
+LLMCtl 在 Worker 健康检查通过后并发执行启动预热，并可周期性直连所有激活 Worker 发送 1-token Chat Completions 请求。该路径不经过 AI 接入层，不占用户额度，不生成用户账单或审计记录。全新安装默认每 300 秒执行；从旧版本原地升级时默认不自动开启，以免未征得同意便增加持续功耗：
+
+```bash
+sudo llmctl keepwarm enable 300
+sudo llmctl keepwarm status
+```
+
+可以在线修改间隔或关闭，无需重启模型：
+
+```bash
+sudo llmctl keepwarm interval 600
+sudo llmctl keepwarm run all
+sudo llmctl keepwarm disable
+```
+
+保活结果包含每个 Worker 的成功状态、首字延迟和总耗时，保存在 root-only 的 `/var/lib/llm-cluster/keepwarm/last-run.json`。间隔越短，空闲后的首请求通常越稳定，但待机功耗也越高。
 
 ### 接入层选择
 
