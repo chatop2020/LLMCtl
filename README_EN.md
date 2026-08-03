@@ -104,7 +104,7 @@ Your existing edge Nginx, load balancer, or firewall remains responsible for the
 - **Portal brand name** replaces `LLMCtl` in the header, sign-in hero, and browser title. The default remains `LLMCtl`.
 - **Published base URL**, for example `https://llm.zjguardian.com`, is metadata used only to generate verification-mail, portal, API, curl-demo, and `llmctl key show` links. It does not make LLMCtl bind the domain, listen on 80/443, obtain certificates, or configure TLS. Leaving it blank preserves the installed fallback address.
 
-Expose only the Nginx front door. Never publish `8001`, `18000`, or `8100-8107`. Control-plane upgrades deliberately preserve Nginx; apply this release's authentication throttling, forwarded-header cleanup, and security response headers explicitly:
+Expose only the Nginx front door. Never publish `8001`, `18000`, or `8100-8107`. Control-plane upgrades preserve the existing Nginx installation and every other site. After a successful upgrade, only an `/etc/nginx/conf.d/llm-cluster.conf` positively identified as LLMCtl-generated is transactionally refreshed with a graceful reload. LLMCtl never generates domains, ports 80/443, certificates, or TLS. You can also reapply and validate it manually:
 
 ```bash
 sudo llmctl nginx apply
@@ -217,7 +217,7 @@ Private or gated Hugging Face models require `HF_TOKEN` when the installer runs,
 
 ## Upgrade the LLMCtl Control Plane
 
-`llmctl upgrade` upgrades only LLMCtl's own programs: the manager, model-catalog/runtime-optimization/gateway helpers, and the account-portal backend and built Vue assets. It does not rerun the installer or modify/restart model workers, the router, Nginx, Docker, model weights, runtime configuration, secrets, or databases.
+`llmctl upgrade` upgrades only LLMCtl's own programs: the manager, model-catalog/runtime-optimization/gateway helpers, and the account-portal backend and built Vue assets. It does not rerun the installer or modify/restart model workers, the router, Docker, model weights, runtime configuration, secrets, or databases. If LLMCtl's own generated Nginx front-door file exists, it is transactionally refreshed after acceptance and Nginx is gracefully reloaded; all other sites remain untouched.
 
 ```bash
 sudo llmctl upgrade

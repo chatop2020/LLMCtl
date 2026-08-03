@@ -104,7 +104,7 @@ sudo llmctl admin set-password
 - **门户品牌名称**：替换页眉、登录页和浏览器标题中的 `LLMCtl`，默认仍为 `LLMCtl`。
 - **公开基准地址**：例如 `https://llm.zjguardian.com`。它只决定验证邮件、门户/API 地址、curl 示例和 `llmctl key show` 中生成的链接；不会让 LLMCtl 绑定域名、监听 80/443、申请证书或配置 TLS。留空继续使用原安装地址。
 
-对外只开放 Nginx 统一入口，不要公开 `8001`、`18000` 或 `8100-8107`。控制面升级不会擅自覆盖现有 Nginx，升级后可显式应用本版的请求限流、代理头清理和安全响应头：
+对外只开放 Nginx 统一入口，不要公开 `8001`、`18000` 或 `8100-8107`。控制面升级保留现有 Nginx 软件和其他站点；升级成功后仅在确认 `/etc/nginx/conf.d/llm-cluster.conf` 是 LLMCtl 生成时事务式刷新该文件并平滑 reload。它不会生成域名、80/443、证书或 TLS。也可随时手工重新应用并校验：
 
 ```bash
 sudo llmctl nginx apply
@@ -217,7 +217,7 @@ Hugging Face 私有或 gated 模型需要在运行安装器时提供 `HF_TOKEN` 
 
 ## 升级 LLMCtl 控制面
 
-`llmctl upgrade` 只升级 LLMCtl 自身程序：管理命令、模型目录/调优/网关配置工具，以及账户门户后端和 Vue 静态资源。它不会重跑安装器，也不会修改或重启模型 Worker、Router、Nginx、Docker、模型权重、运行配置、密钥或数据库。
+`llmctl upgrade` 只升级 LLMCtl 自身程序：管理命令、模型目录/调优/网关配置工具，以及账户门户后端和 Vue 静态资源。它不会重跑安装器，也不会修改或重启模型 Worker、Router、Docker、模型权重、运行配置、密钥或数据库。若存在 LLMCtl 自己生成的 Nginx 入口配置，升级验收完成后会事务式刷新并平滑 reload Nginx；其他站点保持不变。
 
 ```bash
 sudo llmctl upgrade

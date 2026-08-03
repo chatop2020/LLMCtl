@@ -3727,8 +3727,8 @@ onBeforeUnmount(() => {
                   >
                 </div>
                 <p class="muted setting-note">
-                  此设置只生成公开链接并决定 HTTPS 会话安全属性，不修改 Nginx
-                  监听、DNS、证书、端口映射或 Worker。
+                  此设置只是链接与显示元数据，不修改 Nginx、TLS、Cookie、登录跳转、
+                  当前访问地址、端口映射或 Worker。
                 </p>
                 <details class="advanced-settings">
                   <summary>查看自动回退地址</summary>

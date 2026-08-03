@@ -166,7 +166,7 @@ sudo bash install-llm-cluster.sh \
 
 白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查。门户管理员可在线配置并测试 SMTP、关闭/开启注册、调整白名单和新用户默认赠额，也可禁用用户、分组、增减金额余额、发放通用或指定模型的额外 token。赠额支持 `daily`、`weekly`、`monthly` 及指定重置时间；后台会独立执行到期重置，即使额度耗尽导致 key 已关闭也能按时恢复。
 
-管理员还可在“发布、注册与 SMTP”中单独保存门户品牌名称和公开访问源。公开访问源只能是无路径、无凭据、无 query/fragment 的 `http(s)` origin，例如 `https://llm.zjguardian.com`。配置后，它优先于安装期回退地址，用于验证邮件、页内链接、API Base、curl 示例、`llmctl account url`、`llmctl admin show`、`llmctl key show` 和 `llmctl info`；留空不改变原有访问方式。HTTPS origin 会让新签发的门户会话 Cookie 带 `Secure`，已有有效会话在首次从 HTTPS 域名访问时也会原地升级；配置后不要再从明文 HTTP 地址使用门户。品牌名称为 1–40 个可见字符，用于页眉、登录页和浏览器标题。
+管理员还可在“发布、注册与 SMTP”中单独保存门户品牌名称和公开访问源。公开访问源只能是无路径、无凭据、无 query/fragment 的 `http(s)` origin，例如 `https://llm.zjguardian.com`。配置后，它优先于安装期回退地址，用于验证邮件、页内链接、API Base、curl 示例、`llmctl account url`、`llmctl admin show`、`llmctl key show` 和 `llmctl info`；留空使用安装期回退地址。该字段仅是链接与显示元数据，不修改 Nginx、TLS、Cookie、登录回跳或当前访问方式。品牌名称为 1–40 个可见字符，用于页眉、登录页和浏览器标题。
 
 模型管理页把公开 ID（例如 `gdn-inside`）通过 OmniRoute 原生 Combo mapping/model alias 映射到实际 `ornith-1.0-35b-fp8`。用户 key 只授权公开 ID，不授权底层模型或 Combo ID。管理员可为每个模型分别设置输入、输出、缓存读取和思考 token 的 `$/1M` 价格，并按“全体、多个用户组、多个指定用户”发布；token 赠额优先消耗，超出部分才扣金额余额。价格会按版本快照进账本，历史调用不会被新价格重算。
 

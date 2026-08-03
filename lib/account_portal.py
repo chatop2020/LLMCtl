@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.8.1"
+APP_VERSION = "2.8.2"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -1695,36 +1695,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         return morsel.value if morsel else ""
 
     def secure_cookie_suffix(self) -> str:
-        """Apply Secure immediately when the persisted public origin is HTTPS."""
-        settings = self.app.db.settings()
-        try:
-            published = normalize_public_origin(settings.get("published_origin", ""))
-        except ValueError:
-            published = ""
-        return (
-            "; Secure"
-            if self.app.config.cookie_secure or published.startswith("https://")
-            else ""
-        )
+        """Apply the installation-time cookie policy only.
 
-    def queue_secure_session_upgrade(self, user: sqlite3.Row | None) -> None:
-        """Upgrade an existing authenticated browser session on its first HTTPS visit.
-
-        A Secure cookie sent over plaintext HTTP is ignored by browsers, while the
-        same response reached through the configured HTTPS edge is accepted. This
-        lets an administrator save the origin over a LAN address, verify the public
-        route, and move to HTTPS without rotating or invalidating every session.
+        ``published_origin`` is link metadata for mail, curl examples and the UI.
+        It must never change how an existing LAN or reverse-proxy session works.
+        Deployments that require Secure cookies can opt in explicitly with
+        ``ACCOUNT_COOKIE_SECURE`` during installation/configuration.
         """
-        if not user or self.secure_cookie_suffix() != "; Secure":
-            return
-        session = self.cookies().get(SESSION_COOKIE)
-        csrf = self.csrf_token()
-        if not session or not csrf:
-            return
-        self.extra_response_cookies = [
-            f"{SESSION_COOKIE}={session.value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure",
-            f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800; Secure",
-        ]
+        return "; Secure" if self.app.config.cookie_secure else ""
 
     def send_headers(self, status: int, content_type: str = "text/html; charset=utf-8") -> None:
         self.send_response(status)
@@ -1970,7 +1948,6 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/portal-api/session":
             user, _ = self.current_session()
-            self.queue_secure_session_upgrade(user)
             self.json_response(
                 200,
                 {

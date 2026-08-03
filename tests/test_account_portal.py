@@ -604,10 +604,11 @@ class PortalIntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200)
-        status, _, session_headers = self.get(client, "/portal-api/session")
+        status, session_raw, session_headers = self.get(client, "/portal-api/session")
         self.assertEqual(status, 200)
+        self.assertTrue(json.loads(session_raw)["authenticated"])
         upgraded = session_headers.get_all("Set-Cookie") or []
-        self.assertTrue(
+        self.assertFalse(
             any(portal.SESSION_COOKIE in item and "; Secure" in item for item in upgraded)
         )
 
@@ -617,7 +618,7 @@ class PortalIntegrationTests(unittest.TestCase):
         csrf_cookie = next(
             cookie for cookie in fresh_jar if cookie.name == portal.CSRF_COOKIE
         )
-        self.assertTrue(csrf_cookie.secure)
+        self.assertFalse(csrf_cookie.secure)
 
     def test_published_origin_rejects_paths_credentials_queries_and_controls(self):
         client, jar = self.login_admin_api()
