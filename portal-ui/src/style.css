@@ -570,12 +570,57 @@ pre {
   margin-bottom: 12px;
 }
 .switch {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
+  cursor: pointer;
 }
-.switch input {
-  width: auto;
+.switch-control {
+  position: absolute;
+  width: 1px !important;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+.switch > span {
+  position: relative;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 22px;
+  background: #d8e4e9;
+  border: 1px solid #b9ccd5;
+  border-radius: 999px;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+.switch > span::before {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  content: "";
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px #173b4d33;
+  transition: transform 0.15s ease;
+}
+.switch-control:checked + span {
+  background: #1687bd;
+  border-color: #1687bd;
+}
+.switch-control:checked + span::before {
+  transform: translateX(16px);
+}
+.switch-control:focus-visible + span {
+  outline: 3px solid #2e9aca2e;
+  outline-offset: 2px;
 }
 .architecture {
   display: flex;
@@ -849,7 +894,7 @@ dialog::backdrop {
 .active-users-panel .panel-head p {
   margin: 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 13px;
 }
 .operations-kpis article {
   min-height: 112px;
@@ -1097,11 +1142,67 @@ dialog::backdrop {
   width: 34px;
   text-align: center;
 }
-.selection-column input {
-  width: 15px;
-  height: 15px;
+.choice-control {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-grid;
+  flex: 0 0 18px;
+  place-content: center;
+  width: 18px !important;
+  height: 18px;
   margin: 0;
-  accent-color: #148fbe;
+  padding: 0;
+  color: #fff;
+  background: #fff;
+  border: 1.5px solid #8fb2c3;
+  border-radius: 5px;
+  box-shadow: 0 1px 2px #174e6810;
+  cursor: pointer;
+}
+.choice-control[type="radio"] {
+  border-radius: 50%;
+}
+.choice-control::before {
+  content: "";
+  transform: scale(0);
+  transition: transform 0.12s ease;
+}
+.choice-control[type="checkbox"]::before {
+  width: 4px;
+  height: 8px;
+  margin-top: -2px;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) scale(0);
+}
+.choice-control[type="radio"]::before {
+  width: 8px;
+  height: 8px;
+  background: currentColor;
+  border-radius: 50%;
+}
+.choice-control:checked {
+  background: #1687bd;
+  border-color: #1687bd;
+}
+.choice-control[type="checkbox"]:checked::before {
+  transform: rotate(45deg) scale(1);
+}
+.choice-control[type="radio"]:checked::before {
+  transform: scale(1);
+}
+.choice-control:focus-visible {
+  outline: 3px solid #2e9aca2e;
+  outline-offset: 2px;
+}
+.choice-control:disabled {
+  background: #edf3f6;
+  border-color: #c8d7de;
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+.selection-column .choice-control {
+  margin: auto;
 }
 .bulk-policy-dialog {
   width: min(720px, calc(100vw - 32px));
@@ -1109,49 +1210,53 @@ dialog::backdrop {
 .bulk-scope {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 12px;
   margin: 0;
-  padding: 11px;
+  padding: 14px;
   border: 1px solid #cfdee5;
   border-radius: 10px;
 }
 .bulk-scope legend {
-  padding: 0 5px;
+  padding: 0 7px;
   color: #46677a;
-  font-size: 11px;
+  background: #fff;
+  font-size: 13px;
   font-weight: 650;
 }
 .bulk-scope > label {
   display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  padding: 10px;
+  gap: 11px;
+  align-items: center;
+  min-height: 72px;
+  padding: 13px 14px;
   background: #f8fbfc;
   border: 1px solid #dbe7ec;
   border-radius: 8px;
   cursor: pointer;
 }
+.bulk-scope > label:hover {
+  border-color: #8fc3d8;
+}
+.bulk-scope > label:has(.choice-control:checked) {
+  background: #eef8fc;
+  border-color: #55a4c6;
+  box-shadow: inset 0 0 0 1px #55a4c61f;
+}
 .bulk-scope > label.disabled {
   cursor: not-allowed;
   opacity: 0.55;
-}
-.bulk-scope input,
-.bulk-field-toggle input {
-  width: 15px;
-  height: 15px;
-  margin-top: 2px;
-  accent-color: #148fbe;
 }
 .bulk-scope span {
   display: grid;
   gap: 2px;
 }
 .bulk-scope strong {
-  font-size: 12px;
+  font-size: 13px;
 }
 .bulk-scope small {
   color: var(--muted);
-  font-size: 10px;
+  font-size: 12px;
+  font-weight: 450;
 }
 .bulk-policy-fields {
   display: grid;
@@ -1586,6 +1691,22 @@ dialog::backdrop {
 }
 .compact-table td strong {
   font-size: 10px;
+}
+.active-users-table table {
+  min-width: 680px;
+}
+.active-users-table th {
+  padding: 11px 12px;
+  font-size: 12px;
+}
+.active-users-table td {
+  padding: 11px 12px;
+  font-size: 13px;
+}
+.active-users-table .ghost {
+  min-height: 32px;
+  padding: 6px 11px;
+  font-size: 12px;
 }
 .stress-errors {
   margin-top: 10px;

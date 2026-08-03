@@ -3010,7 +3010,7 @@ onBeforeUnmount(() => {
                     </div>
                     <span>{{ adminAnalytics.active_pagination.total }} 人</span>
                   </div>
-                  <div class="table-wrap compact-table">
+                  <div class="table-wrap active-users-table">
                     <table>
                       <thead>
                         <tr>
@@ -3342,7 +3342,11 @@ onBeforeUnmount(() => {
               placeholder="搜索模型或供应商"
             />
             <label class="visibility-filter">
-              <input v-model="showHiddenFreeResources" type="checkbox" />
+              <input
+                v-model="showHiddenFreeResources"
+                class="choice-control"
+                type="checkbox"
+              />
               显示已在原生接入层隐藏的资源
             </label>
             <div class="resource-grid">
@@ -3483,6 +3487,7 @@ onBeforeUnmount(() => {
                   <tr>
                     <th class="selection-column">
                       <input
+                        class="choice-control"
                         type="checkbox"
                         aria-label="选择当前页全部用户"
                         :checked="allCurrentUserPageSelected"
@@ -3504,6 +3509,7 @@ onBeforeUnmount(() => {
                   >
                     <td class="selection-column">
                       <input
+                        class="choice-control"
                         type="checkbox"
                         :aria-label="`选择用户 ${user.email}`"
                         :checked="selectedUserIds.includes(user.id)"
@@ -3951,7 +3957,11 @@ onBeforeUnmount(() => {
                   <small>{{ stressPlan.concurrency }} 个并发槽位 × 每槽 {{ stressPlan.request_multiplier }} 次</small>
                 </div>
                 <label v-if="stressIsHighRisk" class="risk-confirmation">
-                  <input v-model="stressPlan.risk_confirmed" type="checkbox" />
+                  <input
+                    v-model="stressPlan.risk_confirmed"
+                    class="choice-control"
+                    type="checkbox"
+                  />
                   <span><strong>我确认这是高负载测试。</strong>它可能占满 GPU、拉高延迟并影响正在使用 API 的用户。</span>
                 </label>
                 <div class="warning compact-warning">
@@ -4216,6 +4226,7 @@ onBeforeUnmount(() => {
                 <h2>注册策略</h2>
                 <label class="switch"
                   ><input
+                    class="switch-control"
                     type="checkbox"
                     :checked="settings.registration_enabled === '1'"
                     @change="
@@ -4223,7 +4234,7 @@ onBeforeUnmount(() => {
                         ? '1'
                         : '0'
                     "
-                  /><span></span>允许新用户注册</label
+                  /><span aria-hidden="true"></span>允许新用户注册</label
                 ><label
                   >允许邮箱后缀<input
                     v-model="settings.allowed_domains"
@@ -4469,6 +4480,7 @@ onBeforeUnmount(() => {
           >
             <input
               v-model="userEdit.group_ids"
+              class="choice-control"
               type="checkbox"
               :value="group.id"
             />
@@ -4512,7 +4524,12 @@ onBeforeUnmount(() => {
         <fieldset class="bulk-scope">
           <legend>修改范围</legend>
           <label>
-            <input v-model="bulkPolicy.scope" type="radio" value="filtered" />
+            <input
+              v-model="bulkPolicy.scope"
+              class="choice-control"
+              type="radio"
+              value="filtered"
+            />
             <span
               ><strong>当前筛选结果</strong
               ><small>{{ filteredAdminUsers.length }} 位用户；包含所有分页</small></span
@@ -4521,6 +4538,7 @@ onBeforeUnmount(() => {
           <label :class="{ disabled: !selectedUserIds.length }">
             <input
               v-model="bulkPolicy.scope"
+              class="choice-control"
               type="radio"
               value="selected"
               :disabled="!selectedUserIds.length"
@@ -4534,7 +4552,11 @@ onBeforeUnmount(() => {
 
         <section class="bulk-policy-fields">
           <label class="bulk-field-toggle">
-            <input v-model="bulkPolicy.change_max_sessions" type="checkbox" />
+            <input
+              v-model="bulkPolicy.change_max_sessions"
+              class="choice-control"
+              type="checkbox"
+            />
             <span>修改 API Key 活跃会话上限</span>
           </label>
           <label
@@ -4552,6 +4574,7 @@ onBeforeUnmount(() => {
           <label class="bulk-field-toggle">
             <input
               v-model="bulkPolicy.change_requests_per_minute"
+              class="choice-control"
               type="checkbox"
             />
             <span>修改每分钟请求数</span>
@@ -4571,6 +4594,7 @@ onBeforeUnmount(() => {
           <label class="bulk-field-toggle">
             <input
               v-model="bulkPolicy.change_requests_per_day"
+              class="choice-control"
               type="checkbox"
             />
             <span>修改每日请求数</span>
@@ -4782,6 +4806,7 @@ onBeforeUnmount(() => {
             class="capability-option"
             ><input
               v-model="modelEdit.capabilities"
+              class="choice-control"
               type="checkbox"
               :value="cap"
             /><span>{{ cap }}</span></label

@@ -195,6 +195,16 @@ describe("LLMCtl portal contracts", () => {
     expect(style).toContain(".selection-column");
   });
 
+  it("uses readable analytics tables and consistent accessible choice controls", () => {
+    expect(source).toContain('class="table-wrap active-users-table"');
+    expect(source).not.toContain('class="table-wrap compact-table">\n                    <table>\n                      <thead>\n                        <tr>\n                          <th>用户</th>');
+    expect(source.match(/class="choice-control"/g)?.length).toBeGreaterThanOrEqual(10);
+    expect(style).toContain(".active-users-table td");
+    expect(style).toContain(".choice-control:checked");
+    expect(style).toContain('.choice-control[type="radio"]');
+    expect(style).toContain(".bulk-scope > label:has(.choice-control:checked)");
+  });
+
   it("uses public-project LLMCtl language and a light operations-console visual system", () => {
     for (const marker of [
       "OmniRoute",
