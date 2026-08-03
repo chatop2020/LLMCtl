@@ -21,7 +21,7 @@ class StaticDeploymentContracts(unittest.TestCase):
             "[接入层与管理员 / Gateway and administrators]",
             "[API 与内部密钥 / API and internal secrets]",
             "[数据库 / Databases]",
-            "[注册、额度与 SMTP / Registration, quota and SMTP]",
+            "[注册、余额与 SMTP / Registration, balance and SMTP]",
             "[维护网络 / Maintenance networking]",
             "[模型与推理 / Model and inference]",
             "[服务、自启与 Worker / Services and workers]",

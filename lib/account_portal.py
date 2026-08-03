@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.9.0"
+APP_VERSION = "3.0.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -495,6 +495,79 @@ def micros_to_money(value: int) -> str:
     return f"{sign}{value // 1_000_000}.{value % 1_000_000:06d}".rstrip("0").rstrip(".")
 
 
+def tokens_to_money_micros(tokens: int, price_micros_per_million: int) -> int:
+    """Convert a raw token entitlement to cash at one conservative unit price.
+
+    Existing LLMCtl grants were consumed against the most expensive token class
+    first.  Using the highest current model price therefore preserves at least
+    the purchasing power of every remaining grant during the one-time cash
+    migration.  As with request billing, fractional micro-dollars round up.
+    """
+    tokens = max(0, int(tokens))
+    price = max(0, int(price_micros_per_million))
+    return (tokens * price + 999_999) // 1_000_000
+
+
+def apply_welcome_credit(
+    connection: sqlite3.Connection,
+    user_id: str,
+    settings: dict[str, str],
+    stamp: int,
+) -> tuple[int, str]:
+    """Credit the configured one-time welcome balance idempotently."""
+    amount = money_to_micros(settings.get("default_welcome_balance", "0") or "0")
+    if amount < 0:
+        raise ValueError("default welcome balance cannot be negative")
+    source_ref = f"welcome-credit:{user_id}"
+    if amount == 0 or connection.execute(
+        "SELECT 1 FROM balance_transactions WHERE source_ref=?", (source_ref,)
+    ).fetchone():
+        return 0, source_ref
+    account = connection.execute(
+        "SELECT balance_micros FROM billing_accounts WHERE user_id=?", (user_id,)
+    ).fetchone()
+    balance = int(account["balance_micros"] or 0) if account else 0
+    after = balance + amount
+    connection.execute(
+        "INSERT INTO billing_accounts(user_id,balance_micros,suspended,updated_at) "
+        "VALUES(?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET "
+        "balance_micros=excluded.balance_micros,updated_at=excluded.updated_at",
+        (user_id, after, stamp),
+    )
+    connection.execute(
+        """INSERT INTO balance_transactions(
+             user_id,kind,amount_micros,balance_after_micros,actor,note,source_ref,created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            user_id, "credit", amount, after, "system:registration",
+            "Welcome balance", source_ref, stamp,
+        ),
+    )
+    return amount, source_ref
+
+
+def rollback_source_credit(
+    connection: sqlite3.Connection, user_id: str, source_ref: str, stamp: int
+) -> None:
+    """Undo a provisioning credit when the external API-key transaction fails."""
+    transaction = connection.execute(
+        "SELECT amount_micros FROM balance_transactions WHERE user_id=? AND source_ref=?",
+        (user_id, source_ref),
+    ).fetchone()
+    if not transaction:
+        return
+    amount = int(transaction["amount_micros"] or 0)
+    connection.execute(
+        "UPDATE billing_accounts SET balance_micros=balance_micros-?,updated_at=? "
+        "WHERE user_id=?",
+        (amount, stamp, user_id),
+    )
+    connection.execute(
+        "DELETE FROM balance_transactions WHERE user_id=? AND source_ref=?",
+        (user_id, source_ref),
+    )
+
+
 def price_usage(
     input_tokens: int,
     output_tokens: int,
@@ -503,13 +576,14 @@ def price_usage(
     prices: dict[str, Any] | sqlite3.Row,
     available_grant_tokens: int = 0,
 ) -> dict[str, int]:
-    """Price one request and apply token grants without losing price fidelity.
+    """Price one request, retaining legacy grant math for historical replay.
 
     Model prices are expressed in micro-USD per one million tokens. A raw
-    token grant cannot be prorated across the request total because cached,
-    input, output and reasoning tokens can have different prices. We therefore
-    assign grants to the highest-priced billable token classes first. Free
-    token classes never consume a grant.
+    legacy token grant cannot be prorated across the request total because
+    cached, input, output and reasoning tokens can have different prices. The
+    active cash-only settlement path always passes zero; the compatibility
+    branch remains so pre-3.0 ledger calculations and migration tests are
+    reproducible.
     """
     total_input = max(0, int(input_tokens))
     total_output = max(0, int(output_tokens))
@@ -682,6 +756,7 @@ class Config:
     admin_password: str
     initial_registration: bool
     initial_domains: list[str]
+    initial_welcome_balance_micros: int
     initial_quota: int
     initial_reset: str
     initial_reset_time: str
@@ -767,7 +842,13 @@ class Config:
             raise SystemExit("ACCOUNT_ADMIN_USERNAME is invalid") from error
         port = env_int("ACCOUNT_PORT", 8001)
         smtp_port = env_int("SMTP_PORT", 587)
-        initial_quota = env_int("ACCOUNT_DEFAULT_QUOTA_TOKENS", 1000000)
+        initial_quota = env_int("ACCOUNT_DEFAULT_QUOTA_TOKENS", 0)
+        try:
+            initial_welcome_balance_micros = money_to_micros(
+                os.environ.get("ACCOUNT_DEFAULT_WELCOME_BALANCE", "0")
+            )
+        except ValueError as error:
+            raise SystemExit("ACCOUNT_DEFAULT_WELCOME_BALANCE must be a valid USD amount") from error
         verification_ttl = env_int("ACCOUNT_VERIFICATION_TTL", 86400)
         if not 1 <= port <= 65535:
             raise SystemExit("ACCOUNT_PORT must be 1-65535")
@@ -775,6 +856,8 @@ class Config:
             raise SystemExit("SMTP_PORT must be 1-65535")
         if not 0 <= initial_quota <= 10**12:
             raise SystemExit("ACCOUNT_DEFAULT_QUOTA_TOKENS must be 0-1000000000000")
+        if not 0 <= initial_welcome_balance_micros <= 10**15:
+            raise SystemExit("ACCOUNT_DEFAULT_WELCOME_BALANCE must be 0-1000000000 USD")
         if not 300 <= verification_ttl <= 7 * 86400:
             raise SystemExit("ACCOUNT_VERIFICATION_TTL must be 300-604800 seconds")
         if smtp_from:
@@ -813,6 +896,7 @@ class Config:
             admin_password=os.environ.get("ACCOUNT_ADMIN_PASSWORD", os.environ.get("UI_PASSWORD", "")),
             initial_registration=initial_registration,
             initial_domains=domains,
+            initial_welcome_balance_micros=initial_welcome_balance_micros,
             initial_quota=initial_quota,
             initial_reset=reset,
             initial_reset_time=reset_time,
@@ -996,6 +1080,9 @@ CREATE TABLE IF NOT EXISTS token_grants (
   reset_at INTEGER,
   expires_at INTEGER,
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','expired')),
+  converted_at INTEGER,
+  converted_amount_micros INTEGER NOT NULL DEFAULT 0,
+  conversion_rate_micros INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -1028,6 +1115,7 @@ CREATE TABLE IF NOT EXISTS balance_transactions (
   balance_after_micros INTEGER NOT NULL,
   actor TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
+  source_ref TEXT,
   usage_id INTEGER REFERENCES usage_ledger(id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL
 );
@@ -1095,12 +1183,18 @@ class Database:
         self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            had_welcome_balance = connection.execute(
+                "SELECT 1 FROM settings WHERE key='default_welcome_balance'"
+            ).fetchone() is not None
             defaults = {
                 "registration_enabled": "1" if self.config.initial_registration else "0",
                 "allowed_domains": ",".join(self.config.initial_domains),
                 "default_quota_tokens": str(self.config.initial_quota),
                 "default_quota_reset": self.config.initial_reset,
                 "default_quota_reset_time": self.config.initial_reset_time,
+                "default_welcome_balance": micros_to_money(
+                    self.config.initial_welcome_balance_micros
+                ),
                 "default_max_sessions": "1",
                 "default_requests_per_minute": "30",
                 "default_requests_per_day": "2000",
@@ -1194,6 +1288,27 @@ class Database:
                 connection.execute(
                     "ALTER TABLE token_grants ADD COLUMN reset_time TEXT NOT NULL DEFAULT '00:00'"
                 )
+            for name, declaration in {
+                "converted_at": "INTEGER",
+                "converted_amount_micros": "INTEGER NOT NULL DEFAULT 0",
+                "conversion_rate_micros": "INTEGER NOT NULL DEFAULT 0",
+            }.items():
+                if name not in grant_columns:
+                    connection.execute(
+                        f"ALTER TABLE token_grants ADD COLUMN {name} {declaration}"
+                    )
+            transaction_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(balance_transactions)")
+            }
+            if "source_ref" not in transaction_columns:
+                connection.execute(
+                    "ALTER TABLE balance_transactions ADD COLUMN source_ref TEXT"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_balance_source_ref "
+                "ON balance_transactions(source_ref) WHERE source_ref IS NOT NULL"
+            )
             usage_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(usage_ledger)")
             }
@@ -1289,7 +1404,162 @@ class Database:
                             "active", stamp, stamp,
                         ),
                     )
+            self._migrate_token_grants_to_cash(
+                connection, had_welcome_balance=had_welcome_balance
+            )
         os.chmod(self.config.db_path, 0o600)
+
+    @staticmethod
+    def _migrate_token_grants_to_cash(
+        connection: sqlite3.Connection, had_welcome_balance: bool
+    ) -> dict[str, int | str]:
+        """Convert all remaining promotional tokens to cash exactly once.
+
+        The migration is deliberately transactional and fail-closed.  If any
+        active grant cannot be valued, no grant is consumed.  A unique source
+        reference protects balances if initialization is retried.
+        """
+        stamp = now()
+        grants = connection.execute(
+            "SELECT * FROM token_grants WHERE status='active' AND tokens_remaining>0 "
+            "ORDER BY created_at,id"
+        ).fetchall()
+        public_rate_row = connection.execute(
+            "SELECT MAX(MAX(input_price_micros,output_price_micros,"
+            "cached_price_micros,reasoning_price_micros)) rate "
+            "FROM published_models WHERE status='published'"
+        ).fetchone()
+        public_rate = int(public_rate_row["rate"] or 0) if public_rate_row else 0
+        legacy_default = connection.execute(
+            "SELECT value FROM settings WHERE key='default_quota_tokens'"
+        ).fetchone()
+        legacy_tokens = int(legacy_default["value"] or 0) if legacy_default else 0
+        conversions: list[tuple[sqlite3.Row, int, int]] = []
+        blocked: list[str] = []
+        for grant in grants:
+            rate = public_rate
+            if grant["model_id"]:
+                model = connection.execute(
+                    "SELECT MAX(input_price_micros,output_price_micros,"
+                    "cached_price_micros,reasoning_price_micros) rate "
+                    "FROM published_models WHERE id=?",
+                    (grant["model_id"],),
+                ).fetchone()
+                rate = int(model["rate"] or 0) if model else 0
+            if rate <= 0:
+                blocked.append(str(grant["id"]))
+                continue
+            amount = tokens_to_money_micros(grant["tokens_remaining"], rate)
+            conversions.append((grant, rate, amount))
+        if legacy_tokens > 0 and public_rate <= 0:
+            blocked.append("settings:default_quota_tokens")
+
+        status = "complete"
+        if blocked:
+            status = "blocked:missing-price"
+            conversions = []
+        converted = credited = 0
+        for grant, rate, amount in conversions:
+            source_ref = f"token-grant-conversion:{grant['id']}"
+            if connection.execute(
+                "SELECT 1 FROM balance_transactions WHERE source_ref=?", (source_ref,)
+            ).fetchone():
+                continue
+            account = connection.execute(
+                "SELECT balance_micros FROM billing_accounts WHERE user_id=?",
+                (grant["user_id"],),
+            ).fetchone()
+            balance = int(account["balance_micros"] or 0) if account else 0
+            after = balance + amount
+            connection.execute(
+                "INSERT INTO billing_accounts(user_id,balance_micros,suspended,updated_at) "
+                "VALUES(?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "balance_micros=excluded.balance_micros,updated_at=excluded.updated_at",
+                (grant["user_id"], after, stamp),
+            )
+            connection.execute(
+                """INSERT INTO balance_transactions(
+                     user_id,kind,amount_micros,balance_after_micros,actor,note,
+                     source_ref,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    grant["user_id"], "credit", amount, after, "system:migration",
+                    f"Converted {int(grant['tokens_remaining'])} remaining tokens at "
+                    f"{micros_to_money(rate)} USD/1M", source_ref, stamp,
+                ),
+            )
+            connection.execute(
+                "UPDATE token_grants SET tokens_remaining=0,status='disabled',"
+                "converted_at=?,converted_amount_micros=?,conversion_rate_micros=?,"
+                "updated_at=? WHERE id=?",
+                (stamp, amount, rate, stamp, grant["id"]),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(created_at,actor,action,target,status,remote_addr,detail) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    stamp, "system:migration", "billing.grant-to-cash", grant["user_id"],
+                    "success", "local",
+                    json.dumps(
+                        {
+                            "grant_id": grant["id"],
+                            "remaining_tokens": int(grant["tokens_remaining"]),
+                            "rate_micros_per_million": rate,
+                            "credited_micros": amount,
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            converted += 1
+            credited += amount
+
+        if not had_welcome_balance and legacy_tokens > 0 and not blocked:
+            welcome = tokens_to_money_micros(legacy_tokens, public_rate)
+            connection.execute(
+                "UPDATE settings SET value=?,updated_at=? WHERE key='default_welcome_balance'",
+                (micros_to_money(welcome), stamp),
+            )
+        elif blocked and not had_welcome_balance:
+            # initialize() inserted a provisional value for the new setting.
+            # Remove it so a later retry can still recognize and convert the
+            # legacy registration policy after model pricing becomes available.
+            connection.execute(
+                "DELETE FROM settings WHERE key='default_welcome_balance'"
+            )
+        if not blocked:
+            # Retire every legacy source only after all grants were valued.
+            connection.execute(
+                "UPDATE token_grants SET status='disabled',converted_at=COALESCE(converted_at,?),"
+                "converted_amount_micros=COALESCE(converted_amount_micros,0),"
+                "conversion_rate_micros=COALESCE(conversion_rate_micros,0),updated_at=? "
+                "WHERE status='active' AND tokens_remaining<=0",
+                (stamp, stamp),
+            )
+            connection.execute(
+                "UPDATE settings SET value='0',updated_at=? WHERE key='default_quota_tokens'",
+                (stamp,),
+            )
+            connection.execute("UPDATE users SET quota_tokens=0 WHERE role='user'")
+        connection.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES('token_grant_conversion_status',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            (status, stamp),
+        )
+        return {
+            "converted": converted,
+            "credited_micros": credited,
+            "status": status,
+        }
+
+    def finalize_legacy_billing_migration(self) -> dict[str, int | str]:
+        """Retry conversion after the managed model and its prices are present."""
+        with self.connect() as connection:
+            had_welcome_balance = connection.execute(
+                "SELECT 1 FROM settings WHERE key='default_welcome_balance'"
+            ).fetchone() is not None
+            return self._migrate_token_grants_to_cash(
+                connection, had_welcome_balance=had_welcome_balance
+            )
 
     def settings(self) -> dict[str, str]:
         with self.connect() as connection:
@@ -2460,7 +2730,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             elif not ignored_reason:
                 connection.execute(
                     "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,requests_per_minute,requests_per_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, default_rpm, default_rpd, stamp),
+                    (user_id, email, email, password_hash, "user", "pending", 0, settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, default_rpm, default_rpd, stamp),
                 )
             if not ignored_reason:
                 connection.execute(
@@ -2503,7 +2773,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         settings = self.app.db.settings()
         key_id = ""
-        grant_id = ""
+        welcome_source_ref = ""
         try:
             _, domain = normalize_email(record["email"])
             if domain not in normalize_domains(settings.get("allowed_domains", "")):
@@ -2522,22 +2792,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 connection.execute("UPDATE users SET status='active',verified_at=?,api_key_id=?,token_limit_id=NULL WHERE id=?", (stamp, key_id, record["user_id"]))
                 connection.execute("INSERT OR IGNORE INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,0,0,?)", (record["user_id"], stamp))
                 connection.execute("INSERT OR IGNORE INTO user_group_members(user_id,group_id,created_at) VALUES(?,'default',?)", (record["user_id"], stamp))
-                quota = int(settings.get("default_quota_tokens", "0") or 0)
-                if quota:
-                    reset = settings.get("default_quota_reset", "monthly")
-                    grant_id = str(uuid.uuid4())
-                    connection.execute(
-                        "INSERT INTO token_grants(id,user_id,label,tokens_initial,tokens_remaining,reset_interval,reset_time,reset_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            grant_id, record["user_id"], "Welcome recurring grant", quota, quota,
-                            reset, settings.get("default_quota_reset_time", "00:00"),
-                            next_reset_at(
-                                reset,
-                                reset_time=settings.get("default_quota_reset_time", "00:00"),
-                            ),
-                            "active", stamp, stamp,
-                        ),
-                    )
+                _credited, welcome_source_ref = apply_welcome_credit(
+                    connection, record["user_id"], settings, stamp
+                )
             self.app.control.sync_user(record["user_id"])
         except Exception as error:
             if key_id:
@@ -2548,8 +2805,10 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             # a transient gateway error never consumes the verification link
             # or leaves an active account backed by a deleted key.
             with self.app.db.connect() as connection:
-                if grant_id:
-                    connection.execute("DELETE FROM token_grants WHERE id=?", (grant_id,))
+                if welcome_source_ref:
+                    rollback_source_credit(
+                        connection, record["user_id"], welcome_source_ref, now()
+                    )
                 connection.execute("DELETE FROM permission_sync WHERE user_id=?", (record["user_id"],))
                 connection.execute("DELETE FROM user_group_members WHERE user_id=?", (record["user_id"],))
                 connection.execute(
@@ -2695,10 +2954,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         api_url = str(
             payload.get("api_public_url", current.get("api_public_url") or self.app.config.api_public_url)
         ).rstrip("/")
-        try:
-            quota = int(payload.get("default_quota_tokens", current.get("default_quota_tokens", "1000000")))
-        except (TypeError, ValueError) as error:
-            raise ValueError("默认 Token 额度必须是整数") from error
+        welcome_balance_micros = money_to_micros(
+            payload.get(
+                "default_welcome_balance",
+                current.get("default_welcome_balance", "0"),
+            )
+        )
         default_max_sessions = normalize_max_sessions(
             payload.get(
                 "default_max_sessions", current.get("default_max_sessions", "1")
@@ -2719,17 +2980,11 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             ),
             "默认每日请求数",
         )
-        reset = str(payload.get("default_quota_reset", current.get("default_quota_reset", "monthly")))
-        reset_time = str(payload.get("default_quota_reset_time", current.get("default_quota_reset_time", "00:00")))
         currency = str(payload.get("currency", current.get("currency", "USD"))).strip().upper()
         if enabled and not domains:
             raise ValueError("开放注册前请至少配置一个允许的邮箱域名")
-        if not 0 <= quota <= 10**12:
-            raise ValueError("默认赠送 Token 必须在 0-1000000000000 之间")
-        if reset not in {"daily", "weekly", "monthly"}:
-            raise ValueError("额度重置周期无效")
-        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
-            raise ValueError("额度重置时间必须使用 HH:MM 格式")
+        if not 0 <= welcome_balance_micros <= 1_000_000_000_000_000:
+            raise ValueError("默认赠送金额必须在 0-1000000000 之间")
         if not re.fullmatch(r"[A-Z]{3}", currency):
             raise ValueError("货币代码必须是三个大写字母")
         for label, url, allow_ui in (("门户公开 URL", public_url, True), ("API 公开 URL", api_url, False)):
@@ -2758,9 +3013,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             | {
                 "registration_enabled": "1" if enabled else "0",
                 "allowed_domains": ",".join(domains),
-                "default_quota_tokens": str(quota),
-                "default_quota_reset": reset,
-                "default_quota_reset_time": reset_time,
+                "default_welcome_balance": micros_to_money(welcome_balance_micros),
+                "default_quota_tokens": "0",
                 "default_max_sessions": str(default_max_sessions),
                 "default_requests_per_minute": str(default_rpm),
                 "default_requests_per_day": str(default_rpd),
@@ -2776,7 +3030,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         settings = self.app.db.settings()
         registration = settings.get("registration_enabled") == "1"
         register = '<a class="button" href="/register">注册 / Register</a>' if registration else '<span class="muted">注册已关闭 / Registration is closed</span>'
-        body = f'<section class="card"><h1>LLMCtl 模型服务门户</h1><p class="muted">LLMCtl model service portal</p><p>验证允许的邮箱后获得个人 API Key、周期额度、用量和可调用模型。</p><div class="row"><a class="button" href="/login">登录 / Sign in</a>{register}</div></section>'
+        body = f'<section class="card"><h1>LLMCtl 模型服务门户</h1><p class="muted">LLMCtl model service portal</p><p>验证允许的邮箱后获得个人 API Key、预付余额、用量和可调用模型。</p><div class="row"><a class="button" href="/login">登录 / Sign in</a>{register}</div></section>'
         self.response(200, page("Account portal", body))
 
     def show_login(self, message: str = "", error: bool = False) -> None:
@@ -2808,26 +3062,22 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if not row:
             self.response(410, page("Verify", '<div class="card error">验证链接已失效 / Verification link expired.</div>'))
             return
-        body = f'''<section class="card" style="max-width:620px;margin:auto"><h1>确认邮箱 / Confirm email</h1><p>{html.escape(row["email"])}</p><p class="muted">确认后将创建个人 API Key 并启用周期额度。邮件扫描器访问此页面不会自动开通账户。</p><form method="post" action="/verify"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="token" value="{html.escape(raw_token)}"><button>确认并创建 API Key / Verify &amp; create key</button></form></section>'''
+        body = f'''<section class="card" style="max-width:620px;margin:auto"><h1>确认邮箱 / Confirm email</h1><p>{html.escape(row["email"])}</p><p class="muted">确认后将创建个人 API Key，并一次性入账管理员设置的注册赠款。邮件扫描器访问此页面不会自动开通账户。</p><form method="post" action="/verify"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="token" value="{html.escape(raw_token)}"><button>确认并创建 API Key / Verify &amp; create key</button></form></section>'''
         self.response(200, page("Verify email", body))
 
     def show_dashboard(self, user: sqlite3.Row, raw_key: str = "", message: str = "") -> None:
-        usage: dict[str, Any] = {}
         gateway_error = ""
         models: list[dict[str, Any]] = []
         try:
-            if user["api_key_id"]:
-                usage = self.app.omni.usage(user["api_key_id"])
             models = self.app.omni.models()
         except RuntimeError as error:
             gateway_error = str(error)
-        limits = usage.get("limits", []) if isinstance(usage, dict) else []
-        limit = limits[0] if isinstance(limits, list) and limits else {}
-        used = int(limit.get("tokensUsed", 0)) if isinstance(limit, dict) else 0
-        total = int(limit.get("tokenLimit", user["quota_tokens"])) if isinstance(limit, dict) else int(user["quota_tokens"])
-        remaining = max(0, total - used)
-        next_reset = str(limit.get("nextResetAt", "")) if isinstance(limit, dict) else ""
-        reset_label = next_reset or f'{user["quota_reset"]} · {user["quota_reset_time"]}'
+        with self.app.db.connect() as connection:
+            account = connection.execute(
+                "SELECT balance_micros FROM billing_accounts WHERE user_id=?",
+                (user["id"],),
+            ).fetchone()
+        balance = int(account["balance_micros"] or 0) if account else 0
         key_box = ""
         if raw_key:
             key_box = f'''<div class="card wide notice"><h2>请立即复制 API Key / Copy now</h2><p>明文只显示这一次；门户不会保存它。</p><div id="new-key" class="key">{html.escape(raw_key)}</div><p><button data-copy="new-key">复制 / Copy</button></p></div>'''
@@ -2863,7 +3113,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
   -d {shlex.quote(sample_payload)}'''
         flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
         error = '<div class="flash error">AI gateway unavailable; see LLMCtl account logs.</div>' if gateway_error else ""
-        body = f'''{flash}{error}<div class="grid">{key_box}<section class="card"><h2>本周期用量 / Usage</h2><div class="stat">{used:,} / {total:,}</div><p class="muted">剩余 {remaining:,} tokens · 下次重置 / next reset: {html.escape(reset_label)}</p></section><section class="card"><h2>API 地址 / Endpoint</h2><div id="api-base" class="key">{html.escape(api_public_url)}/v1</div><p><button class="secondary" data-copy="api-base">复制 / Copy</button></p></section><section class="card wide"><h2>调用示例 / curl demo</h2><pre id="curl-demo">{html.escape(curl)}</pre><button class="secondary" data-copy="curl-demo">复制示例 / Copy demo</button></section><section class="card wide"><div class="row"><h2>开放模型 / Available models</h2><span class="spacer"></span><span class="muted">{len(model_rows)} models</span></div><div class="models">{''.join(model_rows) or '<p class="muted">No models are currently available.</p>'}</div></section><section class="card wide"><h2>密钥安全 / Key security</h2><p class="muted">轮换会先创建并验证新 Key，再停用旧 Key。新 Key 仍只显示一次。</p><form method="post" action="/rotate-key"><input type="hidden" name="csrf" value="__CSRF__"><button class="danger">轮换 API Key / Rotate key</button></form></section></div>'''
+        body = f'''{flash}{error}<div class="grid">{key_box}<section class="card"><h2>可用余额 / Balance</h2><div class="stat">${html.escape(micros_to_money(balance))}</div><p class="muted">付费调用按模型实际 Token 用量扣款；余额耗尽后停止付费模型权限。</p></section><section class="card"><h2>API 地址 / Endpoint</h2><div id="api-base" class="key">{html.escape(api_public_url)}/v1</div><p><button class="secondary" data-copy="api-base">复制 / Copy</button></p></section><section class="card wide"><h2>调用示例 / curl demo</h2><pre id="curl-demo">{html.escape(curl)}</pre><button class="secondary" data-copy="curl-demo">复制示例 / Copy demo</button></section><section class="card wide"><div class="row"><h2>开放模型 / Available models</h2><span class="spacer"></span><span class="muted">{len(model_rows)} models</span></div><div class="models">{''.join(model_rows) or '<p class="muted">No models are currently available.</p>'}</div></section><section class="card wide"><h2>密钥安全 / Key security</h2><p class="muted">轮换会先创建并验证新 Key，再停用旧 Key。新 Key 仍只显示一次。</p><form method="post" action="/rotate-key"><input type="hidden" name="csrf" value="__CSRF__"><button class="danger">轮换 API Key / Rotate key</button></form></section></div>'''
         self.response(200, page("Dashboard", body, user), user)
 
     def show_admin(self, message: str = "", error: bool = False) -> None:
@@ -2885,7 +3135,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             )
             provisioned = bool(item["api_key_id"])
             controls = (
-                f'''<form method="post" action="/admin/user"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="user_id" value="{html.escape(item["id"])}"><label>Token quota (0 = none)</label><input name="quota" value="{item["quota_tokens"]}" inputmode="numeric"><label>API Key active sessions (0 = unlimited)</label><input name="max_sessions" type="number" min="0" max="10000" value="{item["max_sessions"]}"><label>Requests per minute (0 = unlimited)</label><input name="requests_per_minute" type="number" min="0" max="10000000" value="{item["requests_per_minute"]}"><label>Requests per day (0 = unlimited)</label><input name="requests_per_day" type="number" min="0" max="10000000" value="{item["requests_per_day"]}"><label>Reset</label><select name="reset"><option {"selected" if item["quota_reset"]=="monthly" else ""}>monthly</option><option {"selected" if item["quota_reset"]=="weekly" else ""}>weekly</option><option {"selected" if item["quota_reset"]=="daily" else ""}>daily</option></select><input name="reset_time" value="{html.escape(item["quota_reset_time"])}"><label>Status</label><select name="status">{status_options}</select><p><button class="secondary">保存 / Save</button></p></form>'''
+                f'''<form method="post" action="/admin/user"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="user_id" value="{html.escape(item["id"])}"><label>Balance adjustment (USD)</label><input name="balance_delta" value="0" inputmode="decimal"><label>Adjustment note</label><input name="note" value="Legacy admin adjustment"><label>API Key active sessions (0 = unlimited)</label><input name="max_sessions" type="number" min="0" max="10000" value="{item["max_sessions"]}"><label>Requests per minute (0 = unlimited)</label><input name="requests_per_minute" type="number" min="0" max="10000000" value="{item["requests_per_minute"]}"><label>Requests per day (0 = unlimited)</label><input name="requests_per_day" type="number" min="0" max="10000000" value="{item["requests_per_day"]}"><label>Status</label><select name="status">{status_options}</select><p><button class="secondary">保存 / Save</button></p></form>'''
                 if provisioned
                 else '<span class="muted">等待邮箱验证 / Pending email verification</span>'
             )
@@ -2893,7 +3143,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         audit_rows = "".join(f'<tr><td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["created_at"]))}</td><td>{html.escape(a["actor"])}</td><td>{html.escape(a["action"])}</td><td>{html.escape(a["status"])}</td><td>{html.escape(a["detail"])}</td></tr>' for a in audits)
         checked = "checked" if settings.get("registration_enabled") == "1" else ""
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        registration = f'''<section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许注册的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 API Key 活跃会话上限（0 = 不限制）</label><input name="max_sessions" type="number" min="0" max="10000" value="{html.escape(settings.get("default_max_sessions", "1"))}"><label>默认每分钟请求数（0 = 不限制）</label><input name="requests_per_minute" type="number" min="0" max="10000000" value="{html.escape(settings.get("default_requests_per_minute", "30"))}"><label>默认每日请求数（0 = 不限制）</label><input name="requests_per_day" type="number" min="0" max="10000000" value="{html.escape(settings.get("default_requests_per_day", "2000"))}"><label>默认 Token 额度（0 = 不赠送）</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "0"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">会话上限用于抑制长期共享；RPM 和每日请求数用于限制调用频率。</p></section>'''
+        registration = f'''<section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许注册的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 API Key 活跃会话上限（0 = 不限制）</label><input name="max_sessions" type="number" min="0" max="10000" value="{html.escape(settings.get("default_max_sessions", "1"))}"><label>默认每分钟请求数（0 = 不限制）</label><input name="requests_per_minute" type="number" min="0" max="10000000" value="{html.escape(settings.get("default_requests_per_minute", "30"))}"><label>默认每日请求数（0 = 不限制）</label><input name="requests_per_day" type="number" min="0" max="10000000" value="{html.escape(settings.get("default_requests_per_day", "2000"))}"><label>新用户一次性赠送金额（USD）</label><input name="welcome_balance" value="{html.escape(settings.get("default_welcome_balance", "0"))}" inputmode="decimal"><p><button>保存策略 / Save</button></p></form><p class="small muted">新用户只获得一次性现金余额；每次调用按模型 Token 单价扣款，余额耗尽后停止模型权限。</p></section>'''
         endpoints = f'''<section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(api_public_url)}">{html.escape(api_public_url)}</a></p><p>LLMCtl: {html.escape(portal_public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section>'''
         users_section = f'''<section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section>'''
         audit_section = f'''<section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section>'''
@@ -3021,7 +3271,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             else:
                 user_id = str(uuid.uuid4())
-                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,requests_per_minute,requests_per_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, default_rpm, default_rpd, now()))
+                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,requests_per_minute,requests_per_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", 0, settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, default_rpm, default_rpd, now()))
             if not duplicate_active and not throttled:
                 connection.execute("INSERT INTO verification_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", (token_hash(raw_token), user_id, now() + self.app.config.verification_ttl, now()))
         if duplicate_active or throttled:
@@ -3051,7 +3301,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         settings = self.app.db.settings()
         key_id = ""
-        grant_id = ""
+        welcome_source_ref = ""
         try:
             _, domain = normalize_email(record["email"])
             if domain not in normalize_domains(settings.get("allowed_domains", "")):
@@ -3083,42 +3333,19 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     "(user_id,group_id,created_at) VALUES(?,'default',?)",
                     (record["user_id"], stamp),
                 )
-                quota = int(settings.get("default_quota_tokens", "0") or 0)
-                if quota:
-                    reset = settings.get("default_quota_reset", "monthly")
-                    grant_id = str(uuid.uuid4())
-                    connection.execute(
-                        """INSERT INTO token_grants(
-                             id,user_id,label,tokens_initial,tokens_remaining,
-                             reset_interval,reset_time,reset_at,status,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            grant_id,
-                            record["user_id"],
-                            "Welcome recurring grant",
-                            quota,
-                            quota,
-                            reset,
-                            settings.get("default_quota_reset_time", "00:00"),
-                            next_reset_at(
-                                reset,
-                                reset_time=settings.get(
-                                    "default_quota_reset_time", "00:00"
-                                ),
-                            ),
-                            "active",
-                            stamp,
-                            stamp,
-                        ),
-                    )
+                _credited, welcome_source_ref = apply_welcome_credit(
+                    connection, record["user_id"], settings, stamp
+                )
             self.app.control.sync_user(record["user_id"])
         except Exception as error:
             if key_id:
                 with contextlib.suppress(Exception):
                     self.app.omni.delete_key(key_id)
             with self.app.db.connect() as connection:
-                if grant_id:
-                    connection.execute("DELETE FROM token_grants WHERE id=?", (grant_id,))
+                if welcome_source_ref:
+                    rollback_source_credit(
+                        connection, record["user_id"], welcome_source_ref, now()
+                    )
                 connection.execute(
                     "DELETE FROM permission_sync WHERE user_id=?", (record["user_id"],)
                 )
@@ -3205,7 +3432,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         try:
             domains = normalize_domains(form.get("domains", ""))
-            quota = int(form.get("quota", "0"))
+            welcome_balance = money_to_micros(form.get("welcome_balance", "0"))
             default_max_sessions = normalize_max_sessions(
                 form.get("max_sessions", "1"), "默认活跃会话上限"
             )
@@ -3215,10 +3442,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             default_rpd = normalize_request_limit(
                 form.get("requests_per_day", "2000"), "默认每日请求数"
             )
-            reset = form.get("reset", "")
-            reset_time = form.get("reset_time", "")
             enabled = form.get("enabled") == "1"
-            if (enabled and not domains) or quota < 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
+            if (enabled and not domains) or welcome_balance < 0 or welcome_balance > 1_000_000_000_000_000:
                 raise ValueError("invalid registration settings")
             if enabled and (
                 not self.app.config.public_url
@@ -3228,7 +3453,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 raise ValueError(
                     "public portal URL and SMTP must be configured before registration can be enabled"
                 )
-            values = {"registration_enabled": "1" if enabled else "0", "allowed_domains": ",".join(domains), "default_quota_tokens": str(quota), "default_quota_reset": reset, "default_quota_reset_time": reset_time, "default_max_sessions": str(default_max_sessions), "default_requests_per_minute": str(default_rpm), "default_requests_per_day": str(default_rpd)}
+            values = {"registration_enabled": "1" if enabled else "0", "allowed_domains": ",".join(domains), "default_welcome_balance": micros_to_money(welcome_balance), "default_quota_tokens": "0", "default_max_sessions": str(default_max_sessions), "default_requests_per_minute": str(default_rpm), "default_requests_per_day": str(default_rpd)}
             with self.app.db.connect() as connection:
                 for key, value in values.items():
                     connection.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, value, now()))
@@ -3246,8 +3471,6 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.response(403, page("Forbidden", '<div class="card error">CSRF validation failed</div>'))
             return
         try:
-            quota = int(form.get("quota", "0"))
-            reset, reset_time = form.get("reset", ""), form.get("reset_time", "")
             target_status = form.get("status", "")
             max_sessions = normalize_max_sessions(form.get("max_sessions", "0"))
             rpm = normalize_request_limit(
@@ -3256,41 +3479,37 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             rpd = normalize_request_limit(
                 form.get("requests_per_day", "0"), "每日请求数"
             )
-            if quota < 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or target_status not in {"active", "disabled"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
+            if target_status not in {"active", "disabled"}:
                 raise ValueError("invalid user settings")
             with self.app.db.connect() as connection:
                 target = connection.execute("SELECT * FROM users WHERE id=? AND role='user'", (form.get("user_id", ""),)).fetchone()
+                group_ids = [
+                    str(row["group_id"])
+                    for row in connection.execute(
+                        "SELECT group_id FROM user_group_members WHERE user_id=?",
+                        (form.get("user_id", ""),),
+                    )
+                ]
             if not target or not target["api_key_id"]:
                 raise ValueError("user is not provisioned")
-            self.app.omni.activate_key(target["api_key_id"], target_status == "active")
-            try:
-                self.app.omni.set_key_max_sessions(target["api_key_id"], max_sessions)
-                with self.app.db.connect() as connection:
-                    connection.execute(
-                        "UPDATE users SET status=?,quota_tokens=?,quota_reset=?,quota_reset_time=?,"
-                        "max_sessions=?,requests_per_minute=?,requests_per_day=?,token_limit_id=NULL "
-                        "WHERE id=?",
-                        (
-                            target_status, quota, reset, reset_time, max_sessions,
-                            rpm, rpd, target["id"],
-                        ),
-                    )
-                if target["token_limit_id"]:
-                    self.app.omni.delete_limit(target["token_limit_id"])
-                self.app.control.sync_user(target["id"])
-            except Exception:
-                with contextlib.suppress(Exception):
-                    self.app.omni.activate_key(target["api_key_id"], target["status"] == "active")
-                with contextlib.suppress(Exception):
-                    self.app.omni.set_key_max_sessions(
-                        target["api_key_id"], int(target["max_sessions"])
-                    )
-                raise
+            self.app.control.update_user(
+                {
+                    "user_id": target["id"],
+                    "status": target_status,
+                    "max_sessions": max_sessions,
+                    "requests_per_minute": rpm,
+                    "requests_per_day": rpd,
+                    "group_ids": group_ids,
+                    "balance_delta": form.get("balance_delta", "0"),
+                    "note": form.get("note", "Legacy admin adjustment"),
+                },
+                str(admin["email"]),
+            )
         except Exception as error:
             self.app.db.audit(admin["email"], "user.update", form.get("user_id", ""), "failed", self.client_address[0], type(error).__name__)
             self.show_admin(str(error), True)
             return
-        self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "quota": quota, "reset": reset, "max_sessions": max_sessions, "requests_per_minute": rpm, "requests_per_day": rpd})
+        self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "balance_delta": form.get("balance_delta", "0"), "max_sessions": max_sessions, "requests_per_minute": rpm, "requests_per_day": rpd})
         self.show_admin("用户设置已保存 / User settings saved")
 
 
@@ -3560,7 +3779,6 @@ class PortalControlPlane:
             )
 
     def effective_models(self, user_id: str) -> list[dict[str, Any]]:
-        stamp = now()
         with self.db.connect() as connection:
             account = connection.execute(
                 "SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)
@@ -3580,14 +3798,8 @@ class PortalControlPlane:
                     (user_id, user_id),
                 ).fetchall()
             )
-            grants = connection.execute(
-                "SELECT model_id,tokens_remaining FROM token_grants WHERE user_id=? AND status='active' AND tokens_remaining>0 AND (expires_at IS NULL OR expires_at>?)",
-                (user_id, stamp),
-            ).fetchall()
         balance = int(account["balance_micros"]) if account else 0
         suspended = bool(account["suspended"]) if account else False
-        generic_grant = any(row["model_id"] is None and int(row["tokens_remaining"]) > 0 for row in grants)
-        model_grants = {row["model_id"] for row in grants if row["model_id"]}
         result = []
         for model in models:
             paid = any(
@@ -3597,7 +3809,7 @@ class PortalControlPlane:
                     "reasoning_price_micros",
                 )
             )
-            if not suspended and (not paid or balance > 0 or generic_grant or model["id"] in model_grants):
+            if not suspended and (not paid or balance > 0):
                 result.append(model)
         return result
 
@@ -4256,7 +4468,6 @@ class PortalControlPlane:
         return repaired
 
     def _reconcile_usage(self, user_id: str | None = None) -> dict[str, int]:
-        self.reset_due_grants()
         processed = skipped = 0
         changed_users: set[str] = set()
         with self.db.connect() as connection:
@@ -4349,49 +4560,14 @@ class PortalControlPlane:
                         (model["id"], occurred),
                     ).fetchone() or model
                     stamp = now()
-                    grants = connection.execute(
-                        "SELECT * FROM token_grants WHERE user_id=? AND status='active' AND (model_id IS NULL OR model_id=?) ORDER BY expires_at IS NULL,expires_at,created_at",
-                        (user["id"], model["id"]),
-                    ).fetchall()
-                    for grant in grants:
-                        if grant["expires_at"] and int(grant["expires_at"]) <= stamp:
-                            connection.execute("UPDATE token_grants SET status='expired',updated_at=? WHERE id=?", (stamp, grant["id"]))
-                        elif grant["reset_at"] and int(grant["reset_at"]) <= stamp and grant["reset_interval"] != "none":
-                            connection.execute(
-                                "UPDATE token_grants SET tokens_remaining=tokens_initial,reset_at=?,updated_at=? WHERE id=?",
-                                (
-                                    next_reset_at(
-                                        grant["reset_interval"],
-                                        stamp,
-                                        reset_time=grant["reset_time"] or "00:00",
-                                    ),
-                                    stamp,
-                                    grant["id"],
-                                ),
-                            )
-                    grants = connection.execute(
-                        "SELECT * FROM token_grants WHERE user_id=? AND status='active' AND tokens_remaining>0 AND (model_id IS NULL OR model_id=?) AND (expires_at IS NULL OR expires_at>?) ORDER BY expires_at IS NULL,expires_at,created_at",
-                        (user["id"], model["id"], stamp),
-                    ).fetchall()
                     priced = price_usage(
                         input_tokens,
                         output_tokens,
                         cached_tokens,
                         reasoning_tokens,
                         price,
-                        sum(int(grant["tokens_remaining"]) for grant in grants),
+                        0,
                     )
-                    remaining_grant = priced["granted_tokens"]
-                    for grant in grants:
-                        take = min(remaining_grant, int(grant["tokens_remaining"]))
-                        if take:
-                            connection.execute(
-                                "UPDATE token_grants SET tokens_remaining=tokens_remaining-?,updated_at=? WHERE id=?",
-                                (take, stamp, grant["id"]),
-                            )
-                            remaining_grant -= take
-                        if remaining_grant == 0:
-                            break
                     gross = priced["gross_amount_micros"]
                     grant_amount = priced["grant_amount_micros"]
                     amount = priced["amount_micros"]
@@ -4449,7 +4625,6 @@ class PortalControlPlane:
         }
 
     def user_dashboard(self, user_id: str) -> dict[str, Any]:
-        self.reset_due_grants()
         models = self.effective_models(user_id)
         _portal_url, api_public_url = effective_public_urls(
             self.config, self.db.settings()
@@ -4461,6 +4636,12 @@ class PortalControlPlane:
             account = connection.execute("SELECT * FROM billing_accounts WHERE user_id=?", (user_id,)).fetchone()
             grants = self.rows(connection.execute("SELECT * FROM token_grants WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall())
             transactions = self.rows(connection.execute("SELECT * FROM balance_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall())
+            total_spent_micros = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(amount_micros),0) FROM usage_ledger WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()[0]
+            )
         usage_page = self.usage_page(owner_user_id=user_id)
         result_models = []
         for model in models:
@@ -4472,6 +4653,7 @@ class PortalControlPlane:
             result_models.append(item)
         return {
             "balance": micros_to_money(int(account["balance_micros"]) if account else 0),
+            "total_spent_micros": total_spent_micros,
             "suspended": bool(account["suspended"]) if account else False,
             "has_api_key": bool(key_record and key_record["api_key_id"]),
             "models": result_models,
@@ -4948,19 +5130,11 @@ class PortalControlPlane:
             users = self.rows(
                 connection.execute(
                     """SELECT u.*,b.balance_micros,b.suspended,
-                              p.status permission_status,p.error permission_error,
-                              COALESCE((
-                                SELECT SUM(g.tokens_remaining)
-                                FROM token_grants g
-                                WHERE g.user_id=u.id AND g.status='active'
-                                  AND g.tokens_remaining>0
-                                  AND (g.expires_at IS NULL OR g.expires_at>?)
-                              ),0) active_grant_tokens
+                              p.status permission_status,p.error permission_error
                        FROM users u
                        LEFT JOIN billing_accounts b ON b.user_id=u.id
                        LEFT JOIN permission_sync p ON p.user_id=u.id
                        ORDER BY u.created_at DESC""",
-                    (stamp,),
                 ).fetchall()
             )
             groups = self.rows(connection.execute("SELECT g.*,COUNT(m.user_id) member_count FROM user_groups g LEFT JOIN user_group_members m ON m.group_id=g.id GROUP BY g.id ORDER BY g.name").fetchall())
@@ -5021,7 +5195,9 @@ class PortalControlPlane:
         grant_tokens = int(payload.get("grant_tokens", 0) or 0)
         disable_active_grants = payload.get("disable_active_grants") is True
         grant_reset = str(payload.get("grant_reset", "none"))
-        if grant_tokens < 0 or grant_tokens > 10**12 or grant_reset not in {"none", "daily", "weekly", "monthly"}:
+        if grant_tokens:
+            raise ValueError("Token 赠额已停用，请直接调整用户金额余额")
+        if grant_reset not in {"none", "daily", "weekly", "monthly"}:
             raise ValueError("invalid token grant")
         model_id = str(payload.get("grant_model_id", "")) or None
         grant_reset_time = str(
@@ -5095,15 +5271,6 @@ class PortalControlPlane:
                         "WHERE user_id=? AND status='active'",
                         (stamp, user_id),
                     )
-                if grant_tokens:
-                    connection.execute(
-                        "INSERT INTO token_grants(id,user_id,model_id,label,tokens_initial,tokens_remaining,reset_interval,reset_time,reset_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            str(uuid.uuid4()), user_id, model_id, str(payload.get("grant_label", "Admin token grant")),
-                            grant_tokens, grant_tokens, grant_reset, grant_reset_time,
-                            next_reset_at(grant_reset, reset_time=grant_reset_time), "active", stamp, stamp,
-                        ),
-                    )
         except Exception:
             # SQLite rolled back; restore the last committed policy rather than
             # leaving a correctly configured user disabled.
@@ -5156,22 +5323,6 @@ class PortalControlPlane:
                 file=sys.stderr,
                 flush=True,
             )
-        try:
-            self.reset_due_grants()
-        except Exception as error:
-            print(
-                f"[account-portal] grant reset warning: {error}",
-                file=sys.stderr,
-                flush=True,
-            )
-        try:
-            self.reconcile_usage()
-        except Exception as error:
-            print(
-                f"[account-portal] usage reconciliation warning: {error}",
-                file=sys.stderr,
-                flush=True,
-            )
         with self.db.connect() as connection:
             due = connection.execute(
                 "SELECT id FROM published_models WHERE status='published' AND upstream_free=1 AND (last_health_at IS NULL OR last_health_at<?)",
@@ -5203,6 +5354,7 @@ class PortalServer:
         self.control = PortalControlPlane(config, self.db, self.omni)
         try:
             self.control.seed_managed_model()
+            self.db.finalize_legacy_billing_migration()
         except Exception as error:
             print(
                 f"[account-portal] managed-model seed warning: {error}",
@@ -5223,9 +5375,26 @@ class PortalServer:
                 print(f"[account-portal] maintenance warning: {error}", file=sys.stderr, flush=True)
             self.stop_event.wait(60)
 
+    def billing_loop(self) -> None:
+        """Settle completed calls promptly while `/v1` stays gateway-direct."""
+        interval = max(1, min(30, env_int("ACCOUNT_BILLING_INTERVAL", 2)))
+        if self.stop_event.wait(interval):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.control.reconcile_usage()
+            except Exception as error:
+                print(
+                    f"[account-portal] usage reconciliation warning: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self.stop_event.wait(interval)
+
     def serve(self) -> None:
         print(f"[account-portal] listening on {self.config.bind}:{self.config.port}", flush=True)
         threading.Thread(target=self.maintenance_loop, name="portal-maintenance", daemon=True).start()
+        threading.Thread(target=self.billing_loop, name="portal-billing", daemon=True).start()
         try:
             self.httpd.serve_forever(poll_interval=0.5)
         finally:

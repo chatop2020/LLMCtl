@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="2.9.0"
+readonly INSTALLER_VERSION="3.0.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -71,7 +71,9 @@ ACCOUNT_PUBLIC_URL=""
 ACCOUNT_API_PUBLIC_URL=""
 ACCOUNT_REGISTRATION_ENABLED=0
 ACCOUNT_ALLOWED_EMAIL_DOMAINS=""
-ACCOUNT_DEFAULT_QUOTA_TOKENS=1000000
+ACCOUNT_DEFAULT_WELCOME_BALANCE="0"
+# Retained only so old cluster.env files can be migrated during an upgrade.
+ACCOUNT_DEFAULT_QUOTA_TOKENS=0
 ACCOUNT_QUOTA_RESET="monthly"
 ACCOUNT_QUOTA_RESET_TIME="00:00"
 ACCOUNT_ADMIN_USERNAME="admin"
@@ -192,9 +194,7 @@ Common unattended options:
   --account-api-public-url URL   Public OmniRoute URL shown in API examples
   --registration enabled|disabled
   --allowed-email-domains LIST   Exact comma-separated company email domains
-  --account-default-quota N      Default recurring token quota; default 1000000
-  --account-quota-reset daily|weekly|monthly
-  --account-quota-reset-time HH:MM
+  --account-default-balance USD  One-time welcome cash for new users; default 0
   --account-admin-username USER  Initial portal administrator login name
   --smtp-host HOST --smtp-port PORT
   --smtp-security starttls|ssl|plain
@@ -266,9 +266,7 @@ EOF
   --account-api-public-url URL    调用示例中显示的 OmniRoute 公开地址
   --registration enabled|disabled 是否开放注册
   --allowed-email-domains LIST    允许注册的邮箱域名后缀，逗号分隔且精确匹配
-  --account-default-quota N       默认周期 Token 额度，默认 1000000
-  --account-quota-reset daily|weekly|monthly
-  --account-quota-reset-time HH:MM
+  --account-default-balance USD   新用户一次性赠送金额（美元），默认 0
   --account-admin-username USER   门户初始管理员登录名（不要求是邮箱）
   --smtp-host HOST --smtp-port PORT
   --smtp-security starttls|ssl|plain
@@ -357,6 +355,8 @@ parse_args() {
         case "$2" in enabled) ACCOUNT_REGISTRATION_ENABLED=1 ;; disabled) ACCOUNT_REGISTRATION_ENABLED=0 ;; *) die "$(l10n '--registration 只能是 enabled 或 disabled' '--registration must be enabled or disabled')" ;; esac
         shift 2 ;;
       --allowed-email-domains) need_value "$@"; ACCOUNT_ALLOWED_EMAIL_DOMAINS="$2"; shift 2 ;;
+      --account-default-balance) need_value "$@"; ACCOUNT_DEFAULT_WELCOME_BALANCE="$2"; shift 2 ;;
+      # Backward-compatible upgrade input. New deployments use cash only.
       --account-default-quota) need_value "$@"; ACCOUNT_DEFAULT_QUOTA_TOKENS="$2"; shift 2 ;;
       --account-quota-reset) need_value "$@"; ACCOUNT_QUOTA_RESET="$2"; shift 2 ;;
       --account-quota-reset-time) need_value "$@"; ACCOUNT_QUOTA_RESET_TIME="$2"; shift 2 ;;
@@ -513,8 +513,8 @@ configure_omniroute_portal_interactively() {
     SMTP_PASSWORD="${smtp_password}"
   fi
   read -r -p "$(l10n '发件邮箱: ' 'From email: ')" SMTP_FROM
-  read -r -p "$(l10n "每用户默认周期 Token 额度 [${ACCOUNT_DEFAULT_QUOTA_TOKENS}]: " "Default recurring token quota [${ACCOUNT_DEFAULT_QUOTA_TOKENS}]: ")" answer
-  ACCOUNT_DEFAULT_QUOTA_TOKENS="${answer:-${ACCOUNT_DEFAULT_QUOTA_TOKENS}}"
+  read -r -p "$(l10n "新用户一次性赠送金额（USD）[${ACCOUNT_DEFAULT_WELCOME_BALANCE}]: " "One-time welcome cash per new user (USD) [${ACCOUNT_DEFAULT_WELCOME_BALANCE}]: ")" answer
+  ACCOUNT_DEFAULT_WELCOME_BALANCE="${answer:-${ACCOUNT_DEFAULT_WELCOME_BALANCE}}"
 }
 
 ask() {
@@ -1021,7 +1021,9 @@ validate_scalar_config() {
     (( ACCOUNT_PORT != API_PORT )) || die "$(l10n 'account-port 不能与 API 端口相同' 'account-port cannot equal the API port')"
     (( ACCOUNT_PORT < WORKER_BASE_PORT || ACCOUNT_PORT >= WORKER_BASE_PORT + 16 )) || die "$(l10n 'account-port 与 Worker 端口范围冲突' 'account-port conflicts with the worker port range')"
     [[ "${ACCOUNT_REGISTRATION_ENABLED}" =~ ^[01]$ ]] || die "ACCOUNT_REGISTRATION_ENABLED must be 0 or 1"
-    [[ "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" =~ ^[0-9]+$ ]] && (( ACCOUNT_DEFAULT_QUOTA_TOKENS >= 1 && ACCOUNT_DEFAULT_QUOTA_TOKENS <= 1000000000000 )) || die "$(l10n '默认 Token 额度无效' 'Invalid default token quota')"
+    [[ "${ACCOUNT_DEFAULT_WELCOME_BALANCE}" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "$(l10n '默认赠送金额无效；请输入非负美元金额，最多 6 位小数' 'Invalid welcome balance; enter a non-negative USD amount with at most 6 decimals')"
+    python3 -c 'from decimal import Decimal; import sys; v=Decimal(sys.argv[1]); raise SystemExit(0 if Decimal(0) <= v <= Decimal(1000000000) else 1)' "${ACCOUNT_DEFAULT_WELCOME_BALANCE}" || die "$(l10n '默认赠送金额范围为 0-1000000000 USD' 'Welcome balance must be between 0 and 1000000000 USD')"
+    [[ "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" =~ ^[0-9]+$ ]] && (( ACCOUNT_DEFAULT_QUOTA_TOKENS <= 1000000000000 )) || die "$(l10n '旧版 Token 迁移额度无效' 'Invalid legacy token migration quota')"
     [[ "${ACCOUNT_QUOTA_RESET}" =~ ^(daily|weekly|monthly)$ ]] || die "$(l10n '额度重置周期无效' 'Invalid quota reset interval')"
     [[ "${ACCOUNT_QUOTA_RESET_TIME}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "$(l10n '额度重置时间必须是 HH:MM' 'Quota reset time must be HH:MM')"
     python3 -c 'import sys; value=sys.argv[1].strip(); raise SystemExit(0 if value and all(ord(c) >= 32 and ord(c) != 127 for c in value) else 1)' "${ACCOUNT_ADMIN_USERNAME}" || die "$(l10n '门户管理员登录名不能为空或包含控制字符' 'The portal administrator login name must be non-empty and contain no control characters')"
@@ -1540,6 +1542,7 @@ ACCOUNT_PUBLIC_URL=${ACCOUNT_PUBLIC_URL}
 ACCOUNT_API_PUBLIC_URL=${ACCOUNT_API_PUBLIC_URL}
 ACCOUNT_REGISTRATION_ENABLED=${ACCOUNT_REGISTRATION_ENABLED}
 ACCOUNT_ALLOWED_EMAIL_DOMAINS=${ACCOUNT_ALLOWED_EMAIL_DOMAINS}
+ACCOUNT_DEFAULT_WELCOME_BALANCE=${ACCOUNT_DEFAULT_WELCOME_BALANCE}
 ACCOUNT_DEFAULT_QUOTA_TOKENS=${ACCOUNT_DEFAULT_QUOTA_TOKENS}
 ACCOUNT_QUOTA_RESET=${ACCOUNT_QUOTA_RESET}
 ACCOUNT_QUOTA_RESET_TIME=${ACCOUNT_QUOTA_RESET_TIME}

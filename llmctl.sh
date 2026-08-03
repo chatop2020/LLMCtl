@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.9.0"
+readonly CTL_VERSION="3.0.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -120,7 +120,8 @@ load_config() {
   ACCOUNT_DB_PATH="${ACCOUNT_DB_PATH:-${ACCOUNT_SQLITE}}"
   ACCOUNT_REGISTRATION_ENABLED="${ACCOUNT_REGISTRATION_ENABLED:-0}"
   ACCOUNT_ALLOWED_EMAIL_DOMAINS="${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-}"
-  ACCOUNT_DEFAULT_QUOTA_TOKENS="${ACCOUNT_DEFAULT_QUOTA_TOKENS:-1000000}"
+  ACCOUNT_DEFAULT_WELCOME_BALANCE="${ACCOUNT_DEFAULT_WELCOME_BALANCE:-0}"
+  ACCOUNT_DEFAULT_QUOTA_TOKENS="${ACCOUNT_DEFAULT_QUOTA_TOKENS:-0}"
   ACCOUNT_QUOTA_RESET="${ACCOUNT_QUOTA_RESET:-monthly}"
   ACCOUNT_QUOTA_RESET_TIME="${ACCOUNT_QUOTA_RESET_TIME:-00:00}"
   SMTP_HOST="${SMTP_HOST:-}"
@@ -630,7 +631,7 @@ account_helper() {
   export ACCOUNT_BIND ACCOUNT_PORT ACCOUNT_PUBLIC_URL ACCOUNT_API_PUBLIC_URL
   export ACCOUNT_ADMIN_USERNAME ACCOUNT_ADMIN_USERNAME_B64 ACCOUNT_ADMIN_PASSWORD ACCOUNT_DB_PATH
   export ACCOUNT_REGISTRATION_ENABLED ACCOUNT_ALLOWED_EMAIL_DOMAINS
-  export ACCOUNT_DEFAULT_QUOTA_TOKENS ACCOUNT_QUOTA_RESET ACCOUNT_QUOTA_RESET_TIME
+  export ACCOUNT_DEFAULT_WELCOME_BALANCE ACCOUNT_DEFAULT_QUOTA_TOKENS ACCOUNT_QUOTA_RESET ACCOUNT_QUOTA_RESET_TIME
   export SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USERNAME SMTP_PASSWORD SMTP_FROM
   export GATEWAY_API_KEY API_PORT GATEWAY_INTERNAL_PORT SUPPORTS_OCR
   "${ACCOUNT_HELPER}" "$@"
@@ -1260,6 +1261,7 @@ cmd_info() {
       portal_inventory_status=loaded
       ACCOUNT_REGISTRATION_ENABLED=$(printf '%s' "${portal_inventory}" | jq -r '.settings.registration_enabled // "0"')
       ACCOUNT_ALLOWED_EMAIL_DOMAINS=$(printf '%s' "${portal_inventory}" | jq -r '.settings.allowed_domains // ""')
+      ACCOUNT_DEFAULT_WELCOME_BALANCE=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_welcome_balance // "0"')
       ACCOUNT_DEFAULT_QUOTA_TOKENS=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_tokens // "0"')
       ACCOUNT_QUOTA_RESET=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset // "monthly"')
       ACCOUNT_QUOTA_RESET_TIME=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset_time // "00:00"')
@@ -1363,10 +1365,10 @@ cmd_info() {
       "${POSTGRES_DB}" "${POSTGRES_USER}" "$(secret_value "${POSTGRES_PASSWORD}")" "$(secret_value "${DATABASE_URL}")"
   fi
 
-  printf '\n[注册、额度与 SMTP / Registration, quota and SMTP]\n'
-  printf '门户品牌名称: %s\n允许注册: %s\n允许邮箱后缀: %s\n默认 Token 赠额: %s\n重置: %s @ %s\n对外发布地址: %s\n门户公开 URL: %s\nAPI 公开 URL: %s\n' \
-    "${ACCOUNT_PORTAL_TITLE}" "${ACCOUNT_REGISTRATION_ENABLED}" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-<empty>}" "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" \
-    "${ACCOUNT_QUOTA_RESET}" "${ACCOUNT_QUOTA_RESET_TIME}" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动>}" \
+  printf '\n[注册、余额与 SMTP / Registration, balance and SMTP]\n'
+  printf '门户品牌名称: %s\n允许注册: %s\n允许邮箱后缀: %s\n新用户一次性赠款（USD）: %s\n旧版 Token 迁移状态: %s\n对外发布地址: %s\n门户公开 URL: %s\nAPI 公开 URL: %s\n' \
+    "${ACCOUNT_PORTAL_TITLE}" "${ACCOUNT_REGISTRATION_ENABLED}" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-<empty>}" "${ACCOUNT_DEFAULT_WELCOME_BALANCE}" \
+    "$(printf '%s' "${portal_inventory:-{}}" | jq -r '.settings.token_grant_conversion_status // "not-required"' 2>/dev/null || printf unknown)" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动>}" \
     "${effective_public_origin}/ui/" "${effective_public_origin}"
   printf 'SMTP: %s:%s (%s)\nSMTP 用户名: %s\nSMTP 密码: %s\n发件人: %s\n' \
     "${SMTP_HOST:-<empty>}" "${SMTP_PORT}" "${SMTP_SECURITY}" "${SMTP_USERNAME:-<empty>}" "$(secret_value "${SMTP_PASSWORD}")" "${SMTP_FROM:-<empty>}"

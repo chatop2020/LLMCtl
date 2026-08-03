@@ -98,12 +98,7 @@ const userEdit = reactive({
   requests_per_day: 0,
   balance_delta: "0",
   group_ids: [],
-  grant_tokens: 0,
-  grant_reset: "none",
-  grant_reset_time: "00:00",
-  grant_model_id: "",
-  grant_label: "",
-  disable_active_grants: false,
+  note: "",
 });
 const groupEdit = reactive({
   id: "",
@@ -285,7 +280,6 @@ const filterFields = {
     "status",
     "permission_status",
     "balance",
-    "active_grant_tokens",
   ],
   "admin-groups": ["name", "description", "status"],
   "admin-billing": ["user_email", "user_id", "kind", "note"],
@@ -1276,12 +1270,7 @@ function editUser(user) {
     group_ids: admin.value.memberships
       .filter((m) => m.user_id === user.id)
       .map((m) => m.group_id),
-    grant_tokens: 0,
-    grant_reset: "none",
-    grant_reset_time: admin.value.settings.default_quota_reset_time || "00:00",
-    grant_model_id: "",
-    grant_label: "",
-    disable_active_grants: false,
+    note: "",
   });
   document.querySelector("#user-editor")?.showModal();
 }
@@ -1486,9 +1475,7 @@ function registrationPayload() {
       settings.registration_enabled === "1" ||
       settings.registration_enabled === true,
     allowed_domains: settings.allowed_domains,
-    default_quota_tokens: settings.default_quota_tokens,
-    default_quota_reset: settings.default_quota_reset,
-    default_quota_reset_time: settings.default_quota_reset_time,
+    default_welcome_balance: settings.default_welcome_balance,
     default_max_sessions: settings.default_max_sessions,
     default_requests_per_minute: settings.default_requests_per_minute,
     default_requests_per_day: settings.default_requests_per_day,
@@ -1746,7 +1733,7 @@ onBeforeUnmount(() => {
               <div>
                 <span class="eyebrow">YOUR ACCOUNT</span>
                 <h1>工作台</h1>
-                <p>余额、赠送 Token 和近期使用情况。</p>
+                <p>现金余额和近期使用情况。</p>
               </div>
               <span class="status ok">服务可用</span>
             </div>
@@ -1761,13 +1748,9 @@ onBeforeUnmount(() => {
                 ><small>按个人与用户组授权</small>
               </article>
               <article>
-                <span>赠送 Token</span
-                ><strong>{{
-                  dashboard.grants
-                    .reduce((n, g) => n + g.tokens_remaining, 0)
-                    .toLocaleString()
-                }}</strong
-                ><small>优先于余额消耗</small>
+                <span>累计扣款</span
+                ><strong>{{ money(dashboard.total_spent_micros || 0) }}</strong
+                ><small>按模型实际 Token 用量结算</small>
               </article>
               <article>
                 <span>已记录请求</span
@@ -1784,7 +1767,7 @@ onBeforeUnmount(() => {
                       <th>时间</th>
                       <th>模型</th>
                       <th>输入 / 输出</th>
-                      <th>标价 / 赠额 / 扣款</th>
+                      <th>标价 / 余额扣款</th>
                       <th>请求内容</th>
                     </tr>
                   </thead>
@@ -1802,7 +1785,6 @@ onBeforeUnmount(() => {
                         </td>
                         <td>
                           {{ money(row.gross_amount_micros) }} /
-                          {{ money(row.grant_amount_micros) }} /
                           {{ money(row.amount_micros) }}
                         </td>
                         <td>
@@ -2280,7 +2262,7 @@ onBeforeUnmount(() => {
               <div>
                 <span class="eyebrow">USAGE & BILLING</span>
                 <h1>用量与账单</h1>
-                <p>先按模型分类价格计算标价金额；赠送 Token 精确抵扣对应金额，剩余部分扣减现金余额。</p>
+                <p>按模型输入、输出、缓存与思考 Token 的价格，从现金余额实时结算；余额耗尽后 API Key 停止授权。</p>
               </div>
               <button
                 class="ghost"
@@ -2296,8 +2278,11 @@ onBeforeUnmount(() => {
                 {{ usageRefreshing ? "更新中…" : "刷新用量" }}
               </button>
             </div>
-            <section class="panel">
-              <h2>Token 赠额</h2>
+            <section v-if="dashboard.grants.length" class="panel">
+              <h2>历史 Token 赠额折现</h2>
+              <p class="muted">
+                旧版剩余 Token 已按升级时的模型最高分类单价一次性折算为现金；原记录仅用于审计，不再参与后续扣费。
+              </p>
               <ListFilterBar
                 v-model="listFilters['user-grants'].query"
                 v-model:status="listFilters['user-grants'].status"
@@ -2311,7 +2296,7 @@ onBeforeUnmount(() => {
                 :category-options="resetOptions"
                 category-label="全部重置周期"
                 :count="filteredRows('user-grants', dashboard.grants).length"
-                placeholder="搜索赠额名称或模型"
+                placeholder="搜索历史赠额名称或模型"
               />
               <div class="grant-list">
                 <div
@@ -2329,8 +2314,13 @@ onBeforeUnmount(() => {
                     >
                   </div>
                   <div class="grant-number">
-                    {{ grant.tokens_remaining.toLocaleString() }} /
-                    {{ grant.tokens_initial.toLocaleString() }}
+                    <template v-if="grant.converted_at">
+                      {{ grant.tokens_initial.toLocaleString() }} Token →
+                      {{ money(grant.converted_amount_micros || 0) }}
+                    </template>
+                    <template v-else>
+                      待处理 {{ grant.tokens_remaining.toLocaleString() }} Token
+                    </template>
                   </div>
                 </div>
               </div>
@@ -2389,7 +2379,7 @@ onBeforeUnmount(() => {
                       <th>时间</th>
                       <th>模型</th>
                       <th>输入 / 输出</th>
-                      <th>赠送 Token</th>
+                      <th>历史赠额 Token</th>
                       <th>标价</th>
                       <th>赠额抵扣</th>
                       <th>余额扣款</th>
@@ -2486,8 +2476,7 @@ onBeforeUnmount(() => {
             <section class="panel">
               <h2>金额流水</h2>
               <p class="muted">
-                只有充值、余额调整或赠送 Token
-                不足而实际扣减金额时，才会产生金额流水。
+                注册赠款、管理员调整、旧 Token 折现和每次模型调用扣费都会形成可审计流水。
               </p>
               <ListFilterBar
                 v-model="listFilters['user-billing'].query"
@@ -2526,8 +2515,7 @@ onBeforeUnmount(() => {
                     </tr>
                     <tr v-if="!dashboard.transactions.length">
                       <td colspan="5" class="empty">
-                        暂无金额流水；当前请求由赠送 Token
-                        抵扣，没有发生金额余额变动。
+                        暂无金额流水
                       </td>
                     </tr>
                   </tbody>
@@ -3033,7 +3021,7 @@ onBeforeUnmount(() => {
               <div>
                 <span class="eyebrow">IDENTITY & QUOTA</span>
                 <h1>用户管理</h1>
-                <p>禁用、分组、金额调整与额外 Token 赠送集中完成。</p>
+                <p>禁用、分组、现金余额调整与调用限制集中完成。</p>
               </div>
             </div>
             <ListFilterBar
@@ -3058,7 +3046,6 @@ onBeforeUnmount(() => {
                     <th>用户</th>
                     <th>状态</th>
                     <th>现金余额</th>
-                    <th>有效 Token 赠额</th>
                     <th>调用策略</th>
                     <th>权限同步</th>
                     <th></th>
@@ -3087,7 +3074,6 @@ onBeforeUnmount(() => {
                       >
                     </td>
                     <td>${{ user.balance }}</td>
-                    <td>{{ Number(user.active_grant_tokens || 0).toLocaleString() }}</td>
                     <td>
                       <small>会话 {{ Number(user.max_sessions) === 0 ? "不限" : user.max_sessions }}</small>
                       <small>RPM {{ Number(user.requests_per_minute) === 0 ? "不限" : user.requests_per_minute }}</small>
@@ -3254,7 +3240,7 @@ onBeforeUnmount(() => {
               <div class="panel-head">
                 <div>
                   <h2>请求用量</h2>
-                  <p>标价金额、赠额抵扣金额与现金余额扣款分别记录，三者可逐笔核对。</p>
+                  <p>新请求按模型价格从现金余额扣款；旧赠额字段仅为历史审计保留。</p>
                 </div>
               </div>
               <div class="list-filter" role="search">
@@ -3300,7 +3286,7 @@ onBeforeUnmount(() => {
                       <th>用户</th>
                       <th>模型</th>
                       <th>输入 / 输出</th>
-                      <th>赠送 Token</th>
+                      <th>历史赠额 Token</th>
                       <th>标价</th>
                       <th>赠额抵扣</th>
                       <th>余额扣款</th>
@@ -3422,7 +3408,7 @@ onBeforeUnmount(() => {
               <div class="panel-head">
                 <div>
                   <h2>金额流水</h2>
-                  <p>仅在充值、余额调整或赠额不足产生实际扣费时出现。</p>
+                  <p>注册赠款、充值、余额调整和模型调用扣款均逐笔记录。</p>
                 </div>
               </div>
               <ListFilterBar
@@ -3466,7 +3452,7 @@ onBeforeUnmount(() => {
                     </tr>
                     <tr v-if="!admin.transactions.length">
                       <td colspan="6" class="empty">
-                        暂无金额流水；现有请求可能全部由赠送 Token 抵扣。
+                        暂无金额流水
                       </td>
                     </tr>
                   </tbody>
@@ -3851,23 +3837,15 @@ onBeforeUnmount(() => {
                 ></div><p class="muted">
                   由 AI 接入层按 API Key 原生执行；0 表示不限制。RPM 控制突发调用，每日上限控制持续滥用。
                 </p><label
-                  >默认赠送 Token（0 = 不赠送）<input
-                    v-model="settings.default_quota_tokens"
-                    type="number"
+                  >新用户一次性赠送金额（USD）<input
+                    v-model="settings.default_welcome_balance"
+                    inputmode="decimal"
+                    step="0.000001"
                     min="0"
-                    max="1000000000000" /></label
+                    max="1000000000" /></label
                 ><p class="muted">
-                  赠送 Token 属于优惠额度，会先抵扣对应模型的用量；设为 0 时，新用户直接按模型各项单价从金额余额扣费。
-                </p><label
-                  >重置周期<select v-model="settings.default_quota_reset">
-                    <option value="daily">每日</option>
-                    <option value="weekly">每周</option>
-                    <option value="monthly">每月</option>
-                  </select></label
-                ><label
-                  >重置时间<input
-                    v-model="settings.default_quota_reset_time"
-                    type="time" /></label
+                  注册验证完成后一次性入账。每次请求按实际 Token 和模型单价扣款；余额耗尽后停止模型权限。
+                </p
                 ><button
                   type="button"
                   class="primary"
@@ -4094,36 +4072,9 @@ onBeforeUnmount(() => {
         </fieldset>
         <label
           >金额调整（可为负数）<input v-model="userEdit.balance_delta" /></label
-        ><label
-          >赠送 Token<input
-            v-model.number="userEdit.grant_tokens"
-            type="number" /></label
-        ><label
-          >赠额模型<select v-model="userEdit.grant_model_id">
-            <option value="">所有模型</option>
-            <option v-for="model in admin?.models" :value="model.id">
-              {{ model.public_model_id }}
-            </option>
-          </select></label
-        ><label
-          >赠额重置<select v-model="userEdit.grant_reset">
-            <option value="none">仅本次</option>
-            <option value="daily">每日重置</option>
-            <option value="weekly">每周重置</option>
-            <option value="monthly">每月重置</option>
-          </select></label
-        ><label v-if="userEdit.grant_reset !== 'none'"
-          >重置时间<input
-            v-model="userEdit.grant_reset_time"
-            type="time" /></label
-        ><label>说明<input v-model="userEdit.grant_label" /></label
-        ><label class="switch danger-switch"
-          ><input
-            v-model="userEdit.disable_active_grants"
-            type="checkbox"
-          /><span></span>停用该用户现有的全部有效赠额</label
+        ><label>调整说明<input v-model="userEdit.note" /></label
         ><p class="muted">
-          停用后不删除历史记录；后续请求将按模型单价直接扣减金额余额。需要恢复优惠时可重新发放赠送 Token。
+          正数为充值，负数为扣减。账户只使用现金余额结算；历史 Token 赠额已一次性折现并保留审计记录。
         </p
         ><button
           type="button"

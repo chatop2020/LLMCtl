@@ -92,7 +92,8 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("workspaceRefreshing");
     expect(source).toContain('class="choice-group"');
     expect(source).toContain('<option value="active">正常</option>');
-    expect(source).toContain('<option value="none">仅本次</option>');
+    expect(source).toContain("新用户一次性赠送金额（USD）");
+    expect(source).toContain("历史 Token 赠额已一次性折现");
     expect(source).toContain('api(isAdmin.value ? "admin/billing/reconcile" : "usage/reconcile"');
     expect(source).toContain("usageRefreshTimer = window.setInterval");
     expect(source).toContain("reconcile: !isAdmin.value");
@@ -114,13 +115,13 @@ describe("LLMCtl portal contracts", () => {
   it("shows user and administrator request contents and honest empty ledgers", () => {
     expect(source).toContain("toggleRequestDetail(row)");
     expect(source).toContain('`${isAdmin.value ? "admin/" : ""}usage/');
-    expect(source).toContain("暂无金额流水；现有请求可能全部由赠送 Token 抵扣");
+    expect(source).toContain("注册赠款、管理员调整、旧 Token 折现和每次模型调用扣费");
     expect(source).toContain("尚无请求用量；点击“同步用量”");
     expect(source).toContain("模型输出 <small>仅管理员可见</small>");
     expect(source).toContain("response_messages");
     expect(source).toContain("该请求没有保留可显示的文本内容");
     expect(source).toContain("现金余额");
-    expect(source).toContain("有效 Token 赠额");
+    expect(source).toContain("历史 Token 赠额折现");
     expect(source).toContain("cashTokenCapacity");
   });
 

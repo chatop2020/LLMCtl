@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)
 
-在 Ubuntu 24.04 裸机上，从 Hugging Face 或 ModelScope 搜索模型，按本机 NVIDIA GPU/显存保守筛选并规划拓扑，然后自动部署多个 vLLM Worker，以及 New API、LiteLLM、Bifrost、OmniRoute 四选一的接入层。默认推荐 New API；需要公司内部注册、独立 API key、周期额度和模型门户时可选择 OmniRoute。
+在 Ubuntu 24.04 裸机上，从 Hugging Face 或 ModelScope 搜索模型，按本机 NVIDIA GPU/显存保守筛选并规划拓扑，然后自动部署多个 vLLM Worker，以及 New API、LiteLLM、Bifrost、OmniRoute 四选一的接入层。默认推荐 New API；需要公司内部注册、独立 API key、预付余额和模型门户时可选择 OmniRoute。
 
 项目不使用 Conda，也不改 NVIDIA 驱动。推理依赖位于固定版本的 Docker 镜像中；安装时可以临时使用局域网代理，运行期默认完全离线且不会自动更新。
 
@@ -23,7 +23,7 @@
 - 模型能力匹配时才启用图片/OCR、OpenAI 工具调用、思考解析和请求级思考关闭。
 - 一个 GPU 或一个 TP 分组对应一个 Worker；安装器为所选接入层自动生成全部 Worker、鉴权和数据库配置，并通过 Nginx 统一的 `:8000/v1` 提供服务。
 - 自动安装或复用现有 Nginx：公开入口统一为 `/v1/` 和 `/ui/`；推理请求直接转发到网关，不经过门户；OmniRoute 原生排障界面保留在 `/base_ui/`。LLMCtl 使用独立配置，写入前执行 `nginx -t`，失败回滚，卸载时保留软件包和其他站点。
-- OmniRoute 模式额外部署 Vue 3 企业门户：支持可配置门户品牌、可选公开基准地址（仅用于生成链接）、邮箱验证/精确企业邮箱后缀/注册开关/SMTP 在线配置、用户与用户组、用户独立且登录后保持不变的 API Key（仅手工轮换时更换）、原生活跃会话上限、每分钟/每日请求上限、现金余额、额外 token 赠额及周期自动重置、逐模型输入/输出/缓存/思考定价、逐请求标价/赠额抵扣/余额扣款账本和审计。
+- OmniRoute 模式额外部署 Vue 3 企业门户：支持可配置门户品牌、可选公开基准地址（仅用于生成链接）、邮箱验证/精确企业邮箱后缀/注册开关/SMTP 在线配置、用户与用户组、用户独立且登录后保持不变的 API Key（仅手工轮换时更换）、原生活跃会话上限、每分钟/每日请求上限、预付现金余额、一次性注册赠款、逐模型输入/输出/缓存/思考定价、逐请求扣款账本和审计。余额耗尽后付费模型权限保持关闭，充值后才恢复。
 - 企业门户通过 OmniRoute API 原生管理模型 ID 映射、Combo、用户 key 权限和免费层资源；免费模型必须经过“发现、已配置、可用、实时测试、管理员发布”门禁。用户只获得公开模型 ID 权限，不能用底层模型或 Combo ID 绕过映射。
 - 在线测试支持图片、PDF 和常见文本附件；图片直接作为多模态内容发送，PDF 在浏览器内按页转为图片，不上传到门户后端。流式结果明确标注输入、输出和合计 Token，并展示思考内容、首 Token 延迟与输出速度。
 - 管理端提供服务器后台压测：浏览器只提交和观察任务，独立执行器按并发数与目标输入长度生成有意义的提示词，并实时汇总成功率、RPS、聚合输出 tok/s、TTFT、端到端延迟和 p50/p95/p99；同时记录每个请求命中的 Worker，并每秒采样各 GPU 的利用率、显存、功耗及峰值并行卡数，用于识别路由偏斜。高负载档位需要二次确认。
@@ -48,7 +48,7 @@
 | `lib/model_catalog.py` | Hub 搜索、能力识别、显存估算和部署计划 |
 | `lib/runtime_optimizer.py` | 流式基准、GPU/vLLM 指标采集、保守候选生成与目标评分 |
 | `lib/gateway_config.py` | 四种接入层的无密钥配置生成及 New API/OmniRoute 状态同步 |
-| `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、额度和模型目录 |
+| `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、预付余额和模型目录 |
 | `lib/llm_benchmark.py` | 门户管理端的后台并发压测与流式性能指标执行器 |
 | `portal-ui/` | Vue 3 企业门户源码与前端测试 |
 | `lib/account_portal_ui/` | 已构建、安装时直接复制的门户静态资源 |
@@ -93,7 +93,7 @@ sudo llmctl admin set-password
 | New API（默认） | 中文管理体验、渠道/令牌/用量管理 | 初始化管理员；为每个健康 Worker 创建等权渠道；创建 root-only 调用令牌 |
 | LiteLLM | 更广的供应商兼容与成熟代理配置 | 生成模型列表、`least-busy` 路由、主密钥和 PostgreSQL |
 | Bifrost | 高效转发、可观测与虚拟密钥治理 | 生成 8 个 vLLM key、等权路由、虚拟密钥、管理认证和 PostgreSQL 日志存储 |
-| OmniRoute | 本地 SQLite 网关及公司账户门户 | 创建 8 个 Provider 节点和一个等权 Combo；部署独立门户数据库、邮箱注册、用户 key、周期额度、用量与模型目录 |
+| OmniRoute | 本地 SQLite 网关及公司账户门户 | 创建 8 个 Provider 节点和一个等权 Combo；部署独立门户数据库、邮箱注册、用户 key、预付余额、用量与模型目录 |
 
 四者都使用 `llm-router.service`，实际网关只监听回环地址 `127.0.0.1:18000`；Nginx 在公开 `8000` 端口统一提供 OpenAI 兼容 `/v1/` 和 `/ui/`。统一维护密钥保存在 root-only 的 `GATEWAY_API_KEY`。New API、LiteLLM、Bifrost 使用 `llm-database.service` 的 PostgreSQL；OmniRoute 使用自己的 SQLite，不启动 PostgreSQL，并额外启动只监听回环 `8001` 的 `llm-account.service`。本版不做在线迁移；切换接入层时应使用没有旧服务配置的全新安装。本地模型和已存在的精确 Docker 镜像会分别核验后复用。部署前还应按使用方式审查各上游项目许可证。
 
@@ -286,7 +286,7 @@ sudo llmctl models current
 - 模型编辑器会从当前 AI 接入层读取底层模型的上下文窗口、最大输出和可识别能力。路由组合包含多个目标时，门户显示其中的保守可用值，并列出每个底层目标。
 - 管理员修改最大上下文或最大输出后，LLMCtl 通过接入层原生 API 同步到所有可解析目标；部分失败会保留门户配置、显示失败目标并写入审计，不会把失败伪装成成功。
 - 模型描述、OCR 标签和开放范围属于 LLMCtl 发布元数据；它们会显示在管理列表和用户模型广场，但不会伪装成接入层原生参数。
-- 计费页将请求用量与金额流水分开，每条请求同时记录标价、赠额抵扣和现金余额扣款。赠送 Token 足以覆盖请求时，现金流水为空是正常状态；没有赠额时则按该模型输入/输出/缓存/思考四类 Token 的当前价格扣减余额。用户列表同时展示现金余额和有效 Token 赠额。用户只能查看自己的请求输入；管理员还可查看接入层已保留的最终模型输出，未启用响应保留时界面会明确说明。
+- 计费页将请求用量与金额流水分开，每条请求按该模型输入/输出/缓存/思考四类 Token 的价格扣减现金余额，并保存不可变价格快照。升级到 3.0 时，旧版尚未消费的 Token 赠额按当前模型各类单价中的最高值一次性折现；转换有唯一流水与审计记录，重复升级不会重复入账。余额扣到 `0` 或负数后付费模型权限保持关闭。用户只能查看自己的请求输入；管理员还可查看接入层已保留的最终模型输出，未启用响应保留时界面会明确说明。
 - `llmctl upgrade` 只升级 LLMCtl 控制面、门户静态资源和维护脚本，并执行原地数据库迁移；不会重建或替换现有 Worker 与模型权重。
 
 ## 安全说明

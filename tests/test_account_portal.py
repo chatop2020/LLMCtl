@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import dataclasses
 import http.cookiejar
 import importlib.util
 import json
@@ -207,6 +208,7 @@ class PortalIntegrationTests(unittest.TestCase):
             admin_password="correct horse battery staple",
             initial_registration=True,
             initial_domains=["example.com"],
+            initial_welcome_balance_micros=0,
             initial_quota=1000000,
             initial_reset="monthly",
             initial_reset_time="00:00",
@@ -322,6 +324,9 @@ class PortalIntegrationTests(unittest.TestCase):
         return client, jar
 
     def test_verified_user_gets_one_time_key_quota_usage_models_and_curl(self):
+        self.server.db.update_settings(
+            {"default_welcome_balance": "25.5", "default_quota_tokens": "0"}
+        )
         client, jar = self.opener()
         token = self.register(client, jar)
         status, body, _ = self.get(client, "/verify?token=" + urllib.parse.quote(token))
@@ -333,7 +338,7 @@ class PortalIntegrationTests(unittest.TestCase):
         raw_key = self.fake_omni.created[0][3]
         self.assertIn(("key-1", 1, "create"), self.fake_omni.session_limits)
         self.assertIn(raw_key, dashboard)
-        self.assertIn("12,345 / 1,000,000", dashboard)
+        self.assertIn("$25.5", dashboard)
         self.assertIn("ornith-1.0-35b-fp8", dashboard)
         self.assertIn("https://llm.example.test/v1/chat/completions", dashboard)
         self.assertIn("curl", dashboard)
@@ -353,9 +358,32 @@ class PortalIntegrationTests(unittest.TestCase):
             audit_actions = {
                 item[0] for item in connection.execute("SELECT action FROM audit_events")
             }
+            balance = connection.execute(
+                "SELECT balance_micros FROM billing_accounts WHERE user_id=(SELECT id FROM users WHERE email=?)",
+                ("alice@example.com",),
+            ).fetchone()[0]
+            welcome_rows = connection.execute(
+                "SELECT COUNT(*) FROM balance_transactions WHERE source_ref=(SELECT 'welcome-credit:' || id FROM users WHERE email=?)",
+                ("alice@example.com",),
+            ).fetchone()[0]
         self.assertEqual(row, ("active", "key-1", None, 1))
+        self.assertEqual(balance, 25_500_000)
+        self.assertEqual(welcome_rows, 1)
         self.assertIn("register.email", audit_actions)
         self.assertIn("verify.provision", audit_actions)
+
+    def test_fresh_install_keeps_configured_welcome_cash_without_legacy_quota(self):
+        fresh_path = pathlib.Path(self.tempdir.name) / "fresh" / "portal.db"
+        fresh_config = dataclasses.replace(
+            self.config,
+            db_path=fresh_path,
+            initial_quota=0,
+            initial_welcome_balance_micros=42_500_000,
+        )
+        database = portal.Database(fresh_config)
+        database.initialize()
+        self.assertEqual(database.settings()["default_welcome_balance"], "42.5")
+        self.assertEqual(database.settings()["default_quota_tokens"], "0")
 
     def test_login_reveals_the_same_existing_key_without_rotating_or_auditing_secret(self):
         raw_key = "sk-existing-stable-user-key-abcdefghijklmnopqrstuvwxyz"
@@ -579,9 +607,7 @@ class PortalIntegrationTests(unittest.TestCase):
                 "scope": "registration",
                 "registration_enabled": True,
                 "allowed_domains": "zjguardian.com",
-                "default_quota_tokens": 100000000,
-                "default_quota_reset": "weekly",
-                "default_quota_reset_time": "00:00",
+                "default_welcome_balance": "88.5",
                 "default_max_sessions": 1,
                 "default_requests_per_minute": 45,
                 "default_requests_per_day": 3000,
@@ -599,17 +625,20 @@ class PortalIntegrationTests(unittest.TestCase):
                 row["key"]: row["value"]
                 for row in connection.execute(
                     "SELECT key,value FROM settings WHERE key IN "
-                    "('default_requests_per_minute','default_requests_per_day')"
+                    "('default_requests_per_minute','default_requests_per_day',"
+                    "'default_welcome_balance','default_quota_tokens')"
                 )
             }
         self.assertEqual(values["default_requests_per_minute"], "45")
         self.assertEqual(values["default_requests_per_day"], "3000")
+        self.assertEqual(values["default_welcome_balance"], "88.5")
+        self.assertEqual(values["default_quota_tokens"], "0")
 
         status, body, _ = self.json_post(
             client,
             jar,
             "/portal-api/admin/settings",
-            {"scope": "registration", "default_quota_tokens": 0},
+            {"scope": "registration", "default_welcome_balance": "0"},
         )
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
@@ -975,7 +1004,7 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertNotIn("ornith-1.0-35b-fp8", self.fake_omni.permissions[-1][2])
         self.assertNotIn("combo-internal", self.fake_omni.permissions[-1][2])
 
-    def test_due_recurring_grant_reactivates_key_without_waiting_for_request(self):
+    def test_legacy_grant_cannot_reactivate_zero_balance_key(self):
         self.insert_control_user_and_model(paid=True)
         stamp = portal.now()
         with self.server.db.connect() as connection:
@@ -994,7 +1023,7 @@ class PortalIntegrationTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(grant["tokens_remaining"], 5000)
         self.assertGreater(grant["reset_at"], stamp)
-        self.assertEqual(self.fake_omni.permissions[-1], ("policy-key", [], ["gdn-inside"], True))
+        self.assertEqual(self.fake_omni.permissions[-1], ("policy-key", [], [], False))
 
     def test_usage_reconciliation_skips_in_memory_rows_and_is_idempotent(self):
         self.insert_control_user_and_model(paid=True, source_kind="model")
@@ -1174,53 +1203,164 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertIn(("policy-key", False), self.fake_omni.activated)
         self.assertTrue(self.fake_omni.permissions[-1][3])
 
-    def test_disabling_old_grants_keeps_new_grant_and_reports_both_balances(self):
+    def test_token_grants_cannot_be_reissued_after_cash_migration(self):
+        self.insert_control_user_and_model(paid=True)
+        with self.assertRaisesRegex(ValueError, "Token 赠额已停用"):
+            self.server.control.update_user(
+                {
+                    "user_id": "policy-user",
+                    "status": "active",
+                    "group_ids": ["default"],
+                    "balance_delta": "0",
+                    "grant_tokens": 100,
+                },
+                "admin@example.com",
+            )
+        self.assertNotIn(("policy-key", False), self.fake_omni.activated)
+
+    def test_upgrade_converts_remaining_tokens_to_cash_once_at_highest_price(self):
         self.insert_control_user_and_model(paid=True)
         stamp = portal.now()
         with self.server.db.connect() as connection:
             connection.execute(
+                "UPDATE published_models SET input_price_micros=6000000,"
+                "output_price_micros=12000000,cached_price_micros=2000000,"
+                "reasoning_price_micros=3000000 WHERE id='model-1'"
+            )
+            connection.execute(
+                "UPDATE billing_accounts SET balance_micros=0 "
+                "WHERE user_id='policy-user'"
+            )
+            connection.execute(
                 """INSERT INTO token_grants(
                      id,user_id,label,tokens_initial,tokens_remaining,
                      reset_interval,reset_time,status,created_at,updated_at)
-                   VALUES('old-grant','policy-user','Legacy grant',500,500,
-                          'none','00:00','active',?,?)""",
-                (stamp - 10, stamp - 10),
+                   VALUES('legacy-grant','policy-user','Legacy grant',100000000,
+                          100000000,'weekly','00:00','active',?,?)""",
+                (stamp, stamp),
             )
-        self.server.control.update_user(
-            {
-                "user_id": "policy-user",
-                "status": "active",
-                "group_ids": ["default"],
-                "balance_delta": "0",
-                "grant_tokens": 100,
-                "grant_label": "Replacement grant",
-                "disable_active_grants": True,
-            },
-            "admin@example.com",
-        )
+            connection.execute(
+                "UPDATE settings SET value='100000000' "
+                "WHERE key='default_quota_tokens'"
+            )
+            connection.execute(
+                "DELETE FROM settings WHERE key='default_welcome_balance'"
+            )
+
+        self.server.db.initialize()
         with self.server.db.connect() as connection:
-            grants = {
-                row["label"]: (row["status"], row["tokens_remaining"])
+            balance = connection.execute(
+                "SELECT balance_micros FROM billing_accounts "
+                "WHERE user_id='policy-user'"
+            ).fetchone()["balance_micros"]
+            grant = connection.execute(
+                "SELECT status,tokens_remaining,converted_amount_micros,"
+                "conversion_rate_micros FROM token_grants "
+                "WHERE id='legacy-grant'"
+            ).fetchone()
+            transaction_count = connection.execute(
+                "SELECT COUNT(*) FROM balance_transactions "
+                "WHERE source_ref='token-grant-conversion:legacy-grant'"
+            ).fetchone()[0]
+            settings = {
+                row["key"]: row["value"]
                 for row in connection.execute(
-                    "SELECT label,status,tokens_remaining FROM token_grants "
-                    "WHERE user_id='policy-user'"
+                    "SELECT key,value FROM settings WHERE key IN "
+                    "('default_welcome_balance','default_quota_tokens',"
+                    "'token_grant_conversion_status')"
                 )
             }
-        self.assertEqual(grants["Legacy grant"], ("disabled", 500))
-        self.assertEqual(grants["Replacement grant"], ("active", 100))
-        user = next(
-            row
-            for row in self.server.control.admin_snapshot()["users"]
-            if row["id"] == "policy-user"
-        )
-        self.assertEqual(user["balance"], "1")
-        self.assertEqual(user["active_grant_tokens"], 100)
+        self.assertEqual(balance, 1_200_000_000)
+        self.assertEqual(tuple(grant), ("disabled", 0, 1_200_000_000, 12_000_000))
+        self.assertEqual(transaction_count, 1)
+        self.assertEqual(settings["default_welcome_balance"], "1200")
+        self.assertEqual(settings["default_quota_tokens"], "0")
+        self.assertEqual(settings["token_grant_conversion_status"], "complete")
+
+        self.server.db.initialize()
         with self.server.db.connect() as connection:
-            indexes = {
-                row["name"]
-                for row in connection.execute("PRAGMA index_list(token_grants)")
+            balance_after_retry = connection.execute(
+                "SELECT balance_micros FROM billing_accounts "
+                "WHERE user_id='policy-user'"
+            ).fetchone()["balance_micros"]
+            transaction_count_after_retry = connection.execute(
+                "SELECT COUNT(*) FROM balance_transactions "
+                "WHERE source_ref='token-grant-conversion:legacy-grant'"
+            ).fetchone()[0]
+            audit_count = connection.execute(
+                "SELECT COUNT(*) FROM audit_events "
+                "WHERE action='billing.grant-to-cash' "
+                "AND target='policy-user'"
+            ).fetchone()[0]
+        self.assertEqual(balance_after_retry, 1_200_000_000)
+        self.assertEqual(transaction_count_after_retry, 1)
+        self.assertEqual(audit_count, 1)
+
+    def test_completed_request_that_exhausts_balance_keeps_key_disabled(self):
+        self.insert_control_user_and_model(paid=True)
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "UPDATE billing_accounts SET balance_micros=100 "
+                "WHERE user_id='policy-user'"
+            )
+        self.fake_omni.logs = [
+            {
+                "id": "request-exhausts-balance",
+                "status": 200,
+                "active": False,
+                "detailState": "persisted",
+                "requestedModel": "gdn-inside",
+                "model": "ornith-1.0-35b-fp8",
+                "provider": "local",
+                "tokens": {"in": 100, "out": 20},
+                "timestamp": stamp,
             }
-        self.assertIn("idx_grants_active_balance", indexes)
+        ]
+        result = self.server.control.reconcile_usage(user_id="policy-user")
+        with self.server.db.connect() as connection:
+            balance = connection.execute(
+                "SELECT balance_micros FROM billing_accounts "
+                "WHERE user_id='policy-user'"
+            ).fetchone()["balance_micros"]
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(balance, -40)
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertEqual(self.fake_omni.permissions[-1][-1], False)
+
+    def test_exact_zero_balance_removes_paid_model_permission(self):
+        self.insert_control_user_and_model(paid=True)
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "UPDATE billing_accounts SET balance_micros=100 "
+                "WHERE user_id='policy-user'"
+            )
+        # $1/1M input + $2/1M output: 60 input and 20 output tokens cost
+        # exactly 100 micro-dollars, leaving neither a rounding remainder nor
+        # permission to issue another paid request.
+        self.fake_omni.logs = [
+            {
+                "id": "request-reaches-zero",
+                "status": 200,
+                "active": False,
+                "detailState": "persisted",
+                "requestedModel": "gdn-inside",
+                "model": "ornith-1.0-35b-fp8",
+                "provider": "local",
+                "tokens": {"in": 60, "out": 20},
+                "timestamp": stamp,
+            }
+        ]
+        result = self.server.control.reconcile_usage(user_id="policy-user")
+        with self.server.db.connect() as connection:
+            balance = connection.execute(
+                "SELECT balance_micros FROM billing_accounts "
+                "WHERE user_id='policy-user'"
+            ).fetchone()["balance_micros"]
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(balance, 0)
+        self.assertEqual(self.fake_omni.permissions[-1][-1], False)
 
     def test_invalid_active_session_limit_is_rejected_before_key_is_disabled(self):
         self.insert_control_user_and_model()
@@ -1425,6 +1565,13 @@ class PortalIntegrationTests(unittest.TestCase):
 
 
 class PortalUnitTests(unittest.TestCase):
+    def test_token_credit_conversion_uses_ceil_and_preserves_value(self):
+        self.assertEqual(
+            portal.tokens_to_money_micros(100_000_000, 12_000_000),
+            1_200_000_000,
+        )
+        self.assertEqual(portal.tokens_to_money_micros(1, 1), 1)
+
     def test_usage_price_separates_list_price_grant_discount_and_wallet_debit(self):
         prices = {
             "input_price_micros": 1_000_000,
