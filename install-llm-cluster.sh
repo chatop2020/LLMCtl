@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="3.2.0"
+readonly INSTALLER_VERSION="3.2.1"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -1697,12 +1697,15 @@ EOF
 install_manager() {
   install -m 755 "${MANAGER_SOURCE}" /usr/local/sbin/llmctl
   install -d -m 755 /usr/local/lib/llm-cluster
+  install -d -m 755 /usr/local/lib/llm-cluster/systemd
   install -m 755 "${UPGRADER_SOURCE}" /usr/local/lib/llm-cluster/upgrade-llmctl.sh
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
   install -m 755 "${BENCHMARK_SOURCE}" /usr/local/lib/llm-cluster/llm_benchmark.py
+  install -m 644 "${KEEPWARM_SERVICE_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-keepwarm.service
+  install -m 644 "${KEEPWARM_TIMER_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-keepwarm.timer
   rm -rf /usr/local/lib/llm-cluster/account_portal_ui
   cp -a "${ACCOUNT_UI_SOURCE}" /usr/local/lib/llm-cluster/account_portal_ui
   chown -R root:root /usr/local/lib/llm-cluster/account_portal_ui

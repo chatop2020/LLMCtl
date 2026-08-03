@@ -55,14 +55,24 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             self.assertTrue(
                 destination == "/usr/local/sbin/llmctl"
                 or destination.startswith("/usr/local/lib/llm-cluster/")
-                or destination in {
-                    "/etc/systemd/system/llm-keepwarm.service",
-                    "/etc/systemd/system/llm-keepwarm.timer",
-                }
             )
             self.assertNotIn("llm-worker@", destination.lower())
             self.assertRegex(mode, r"^0[0-7]{3}$")
-            self.assertIn(restart, {"none", "account", "systemd"})
+            self.assertIn(restart, {"none", "account"})
+
+    def test_manifest_remains_accepted_by_the_previous_upgrader_allowlist(self):
+        """The updater already installed on a host validates the new manifest first."""
+        for raw_line in MANIFEST.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            _, _, destination, _, restart = line.split()
+            self.assertTrue(
+                destination == "/usr/local/sbin/llmctl"
+                or destination.startswith("/usr/local/lib/llm-cluster/"),
+                f"legacy updater rejects destination {destination}",
+            )
+            self.assertIn(restart, {"none", "account"})
 
     def test_llmctl_delegates_upgrade_and_installer_installs_helper(self):
         self.assertIn("cmd_upgrade() {", MANAGER)
@@ -71,6 +81,10 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("llmctl upgrade --from-zip FILE", MANAGER)
         self.assertIn(
             'install -m 755 "${UPGRADER_SOURCE}" /usr/local/lib/llm-cluster/upgrade-llmctl.sh',
+            INSTALLER,
+        )
+        self.assertIn(
+            'install -m 644 "${KEEPWARM_SERVICE_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-keepwarm.service',
             INSTALLER,
         )
 
@@ -88,6 +102,8 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("/usr/local/sbin/llmctl nginx apply", source)
         self.assertIn("域名、80/443、证书和 TLS 仍由外部出口管理", source)
         self.assertIn("restore_control_plane()", source)
+        self.assertIn("restore_keepwarm_systemd_units", source)
+        self.assertIn("configure_keepwarm_timer", source)
         self.assertIn("load_saved_proxy()", source)
         self.assertIn("prompt_new_proxy()", source)
 

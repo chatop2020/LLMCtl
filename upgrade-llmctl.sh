@@ -18,6 +18,9 @@ readonly BACKUP_ROOT="/var/backups/llmctl"
 readonly ACCOUNT_SERVICE="llm-account.service"
 readonly MANAGED_NGINX_CONFIG="/etc/nginx/conf.d/llm-cluster.conf"
 readonly DEFAULT_NO_PROXY="127.0.0.1,localhost,::1"
+readonly KEEPWARM_UNIT_SOURCE_DIR="/usr/local/lib/llm-cluster/systemd"
+readonly KEEPWARM_SERVICE_UNIT="/etc/systemd/system/llm-keepwarm.service"
+readonly KEEPWARM_TIMER_UNIT="/etc/systemd/system/llm-keepwarm.timer"
 
 LANG_CODE=""
 LOCAL_ZIP=""
@@ -141,8 +144,7 @@ restore_control_plane() {
       fi
     done <"${BACKUP_DIR}/manifest.tsv"
   fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  configure_keepwarm_timer >/dev/null 2>&1 || true
+  restore_keepwarm_systemd_units >/dev/null 2>&1 || true
   if [[ -e "${BACKUP_DIR}/control-plane-version.env" ]]; then
     install -d -m 0755 "$(dirname "${RELEASE_ENV}")"
     cp -a "${BACKUP_DIR}/control-plane-version.env" "${RELEASE_ENV}"
@@ -433,11 +435,11 @@ validate_manifest() {
     [[ "${entry_type}" == "file" || "${entry_type}" == "dir" ]] || die "$(l10n "升级清单类型无效：${entry_type}" "Invalid manifest type: ${entry_type}")"
     [[ "${source}" != /* && "${source}" != *..* ]] || die "$(l10n "升级清单源路径不安全：${source}" "Unsafe manifest source path: ${source}")"
     case "${destination}" in
-      /usr/local/sbin/llmctl|/usr/local/lib/llm-cluster/*|/etc/systemd/system/llm-keepwarm.service|/etc/systemd/system/llm-keepwarm.timer) ;;
+      /usr/local/sbin/llmctl|/usr/local/lib/llm-cluster/*) ;;
       *) die "$(l10n "升级清单目标不在 LLMCtl 控制面范围：${destination}" "Manifest destination is outside the LLMCtl control-plane scope: ${destination}")" ;;
     esac
     [[ "${mode}" =~ ^0[0-7]{3}$ ]] || die "$(l10n "升级清单权限无效：${mode}" "Invalid manifest mode: ${mode}")"
-    [[ "${restart}" == "none" || "${restart}" == "account" || "${restart}" == "systemd" ]] || die "$(l10n "升级清单重启范围无效：${restart}" "Invalid manifest restart scope: ${restart}")"
+    [[ "${restart}" == "none" || "${restart}" == "account" ]] || die "$(l10n "升级清单重启范围无效：${restart}" "Invalid manifest restart scope: ${restart}")"
     source_path="${SOURCE_ROOT}/${source}"
     if [[ "${entry_type}" == "file" ]]; then [[ -f "${source_path}" ]] || die "$(l10n "升级包缺少文件：${source}" "Upgrade archive is missing file: ${source}")"
     else [[ -d "${source_path}" ]] || die "$(l10n "升级包缺少目录：${source}" "Upgrade archive is missing directory: ${source}")"; fi
@@ -478,16 +480,37 @@ read_cluster_value() {
   printf '%s\n' "${value:-${default_value}}"
 }
 
-configure_keepwarm_timer() {
+apply_keepwarm_timer_state() {
   local enabled
   systemctl daemon-reload
   enabled=$(read_cluster_value KEEPWARM_ENABLED 0)
-  if [[ "${enabled}" == 1 ]]; then
+  if [[ "${enabled}" == 1 && -r "${KEEPWARM_SERVICE_UNIT}" && -r "${KEEPWARM_TIMER_UNIT}" ]]; then
     install -d -m 0700 /var/lib/llm-cluster/keepwarm
     systemctl enable --now llm-keepwarm.timer
   else
     systemctl disable --now llm-keepwarm.timer >/dev/null 2>&1 || true
   fi
+}
+
+configure_keepwarm_timer() {
+  local service_source="${KEEPWARM_UNIT_SOURCE_DIR}/llm-keepwarm.service"
+  local timer_source="${KEEPWARM_UNIT_SOURCE_DIR}/llm-keepwarm.timer"
+  [[ -r "${service_source}" && -r "${timer_source}" ]] || \
+    die "$(l10n '升级后的控制面缺少 Worker 保活单元' 'The upgraded control plane is missing Worker keep-warm units')"
+  install -m 0644 "${service_source}" "${KEEPWARM_SERVICE_UNIT}"
+  install -m 0644 "${timer_source}" "${KEEPWARM_TIMER_UNIT}"
+  apply_keepwarm_timer_state
+}
+
+restore_keepwarm_systemd_units() {
+  local unit
+  rm -f -- "${KEEPWARM_SERVICE_UNIT}" "${KEEPWARM_TIMER_UNIT}"
+  for unit in llm-keepwarm.service llm-keepwarm.timer; do
+    if [[ -e "${BACKUP_DIR}/systemd/${unit}" ]]; then
+      cp -a "${BACKUP_DIR}/systemd/${unit}" "/etc/systemd/system/${unit}"
+    fi
+  done
+  apply_keepwarm_timer_state
 }
 
 wait_for_account_portal() {
@@ -519,7 +542,7 @@ refresh_managed_nginx() {
 }
 
 backup_control_plane() {
-  local timestamp destination entry_type source mode restart backup_path
+  local timestamp destination entry_type source mode restart backup_path unit
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   BACKUP_DIR="${BACKUP_ROOT}/control-plane-${timestamp}"
   install -d -m 0700 "${BACKUP_DIR}/files"
@@ -532,6 +555,10 @@ backup_control_plane() {
       cp -a "${destination}" "${backup_path}"
     fi
   done <"${SOURCE_ROOT}/upgrade-manifest.tsv"
+  install -d -m 0700 "${BACKUP_DIR}/systemd"
+  for unit in llm-keepwarm.service llm-keepwarm.timer; do
+    [[ ! -e "/etc/systemd/system/${unit}" ]] || cp -a "/etc/systemd/system/${unit}" "${BACKUP_DIR}/systemd/${unit}"
+  done
   [[ ! -e "${RELEASE_ENV}" ]] || cp -a "${RELEASE_ENV}" "${BACKUP_DIR}/control-plane-version.env"
   printf 'created_at=%s\nsource_commit=%s\narchive_sha256=%s\n' \
     "${timestamp}" "${SOURCE_COMMIT}" "${ARCHIVE_SHA256}" >"${BACKUP_DIR}/upgrade.txt"
@@ -545,7 +572,7 @@ install_control_plane() {
   [[ -r "${CLUSTER_ENV}" ]] || die "$(l10n '未检测到现有 LLMCtl 部署' 'No existing LLMCtl deployment was detected')"
   backup_control_plane
   local router_before router_after workers_before workers_after account_port
-  local entry_type source destination mode restart source_path restart_account=0 restart_systemd=0
+  local entry_type source destination mode restart source_path restart_account=0
   router_before=$(systemctl is-active llm-router.service 2>/dev/null || true)
   workers_before=$(systemctl list-units 'llm-worker@*.service' --state=running --no-legend 2>/dev/null | wc -l | tr -d ' ')
   systemctl is-active --quiet "${ACCOUNT_SERVICE}" && ACCOUNT_WAS_ACTIVE=1 || ACCOUNT_WAS_ACTIVE=0
@@ -564,13 +591,10 @@ install_control_plane() {
     if [[ "${entry_type}" == "file" ]]; then install -m "${mode}" "${source_path}" "${destination}"
     else cp -a "${source_path}" "${destination}"; chmod "${mode}" "${destination}"; fi
     [[ "${restart}" != "account" ]] || restart_account=1
-    [[ "${restart}" != "systemd" ]] || restart_systemd=1
   done <"${SOURCE_ROOT}/upgrade-manifest.tsv"
 
   /usr/local/sbin/llmctl version >/dev/null
-  if (( restart_systemd )); then
-    configure_keepwarm_timer
-  fi
+  configure_keepwarm_timer
   if (( ACCOUNT_WAS_ACTIVE && restart_account )); then
     systemctl start "${ACCOUNT_SERVICE}"
     account_port=$(read_cluster_value ACCOUNT_PORT 8001)

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.2.0"
+readonly CTL_VERSION="3.2.1"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -34,6 +34,9 @@ readonly NGINX_STATE_DIR="${STATE_DIR}/nginx"
 readonly KEEPWARM_STATE_DIR="${STATE_DIR}/keepwarm"
 readonly KEEPWARM_STATE_FILE="${KEEPWARM_STATE_DIR}/last-run.json"
 readonly KEEPWARM_LOCK_FILE="${KEEPWARM_STATE_DIR}/run.lock"
+readonly KEEPWARM_UNIT_SOURCE_DIR="${LLM_KEEPWARM_UNIT_SOURCE_DIR:-/usr/local/lib/llm-cluster/systemd}"
+readonly KEEPWARM_SERVICE_UNIT="/etc/systemd/system/llm-keepwarm.service"
+readonly KEEPWARM_TIMER_UNIT="/etc/systemd/system/llm-keepwarm.timer"
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
@@ -598,6 +601,18 @@ keepwarm_last_finished_epoch() {
   jq -r '.finished_epoch // 0' "${KEEPWARM_STATE_FILE}" 2>/dev/null || printf '0\n'
 }
 
+install_keepwarm_units() {
+  local service_source="${KEEPWARM_UNIT_SOURCE_DIR}/llm-keepwarm.service"
+  local timer_source="${KEEPWARM_UNIT_SOURCE_DIR}/llm-keepwarm.timer"
+  if [[ -r "${service_source}" && -r "${timer_source}" ]]; then
+    install -m 0644 "${service_source}" "${KEEPWARM_SERVICE_UNIT}"
+    install -m 0644 "${timer_source}" "${KEEPWARM_TIMER_UNIT}"
+  elif [[ ! -r "${KEEPWARM_SERVICE_UNIT}" || ! -r "${KEEPWARM_TIMER_UNIT}" ]]; then
+    die "缺少 Worker 保活 systemd 单元；请重新执行 llmctl upgrade"
+  fi
+  systemctl daemon-reload
+}
+
 cmd_keepwarm_tick() {
   require_root; load_config
   (( KEEPWARM_ENABLED == 1 )) || return 0
@@ -612,7 +627,7 @@ cmd_keepwarm_tick() {
 
 cmd_keepwarm() {
   require_root; load_config
-  local action="${1:-status}" value="${2:-}" ids timer_active timer_enabled
+  local action="${1:-status}" value="${2:-}" ids timer_active timer_enabled previous_enabled
   case "${action}" in
     status)
       timer_active=$(systemctl is-active llm-keepwarm.timer 2>/dev/null || true)
@@ -631,10 +646,14 @@ cmd_keepwarm() {
         [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 60 && value <= 86400 )) || die "保活间隔范围 60-86400 秒"
         set_env_value "${CLUSTER_ENV}" KEEPWARM_INTERVAL_SECONDS "${value}"
       fi
-      set_env_value "${CLUSTER_ENV}" KEEPWARM_ENABLED 1
       install -d -m 0700 "${KEEPWARM_STATE_DIR}"
-      systemctl daemon-reload
-      systemctl enable --now llm-keepwarm.timer
+      install_keepwarm_units
+      previous_enabled="${KEEPWARM_ENABLED}"
+      set_env_value "${CLUSTER_ENV}" KEEPWARM_ENABLED 1
+      if ! systemctl enable --now llm-keepwarm.timer; then
+        set_env_value "${CLUSTER_ENV}" KEEPWARM_ENABLED "${previous_enabled}"
+        die "Worker 保活定时器启用失败；配置已恢复"
+      fi
       load_config
       keepwarm_run_ids "${ACTIVE_WORKERS}" enable || warn "部分 Worker 首次保活失败；定时器仍已启用，请运行 llmctl keepwarm status 查看详情。"
       ;;
