@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.8.3"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -568,6 +568,16 @@ def normalize_portal_title(value: Any) -> str:
     return title
 
 
+def normalize_max_sessions(value: Any, label: str = "API Key 活跃会话上限") -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label}必须是整数") from error
+    if not 0 <= result <= 10000:
+        raise ValueError(f"{label}必须在 0-10000 之间")
+    return result
+
+
 def effective_public_urls(config: "Config", settings: dict[str, str]) -> tuple[str, str]:
     """Return the effective portal URL and API origin.
 
@@ -771,6 +781,7 @@ CREATE TABLE IF NOT EXISTS users (
   quota_tokens INTEGER NOT NULL,
   quota_reset TEXT NOT NULL,
   quota_reset_time TEXT NOT NULL,
+  max_sessions INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   verified_at INTEGER,
   last_login_at INTEGER
@@ -1012,6 +1023,7 @@ class Database:
                 "default_quota_tokens": str(self.config.initial_quota),
                 "default_quota_reset": self.config.initial_reset,
                 "default_quota_reset_time": self.config.initial_reset_time,
+                "default_max_sessions": "1",
                 "portal_title": "LLMCtl",
                 "published_origin": "",
                 "public_url": self.config.public_url,
@@ -1042,6 +1054,13 @@ class Database:
             }
             if "login_name" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN login_name TEXT")
+            if "max_sessions" not in user_columns:
+                # Existing keys predate this control and remain unlimited until
+                # an administrator explicitly changes them. New registrations
+                # use default_max_sessions (1 by default).
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN max_sessions INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 "UPDATE users SET login_name=email WHERE login_name IS NULL OR TRIM(login_name)=''"
             )
@@ -1245,7 +1264,9 @@ class OmniRouteClient:
             raise RuntimeError(f"OmniRoute {method} {path}: invalid JSON") from error
         return parsed
 
-    def create_user_key(self, user_id: str, email: str) -> tuple[str, str]:
+    def create_user_key(
+        self, user_id: str, email: str, max_sessions: int = 0
+    ) -> tuple[str, str]:
         response = self.request(
             "POST",
             "/api/keys",
@@ -1259,6 +1280,7 @@ class OmniRouteClient:
                 "allowedCombos": ["__llmctl_no_combos__"],
                 "streamDefaultMode": "json",
                 "noLog": False,
+                "maxSessions": max_sessions,
             },
         )
         key_id, raw_key = str(response.get("id", "")), str(response.get("key", ""))
@@ -1335,6 +1357,13 @@ class OmniRouteClient:
             "PATCH",
             f"/api/keys/{urllib.parse.quote(key_id, safe='')}",
             {"isActive": active},
+        )
+
+    def set_key_max_sessions(self, key_id: str, max_sessions: int) -> None:
+        self.request(
+            "PATCH",
+            f"/api/keys/{urllib.parse.quote(key_id, safe='')}",
+            {"maxSessions": max_sessions},
         )
 
     def usage(self, key_id: str) -> dict[str, Any]:
@@ -1446,7 +1475,12 @@ class OmniRouteClient:
         return response
 
     def patch_key_permissions(
-        self, key_id: str, allowed_models: list[str], allowed_combos: list[str], active: bool
+        self,
+        key_id: str,
+        allowed_models: list[str],
+        allowed_combos: list[str],
+        active: bool,
+        max_sessions: int = 0,
     ) -> None:
         self.request(
             "PATCH",
@@ -1456,6 +1490,7 @@ class OmniRouteClient:
                 "allowedCombos": allowed_combos or ["__llmctl_no_combos__"],
                 "isActive": active,
                 "noLog": False,
+                "maxSessions": max_sessions,
             },
         )
 
@@ -2261,6 +2296,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         raw_token, stamp = secrets.token_urlsafe(40), now()
         ignored_reason = ""
+        default_max_sessions = normalize_max_sessions(
+            settings.get("default_max_sessions", "1"), "默认活跃会话上限"
+        )
         with self.app.db.connect() as connection:
             user = connection.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             if user and user["status"] != "pending":
@@ -2277,14 +2315,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 user_id = str(uuid.uuid4())
             if not ignored_reason and user:
                 connection.execute(
-                    "UPDATE users SET login_name=?,password_hash=? WHERE id=?",
-                    (email, password_hash, user_id),
+                    "UPDATE users SET login_name=?,password_hash=?,max_sessions=? WHERE id=?",
+                    (email, password_hash, default_max_sessions, user_id),
                 )
                 connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             elif not ignored_reason:
                 connection.execute(
-                    "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], stamp),
+                    "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, stamp),
                 )
             if not ignored_reason:
                 connection.execute(
@@ -2332,7 +2370,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             _, domain = normalize_email(record["email"])
             if domain not in normalize_domains(settings.get("allowed_domains", "")):
                 raise ValueError("email domain is no longer allowed")
-            key_id, raw_key = self.app.omni.create_user_key(record["user_id"], record["email"])
+            key_id, raw_key = self.app.omni.create_user_key(
+                record["user_id"], record["email"], int(record["max_sessions"])
+            )
             stamp = now()
             with self.app.db.connect() as connection:
                 changed = connection.execute(
@@ -2415,7 +2455,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if user["role"] != "user":
             raise ValueError("only user API keys can be rotated here")
         old_id = str(user["api_key_id"] or "")
-        new_id, raw_key = self.app.omni.create_user_key(user["id"], user["email"])
+        new_id, raw_key = self.app.omni.create_user_key(
+            user["id"], user["email"], int(user["max_sessions"])
+        )
         try:
             with self.app.db.connect() as connection:
                 connection.execute("UPDATE users SET api_key_id=?,token_limit_id=NULL WHERE id=?", (new_id, user["id"]))
@@ -2518,6 +2560,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             quota = int(payload.get("default_quota_tokens", current.get("default_quota_tokens", "1000000")))
         except (TypeError, ValueError) as error:
             raise ValueError("默认 Token 额度必须是整数") from error
+        default_max_sessions = normalize_max_sessions(
+            payload.get(
+                "default_max_sessions", current.get("default_max_sessions", "1")
+            ),
+            "默认活跃会话上限",
+        )
         reset = str(payload.get("default_quota_reset", current.get("default_quota_reset", "monthly")))
         reset_time = str(payload.get("default_quota_reset_time", current.get("default_quota_reset_time", "00:00")))
         currency = str(payload.get("currency", current.get("currency", "USD"))).strip().upper()
@@ -2560,6 +2608,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 "default_quota_tokens": str(quota),
                 "default_quota_reset": reset,
                 "default_quota_reset_time": reset_time,
+                "default_max_sessions": str(default_max_sessions),
                 "published_origin": published_origin,
                 "public_url": public_url,
                 "api_public_url": api_url,
@@ -2585,9 +2634,11 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if settings.get("registration_enabled") != "1":
             self.response(403, page("Registration closed", '<div class="card notice">注册已关闭 / Registration is closed.</div>'))
             return
-        domains = settings.get("allowed_domains", "")
+        domains = "、".join(
+            f"@{domain}" for domain in normalize_domains(settings.get("allowed_domains", ""))
+        )
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<section class="card" style="max-width:560px;margin:auto"><h1>注册 / Register</h1><p class="muted">仅允许：{html.escape(domains)}</p><form method="post" action="/register"><input type="hidden" name="csrf" value="__CSRF__"><label>邮箱 / Email</label><input name="email" type="email" required><label>密码 / Password</label><input name="password" type="password" minlength="8" maxlength="200" required><label>确认密码 / Confirm</label><input name="confirm" type="password" minlength="8" maxlength="200" required><p class="small muted">8-200 个字符，不能为纯数字；收到邮件后请点击其中的验证链接。</p><button>发送验证邮件 / Send verification</button></form></section>'''
+        body = f'''{flash}<section class="card" style="max-width:560px;margin:auto"><h1>注册 / Register</h1><p class="muted">允许注册邮箱：{html.escape(domains or "管理员尚未配置")}</p><form method="post" action="/register"><input type="hidden" name="csrf" value="__CSRF__"><label>邮箱 / Email</label><input name="email" type="email" required><label>密码 / Password</label><input name="password" type="password" minlength="8" maxlength="200" required><label>确认密码 / Confirm</label><input name="confirm" type="password" minlength="8" maxlength="200" required><p class="small muted">8-200 个字符，不能为纯数字；收到邮件后请点击其中的验证链接。</p><button>发送验证邮件 / Send verification</button></form></section>'''
         self.response(200, page("Register", body))
 
     def show_verify(self, raw_token: str) -> None:
@@ -2679,7 +2730,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             )
             provisioned = bool(item["api_key_id"])
             controls = (
-                f'''<form method="post" action="/admin/user"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="user_id" value="{html.escape(item["id"])}"><label>Token quota</label><input name="quota" value="{item["quota_tokens"]}" inputmode="numeric"><label>Reset</label><select name="reset"><option {"selected" if item["quota_reset"]=="monthly" else ""}>monthly</option><option {"selected" if item["quota_reset"]=="weekly" else ""}>weekly</option><option {"selected" if item["quota_reset"]=="daily" else ""}>daily</option></select><input name="reset_time" value="{html.escape(item["quota_reset_time"])}"><label>Status</label><select name="status">{status_options}</select><p><button class="secondary">保存 / Save</button></p></form>'''
+                f'''<form method="post" action="/admin/user"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="user_id" value="{html.escape(item["id"])}"><label>Token quota</label><input name="quota" value="{item["quota_tokens"]}" inputmode="numeric"><label>API Key active sessions (0 = unlimited)</label><input name="max_sessions" type="number" min="0" max="10000" value="{item["max_sessions"]}"><label>Reset</label><select name="reset"><option {"selected" if item["quota_reset"]=="monthly" else ""}>monthly</option><option {"selected" if item["quota_reset"]=="weekly" else ""}>weekly</option><option {"selected" if item["quota_reset"]=="daily" else ""}>daily</option></select><input name="reset_time" value="{html.escape(item["quota_reset_time"])}"><label>Status</label><select name="status">{status_options}</select><p><button class="secondary">保存 / Save</button></p></form>'''
                 if provisioned
                 else '<span class="muted">等待邮箱验证 / Pending email verification</span>'
             )
@@ -2687,7 +2738,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         audit_rows = "".join(f'<tr><td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["created_at"]))}</td><td>{html.escape(a["actor"])}</td><td>{html.escape(a["action"])}</td><td>{html.escape(a["status"])}</td><td>{html.escape(a["detail"])}</td></tr>' for a in audits)
         checked = "checked" if settings.get("registration_enabled") == "1" else ""
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">开启注册要求安装时已配置 SMTP；域名在验证时会再次检查。</p></section><section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(api_public_url)}">{html.escape(api_public_url)}</a></p><p>LLMCtl: {html.escape(portal_public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
+        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许注册的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 API Key 活跃会话上限（0 = 不限制）</label><input name="max_sessions" type="number" min="0" max="10000" value="{html.escape(settings.get("default_max_sessions", "1"))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">新用户默认限制为 1 个接入层原生活跃会话；会话闲置后由网关自动释放。</p></section><section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(api_public_url)}">{html.escape(api_public_url)}</a></p><p>LLMCtl: {html.escape(portal_public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
         self.response(200, page("Admin", body, user), user)
 
     def handle_login(self, form: dict[str, str]) -> None:
@@ -2780,6 +2831,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         remote = self.client_address[0]
         raw_token = secrets.token_urlsafe(40)
+        default_max_sessions = normalize_max_sessions(
+            settings.get("default_max_sessions", "1"), "默认活跃会话上限"
+        )
         duplicate_active = False
         throttled = False
         with self.app.db.connect() as connection:
@@ -2796,13 +2850,13 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     throttled = True
                 else:
                     connection.execute(
-                        "UPDATE users SET login_name=?,password_hash=? WHERE id=?",
-                        (email, password_hash, user_id),
+                        "UPDATE users SET login_name=?,password_hash=?,max_sessions=? WHERE id=?",
+                        (email, password_hash, default_max_sessions, user_id),
                     )
                     connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             else:
                 user_id = str(uuid.uuid4())
-                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], now()))
+                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, now()))
             if not duplicate_active and not throttled:
                 connection.execute("INSERT INTO verification_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", (token_hash(raw_token), user_id, now() + self.app.config.verification_ttl, now()))
         if duplicate_active or throttled:
@@ -2835,7 +2889,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             _, domain = normalize_email(record["email"])
             if domain not in normalize_domains(settings.get("allowed_domains", "")):
                 raise ValueError("email domain is no longer allowed")
-            key_id, raw_key = self.app.omni.create_user_key(record["user_id"], record["email"])
+            key_id, raw_key = self.app.omni.create_user_key(
+                record["user_id"], record["email"], int(record["max_sessions"])
+            )
             limit_id = ""
             try:
                 limit_id = self.app.omni.set_limit(key_id, record["quota_tokens"], record["quota_reset"], record["quota_reset_time"])
@@ -2882,7 +2938,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         old_id = user["api_key_id"]
         old_limit_id = user["token_limit_id"]
         try:
-            new_id, raw_key = self.app.omni.create_user_key(user["id"], user["email"])
+            new_id, raw_key = self.app.omni.create_user_key(
+                user["id"], user["email"], int(user["max_sessions"])
+            )
             limit_id = ""
             try:
                 limit_id = self.app.omni.set_limit(new_id, user["quota_tokens"], user["quota_reset"], user["quota_reset_time"])
@@ -2919,6 +2977,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         try:
             domains = normalize_domains(form.get("domains", ""))
             quota = int(form.get("quota", "0"))
+            default_max_sessions = normalize_max_sessions(
+                form.get("max_sessions", "1"), "默认活跃会话上限"
+            )
             reset = form.get("reset", "")
             reset_time = form.get("reset_time", "")
             enabled = form.get("enabled") == "1"
@@ -2932,7 +2993,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 raise ValueError(
                     "public portal URL and SMTP must be configured before registration can be enabled"
                 )
-            values = {"registration_enabled": "1" if enabled else "0", "allowed_domains": ",".join(domains), "default_quota_tokens": str(quota), "default_quota_reset": reset, "default_quota_reset_time": reset_time}
+            values = {"registration_enabled": "1" if enabled else "0", "allowed_domains": ",".join(domains), "default_quota_tokens": str(quota), "default_quota_reset": reset, "default_quota_reset_time": reset_time, "default_max_sessions": str(default_max_sessions)}
             with self.app.db.connect() as connection:
                 for key, value in values.items():
                     connection.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, value, now()))
@@ -2953,6 +3014,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             quota = int(form.get("quota", "0"))
             reset, reset_time = form.get("reset", ""), form.get("reset_time", "")
             target_status = form.get("status", "")
+            max_sessions = normalize_max_sessions(form.get("max_sessions", "0"))
             if quota <= 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or target_status not in {"active", "disabled"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
                 raise ValueError("invalid user settings")
             with self.app.db.connect() as connection:
@@ -2961,12 +3023,17 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 raise ValueError("user is not provisioned")
             self.app.omni.activate_key(target["api_key_id"], target_status == "active")
             try:
+                self.app.omni.set_key_max_sessions(target["api_key_id"], max_sessions)
                 limit_id = self.app.omni.set_limit(target["api_key_id"], quota, reset, reset_time, target["token_limit_id"])
                 with self.app.db.connect() as connection:
-                    connection.execute("UPDATE users SET status=?,quota_tokens=?,quota_reset=?,quota_reset_time=?,token_limit_id=? WHERE id=?", (target_status, quota, reset, reset_time, limit_id, target["id"]))
+                    connection.execute("UPDATE users SET status=?,quota_tokens=?,quota_reset=?,quota_reset_time=?,max_sessions=?,token_limit_id=? WHERE id=?", (target_status, quota, reset, reset_time, max_sessions, limit_id, target["id"]))
             except Exception:
                 with contextlib.suppress(Exception):
                     self.app.omni.activate_key(target["api_key_id"], target["status"] == "active")
+                with contextlib.suppress(Exception):
+                    self.app.omni.set_key_max_sessions(
+                        target["api_key_id"], int(target["max_sessions"])
+                    )
                 if target["token_limit_id"]:
                     with contextlib.suppress(Exception):
                         self.app.omni.set_limit(
@@ -2981,7 +3048,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.app.db.audit(admin["email"], "user.update", form.get("user_id", ""), "failed", self.client_address[0], type(error).__name__)
             self.show_admin(str(error), True)
             return
-        self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "quota": quota, "reset": reset})
+        self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "quota": quota, "reset": reset, "max_sessions": max_sessions})
         self.show_admin("用户设置已保存 / User settings saved")
 
 
@@ -3313,6 +3380,7 @@ class PortalControlPlane:
             self.omni.patch_key_permissions(
                 user["api_key_id"], allowed_models, allowed_combos,
                 user["status"] == "active" and bool(models),
+                int(user["max_sessions"]),
             )
             sync_status, error = "synced", ""
         except Exception as exc:
@@ -4685,6 +4753,9 @@ class PortalControlPlane:
             user = connection.execute("SELECT * FROM users WHERE id=? AND role='user'", (user_id,)).fetchone()
             if not user:
                 raise ValueError("user not found")
+            max_sessions = normalize_max_sessions(
+                payload.get("max_sessions", user["max_sessions"])
+            )
             if group_ids:
                 placeholders = ",".join("?" for _ in group_ids)
                 found = int(
@@ -4704,7 +4775,10 @@ class PortalControlPlane:
             self.omni.activate_key(str(user["api_key_id"]), False)
         try:
             with self.db.connect() as connection:
-                connection.execute("UPDATE users SET status=? WHERE id=?", (status, user_id))
+                connection.execute(
+                    "UPDATE users SET status=?,max_sessions=? WHERE id=?",
+                    (status, max_sessions, user_id),
+                )
                 connection.execute("DELETE FROM user_group_members WHERE user_id=?", (user_id,))
                 for group_id in group_ids:
                     connection.execute(

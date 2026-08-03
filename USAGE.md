@@ -164,7 +164,7 @@ sudo bash install-llm-cluster.sh \
   --smtp-from llm@example.com
 ```
 
-白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查。门户管理员可在线配置并测试 SMTP、关闭/开启注册、调整白名单和新用户默认赠额，也可禁用用户、分组、增减金额余额、发放通用或指定模型的额外 token。赠额支持 `daily`、`weekly`、`monthly` 及指定重置时间；后台会独立执行到期重置，即使额度耗尽导致 key 已关闭也能按时恢复。
+白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查，注册页按后端当前配置显示为 `@example.com` 等允许邮箱后缀。门户管理员可在线配置并测试 SMTP、关闭/开启注册、调整白名单、新用户默认赠额和默认 API Key 活跃会话上限，也可按用户覆盖会话上限、禁用用户、分组、增减金额余额、发放通用或指定模型的额外 token。新用户默认上限为 `1`；`0` 表示不限制。该值直接同步到 OmniRoute 原生 `maxSessions`，按模型、系统提示、首条用户消息和工具等会话指纹限制活跃会话，闲置约 15 分钟后释放；它不是 HTTP 并发数，也不能绝对等同于真实人数。升级前已有用户保持 `0`，需由管理员按需改为 `1`。赠额支持 `daily`、`weekly`、`monthly` 及指定重置时间；后台会独立执行到期重置，即使额度耗尽导致 key 已关闭也能按时恢复。
 
 管理员还可在“发布、注册与 SMTP”中单独保存门户品牌名称和公开访问源。公开访问源只能是无路径、无凭据、无 query/fragment 的 `http(s)` origin，例如 `https://llm.zjguardian.com`。配置后，它优先于安装期回退地址，用于验证邮件、页内链接、API Base、curl 示例、`llmctl account url`、`llmctl admin show`、`llmctl key show` 和 `llmctl info`；留空使用安装期回退地址。该字段仅是链接与显示元数据，不修改 Nginx、TLS、Cookie、登录回跳或当前访问方式。品牌名称为 1–40 个可见字符，用于页眉、登录页和浏览器标题。
 

@@ -93,6 +93,7 @@ const apiKeyField = ref(null);
 const userEdit = reactive({
   user_id: "",
   status: "active",
+  max_sessions: 0,
   balance_delta: "0",
   group_ids: [],
   grant_tokens: 0,
@@ -138,6 +139,11 @@ const portalTitle = computed(
 );
 const portalInitial = computed(
   () => Array.from(portalTitle.value.trim())[0]?.toUpperCase() || "L",
+);
+const allowedRegistrationEmails = computed(() =>
+  (publicConfig.value.allowed_domains || [])
+    .map((domain) => `@${String(domain).replace(/^@+/, "")}`)
+    .join("、"),
 );
 const smtpTestRecipient = ref("");
 const showHiddenFreeResources = ref(false);
@@ -1245,6 +1251,7 @@ function editUser(user) {
   Object.assign(userEdit, {
     user_id: user.id,
     status: user.status,
+    max_sessions: Number(user.max_sessions ?? 0),
     balance_delta: "0",
     group_ids: admin.value.memberships
       .filter((m) => m.user_id === user.id)
@@ -1461,6 +1468,7 @@ function registrationPayload() {
     default_quota_tokens: settings.default_quota_tokens,
     default_quota_reset: settings.default_quota_reset,
     default_quota_reset_time: settings.default_quota_reset_time,
+    default_max_sessions: settings.default_max_sessions,
     public_url: settings.public_url,
     api_public_url: settings.api_public_url,
   };
@@ -1637,8 +1645,8 @@ onBeforeUnmount(() => {
         >
           <h2>{{ authMode === "login" ? "欢迎回来" : `创建 ${portalTitle} 账户` }}</h2>
           <p class="muted" v-if="authMode === 'register'">
-            允许域名：{{
-              publicConfig.allowed_domains?.join(", ") || "管理员尚未配置"
+            允许注册邮箱：{{
+              allowedRegistrationEmails || "管理员尚未配置"
             }}
           </p>
           <label
@@ -3016,6 +3024,7 @@ onBeforeUnmount(() => {
                     <th>用户</th>
                     <th>状态</th>
                     <th>余额</th>
+                    <th>Key 活跃会话</th>
                     <th>权限同步</th>
                     <th></th>
                   </tr>
@@ -3043,6 +3052,9 @@ onBeforeUnmount(() => {
                       >
                     </td>
                     <td>${{ user.balance }}</td>
+                    <td>
+                      {{ Number(user.max_sessions) === 0 ? "不限制" : user.max_sessions }}
+                    </td>
                     <td>
                       <span
                         class="status"
@@ -3775,6 +3787,14 @@ onBeforeUnmount(() => {
                     v-model="settings.allowed_domains"
                     placeholder="example.com,corp.example.com" /></label
                 ><label
+                  >默认 API Key 活跃会话上限<input
+                    v-model.number="settings.default_max_sessions"
+                    type="number"
+                    min="0"
+                    max="10000" /></label
+                ><p class="muted">
+                  默认 1；0 表示不限制。由当前 AI 接入层的原生 maxSessions 执行，闲置会话约 15 分钟后释放。
+                </p><label
                   >默认赠送 Token<input
                     v-model="settings.default_quota_tokens"
                     type="number" /></label
@@ -3957,6 +3977,16 @@ onBeforeUnmount(() => {
             <option value="disabled">已禁用</option>
           </select></label
         >
+        <label
+          >API Key 活跃会话上限<input
+            v-model.number="userEdit.max_sessions"
+            type="number"
+            min="0"
+            max="10000"
+        /></label>
+        <p class="muted">
+          建议设为 1，降低 Key 被多人共享的风险；0 表示不限制。该值直接同步到当前 AI 接入层的原生 maxSessions。它按模型、首条消息等识别会话，闲置约 15 分钟释放，不是 HTTP 并发请求数。
+        </p>
         <fieldset class="choice-group">
           <legend>所属用户组</legend>
           <label

@@ -38,6 +38,11 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("published_origin");
     expect(source).toContain("https://llm.zjguardian.com");
     expect(source).toContain("测试邮件使用当前表单内容，不必先保存");
+    expect(source).toContain("default_max_sessions");
+    expect(source).toContain("userEdit.max_sessions");
+    expect(source).toContain("原生 maxSessions");
+    expect(source).toContain("允许注册邮箱");
+    expect(source).toContain("allowedRegistrationEmails");
   });
 
   it("gives scoped progress feedback and a non-blocking dismissible toast", () => {

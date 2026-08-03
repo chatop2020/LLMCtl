@@ -30,6 +30,7 @@ class FakeOmniRoute:
         self.deleted = []
         self.activated = []
         self.permissions = []
+        self.session_limits = []
         self.deleted_aliases = []
         self.logs = []
         self.test_error = None
@@ -43,10 +44,11 @@ class FakeOmniRoute:
         self.aliases = []
         self.revealed = []
 
-    def create_user_key(self, user_id, email):
+    def create_user_key(self, user_id, email, max_sessions=0):
         key_id = f"key-{len(self.created) + 1}"
         raw = f"sk-user-secret-{len(self.created) + 1}-abcdefghijklmnopqrstuvwxyz"
         self.created.append((key_id, user_id, email, raw))
+        self.session_limits.append((key_id, max_sessions, "create"))
         return key_id, raw
 
     def reveal_user_key(self, key_id):
@@ -69,6 +71,9 @@ class FakeOmniRoute:
 
     def activate_key(self, key_id, active):
         self.activated.append((key_id, active))
+
+    def set_key_max_sessions(self, key_id, max_sessions):
+        self.session_limits.append((key_id, max_sessions, "patch"))
 
     def usage(self, key_id):
         return {
@@ -130,8 +135,11 @@ class FakeOmniRoute:
     def set_max_output_override(self, provider, model_id, value):
         self.output_updates.append((provider, model_id, value))
 
-    def patch_key_permissions(self, key_id, allowed_models, allowed_combos, active):
+    def patch_key_permissions(
+        self, key_id, allowed_models, allowed_combos, active, max_sessions=0
+    ):
         self.permissions.append((key_id, allowed_models, allowed_combos, active))
+        self.session_limits.append((key_id, max_sessions, "permissions"))
 
     def call_logs(self, key_id, limit=200, offset=0):
         return self.logs[offset : offset + limit]
@@ -315,6 +323,7 @@ class PortalIntegrationTests(unittest.TestCase):
         status, dashboard, _ = self.post(client, "/verify", {"csrf": csrf, "token": token})
         self.assertEqual(status, 200)
         raw_key = self.fake_omni.created[0][3]
+        self.assertIn(("key-1", 1, "create"), self.fake_omni.session_limits)
         self.assertIn(raw_key, dashboard)
         self.assertIn("12,345 / 1,000,000", dashboard)
         self.assertIn("ornith-1.0-35b-fp8", dashboard)
@@ -330,13 +339,13 @@ class PortalIntegrationTests(unittest.TestCase):
 
         with sqlite3.connect(self.db_path) as connection:
             row = connection.execute(
-                "SELECT status,api_key_id,token_limit_id FROM users WHERE email=?",
+                "SELECT status,api_key_id,token_limit_id,max_sessions FROM users WHERE email=?",
                 ("alice@example.com",),
             ).fetchone()
             audit_actions = {
                 item[0] for item in connection.execute("SELECT action FROM audit_events")
             }
-        self.assertEqual(row, ("active", "key-1", "limit-key-1"))
+        self.assertEqual(row, ("active", "key-1", "limit-key-1", 1))
         self.assertIn("register.email", audit_actions)
         self.assertIn("verify.provision", audit_actions)
 
@@ -551,6 +560,98 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(captured[0][0].smtp_host, "preview.example.com")
         self.assertEqual(captured[0][0].smtp_password, "preview-password")
         self.assertEqual(captured[0][1], "admin@example.com")
+
+    def test_registration_settings_store_default_native_session_limit(self):
+        client, jar = self.login_admin_api()
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/settings",
+            {
+                "scope": "registration",
+                "registration_enabled": True,
+                "allowed_domains": "zjguardian.com",
+                "default_quota_tokens": 100000000,
+                "default_quota_reset": "weekly",
+                "default_quota_reset_time": "00:00",
+                "default_max_sessions": 1,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        with self.server.db.connect() as connection:
+            value = connection.execute(
+                "SELECT value FROM settings WHERE key='default_max_sessions'"
+            ).fetchone()["value"]
+        self.assertEqual(value, "1")
+
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/settings",
+            {"scope": "registration", "default_max_sessions": -1},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("0-10000", body["error"])
+
+    def test_existing_database_migrates_session_limit_without_restricting_old_keys(self):
+        legacy_path = pathlib.Path(self.tempdir.name) / "legacy" / "account-portal.db"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(legacy_path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE users (
+                  id TEXT PRIMARY KEY,
+                  email TEXT NOT NULL UNIQUE,
+                  login_name TEXT,
+                  password_hash TEXT NOT NULL,
+                  role TEXT NOT NULL CHECK(role IN ('admin','user')),
+                  status TEXT NOT NULL CHECK(status IN ('pending','active','disabled')),
+                  api_key_id TEXT,
+                  token_limit_id TEXT,
+                  quota_tokens INTEGER NOT NULL,
+                  quota_reset TEXT NOT NULL,
+                  quota_reset_time TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  verified_at INTEGER,
+                  last_login_at INTEGER
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO users(id,email,login_name,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-admin",
+                    "admin@llmctl.local",
+                    "admin",
+                    portal.hash_admin_password("correct horse battery staple"),
+                    "admin",
+                    "active",
+                    "legacy-key",
+                    0,
+                    "monthly",
+                    "00:00",
+                    portal.now(),
+                    portal.now(),
+                ),
+            )
+
+        legacy_config = portal.dataclasses.replace(self.config, db_path=legacy_path)
+        portal.Database(legacy_config).initialize()
+        with sqlite3.connect(legacy_path) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(users)")
+            }
+            existing_limit = connection.execute(
+                "SELECT max_sessions FROM users WHERE id='legacy-admin'"
+            ).fetchone()[0]
+            default_limit = connection.execute(
+                "SELECT value FROM settings WHERE key='default_max_sessions'"
+            ).fetchone()[0]
+        self.assertIn("max_sessions", columns)
+        self.assertEqual(existing_limit, 0)
+        self.assertEqual(default_limit, "1")
 
     def test_optional_published_origin_overrides_links_and_can_be_cleared(self):
         client, jar = self.login_admin_api()
@@ -997,6 +1098,42 @@ class PortalIntegrationTests(unittest.TestCase):
             )
         self.assertNotIn(("policy-key", False), self.fake_omni.activated)
 
+    def test_admin_updates_native_key_active_session_limit(self):
+        self.insert_control_user_and_model()
+        self.server.control.update_user(
+            {
+                "user_id": "policy-user",
+                "status": "active",
+                "max_sessions": 1,
+                "group_ids": ["default"],
+                "balance_delta": "0",
+                "grant_tokens": 0,
+            },
+            "admin@example.com",
+        )
+        with self.server.db.connect() as connection:
+            value = connection.execute(
+                "SELECT max_sessions FROM users WHERE id='policy-user'"
+            ).fetchone()["max_sessions"]
+        self.assertEqual(value, 1)
+        self.assertIn(("policy-key", 1, "permissions"), self.fake_omni.session_limits)
+
+    def test_invalid_active_session_limit_is_rejected_before_key_is_disabled(self):
+        self.insert_control_user_and_model()
+        with self.assertRaisesRegex(ValueError, "必须在 0-10000 之间"):
+            self.server.control.update_user(
+                {
+                    "user_id": "policy-user",
+                    "status": "active",
+                    "max_sessions": 10001,
+                    "group_ids": ["default"],
+                    "balance_delta": "0",
+                    "grant_tokens": 0,
+                },
+                "admin@example.com",
+            )
+        self.assertNotIn(("policy-key", False), self.fake_omni.activated)
+
     def test_chinese_group_name_is_normalized_and_duplicate_is_actionable(self):
         group_id = self.server.control.save_group(
             {"name": "  研发Ａ组  ", "description": "研发成员", "status": "active"}
@@ -1184,6 +1321,29 @@ class PortalIntegrationTests(unittest.TestCase):
 
 
 class PortalUnitTests(unittest.TestCase):
+    def test_native_key_payload_and_policy_patch_include_max_sessions(self):
+        config = mock.Mock(
+            gateway_manage_key="sk-management-test",
+            gateway_url="http://127.0.0.1:18000",
+        )
+        client = portal.OmniRouteClient(config)
+        calls = []
+
+        def request(method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "POST":
+                return {
+                    "id": "key-1",
+                    "key": "sk-new-native-key-abcdefghijklmnopqrstuvwxyz",
+                }
+            return {}
+
+        client.request = request
+        client.create_user_key("user-1", "user@example.com", 1)
+        client.patch_key_permissions("key-1", ["model-a"], [], True, 3)
+        self.assertEqual(calls[0][2]["maxSessions"], 1)
+        self.assertEqual(calls[1][2]["maxSessions"], 3)
+
     def test_existing_key_reveal_enables_omniroute_native_flag_without_restart(self):
         config = mock.Mock(
             gateway_manage_key="sk-management-test",
