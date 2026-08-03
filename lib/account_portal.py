@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -1151,6 +1151,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_ledger(user_id,occurred_
 CREATE INDEX IF NOT EXISTS idx_usage_user_time_v2 ON usage_ledger(user_id,occurred_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_ledger(occurred_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage_ledger(public_model_id,occurred_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_user_model_time ON usage_ledger(user_id,public_model_id,occurred_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_model_fk ON usage_ledger(model_id,id);
 CREATE INDEX IF NOT EXISTS idx_balance_user_time ON balance_transactions(user_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_grants_user_status ON token_grants(user_id,status);
@@ -2477,6 +2478,24 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 except ValueError as error:
                     self.json_response(400, {"error": str(error)})
             return
+        if path == "/portal-api/admin/analytics":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+                    self.json_response(
+                        200,
+                        self.app.control.admin_analytics(
+                            range_key=values.get("range", ["today"])[-1].strip(),
+                            model_id=values.get("model", [""])[-1].strip(),
+                            selected_user_id=values.get("user", [""])[-1].strip(),
+                            active_page=int(values.get("active_page", ["1"])[-1]),
+                            active_page_size=int(values.get("active_page_size", ["10"])[-1]),
+                        ),
+                    )
+                except (TypeError, ValueError) as error:
+                    self.json_response(400, {"error": str(error)})
+            return
         if path == "/portal-api/admin/stress":
             user, _ = self.api_require(admin=True)
             if user:
@@ -2576,6 +2595,10 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/portal-api/admin/users/update":
                 self.app.control.update_user(payload, user_identity(user))
                 result = {"ok": True}
+            elif path == "/portal-api/admin/users/bulk-policy":
+                result = self.app.control.bulk_update_user_policies(
+                    payload, user_identity(user)
+                )
             elif path == "/portal-api/admin/groups/save":
                 # save_group owns the fail-closed quiesce/mutate/resync cycle.
                 # Repeating it here needlessly disables every user key twice.
@@ -2615,7 +2638,21 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             and isinstance(result, dict)
             else result
         )
-        self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "success", self.remote_addr(), audit_result)
+        audit_status = (
+            "partial"
+            if path == "/portal-api/admin/users/bulk-policy"
+            and isinstance(result, dict)
+            and result.get("failed")
+            else "success"
+        )
+        self.app.db.audit(
+            user_identity(user),
+            path.removeprefix("/portal-api/"),
+            str(payload.get("id", "")),
+            audit_status,
+            self.remote_addr(),
+            audit_result,
+        )
         self.json_response(200, result)
 
     def api_login(self, payload: dict[str, Any]) -> None:
@@ -3814,6 +3851,13 @@ class PortalControlPlane:
         return result
 
     def sync_user(self, user_id: str) -> None:
+        # Permission publication, usage settlement, and administrator policy
+        # changes share one lock so a maintenance tick cannot re-enable a key
+        # with a stale policy during a fail-closed update.
+        with self.lock:
+            self._sync_user(user_id)
+
+    def _sync_user(self, user_id: str) -> None:
         with self.db.connect() as connection:
             user = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not user or not user["api_key_id"]:
@@ -4719,6 +4763,319 @@ class PortalControlPlane:
             "total": total,
         }
 
+    @staticmethod
+    def analytics_window(
+        range_key: str, stamp: int | None = None
+    ) -> tuple[ZoneInfo, str, str, list[dict[str, Any]]]:
+        """Build local-calendar buckets without relying on SQLite's host timezone.
+
+        Epoch boundaries keep the SQL indexable and remain correct in named
+        timezones with daylight-saving transitions. The last bucket is partial
+        and ends at the dashboard generation time.
+        """
+        ranges = {
+            "today": ("今日", "hour"),
+            "7d": ("近 7 天", "day"),
+            "30d": ("近 30 天", "day"),
+            "12m": ("近 12 个月", "month"),
+        }
+        if range_key not in ranges:
+            raise ValueError("统计范围无效")
+        timezone_name = os.environ.get("TZ", "Asia/Shanghai")
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            zone, timezone_name = ZoneInfo("UTC"), "UTC"
+        generated_at = stamp if stamp is not None else now()
+        current = datetime.datetime.fromtimestamp(generated_at, zone)
+        label, grain = ranges[range_key]
+        if range_key == "today":
+            cursor = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            count = current.hour + 1
+
+            def advance(value: datetime.datetime) -> datetime.datetime:
+                return value + datetime.timedelta(hours=1)
+
+            def bucket_label(value: datetime.datetime) -> str:
+                return value.strftime("%H:00")
+
+        elif range_key in {"7d", "30d"}:
+            count = 7 if range_key == "7d" else 30
+            cursor = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            cursor -= datetime.timedelta(days=count - 1)
+
+            def advance(value: datetime.datetime) -> datetime.datetime:
+                return value + datetime.timedelta(days=1)
+
+            def bucket_label(value: datetime.datetime) -> str:
+                return value.strftime("%m/%d")
+
+        else:
+            count = 12
+            month_index = current.year * 12 + current.month - 1 - (count - 1)
+            cursor = current.replace(
+                year=month_index // 12,
+                month=month_index % 12 + 1,
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+
+            def advance(value: datetime.datetime) -> datetime.datetime:
+                next_index = value.year * 12 + value.month
+                return value.replace(
+                    year=next_index // 12, month=next_index % 12 + 1
+                )
+
+            def bucket_label(value: datetime.datetime) -> str:
+                return value.strftime("%Y/%m")
+
+        buckets: list[dict[str, Any]] = []
+        dashboard_end = generated_at + 1
+        for index in range(count):
+            next_cursor = advance(cursor)
+            start_at = int(cursor.timestamp())
+            end_at = min(int(next_cursor.timestamp()), dashboard_end)
+            buckets.append(
+                {
+                    "index": index,
+                    "label": bucket_label(cursor),
+                    "start_at": start_at,
+                    "end_at": max(start_at + 1, end_at),
+                }
+            )
+            cursor = next_cursor
+        return zone, timezone_name, label, buckets
+
+    @staticmethod
+    def _usage_conditions(
+        start_at: int,
+        end_at: int,
+        model_id: str = "",
+        user_id: str = "",
+    ) -> tuple[str, list[Any]]:
+        conditions = ["l.occurred_at>=?", "l.occurred_at<?"]
+        parameters: list[Any] = [start_at, end_at]
+        if model_id:
+            conditions.append("l.public_model_id=?")
+            parameters.append(model_id)
+        if user_id:
+            conditions.append("l.user_id=?")
+            parameters.append(user_id)
+        return " AND ".join(conditions), parameters
+
+    def _usage_summary(
+        self,
+        connection: sqlite3.Connection,
+        start_at: int,
+        end_at: int,
+        model_id: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        where, parameters = self._usage_conditions(
+            start_at, end_at, model_id, user_id
+        )
+        row = connection.execute(
+            f"""SELECT COUNT(*) requests,
+                       COUNT(DISTINCT l.user_id) active_users,
+                       COALESCE(SUM(l.input_tokens),0) input_tokens,
+                       COALESCE(SUM(l.output_tokens),0) output_tokens,
+                       COALESCE(SUM(l.input_tokens+l.output_tokens),0) total_tokens,
+                       COALESCE(SUM(l.cached_tokens),0) cached_tokens,
+                       COALESCE(SUM(l.reasoning_tokens),0) reasoning_tokens,
+                       COALESCE(SUM(l.amount_micros),0) amount_micros,
+                       MAX(l.occurred_at) last_activity_at
+                FROM usage_ledger l WHERE {where}""",
+            parameters,
+        ).fetchone()
+        result = dict(row)
+        requests = int(result["requests"] or 0)
+        result["average_tokens_per_request"] = (
+            round(int(result["total_tokens"] or 0) / requests, 2)
+            if requests
+            else 0
+        )
+        return result
+
+    def _usage_series(
+        self,
+        connection: sqlite3.Connection,
+        buckets: list[dict[str, Any]],
+        model_id: str = "",
+        user_id: str = "",
+    ) -> list[dict[str, Any]]:
+        values = ",".join("(?,?,?)" for _ in buckets)
+        parameters: list[Any] = []
+        for bucket in buckets:
+            parameters.extend(
+                (bucket["index"], bucket["start_at"], bucket["end_at"])
+            )
+        join_conditions = [
+            "l.occurred_at>=b.start_at",
+            "l.occurred_at<b.end_at",
+        ]
+        if model_id:
+            join_conditions.append("l.public_model_id=?")
+            parameters.append(model_id)
+        if user_id:
+            join_conditions.append("l.user_id=?")
+            parameters.append(user_id)
+        rows = connection.execute(
+            f"""WITH buckets(bucket_index,start_at,end_at) AS (VALUES {values})
+                SELECT b.bucket_index,
+                       COUNT(l.id) requests,
+                       COUNT(DISTINCT l.user_id) active_users,
+                       COALESCE(SUM(l.input_tokens),0) input_tokens,
+                       COALESCE(SUM(l.output_tokens),0) output_tokens,
+                       COALESCE(SUM(l.input_tokens+l.output_tokens),0) total_tokens,
+                       COALESCE(SUM(l.cached_tokens),0) cached_tokens,
+                       COALESCE(SUM(l.reasoning_tokens),0) reasoning_tokens,
+                       COALESCE(SUM(l.amount_micros),0) amount_micros
+                FROM buckets b
+                LEFT JOIN usage_ledger l ON {' AND '.join(join_conditions)}
+                GROUP BY b.bucket_index ORDER BY b.bucket_index""",
+            parameters,
+        ).fetchall()
+        by_index = {int(row["bucket_index"]): dict(row) for row in rows}
+        return [
+            {
+                **by_index.get(bucket["index"], {}),
+                "bucket_index": bucket["index"],
+                "label": bucket["label"],
+                "start_at": bucket["start_at"],
+                "end_at": bucket["end_at"],
+            }
+            for bucket in buckets
+        ]
+
+    def admin_analytics(
+        self,
+        range_key: str = "today",
+        model_id: str = "",
+        selected_user_id: str = "",
+        active_page: int = 1,
+        active_page_size: int = 10,
+    ) -> dict[str, Any]:
+        if any(len(value) > 200 for value in (model_id, selected_user_id)):
+            raise ValueError("筛选条件过长")
+        if active_page < 1 or not 1 <= active_page_size <= 50:
+            raise ValueError("活跃用户分页范围无效")
+        generated_at = now()
+        _zone, timezone_name, range_label, buckets = self.analytics_window(
+            range_key, generated_at
+        )
+        start_at, end_at = buckets[0]["start_at"], generated_at + 1
+        with self.db.connect() as connection:
+            selected_user = None
+            if selected_user_id:
+                user = connection.execute(
+                    "SELECT id,email,status FROM users WHERE id=? AND role='user'",
+                    (selected_user_id,),
+                ).fetchone()
+                if not user:
+                    raise ValueError("用户不存在")
+                selected_user = {
+                    **dict(user),
+                    "summary": self._usage_summary(
+                        connection,
+                        start_at,
+                        end_at,
+                        model_id,
+                        selected_user_id,
+                    ),
+                    "timeseries": self._usage_series(
+                        connection, buckets, model_id, selected_user_id
+                    ),
+                }
+            summary = self._usage_summary(
+                connection, start_at, end_at, model_id
+            )
+            timeseries = self._usage_series(connection, buckets, model_id)
+            where, parameters = self._usage_conditions(
+                start_at, end_at, model_id
+            )
+            top_users = self.rows(
+                connection.execute(
+                    f"""SELECT u.id user_id,u.email,
+                               COUNT(l.id) requests,
+                               SUM(l.input_tokens) input_tokens,
+                               SUM(l.output_tokens) output_tokens,
+                               SUM(l.input_tokens+l.output_tokens) total_tokens,
+                               SUM(l.amount_micros) amount_micros,
+                               MAX(l.occurred_at) last_activity_at
+                        FROM usage_ledger l JOIN users u ON u.id=l.user_id
+                        WHERE {where}
+                        GROUP BY u.id,u.email
+                        ORDER BY total_tokens DESC,last_activity_at DESC
+                        LIMIT 10""",
+                    parameters,
+                ).fetchall()
+            )
+            active_total = int(
+                connection.execute(
+                    f"SELECT COUNT(DISTINCT l.user_id) FROM usage_ledger l WHERE {where}",
+                    parameters,
+                ).fetchone()[0]
+            )
+            active_pages = max(
+                1, (active_total + active_page_size - 1) // active_page_size
+            )
+            effective_page = min(active_page, active_pages)
+            active_users = self.rows(
+                connection.execute(
+                    f"""SELECT u.id user_id,u.email,u.status,
+                               COUNT(l.id) requests,
+                               SUM(l.input_tokens+l.output_tokens) total_tokens,
+                               SUM(l.amount_micros) amount_micros,
+                               MAX(l.occurred_at) last_activity_at
+                        FROM usage_ledger l JOIN users u ON u.id=l.user_id
+                        WHERE {where}
+                        GROUP BY u.id,u.email,u.status
+                        ORDER BY last_activity_at DESC,u.email
+                        LIMIT ? OFFSET ?""",
+                    [
+                        *parameters,
+                        active_page_size,
+                        (effective_page - 1) * active_page_size,
+                    ],
+                ).fetchall()
+            )
+        total_tokens = max(1, int(summary["total_tokens"] or 0))
+        for row in top_users:
+            row["share_percent"] = round(
+                int(row["total_tokens"] or 0) * 100 / total_tokens, 2
+            )
+        return {
+            "generated_at": generated_at,
+            "timezone": timezone_name,
+            "source": "usage_ledger",
+            "settlement_lag_seconds": 2,
+            "token_definition": "input_tokens + output_tokens",
+            "range": {
+                "key": range_key,
+                "label": range_label,
+                "grain": "hour" if range_key == "today" else (
+                    "month" if range_key == "12m" else "day"
+                ),
+                "start_at": start_at,
+                "end_at": generated_at,
+            },
+            "filters": {"model": model_id},
+            "summary": summary,
+            "timeseries": timeseries,
+            "top_users": top_users,
+            "active_users": active_users,
+            "active_pagination": {
+                "page": effective_page,
+                "page_size": active_page_size,
+                "pages": active_pages,
+                "total": active_total,
+            },
+            "selected_user": selected_user,
+        }
+
     def user_request_detail(self, user_id: str, request_id: str) -> dict[str, Any]:
         if not request_id or len(request_id) > 200:
             raise ValueError("请求记录不存在")
@@ -5180,6 +5537,87 @@ class PortalControlPlane:
             "usage_pagination": {key: usage_page[key] for key in ("page", "page_size", "pages", "total")},
             "transactions": transactions, "gateway_models": gateway_models, "combos": combos,
             "gateway_error": gateway_error, "stress_runs": stress_runs,
+        }
+
+    def bulk_update_user_policies(
+        self, payload: dict[str, Any], actor: str
+    ) -> dict[str, Any]:
+        with self.lock:
+            return self._bulk_update_user_policies(payload, actor)
+
+    def _bulk_update_user_policies(
+        self, payload: dict[str, Any], actor: str
+    ) -> dict[str, Any]:
+        """Atomically update selected local policies, then publish each key.
+
+        The caller must send explicit user IDs. This prevents a stale browser
+        filter from silently turning a targeted change into a global one.
+        Keys are disabled before the SQLite commit and only re-enabled by a
+        successful sync of the newly committed policy.
+        """
+        raw_ids = payload.get("user_ids", [])
+        if not isinstance(raw_ids, list):
+            raise ValueError("批量用户范围无效")
+        user_ids = list(dict.fromkeys(str(value).strip() for value in raw_ids if str(value).strip()))
+        if not user_ids or len(user_ids) > 2000:
+            raise ValueError("请选择 1-2000 个用户")
+        requested: dict[str, int] = {}
+        field_specs = {
+            "max_sessions": (normalize_max_sessions, "API Key 活跃会话上限"),
+            "requests_per_minute": (normalize_request_limit, "每分钟请求数"),
+            "requests_per_day": (normalize_request_limit, "每日请求数"),
+        }
+        for field, (normalizer, label) in field_specs.items():
+            if field not in payload or payload.get(field) is None:
+                continue
+            requested[field] = normalizer(payload[field], label)
+        if not requested:
+            raise ValueError("至少选择一个要修改的调用策略")
+        placeholders = ",".join("?" for _ in user_ids)
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                f"SELECT id,email,api_key_id FROM users WHERE role='user' AND id IN ({placeholders})",
+                user_ids,
+            ).fetchall()
+        if len(rows) != len(user_ids):
+            raise ValueError("批量范围包含不存在的用户，请刷新页面后重试")
+        disabled_ids: list[str] = []
+        try:
+            for row in rows:
+                if row["api_key_id"]:
+                    self.omni.activate_key(str(row["api_key_id"]), False)
+                disabled_ids.append(str(row["id"]))
+        except Exception as error:
+            for user_id in disabled_ids:
+                with contextlib.suppress(Exception):
+                    self.sync_user(user_id)
+            raise RuntimeError("无法安全停用全部目标 Key；本次批量修改未执行") from error
+        assignments = ",".join(f"{field}=?" for field in requested)
+        try:
+            with self.db.connect() as connection:
+                connection.execute(
+                    f"UPDATE users SET {assignments} WHERE role='user' AND id IN ({placeholders})",
+                    [*requested.values(), *user_ids],
+                )
+        except Exception:
+            for user_id in disabled_ids:
+                with contextlib.suppress(Exception):
+                    self.sync_user(user_id)
+            raise
+        failed: list[dict[str, str]] = []
+        for row in rows:
+            try:
+                self.sync_user(str(row["id"]))
+            except RuntimeError as error:
+                failed.append(
+                    {"user_id": str(row["id"]), "email": str(row["email"]), "error": str(error)}
+                )
+        return {
+            "updated": len(rows),
+            "synced": len(rows) - len(failed),
+            "failed": failed,
+            "changes": requested,
+            "actor": actor,
         }
 
     def update_user(self, payload: dict[str, Any], actor: str) -> None:

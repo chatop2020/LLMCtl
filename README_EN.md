@@ -241,6 +241,12 @@ sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
 
 Add `--check` to download and validate without replacing files. Upgrade metadata is stored in `/var/lib/llm-cluster/control-plane-version.env`, backups are kept under `/var/backups/llmctl/`, and `llmctl info` reports the installed control-plane commit.
 
+## Operations Metrics and Bulk Call Policies
+
+In OmniRoute mode, the administrator home page aggregates LLMCtl's separate SQLite usage ledger into Today (hourly), 7-day, 30-day, and 12-month views. It reports requests, active users, input/output/cached/reasoning tokens, cash charges, the top ten users by token usage, a server-paginated recent-active-user list, and per-user trends. Total tokens always means input plus output; cached tokens are a subset of input and reasoning tokens are a subset of output, so neither is counted twice. Every view supports model filtering and states its ledger source, timezone, and typical two-second settlement lag. Internal stress traffic or calls that cannot be mapped to a portal user are not presented as user usage.
+
+User management can bulk-update the API-key active-session limit, requests per minute (RPM), and requests per day for either the current filtered result or explicitly selected users. The browser submits an explicit list of user IDs. The backend validates the entire scope, briefly disables the target keys, commits the SQLite changes atomically, and then synchronizes each key to the selected AI gateway. A failed synchronization remains fail-closed. Bulk policy updates do not change cash balances, account status, groups, or model permissions, and every operation is written to the audit log.
+
 ## Model Catalog Commands
 
 After installation, you can still inspect the hardware and browse candidate models:

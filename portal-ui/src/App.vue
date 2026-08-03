@@ -33,6 +33,8 @@ const publicConfig = ref({
 });
 const dashboard = ref(null);
 const admin = ref(null);
+const adminAnalytics = ref(null);
+const analyticsLoading = ref(false);
 const busy = ref(false);
 const operation = ref("");
 const workspaceRefreshing = ref(false);
@@ -42,6 +44,8 @@ let toastTimer = null;
 let workspaceLoadVersion = 0;
 let usageRefreshTimer = null;
 let stressRefreshTimer = null;
+let analyticsRefreshTimer = null;
+let analyticsLoadVersion = 0;
 const authMode = ref(
   location.hash.startsWith("#/register")
     ? "register"
@@ -99,6 +103,22 @@ const userEdit = reactive({
   balance_delta: "0",
   group_ids: [],
   note: "",
+});
+const selectedUserIds = ref([]);
+const analyticsFilters = reactive({
+  range: "today",
+  model: "",
+  user: "",
+  active_page: 1,
+});
+const bulkPolicy = reactive({
+  scope: "filtered",
+  change_max_sessions: true,
+  max_sessions: 5,
+  change_requests_per_minute: true,
+  requests_per_minute: 100,
+  change_requests_per_day: true,
+  requests_per_day: 8000,
 });
 const groupEdit = reactive({
   id: "",
@@ -286,8 +306,49 @@ const filterFields = {
   "admin-stress": ["public_model_id", "status", "created_by", "error"],
   "admin-audit": ["actor", "action", "target", "status", "detail"],
 };
+const filteredAdminUsers = computed(() =>
+  filteredRows(
+    "admin-users",
+    (admin.value?.users || []).filter((user) => user.role === "user"),
+  ),
+);
+const currentAdminUserPage = computed(() =>
+  pageRows("admin-users", filteredAdminUsers.value),
+);
+const bulkTargetUsers = computed(() => {
+  if (bulkPolicy.scope === "selected") {
+    const selected = new Set(selectedUserIds.value);
+    return (admin.value?.users || []).filter(
+      (user) => user.role === "user" && selected.has(user.id),
+    );
+  }
+  return filteredAdminUsers.value;
+});
+const allCurrentUserPageSelected = computed(
+  () =>
+    currentAdminUserPage.value.length > 0 &&
+    currentAdminUserPage.value.every((user) =>
+      selectedUserIds.value.includes(user.id),
+    ),
+);
+const analyticsMaxTokens = computed(() =>
+  Math.max(
+    1,
+    ...(adminAnalytics.value?.timeseries || []).map((row) =>
+      Number(row.total_tokens || 0),
+    ),
+  ),
+);
+const selectedUserAnalyticsMaxTokens = computed(() =>
+  Math.max(
+    1,
+    ...(adminAnalytics.value?.selected_user?.timeseries || []).map((row) =>
+      Number(row.total_tokens || 0),
+    ),
+  ),
+);
 const PaginationBar = (props, { emit }) =>
-  props.total <= PAGE_SIZE
+  props.pages <= 1
     ? null
     : h(
         "nav",
@@ -485,12 +546,42 @@ function clearAuthenticatedClientState() {
   showApiKey.value = false;
   dashboard.value = null;
   admin.value = null;
+  adminAnalytics.value = null;
+  selectedUserIds.value = [];
   section.value = "overview";
   usageFilters.user = "";
   usageFilters.model = "";
   for (const key of Object.keys(requestDetails)) delete requestDetails[key];
   resetChatResult();
   chat.status = "idle";
+}
+
+async function loadAdminAnalytics(activePage = analyticsFilters.active_page, options = {}) {
+  if (!isAdmin.value || !session.value?.authenticated) return;
+  const version = ++analyticsLoadVersion;
+  analyticsLoading.value = true;
+  const params = new URLSearchParams({
+    range: analyticsFilters.range,
+    model: analyticsFilters.model,
+    user: analyticsFilters.user,
+    active_page: String(activePage || 1),
+    active_page_size: "10",
+  });
+  try {
+    const result = await api(`admin/analytics?${params}`);
+    if (version !== analyticsLoadVersion) return;
+    adminAnalytics.value = result;
+    analyticsFilters.active_page = result.active_pagination?.page || 1;
+  } catch (error) {
+    if (!options.silent) notify(`运行统计读取失败：${error.message}`, "bad");
+  } finally {
+    if (version === analyticsLoadVersion) analyticsLoading.value = false;
+  }
+}
+
+async function changeAnalyticsFilters() {
+  analyticsFilters.active_page = 1;
+  await loadAdminAnalytics(1);
 }
 
 function applyAdminSnapshot(snapshot) {
@@ -555,6 +646,8 @@ async function refreshWorkspace() {
       (usageFilters.user || usageFilters.model)
     )
       await loadUsagePage(1);
+    if (isAdmin.value && section.value === "overview")
+      await loadAdminAnalytics(analyticsFilters.active_page);
   } finally {
     if (version === workspaceLoadVersion) workspaceRefreshing.value = false;
   }
@@ -688,6 +781,30 @@ function compactTokens(value) {
   const number = Number(value || 0);
   if (number >= 1000) return `${number / 1000}k`;
   return String(number);
+}
+
+function formatTokens(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function analyticsSegmentHeight(value, maximum) {
+  return `${Math.max(0, (Number(value || 0) / Math.max(1, maximum)) * 100)}%`;
+}
+
+function analyticsLabelVisible(index, total) {
+  if (total <= 12) return true;
+  const step = Math.ceil(total / 8);
+  return index === 0 || index === total - 1 || index % step === 0;
+}
+
+async function analyzeUser(userId) {
+  analyticsFilters.user = userId || "";
+  await loadAdminAnalytics(1);
+  if (userId) await nextTick();
+  document.querySelector("#user-usage-analysis")?.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  });
 }
 
 async function goToSection(nextSection) {
@@ -1411,6 +1528,65 @@ async function saveUser() {
   if (result) document.querySelector("#user-editor")?.close();
 }
 
+function toggleUserSelection(userId, checked) {
+  const selected = new Set(selectedUserIds.value);
+  if (checked) selected.add(userId);
+  else selected.delete(userId);
+  selectedUserIds.value = [...selected];
+}
+
+function toggleCurrentUserPage(checked) {
+  const selected = new Set(selectedUserIds.value);
+  for (const user of currentAdminUserPage.value) {
+    if (checked) selected.add(user.id);
+    else selected.delete(user.id);
+  }
+  selectedUserIds.value = [...selected];
+}
+
+function openBulkPolicy() {
+  bulkPolicy.scope = selectedUserIds.value.length ? "selected" : "filtered";
+  document.querySelector("#bulk-policy-editor")?.showModal();
+}
+
+async function saveBulkPolicy() {
+  if (!bulkTargetUsers.value.length)
+    return notify("当前批量范围没有用户", "bad");
+  const payload = {
+    user_ids: bulkTargetUsers.value.map((user) => user.id),
+  };
+  if (bulkPolicy.change_max_sessions)
+    payload.max_sessions = bulkPolicy.max_sessions;
+  if (bulkPolicy.change_requests_per_minute)
+    payload.requests_per_minute = bulkPolicy.requests_per_minute;
+  if (bulkPolicy.change_requests_per_day)
+    payload.requests_per_day = bulkPolicy.requests_per_day;
+  if (Object.keys(payload).length === 1)
+    return notify("请至少勾选一个要修改的字段", "bad");
+  const result = await action(
+    () =>
+      api("admin/users/bulk-policy", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    `已更新 ${bulkTargetUsers.value.length} 个用户的调用策略`,
+    {
+      key: "bulk-user-policy",
+      pending: `正在停用、更新并重新同步 ${bulkTargetUsers.value.length} 个用户 Key…`,
+    },
+  );
+  if (!result) return;
+  if (result.failed?.length) {
+    notify(
+      `${result.synced}/${result.updated} 个用户同步成功；${result.failed.length} 个 Key 已保持停用，请查看权限异常。`,
+      "bad",
+    );
+    return;
+  }
+  selectedUserIds.value = [];
+  document.querySelector("#bulk-policy-editor")?.close();
+}
+
 async function saveGroup() {
   const result = await action(
     () =>
@@ -1579,6 +1755,17 @@ onMounted(async () => {
       });
     }, 15_000);
     stressRefreshTimer = window.setInterval(pollStressRun, 2_000);
+    analyticsRefreshTimer = window.setInterval(() => {
+      if (
+        !isAdmin.value ||
+        section.value !== "overview" ||
+        document.hidden ||
+        busy.value ||
+        analyticsLoading.value
+      )
+        return;
+      loadAdminAnalytics(analyticsFilters.active_page, { silent: true });
+    }, 30_000);
   } catch (error) {
     notify(error.message, "bad");
   }
@@ -1587,6 +1774,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (usageRefreshTimer) window.clearInterval(usageRefreshTimer);
   if (stressRefreshTimer) window.clearInterval(stressRefreshTimer);
+  if (analyticsRefreshTimer) window.clearInterval(analyticsRefreshTimer);
   if (chatTimer) window.clearInterval(chatTimer);
   if (toastTimer) window.clearTimeout(toastTimer);
 });
@@ -2651,69 +2839,311 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </div>
-            <div class="metrics">
-              <article>
-                <span>用户</span
-                ><strong>{{
-                  admin.users.filter((u) => u.role === "user").length
-                }}</strong
-                ><small
-                  >{{
-                    admin.users.filter(
-                      (u) => u.role === "user" && u.status === "active",
-                    ).length
-                  }}
-                  active</small
+            <section class="panel analytics-toolbar">
+              <div>
+                <strong>用量观察范围</strong>
+                <small>按已结算请求统计；切换模型会同步更新全部指标。</small>
+              </div>
+              <select
+                v-model="analyticsFilters.range"
+                aria-label="统计时间范围"
+                @change="changeAnalyticsFilters"
+              >
+                <option value="today">今日（按小时）</option>
+                <option value="7d">近 7 天（按天）</option>
+                <option value="30d">近 30 天（按天）</option>
+                <option value="12m">近 12 个月（按月）</option>
+              </select>
+              <select
+                v-model="analyticsFilters.model"
+                aria-label="按模型筛选运行统计"
+                @change="changeAnalyticsFilters"
+              >
+                <option value="">全部模型</option>
+                <option
+                  v-for="model in admin.models"
+                  :key="model.id"
+                  :value="model.public_model_id"
                 >
-              </article>
-              <article>
-                <span>开放模型</span
-                ><strong>{{
-                  admin.models.filter((m) => m.status === "published").length
-                }}</strong
-                ><small
-                  >{{
-                    admin.models.filter((m) => m.health_status === "healthy")
-                      .length
-                  }}
-                  healthy</small
+                  {{ model.public_model_id }}
+                </option>
+              </select>
+              <button
+                type="button"
+                class="ghost"
+                :disabled="analyticsLoading"
+                @click="loadAdminAnalytics(analyticsFilters.active_page)"
+              >
+                {{ analyticsLoading ? "刷新中…" : "刷新统计" }}
+              </button>
+            </section>
+
+            <template v-if="adminAnalytics">
+              <div class="metrics operations-kpis">
+                <article>
+                  <span>{{ adminAnalytics.range.label }}总 Token</span>
+                  <strong>{{ formatTokens(adminAnalytics.summary.total_tokens) }}</strong>
+                  <small>输入 + 输出，不重复计算缓存与思考</small>
+                </article>
+                <article>
+                  <span>{{ adminAnalytics.range.label }}请求</span>
+                  <strong>{{ formatTokens(adminAnalytics.summary.requests) }}</strong>
+                  <small
+                    >平均
+                    {{ formatTokens(adminAnalytics.summary.average_tokens_per_request) }}
+                    Token / 请求</small
+                  >
+                </article>
+                <article>
+                  <span>{{ adminAnalytics.range.label }}活跃用户</span>
+                  <strong>{{ formatTokens(adminAnalytics.summary.active_users) }}</strong>
+                  <small>至少产生 1 条已结算请求</small>
+                </article>
+                <article>
+                  <span>{{ adminAnalytics.range.label }}余额扣款</span>
+                  <strong>{{ money(adminAnalytics.summary.amount_micros) }}</strong>
+                  <small>按请求发生时的模型价格快照结算</small>
+                </article>
+              </div>
+
+              <section class="panel usage-trend-panel">
+                <div class="panel-head analytics-panel-head">
+                  <div>
+                    <h2>Token 用量趋势</h2>
+                    <p>
+                      {{ adminAnalytics.range.label }} ·
+                      {{ analyticsFilters.model || "全部模型" }}
+                    </p>
+                  </div>
+                  <div class="chart-legend" aria-label="图例">
+                    <span><i class="input"></i>输入</span>
+                    <span><i class="output"></i>输出</span>
+                  </div>
+                </div>
+                <div class="usage-composition" aria-label="Token 构成">
+                  <span
+                    ><b>{{ formatTokens(adminAnalytics.summary.input_tokens) }}</b
+                    >输入 Token</span
+                  ><span
+                    ><b>{{ formatTokens(adminAnalytics.summary.output_tokens) }}</b
+                    >输出 Token</span
+                  ><span
+                    ><b>{{ formatTokens(adminAnalytics.summary.cached_tokens) }}</b
+                    >缓存命中 Token（输入子集）</span
+                  ><span
+                    ><b>{{ formatTokens(adminAnalytics.summary.reasoning_tokens) }}</b
+                    >思考 Token（输出子集）</span
+                  >
+                </div>
+                <div
+                  class="usage-chart"
+                  role="img"
+                  :aria-label="`${adminAnalytics.range.label} Token 用量柱状图`"
                 >
-              </article>
-              <article>
-                <span>免费资源</span
-                ><strong>{{
-                  admin.free_resources.filter((r) => r.available).length
-                }}</strong
-                ><small
-                  >{{
-                    admin.free_resources.filter(
-                      (r) => r.test_status === "healthy",
-                    ).length
-                  }}
-                  tested</small
+                  <div
+                    v-for="(point, index) in adminAnalytics.timeseries"
+                    :key="point.start_at"
+                    class="chart-slot"
+                    :title="`${point.label}：输入 ${formatTokens(point.input_tokens)}，输出 ${formatTokens(point.output_tokens)}，请求 ${formatTokens(point.requests)}`"
+                  >
+                    <div class="chart-value">
+                      {{ point.total_tokens ? compactTokens(point.total_tokens) : "" }}
+                    </div>
+                    <div class="chart-column">
+                      <i
+                        class="chart-segment output"
+                        :style="{ height: analyticsSegmentHeight(point.output_tokens, analyticsMaxTokens) }"
+                      ></i>
+                      <i
+                        class="chart-segment input"
+                        :style="{ height: analyticsSegmentHeight(point.input_tokens, analyticsMaxTokens) }"
+                      ></i>
+                    </div>
+                    <small v-if="analyticsLabelVisible(index, adminAnalytics.timeseries.length)">
+                      {{ point.label }}
+                    </small>
+                  </div>
+                </div>
+                <p class="analytics-source">
+                  数据源：LLMCtl 已结算用量账本 · 时区 {{ adminAnalytics.timezone }} ·
+                  通常延迟约 {{ adminAnalytics.settlement_lag_seconds }} 秒 ·
+                  更新于 {{ date(adminAnalytics.generated_at) }}
+                </p>
+              </section>
+
+              <div class="analytics-grid">
+                <section class="panel ranking-panel">
+                  <div class="panel-head">
+                    <div>
+                      <h2>Token 用量 Top 10</h2>
+                      <p>按所选时间和模型范围排序。</p>
+                    </div>
+                  </div>
+                  <div v-if="adminAnalytics.top_users.length" class="ranking-list">
+                    <button
+                      v-for="(user, index) in adminAnalytics.top_users"
+                      :key="user.user_id"
+                      type="button"
+                      class="ranking-row"
+                      @click="analyzeUser(user.user_id)"
+                    >
+                      <span class="rank">{{ index + 1 }}</span>
+                      <span class="ranking-identity"
+                        ><strong>{{ user.email }}</strong
+                        ><small>{{ formatTokens(user.requests) }} 次请求</small></span
+                      >
+                      <span class="ranking-value"
+                        ><strong>{{ formatTokens(user.total_tokens) }}</strong
+                        ><small>{{ user.share_percent }}%</small></span
+                      >
+                      <i><b :style="{ width: `${user.share_percent}%` }"></b></i>
+                    </button>
+                  </div>
+                  <p v-else class="empty-state">当前范围尚无已结算请求。</p>
+                </section>
+
+                <section class="panel active-users-panel">
+                  <div class="panel-head">
+                    <div>
+                      <h2>最近活跃用户</h2>
+                      <p>按最后一次已结算请求倒序。</p>
+                    </div>
+                    <span>{{ adminAnalytics.active_pagination.total }} 人</span>
+                  </div>
+                  <div class="table-wrap compact-table">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>用户</th>
+                          <th>最后活跃</th>
+                          <th>请求</th>
+                          <th>Token</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="user in adminAnalytics.active_users"
+                          :key="user.user_id"
+                        >
+                          <td>{{ user.email }}</td>
+                          <td>{{ date(user.last_activity_at) }}</td>
+                          <td>{{ formatTokens(user.requests) }}</td>
+                          <td>{{ formatTokens(user.total_tokens) }}</td>
+                          <td>
+                            <button class="ghost" @click="analyzeUser(user.user_id)">
+                              分析
+                            </button>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <PaginationBar
+                    :page="adminAnalytics.active_pagination.page"
+                    :pages="adminAnalytics.active_pagination.pages"
+                    :total="adminAnalytics.active_pagination.total"
+                    @previous="loadAdminAnalytics(adminAnalytics.active_pagination.page - 1)"
+                    @next="loadAdminAnalytics(adminAnalytics.active_pagination.page + 1)"
+                  />
+                </section>
+              </div>
+
+              <section id="user-usage-analysis" class="panel user-analysis">
+                <div class="panel-head analytics-panel-head">
+                  <div>
+                    <h2>单用户用量分析</h2>
+                    <p>沿用上方时间和模型范围，可按小时、天或月观察。</p>
+                  </div>
+                  <select
+                    v-model="analyticsFilters.user"
+                    aria-label="选择要分析的用户"
+                    @change="analyzeUser(analyticsFilters.user)"
+                  >
+                    <option value="">选择用户</option>
+                    <option
+                      v-for="user in admin.users.filter((item) => item.role === 'user')"
+                      :key="user.id"
+                      :value="user.id"
+                    >
+                      {{ user.email }}
+                    </option>
+                  </select>
+                </div>
+                <template v-if="adminAnalytics.selected_user">
+                  <div class="user-analysis-summary">
+                    <span
+                      ><b>{{ adminAnalytics.selected_user.email }}</b
+                      >当前分析对象</span
+                    ><span
+                      ><b>{{ formatTokens(adminAnalytics.selected_user.summary.total_tokens) }}</b
+                      >总 Token</span
+                    ><span
+                      ><b>{{ formatTokens(adminAnalytics.selected_user.summary.requests) }}</b
+                      >请求数</span
+                    ><span
+                      ><b>{{ money(adminAnalytics.selected_user.summary.amount_micros) }}</b
+                      >余额扣款</span
+                    >
+                  </div>
+                  <div class="usage-chart user-usage-chart" role="img" aria-label="单用户 Token 用量趋势">
+                    <div
+                      v-for="(point, index) in adminAnalytics.selected_user.timeseries"
+                      :key="point.start_at"
+                      class="chart-slot"
+                      :title="`${point.label}：输入 ${formatTokens(point.input_tokens)}，输出 ${formatTokens(point.output_tokens)}`"
+                    >
+                      <div class="chart-value">
+                        {{ point.total_tokens ? compactTokens(point.total_tokens) : "" }}
+                      </div>
+                      <div class="chart-column">
+                        <i
+                          class="chart-segment output"
+                          :style="{ height: analyticsSegmentHeight(point.output_tokens, selectedUserAnalyticsMaxTokens) }"
+                        ></i>
+                        <i
+                          class="chart-segment input"
+                          :style="{ height: analyticsSegmentHeight(point.input_tokens, selectedUserAnalyticsMaxTokens) }"
+                        ></i>
+                      </div>
+                      <small v-if="analyticsLabelVisible(index, adminAnalytics.selected_user.timeseries.length)">
+                        {{ point.label }}
+                      </small>
+                    </div>
+                  </div>
+                </template>
+                <p v-else class="empty-state">选择一个活跃用户查看其用量趋势。</p>
+              </section>
+            </template>
+            <section v-else class="panel empty-state">
+              {{ analyticsLoading ? "正在读取运行统计…" : "运行统计暂不可用。" }}
+            </section>
+
+            <details class="panel service-inventory">
+              <summary>控制面状态与服务入口</summary>
+              <div class="service-facts">
+                <span
+                  ><b>{{ admin.users.filter((u) => u.role === "user").length }}</b
+                  >用户</span
+                ><span
+                  ><b>{{ admin.models.filter((m) => m.status === "published").length }}</b
+                  >开放模型</span
+                ><span
+                  ><b>{{ admin.free_resources.filter((r) => r.available).length }}</b
+                  >可用免费资源</span
+                ><span
+                  ><b>{{ admin.users.filter((u) => u.permission_status === "failed").length }}</b
+                  >权限异常</span
                 >
-              </article>
-              <article>
-                <span>权限异常</span
-                ><strong>{{
-                  admin.users.filter((u) => u.permission_status === "failed")
-                    .length
-                }}</strong
-                ><small>可一键重新对账</small>
-              </article>
-            </div>
-            <section class="panel">
-              <h2>服务入口</h2>
+              </div>
               <div class="architecture">
                 <div><strong>/ui/</strong><span>LLMCtl 门户</span></div>
                 <i>→</i>
-                <div>
-                  <strong>/portal-api/</strong><span>账户与管理 API</span>
-                </div>
+                <div><strong>/portal-api/</strong><span>账户与管理 API</span></div>
                 <i class="split">↘</i>
                 <div><strong>/v1/</strong><span>推理 API</span></div>
               </div>
-            </section>
+            </details>
           </section>
 
           <section v-if="section === 'models'" class="page">
@@ -3023,6 +3453,19 @@ onBeforeUnmount(() => {
                 <h1>用户管理</h1>
                 <p>禁用、分组、现金余额调整与调用限制集中完成。</p>
               </div>
+              <div class="button-row">
+                <span v-if="selectedUserIds.length" class="selection-count"
+                  >已选 {{ selectedUserIds.length }} 人</span
+                >
+                <button
+                  type="button"
+                  class="primary"
+                  :disabled="!filteredAdminUsers.length || busy"
+                  @click="openBulkPolicy"
+                >
+                  批量修改调用策略
+                </button>
+              </div>
             </div>
             <ListFilterBar
               v-model="listFilters['admin-users'].query"
@@ -3031,18 +3474,21 @@ onBeforeUnmount(() => {
                 statusOptions.slice(0, 1).concat(statusOptions.slice(2, 3))
               "
               status-label="全部账户状态"
-              :count="
-                filteredRows(
-                  'admin-users',
-                  admin.users.filter((user) => user.role === 'user'),
-                ).length
-              "
+              :count="filteredAdminUsers.length"
               placeholder="搜索邮箱或同步状态"
             />
             <div class="table-wrap panel">
               <table>
                 <thead>
                   <tr>
+                    <th class="selection-column">
+                      <input
+                        type="checkbox"
+                        aria-label="选择当前页全部用户"
+                        :checked="allCurrentUserPageSelected"
+                        @change="toggleCurrentUserPage($event.target.checked)"
+                      />
+                    </th>
                     <th>用户</th>
                     <th>状态</th>
                     <th>现金余额</th>
@@ -3053,15 +3499,17 @@ onBeforeUnmount(() => {
                 </thead>
                 <tbody>
                   <tr
-                    v-for="user in pageRows(
-                      'admin-users',
-                      filteredRows(
-                        'admin-users',
-                        admin.users.filter((u) => u.role === 'user'),
-                      ),
-                    )"
+                    v-for="user in currentAdminUserPage"
                     :key="user.id"
                   >
+                    <td class="selection-column">
+                      <input
+                        type="checkbox"
+                        :aria-label="`选择用户 ${user.email}`"
+                        :checked="selectedUserIds.includes(user.id)"
+                        @change="toggleUserSelection(user.id, $event.target.checked)"
+                      />
+                    </td>
                     <td>
                       <strong>{{ user.email }}</strong
                       ><small>{{ date(user.created_at) }}</small>
@@ -3102,48 +3550,14 @@ onBeforeUnmount(() => {
               </table>
             </div>
             <PaginationBar
-              :page="
-                pageNumber(
-                  'admin-users',
-                  filteredRows(
-                    'admin-users',
-                    admin.users.filter((u) => u.role === 'user'),
-                  ),
-                )
-              "
-              :pages="
-                pageCount(
-                  filteredRows(
-                    'admin-users',
-                    admin.users.filter((u) => u.role === 'user'),
-                  ),
-                )
-              "
-              :total="
-                filteredRows(
-                  'admin-users',
-                  admin.users.filter((u) => u.role === 'user'),
-                ).length
-              "
+              :page="pageNumber('admin-users', filteredAdminUsers)"
+              :pages="pageCount(filteredAdminUsers)"
+              :total="filteredAdminUsers.length"
               @previous="
-                changePage(
-                  'admin-users',
-                  filteredRows(
-                    'admin-users',
-                    admin.users.filter((u) => u.role === 'user'),
-                  ),
-                  -1,
-                )
+                changePage('admin-users', filteredAdminUsers, -1)
               "
               @next="
-                changePage(
-                  'admin-users',
-                  filteredRows(
-                    'admin-users',
-                    admin.users.filter((u) => u.role === 'user'),
-                  ),
-                  1,
-                )
+                changePage('admin-users', filteredAdminUsers, 1)
               "
             />
           </section>
@@ -4083,6 +4497,109 @@ onBeforeUnmount(() => {
           @click="saveUser"
         >
           {{ operation === "user-save" ? "保存中…" : "保存并同步权限" }}
+        </button>
+      </div>
+    </dialog>
+    <dialog id="bulk-policy-editor" class="bulk-policy-dialog">
+      <form method="dialog" class="dialog-head">
+        <div>
+          <h2>批量修改调用策略</h2>
+          <p>只更新明确勾选的字段，其他用户资料保持不变。</p>
+        </div>
+        <button class="icon-button" aria-label="关闭">×</button>
+      </form>
+      <div class="form-stack">
+        <fieldset class="bulk-scope">
+          <legend>修改范围</legend>
+          <label>
+            <input v-model="bulkPolicy.scope" type="radio" value="filtered" />
+            <span
+              ><strong>当前筛选结果</strong
+              ><small>{{ filteredAdminUsers.length }} 位用户；包含所有分页</small></span
+            >
+          </label>
+          <label :class="{ disabled: !selectedUserIds.length }">
+            <input
+              v-model="bulkPolicy.scope"
+              type="radio"
+              value="selected"
+              :disabled="!selectedUserIds.length"
+            />
+            <span
+              ><strong>已勾选用户</strong
+              ><small>{{ selectedUserIds.length }} 位用户</small></span
+            >
+          </label>
+        </fieldset>
+
+        <section class="bulk-policy-fields">
+          <label class="bulk-field-toggle">
+            <input v-model="bulkPolicy.change_max_sessions" type="checkbox" />
+            <span>修改 API Key 活跃会话上限</span>
+          </label>
+          <label
+            >活动会话数
+            <input
+              v-model.number="bulkPolicy.max_sessions"
+              type="number"
+              min="0"
+              max="10000"
+              :disabled="!bulkPolicy.change_max_sessions"
+            />
+            <small>原生 maxSessions；0 表示不限制，不等于 HTTP 并发数。</small>
+          </label>
+
+          <label class="bulk-field-toggle">
+            <input
+              v-model="bulkPolicy.change_requests_per_minute"
+              type="checkbox"
+            />
+            <span>修改每分钟请求数</span>
+          </label>
+          <label
+            >RPM
+            <input
+              v-model.number="bulkPolicy.requests_per_minute"
+              type="number"
+              min="0"
+              max="10000000"
+              :disabled="!bulkPolicy.change_requests_per_minute"
+            />
+            <small>按 API Key 限制突发请求；0 表示不限制。</small>
+          </label>
+
+          <label class="bulk-field-toggle">
+            <input
+              v-model="bulkPolicy.change_requests_per_day"
+              type="checkbox"
+            />
+            <span>修改每日请求数</span>
+          </label>
+          <label
+            >每日请求上限
+            <input
+              v-model.number="bulkPolicy.requests_per_day"
+              type="number"
+              min="0"
+              max="10000000"
+              :disabled="!bulkPolicy.change_requests_per_day"
+            />
+            <small>控制持续滥用；0 表示不限制。</small>
+          </label>
+        </section>
+
+        <div class="warning bulk-policy-warning">
+          将修改 <strong>{{ bulkTargetUsers.length }}</strong> 位用户。保存时会短暂停用这些
+          Key，写入本地策略后逐一同步到当前 AI 接入层；同步失败的 Key 会保持停用，避免旧策略继续生效。
+          现金余额、账户状态、用户组和模型权限不会被修改。
+        </div>
+        <button
+          type="button"
+          class="primary"
+          :disabled="busy || !bulkTargetUsers.length"
+          @click="saveBulkPolicy"
+        >
+          {{ operation === "bulk-user-policy" ? "正在批量同步…" : `确认修改 ${bulkTargetUsers.length} 位用户` }}
         </button>
       </div>
     </dialog>

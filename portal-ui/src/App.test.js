@@ -157,6 +157,44 @@ describe("LLMCtl portal contracts", () => {
     expect(source).not.toContain("尚未保存，请输入或前往 API Key 页面轮换");
   });
 
+  it("builds source-backed operations analytics without double-counting token subsets", () => {
+    for (const marker of [
+      "admin/analytics?",
+      "adminAnalytics.summary.total_tokens",
+      "adminAnalytics.timeseries",
+      "adminAnalytics.top_users",
+      "adminAnalytics.active_users",
+      "adminAnalytics.selected_user",
+      "settlement_lag_seconds",
+      "输入 + 输出，不重复计算缓存与思考",
+      "今日（按小时）",
+      "近 7 天（按天）",
+      "近 30 天（按天）",
+      "近 12 个月（按月）",
+      "analyticsRefreshTimer",
+    ])
+      expect(source).toContain(marker);
+    expect(style).toContain(".usage-chart");
+    expect(style).toContain(".ranking-list");
+  });
+
+  it("supports explicit audited bulk updates for mutable user call policies", () => {
+    for (const marker of [
+      "admin/users/bulk-policy",
+      "selectedUserIds",
+      "filteredAdminUsers",
+      "bulkTargetUsers",
+      "change_max_sessions",
+      "change_requests_per_minute",
+      "change_requests_per_day",
+      "批量修改调用策略",
+      "现金余额、账户状态、用户组和模型权限不会被修改",
+    ])
+      expect(source).toContain(marker);
+    expect(style).toContain(".bulk-policy-dialog");
+    expect(style).toContain(".selection-column");
+  });
+
   it("uses public-project LLMCtl language and a light operations-console visual system", () => {
     for (const marker of [
       "OmniRoute",

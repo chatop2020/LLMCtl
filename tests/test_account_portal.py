@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import dataclasses
+import datetime
 import http.cookiejar
 import importlib.util
 import json
@@ -918,6 +919,7 @@ class PortalIntegrationTests(unittest.TestCase):
                 "idx_usage_user_time_v2",
                 "idx_usage_time",
                 "idx_usage_model_time",
+                "idx_usage_user_model_time",
                 "idx_usage_model_fk",
             }.issubset(
                 indexes
@@ -937,6 +939,177 @@ class PortalIntegrationTests(unittest.TestCase):
             self.server.control.usage_page(owner_user_id="missing-user")["total"],
             0,
         )
+
+    def test_admin_analytics_uses_local_buckets_and_does_not_double_count_subtokens(self):
+        self.insert_control_user_and_model()
+        zone = portal.ZoneInfo("Asia/Shanghai")
+        current = int(datetime.datetime(2026, 8, 3, 10, 30, tzinfo=zone).timestamp())
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id,email,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "analytics-user", "analytics@example.com", portal.hash_password("another password"),
+                    "user", "active", "analytics-key", 0, "none", "00:00", current, current,
+                ),
+            )
+            for request_id, user_id, hour, input_tokens, output_tokens, cached, reasoning in (
+                ("analytics-a", "policy-user", 9, 100, 50, 20, 10),
+                ("analytics-b", "analytics-user", 10, 40, 10, 5, 2),
+            ):
+                occurred = int(
+                    datetime.datetime(2026, 8, 3, hour, 15, tzinfo=zone).timestamp()
+                )
+                connection.execute(
+                    """INSERT INTO usage_ledger(
+                         request_id,user_id,api_key_id,model_id,public_model_id,
+                         provider,resolved_model,input_tokens,output_tokens,cached_tokens,
+                         reasoning_tokens,granted_tokens,amount_micros,price_snapshot_json,
+                         occurred_at,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        request_id, user_id, f"{user_id}-key", "model-1", "gdn-inside",
+                        "local", "ornith", input_tokens, output_tokens, cached,
+                        reasoning, 0, 100, "{}", occurred, current,
+                    ),
+                )
+        with mock.patch.dict(portal.os.environ, {"TZ": "Asia/Shanghai"}), mock.patch.object(
+            portal, "now", return_value=current
+        ):
+            result = self.server.control.admin_analytics(
+                range_key="today", selected_user_id="policy-user"
+            )
+        self.assertEqual(result["timezone"], "Asia/Shanghai")
+        self.assertEqual(result["range"]["grain"], "hour")
+        self.assertEqual(len(result["timeseries"]), 11)
+        self.assertEqual(result["summary"]["input_tokens"], 140)
+        self.assertEqual(result["summary"]["output_tokens"], 60)
+        self.assertEqual(result["summary"]["total_tokens"], 200)
+        self.assertEqual(result["summary"]["cached_tokens"], 25)
+        self.assertEqual(result["summary"]["reasoning_tokens"], 12)
+        self.assertEqual(result["summary"]["active_users"], 2)
+        self.assertEqual(result["top_users"][0]["email"], "policy@example.com")
+        self.assertEqual(result["active_pagination"]["total"], 2)
+        self.assertEqual(result["selected_user"]["summary"]["total_tokens"], 150)
+        self.assertEqual(result["timeseries"][9]["total_tokens"], 150)
+        self.assertEqual(result["timeseries"][10]["total_tokens"], 50)
+
+    def test_bulk_user_policy_update_is_explicit_atomic_and_synced(self):
+        self.insert_control_user_and_model()
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id,email,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "bulk-user", "bulk@example.com", portal.hash_password("another password"),
+                    "user", "active", "bulk-key", 0, "none", "00:00", stamp, stamp,
+                ),
+            )
+        result = self.server.control.bulk_update_user_policies(
+            {
+                "user_ids": ["policy-user", "bulk-user"],
+                "max_sessions": 5,
+                "requests_per_minute": 100,
+                "requests_per_day": 8000,
+            },
+            "admin",
+        )
+        self.assertEqual(result["updated"], 2)
+        self.assertEqual(result["synced"], 2)
+        self.assertEqual(result["failed"], [])
+        with self.server.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT max_sessions,requests_per_minute,requests_per_day FROM users WHERE id IN ('policy-user','bulk-user')"
+            ).fetchall()
+        self.assertEqual(
+            {(row["max_sessions"], row["requests_per_minute"], row["requests_per_day"]) for row in rows},
+            {(5, 100, 8000)},
+        )
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertIn(("bulk-key", False), self.fake_omni.activated)
+        self.assertIn(("policy-key", 100, 8000, "permissions"), self.fake_omni.rate_limits)
+        self.assertIn(("bulk-key", 100, 8000, "permissions"), self.fake_omni.rate_limits)
+
+    def test_bulk_user_policy_update_validates_full_scope_before_disabling_keys(self):
+        self.insert_control_user_and_model()
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            self.server.control.bulk_update_user_policies(
+                {
+                    "user_ids": ["policy-user", "missing-user"],
+                    "requests_per_minute": 100,
+                },
+                "admin",
+            )
+        self.assertNotIn(("policy-key", False), self.fake_omni.activated)
+
+    def test_bulk_user_policy_update_keeps_failed_key_disabled(self):
+        self.insert_control_user_and_model()
+        original_patch = self.fake_omni.patch_key_permissions
+
+        def fail_policy_sync(key_id, *args, **kwargs):
+            if key_id == "policy-key":
+                raise RuntimeError("gateway policy sync failed")
+            return original_patch(key_id, *args, **kwargs)
+
+        with mock.patch.object(
+            self.fake_omni,
+            "patch_key_permissions",
+            side_effect=fail_policy_sync,
+        ):
+            result = self.server.control.bulk_update_user_policies(
+                {
+                    "user_ids": ["policy-user"],
+                    "requests_per_minute": 100,
+                },
+                "admin",
+            )
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["failed"][0]["user_id"], "policy-user")
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertNotIn(("policy-key", True), self.fake_omni.activated)
+        with self.server.db.connect() as connection:
+            user = connection.execute(
+                "SELECT requests_per_minute FROM users WHERE id='policy-user'"
+            ).fetchone()
+            sync = connection.execute(
+                "SELECT status,error FROM permission_sync WHERE user_id='policy-user'"
+            ).fetchone()
+        self.assertEqual(user["requests_per_minute"], 100)
+        self.assertEqual(sync["status"], "failed")
+        self.assertIn("gateway policy sync failed", sync["error"])
+
+    def test_admin_analytics_and_bulk_policy_http_routes_require_admin_session(self):
+        self.insert_control_user_and_model()
+        client, jar = self.login_admin_api()
+        status, raw, _ = self.get(
+            client,
+            "/portal-api/admin/analytics?range=today&active_page=1&active_page_size=10",
+        )
+        self.assertEqual(status, 200)
+        analytics = json.loads(raw)
+        self.assertEqual(analytics["source"], "usage_ledger")
+        self.assertEqual(analytics["token_definition"], "input_tokens + output_tokens")
+
+        status, result, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/users/bulk-policy",
+            {
+                "user_ids": ["policy-user"],
+                "max_sessions": 5,
+                "requests_per_minute": 100,
+                "requests_per_day": 8000,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["updated"], 1)
+        with self.server.db.connect() as connection:
+            event = connection.execute(
+                "SELECT status,detail FROM audit_events "
+                "WHERE action='admin/users/bulk-policy' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(event["status"], "success")
+        self.assertIn('"requests_per_minute":100', event["detail"])
 
     def test_combo_metadata_uses_conservative_limits_and_syncs_every_target(self):
         self.fake_omni.combo_items = [
