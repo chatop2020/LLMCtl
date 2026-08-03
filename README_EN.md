@@ -23,7 +23,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - Enable image/OCR input, OpenAI tool calling, reasoning parsing, and per-request reasoning disable controls only when the model capability matches.
 - Map one GPU or one TP group to each worker. The installer configures all workers, authentication, and database state for the selected gateway and exposes a consistent Nginx-fronted `:8000/v1` endpoint.
 - Install or reuse Nginx automatically. `/v1/` and `/ui/` are the consistent public entry points; inference goes directly to the gateway without passing through the portal; OmniRoute's native troubleshooting UI remains available at `/base_ui/`. LLMCtl owns an isolated config, validates it with `nginx -t`, rolls back failed changes, and preserves the package and unrelated sites on uninstall.
-- In OmniRoute mode, deploy a Vue 3 company portal with email verification, an exact corporate-domain allowlist, registration and SMTP controls, users and groups, personal API keys that remain stable across sign-ins and change only on explicit rotation, money balances, additional recurring token grants, per-model input/output/cache/reasoning prices, a usage ledger, and audit events.
+- In OmniRoute mode, deploy a Vue 3 company portal with configurable branding and an optional HTTPS published origin, email verification, an exact corporate-domain allowlist, registration and SMTP controls, users and groups, personal API keys that remain stable across sign-ins and change only on explicit rotation, money balances, additional recurring token grants, per-model input/output/cache/reasoning prices, a usage ledger, and audit events.
 - Use native OmniRoute APIs for model-ID mappings, Combos, per-key access, and free-tier resources. A free model must be discovered, configured, currently available, live-tested, and explicitly published. User keys authorize only the public model ID, so underlying model or Combo IDs cannot bypass portal policy.
 - Accept images, PDFs, and common text attachments in the playground. Images are sent as multimodal content, while PDFs are rendered to page images in the browser and are never uploaded to the portal backend. Streaming results label input, output, and total tokens explicitly and show reasoning content, TTFT, and output speed.
 - Run administration benchmarks on the server. The browser only submits and observes a job; a separate process generates meaningful prompts for the selected concurrency and target input size, then reports success rate, RPS, aggregate output tok/s, TTFT, end-to-end latency, and p50/p95/p99 in real time. It also records the Worker selected for every request and samples per-GPU utilization, memory, power, and peak simultaneous active-GPU count once per second to expose routing skew. High-load plans require explicit confirmation.
@@ -96,6 +96,23 @@ The wizard offers four choices before image download. For unattended installs, u
 | OmniRoute | Local SQLite gateway plus a company account portal | Creates eight provider nodes and one equal-weight Combo; deploys a separate portal database, email registration, personal keys, recurring quotas, usage, and a model catalog |
 
 All four use `llm-router.service`, but the actual gateway listens only on `127.0.0.1:18000`. Nginx publishes the consistent OpenAI-compatible `/v1/` and `/ui/` entry points on port `8000`; the root-only maintenance key is stored in `GATEWAY_API_KEY`. New API, LiteLLM, and Bifrost use PostgreSQL through `llm-database.service`. OmniRoute uses its own SQLite database, does not start PostgreSQL, and adds `llm-account.service` on loopback port `8001`. There is no online migration between gateway types: select one during a clean install after old service configuration has been removed. Existing model files and exact local Docker images are verified and reused. Review the upstream licenses for your distribution and modification model.
+
+### Publishing over HTTPS
+
+Your existing edge Nginx, load balancer, or firewall remains responsible for the public domain, certificate, and port mapping. In OmniRoute mode, the portal administrator can configure these fields under **Publishing, registration & SMTP**:
+
+- **Portal brand name** replaces `LLMCtl` in the header, sign-in hero, and browser title. The default remains `LLMCtl`.
+- **Published origin**, for example `https://llm.zjguardian.com`, becomes the canonical verification-mail, portal, API, curl-demo, and `llmctl key show` origin. Leaving it blank preserves the installed fallback address.
+
+Expose only the Nginx front door. Never publish `8001`, `18000`, or `8100-8107`. Control-plane upgrades deliberately preserve Nginx; apply this release's authentication throttling, forwarded-header cleanup, and security response headers explicitly:
+
+```bash
+sudo llmctl nginx apply
+sudo llmctl nginx test
+sudo llmctl info --redact
+```
+
+`/base_ui/` is the native gateway administration/troubleshooting surface, not an end-user page. Restrict it at the edge with an ACL, VPN, or management network. See [USAGE_EN.md](USAGE_EN.md) for the full checklist.
 
 ## Quick Start
 

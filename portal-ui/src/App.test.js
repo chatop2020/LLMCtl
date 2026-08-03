@@ -33,6 +33,10 @@ describe("LLMCtl portal contracts", () => {
     }
     expect(source).toMatch(/scope:\s*["']registration["']/);
     expect(source).toMatch(/scope:\s*["']smtp["']/);
+    expect(source).toMatch(/scope:\s*["']publishing["']/);
+    expect(source).toContain("portal_title");
+    expect(source).toContain("published_origin");
+    expect(source).toContain("https://llm.zjguardian.com");
     expect(source).toContain("测试邮件使用当前表单内容，不必先保存");
   });
 
@@ -151,7 +155,8 @@ describe("LLMCtl portal contracts", () => {
     ]) {
       expect(source).not.toContain(marker);
     }
-    expect(source).toContain("LLMCtl 模型服务门户");
+    expect(source).toContain("{{ portalTitle }} 模型服务门户");
+    expect(source).toContain("document.title = `${title} 模型服务门户`");
     expect(style).toContain("--bg: #f4f9fc");
     expect(style).toContain("background: #fffffff2");
   });

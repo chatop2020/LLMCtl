@@ -525,6 +525,50 @@ pre {
   grid-template-columns: 1fr 1fr;
   gap: 17px;
 }
+.settings-publish {
+  grid-column: 1 / -1;
+}
+.settings-publish .panel-head {
+  align-items: flex-start;
+}
+.settings-publish h2,
+.settings-publish .setting-note {
+  margin: 0;
+}
+.publish-preview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.publish-preview span {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 13px;
+  background: color-mix(in srgb, var(--surface) 80%, var(--bg));
+}
+.publish-preview small,
+.publish-preview code {
+  display: block;
+}
+.publish-preview small {
+  margin-bottom: 5px;
+  color: var(--muted);
+}
+.publish-preview code {
+  overflow-wrap: anywhere;
+}
+.advanced-settings {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.advanced-settings summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.advanced-settings[open] summary {
+  margin-bottom: 12px;
+}
 .switch {
   display: flex;
   align-items: center;
@@ -713,6 +757,9 @@ dialog::backdrop {
   }
   .settings-grid,
   .chat-layout {
+    grid-template-columns: 1fr;
+  }
+  .publish-preview {
     grid-template-columns: 1fr;
   }
 }

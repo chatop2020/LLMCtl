@@ -18,6 +18,7 @@ import hmac
 import html
 import http.cookies
 import http.server
+import ipaddress
 import json
 import mimetypes
 import os
@@ -43,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -515,6 +516,76 @@ def portal_ui_url(value: str) -> str:
     return value
 
 
+def normalize_public_origin(value: Any) -> str:
+    """Validate and canonicalize an optional externally published origin.
+
+    The setting is deliberately an origin rather than a free-form URL.  It is
+    used in verification mail and generated API examples, so accepting paths,
+    credentials, control characters, queries, or fragments would create a
+    phishing/header-injection footgun for a public installation.
+    """
+    origin = str(value or "").strip()
+    if not origin:
+        return ""
+    if len(origin) > 2048 or any(ord(char) < 32 or ord(char) == 127 for char in origin):
+        raise ValueError("对外发布地址无效")
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("对外发布地址无效") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("对外发布地址必须是无路径、无凭据的 http(s) 地址")
+    hostname = parsed.hostname.lower().rstrip(".")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            hostname = normalize_domain(hostname)
+        except ValueError as error:
+            raise ValueError("对外发布地址主机名无效") from error
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = 80 if parsed.scheme == "http" else 443
+    port_suffix = f":{port}" if port and port != default_port else ""
+    return f"{parsed.scheme}://{host}{port_suffix}"
+
+
+def normalize_portal_title(value: Any) -> str:
+    title = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if (
+        not 1 <= len(title) <= 40
+        or any(unicodedata.category(char).startswith("C") for char in title)
+    ):
+        raise ValueError("门户品牌名称必须是 1-40 个可见字符")
+    return title
+
+
+def effective_public_urls(config: "Config", settings: dict[str, str]) -> tuple[str, str]:
+    """Return the effective portal URL and API origin.
+
+    A configured external origin wins.  Blank keeps the legacy/current access
+    URLs, preserving existing LAN-only installations and upgrades.
+    """
+    try:
+        published = normalize_public_origin(settings.get("published_origin", ""))
+    except ValueError:
+        # A manually corrupted SQLite value must not become an unsafe link.
+        published = ""
+    if published:
+        return f"{published}/ui", published
+    portal_url = portal_ui_url(settings.get("public_url", "") or config.public_url)
+    api_url = (settings.get("api_public_url", "") or config.api_public_url).rstrip("/")
+    return portal_url, api_url
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     bind: str
@@ -941,6 +1012,8 @@ class Database:
                 "default_quota_tokens": str(self.config.initial_quota),
                 "default_quota_reset": self.config.initial_reset,
                 "default_quota_reset_time": self.config.initial_reset_time,
+                "portal_title": "LLMCtl",
+                "published_origin": "",
                 "public_url": self.config.public_url,
                 "api_public_url": self.config.api_public_url,
                 "smtp_host": self.config.smtp_host,
@@ -1495,10 +1568,11 @@ def effective_mail_config(config: Config, settings: dict[str, str]) -> Config:
         smtp_port = int(settings.get("smtp_port", str(config.smtp_port)))
     except ValueError:
         smtp_port = config.smtp_port
+    public_url, api_public_url = effective_public_urls(config, settings)
     return dataclasses.replace(
         config,
-        public_url=portal_ui_url(settings.get("public_url", config.public_url)),
-        api_public_url=settings.get("api_public_url", config.api_public_url).rstrip("/"),
+        public_url=public_url,
+        api_public_url=api_public_url,
         smtp_host=settings.get("smtp_host", config.smtp_host),
         smtp_port=smtp_port,
         smtp_security=settings.get("smtp_security", config.smtp_security),
@@ -1620,6 +1694,38 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         morsel = self.cookies().get(CSRF_COOKIE)
         return morsel.value if morsel else ""
 
+    def secure_cookie_suffix(self) -> str:
+        """Apply Secure immediately when the persisted public origin is HTTPS."""
+        settings = self.app.db.settings()
+        try:
+            published = normalize_public_origin(settings.get("published_origin", ""))
+        except ValueError:
+            published = ""
+        return (
+            "; Secure"
+            if self.app.config.cookie_secure or published.startswith("https://")
+            else ""
+        )
+
+    def queue_secure_session_upgrade(self, user: sqlite3.Row | None) -> None:
+        """Upgrade an existing authenticated browser session on its first HTTPS visit.
+
+        A Secure cookie sent over plaintext HTTP is ignored by browsers, while the
+        same response reached through the configured HTTPS edge is accepted. This
+        lets an administrator save the origin over a LAN address, verify the public
+        route, and move to HTTPS without rotating or invalidating every session.
+        """
+        if not user or self.secure_cookie_suffix() != "; Secure":
+            return
+        session = self.cookies().get(SESSION_COOKIE)
+        csrf = self.csrf_token()
+        if not session or not csrf:
+            return
+        self.extra_response_cookies = [
+            f"{SESSION_COOKIE}={session.value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure",
+            f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800; Secure",
+        ]
+
     def send_headers(self, status: int, content_type: str = "text/html; charset=utf-8") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -1640,7 +1746,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         self.send_headers(status)
         if not self.csrf_token():
             csrf = secrets.token_urlsafe(24)
-            secure = "; Secure" if self.app.config.cookie_secure else ""
+            secure = self.secure_cookie_suffix()
             self.send_header(
                 "Set-Cookie", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=86400{secure}"
             )
@@ -1658,7 +1764,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         self.send_headers(status, "application/json")
         if not self.csrf_token():
             csrf = secrets.token_urlsafe(24)
-            secure = "; Secure" if self.app.config.cookie_secure else ""
+            secure = self.secure_cookie_suffix()
             self.send_header(
                 "Set-Cookie", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}"
             )
@@ -1805,7 +1911,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 one_time = self.cookies().get("llm_key_once")
                 raw_key = urllib.parse.unquote(one_time.value) if one_time else ""
                 if one_time:
-                    secure = "; Secure" if self.app.config.cookie_secure else ""
+                    secure = self.secure_cookie_suffix()
                     self.extra_response_cookies = [
                         f"llm_key_once=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
                     ]
@@ -1848,18 +1954,23 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
     def handle_api_get(self, path: str, query: str = "") -> None:
         if path == "/portal-api/public":
             settings = self.app.db.settings()
+            portal_url, api_url = effective_public_urls(self.app.config, settings)
             self.json_response(
                 200,
                 {
                     "version": APP_VERSION,
                     "registration_enabled": settings.get("registration_enabled") == "1",
                     "allowed_domains": normalize_domains(settings.get("allowed_domains", "")),
-                    "api_public_url": settings.get("api_public_url", self.app.config.api_public_url),
+                    "portal_title": settings.get("portal_title", "LLMCtl"),
+                    "published_origin": settings.get("published_origin", ""),
+                    "portal_public_url": portal_url,
+                    "api_public_url": api_url,
                 },
             )
             return
         if path == "/portal-api/session":
             user, _ = self.current_session()
+            self.queue_secure_session_upgrade(user)
             self.json_response(
                 200,
                 {
@@ -2023,7 +2134,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             if morsel:
                 with self.app.db.connect() as connection:
                     connection.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(morsel.value),))
-            secure = "; Secure" if self.app.config.cookie_secure else ""
+            secure = self.secure_cookie_suffix()
             self.extra_response_cookies = [f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"]
             self.json_response(200, {"ok": True})
             return
@@ -2110,7 +2221,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 self.json_response(429, {"error": "too many attempts; try again later"})
                 return
             user, matched_identity = find_user_by_login(connection, supplied_identity)
-            valid = bool(user and user["status"] == "active" and verify_password(str(payload.get("password", "")), user["password_hash"]))
+            candidate_hash = user["password_hash"] if user else DUMMY_PASSWORD_HASH
+            password_valid = verify_password(str(payload.get("password", "")), candidate_hash)
+            valid = bool(user and user["status"] == "active" and password_valid)
             if not valid:
                 current = now()
                 attempts = 1 if not failure or current - failure["window_started_at"] > 900 else int(failure["attempts"]) + 1
@@ -2131,7 +2244,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.app.db.audit("anonymous", "login.failed", normalized_identity or "invalid", "denied", remote)
             self.json_response(401, {"error": "invalid credentials or account status"})
             return
-        secure = "; Secure" if self.app.config.cookie_secure else ""
+        secure = self.secure_cookie_suffix()
         self.extra_response_cookies = [
             f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}",
             f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}",
@@ -2306,7 +2419,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 "INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at) VALUES(?,?,?,?,?)",
                 (token_hash(raw_session), record["user_id"], csrf, now() + 7 * 86400, now()),
             )
-        secure = "; Secure" if self.app.config.cookie_secure else ""
+        secure = self.secure_cookie_suffix()
         self.extra_response_cookies = [
             f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}",
             f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}",
@@ -2370,9 +2483,31 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
 
     def api_update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         scope = str(payload.get("scope", "all")).strip().lower()
-        if scope not in {"all", "registration", "smtp"}:
+        if scope not in {"all", "publishing", "registration", "smtp"}:
             raise ValueError("invalid settings scope")
         current = self.app.db.settings()
+        if scope == "publishing":
+            portal_title = normalize_portal_title(
+                payload.get("portal_title", current.get("portal_title", "LLMCtl"))
+            )
+            published_origin = normalize_public_origin(
+                payload.get("published_origin", current.get("published_origin", ""))
+            )
+            self.app.db.update_settings(
+                {"portal_title": portal_title, "published_origin": published_origin}
+            )
+            portal_url, api_url = effective_public_urls(
+                self.app.config,
+                current | {"published_origin": published_origin},
+            )
+            return {
+                "ok": True,
+                "scope": scope,
+                "portal_title": portal_title,
+                "published_origin": published_origin,
+                "portal_public_url": portal_url,
+                "api_public_url": api_url,
+            }
         smtp_values: dict[str, str] = {}
         if scope in {"all", "smtp"}:
             smtp = self.smtp_config_from_payload(payload)
@@ -2393,6 +2528,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         )
         enabled = enabled_value is True or str(enabled_value).strip().lower() in {"1", "true", "yes", "on"}
         domains = normalize_domains(str(payload.get("allowed_domains", current.get("allowed_domains", ""))))
+        published_origin = normalize_public_origin(
+            payload.get("published_origin", current.get("published_origin", ""))
+        )
         public_url = str(
             payload.get("public_url", current.get("public_url") or self.app.config.public_url)
         ).rstrip("/")
@@ -2445,6 +2583,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 "default_quota_tokens": str(quota),
                 "default_quota_reset": reset,
                 "default_quota_reset_time": reset_time,
+                "published_origin": published_origin,
                 "public_url": public_url,
                 "api_public_url": api_url,
                 "currency": currency,
@@ -2531,14 +2670,17 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        curl = f'''curl {shlex.quote(self.app.config.api_public_url + "/v1/chat/completions")} \\
+        _portal_url, api_public_url = effective_public_urls(
+            self.app.config, self.app.db.settings()
+        )
+        curl = f'''curl {shlex.quote(api_public_url + "/v1/chat/completions")} \\
   -H 'Authorization: Bearer YOUR_API_KEY' \\
   -H 'Accept: application/json' \\
   -H 'Content-Type: application/json' \\
   -d {shlex.quote(sample_payload)}'''
         flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
         error = '<div class="flash error">AI gateway unavailable; see LLMCtl account logs.</div>' if gateway_error else ""
-        body = f'''{flash}{error}<div class="grid">{key_box}<section class="card"><h2>本周期用量 / Usage</h2><div class="stat">{used:,} / {total:,}</div><p class="muted">剩余 {remaining:,} tokens · 下次重置 / next reset: {html.escape(reset_label)}</p></section><section class="card"><h2>API 地址 / Endpoint</h2><div id="api-base" class="key">{html.escape(self.app.config.api_public_url)}/v1</div><p><button class="secondary" data-copy="api-base">复制 / Copy</button></p></section><section class="card wide"><h2>调用示例 / curl demo</h2><pre id="curl-demo">{html.escape(curl)}</pre><button class="secondary" data-copy="curl-demo">复制示例 / Copy demo</button></section><section class="card wide"><div class="row"><h2>开放模型 / Available models</h2><span class="spacer"></span><span class="muted">{len(model_rows)} models</span></div><div class="models">{''.join(model_rows) or '<p class="muted">No models are currently available.</p>'}</div></section><section class="card wide"><h2>密钥安全 / Key security</h2><p class="muted">轮换会先创建并验证新 Key，再停用旧 Key。新 Key 仍只显示一次。</p><form method="post" action="/rotate-key"><input type="hidden" name="csrf" value="__CSRF__"><button class="danger">轮换 API Key / Rotate key</button></form></section></div>'''
+        body = f'''{flash}{error}<div class="grid">{key_box}<section class="card"><h2>本周期用量 / Usage</h2><div class="stat">{used:,} / {total:,}</div><p class="muted">剩余 {remaining:,} tokens · 下次重置 / next reset: {html.escape(reset_label)}</p></section><section class="card"><h2>API 地址 / Endpoint</h2><div id="api-base" class="key">{html.escape(api_public_url)}/v1</div><p><button class="secondary" data-copy="api-base">复制 / Copy</button></p></section><section class="card wide"><h2>调用示例 / curl demo</h2><pre id="curl-demo">{html.escape(curl)}</pre><button class="secondary" data-copy="curl-demo">复制示例 / Copy demo</button></section><section class="card wide"><div class="row"><h2>开放模型 / Available models</h2><span class="spacer"></span><span class="muted">{len(model_rows)} models</span></div><div class="models">{''.join(model_rows) or '<p class="muted">No models are currently available.</p>'}</div></section><section class="card wide"><h2>密钥安全 / Key security</h2><p class="muted">轮换会先创建并验证新 Key，再停用旧 Key。新 Key 仍只显示一次。</p><form method="post" action="/rotate-key"><input type="hidden" name="csrf" value="__CSRF__"><button class="danger">轮换 API Key / Rotate key</button></form></section></div>'''
         self.response(200, page("Dashboard", body, user), user)
 
     def show_admin(self, message: str = "", error: bool = False) -> None:
@@ -2546,6 +2688,9 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if not user:
             return
         settings = self.app.db.settings()
+        portal_public_url, api_public_url = effective_public_urls(
+            self.app.config, settings
+        )
         with self.app.db.connect() as connection:
             users = connection.execute("SELECT * FROM users WHERE role='user' ORDER BY created_at DESC LIMIT 500").fetchall()
             audits = connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 100").fetchall()
@@ -2565,7 +2710,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         audit_rows = "".join(f'<tr><td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["created_at"]))}</td><td>{html.escape(a["actor"])}</td><td>{html.escape(a["action"])}</td><td>{html.escape(a["status"])}</td><td>{html.escape(a["detail"])}</td></tr>' for a in audits)
         checked = "checked" if settings.get("registration_enabled") == "1" else ""
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">开启注册要求安装时已配置 SMTP；域名在验证时会再次检查。</p></section><section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(self.app.config.api_public_url)}">{html.escape(self.app.config.api_public_url)}</a></p><p>LLMCtl: {html.escape(self.app.config.public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
+        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">开启注册要求安装时已配置 SMTP；域名在验证时会再次检查。</p></section><section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(api_public_url)}">{html.escape(api_public_url)}</a></p><p>LLMCtl: {html.escape(portal_public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
         self.response(200, page("Admin", body, user), user)
 
     def handle_login(self, form: dict[str, str]) -> None:
@@ -2622,7 +2767,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 self.show_login("登录名、密码或账户状态无效 / Invalid credentials or account", True)
             return
         self.app.db.audit(user_identity(user), "login.success", user["id"], "success", remote)
-        secure = "; Secure" if self.app.config.cookie_secure else ""
+        secure = self.secure_cookie_suffix()
         self.redirect("/admin" if user["role"] == "admin" else "/", [f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}"])
 
     def handle_logout(self, form: dict[str, str]) -> None:
@@ -2634,7 +2779,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if morsel:
             with self.app.db.connect() as connection:
                 connection.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(morsel.value),))
-        self.redirect("/", [f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"])
+        secure = self.secure_cookie_suffix()
+        self.redirect("/", [f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"])
 
     def handle_register(self, form: dict[str, str]) -> None:
         if not self.verify_csrf(form):
@@ -2740,7 +2886,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             raw_session = secrets.token_urlsafe(32)
             csrf = secrets.token_urlsafe(24)
             connection.execute("INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at) VALUES(?,?,?,?,?)", (token_hash(raw_session), user["id"], csrf, now() + 7 * 86400, now()))
-        secure = "; Secure" if self.app.config.cookie_secure else ""
+        secure = self.secure_cookie_suffix()
         self.send_response(303)
         self.send_header("Location", "/?provisioned=1")
         # One-time key is carried in a short-lived HttpOnly cookie only to bridge the redirect.
@@ -3994,6 +4140,9 @@ class PortalControlPlane:
     def user_dashboard(self, user_id: str) -> dict[str, Any]:
         self.reset_due_grants()
         models = self.effective_models(user_id)
+        _portal_url, api_public_url = effective_public_urls(
+            self.config, self.db.settings()
+        )
         with self.db.connect() as connection:
             key_record = connection.execute(
                 "SELECT api_key_id FROM users WHERE id=?", (user_id,)
@@ -4019,7 +4168,7 @@ class PortalControlPlane:
             "usage": usage_page["items"],
             "usage_pagination": {key: usage_page[key] for key in ("page", "page_size", "pages", "total")},
             "transactions": transactions,
-            "api_base": self.db.settings().get("api_public_url", self.config.api_public_url).rstrip("/") + "/v1",
+            "api_base": api_public_url.rstrip("/") + "/v1",
         }
 
     def usage_page(
@@ -4505,6 +4654,9 @@ class PortalControlPlane:
             for key in ("input", "output", "cached", "reasoning"):
                 model[f"{key}_price"] = micros_to_money(model[f"{key}_price_micros"])
         settings = self.db.settings()
+        portal_public_url, api_public_url = effective_public_urls(self.config, settings)
+        settings["effective_public_url"] = portal_public_url
+        settings["effective_api_public_url"] = api_public_url
         if settings.get("smtp_password"):
             settings["smtp_password_configured"] = "1"
             settings["smtp_password"] = ""

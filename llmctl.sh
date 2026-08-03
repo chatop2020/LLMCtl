@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="2.7.0"
+readonly CTL_VERSION="2.8.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -108,6 +108,8 @@ load_config() {
   DOCKER_NETWORK="${DOCKER_NETWORK:-llm-cluster-net}"
   ACCOUNT_PUBLIC_URL="${ACCOUNT_PUBLIC_URL:-}"
   ACCOUNT_API_PUBLIC_URL="${ACCOUNT_API_PUBLIC_URL:-}"
+  ACCOUNT_PORTAL_TITLE="${ACCOUNT_PORTAL_TITLE:-LLMCtl}"
+  ACCOUNT_PUBLISHED_ORIGIN="${ACCOUNT_PUBLISHED_ORIGIN:-}"
   ACCOUNT_ADMIN_USERNAME_B64="${ACCOUNT_ADMIN_USERNAME_B64:-}"
   if [[ -n "${ACCOUNT_ADMIN_USERNAME_B64}" ]]; then
     ACCOUNT_ADMIN_USERNAME=$(python3 -c 'import base64,sys; print(base64.b64decode(sys.argv[1], validate=True).decode("utf-8"), end="")' "${ACCOUNT_ADMIN_USERNAME_B64}") || \
@@ -303,6 +305,7 @@ usage() {
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
+  llmctl nginx <apply|test|status>              应用、校验或查看 LLMCtl Nginx 公开入口
   llmctl timezone show|set [时区]              查看或设置系统时区（默认 Asia/Shanghai）
 
   llmctl logs [all] [-f]                      全部组件日志（默认）
@@ -633,6 +636,26 @@ account_helper() {
   "${ACCOUNT_HELPER}" "$@"
 }
 
+persisted_published_origin() {
+  [[ "${GATEWAY_KIND:-}" == omniroute && -f "${ACCOUNT_DB_PATH:-/nonexistent}" ]] || return 0
+  account_helper dump-config 2>/dev/null | jq -r '.settings.published_origin // ""' 2>/dev/null || true
+}
+
+effective_account_origin() {
+  local persisted
+  persisted=$(persisted_published_origin)
+  if [[ -n "${persisted}" ]]; then
+    printf '%s\n' "${persisted%/}"
+  elif [[ -n "${ACCOUNT_API_PUBLIC_URL:-}" ]]; then
+    printf '%s\n' "${ACCOUNT_API_PUBLIC_URL%/}"
+  elif [[ -n "${ACCOUNT_PUBLIC_URL:-}" ]]; then
+    persisted="${ACCOUNT_PUBLIC_URL%/}"
+    printf '%s\n' "${persisted%/ui}"
+  else
+    public_local_base_url
+  fi
+}
+
 render_router_config() {
   local worker_ids="${1:-}" output
   [[ -n "${worker_ids}" ]] || die "没有健康 Worker，拒绝生成空路由。"
@@ -802,6 +825,24 @@ render_nginx_config() {
     proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
     proxy_buffering off;
   }
+  # Public authentication endpoints receive a second, IP-wide throttle in
+  # addition to the portal's identity lockout. Exact locations override the
+  # generic portal-api proxy while keeping inference traffic unrestricted.
+  location = /portal-api/auth/login {
+    limit_req zone=llmctl_auth burst=10 nodelay;
+    proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
+    proxy_buffering off;
+  }
+  location = /portal-api/auth/register {
+    limit_req zone=llmctl_auth burst=10 nodelay;
+    proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
+    proxy_buffering off;
+  }
+  location = /portal-api/auth/verify {
+    limit_req zone=llmctl_auth burst=10 nodelay;
+    proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
+    proxy_buffering off;
+  }
   location = /base_ui { return 302 /base_ui/; }
   location ^~ /base_ui/ {
     rewrite ^/base_ui/(.*)$ /\$1 break;
@@ -832,17 +873,22 @@ map \$http_upgrade \$llmctl_connection_upgrade {
   '' close;
 }
 
+limit_req_zone \$binary_remote_addr zone=llmctl_auth:10m rate=30r/m;
+
 server {
   listen ${listen_address};
   # Exact host/IP names allow this isolated server to coexist with an existing
   # Nginx installation on the same listen socket without replacing its sites.
   server_name ${server_names};
+  server_tokens off;
   client_max_body_size 128m;
 
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  # Never preserve a client-supplied X-Forwarded-For value. The portal trusts
+  # this header only from the local Nginx hop for audit and login throttling.
+  proxy_set_header X-Forwarded-For \$remote_addr;
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_set_header Upgrade \$http_upgrade;
   proxy_set_header Connection \$llmctl_connection_upgrade;
@@ -850,6 +896,11 @@ server {
   proxy_send_timeout 7200s;
   proxy_read_timeout 7200s;
   proxy_request_buffering off;
+  limit_req_status 429;
+
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
   location = / { return 302 /ui/; }
   location = /ui { return 302 /ui/; }
@@ -859,11 +910,15 @@ ${ui_block}
     proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
     proxy_buffering off;
     add_header X-Accel-Buffering no always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
   }
   location ^~ /v1beta/ {
     proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
     proxy_buffering off;
     add_header X-Accel-Buffering no always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
   }
 
   # Native gateway assets, management APIs, OAuth callbacks and deep links.
@@ -923,6 +978,25 @@ cmd_nginx_install() {
     systemctl start nginx.service
   fi
   log "Nginx 统一入口已配置：$(public_local_base_url)/ui/ 与 $(public_local_base_url)/v1/"
+}
+
+cmd_nginx() {
+  require_root
+  load_config
+  case "${1:-status}" in
+    apply) cmd_nginx_install ;;
+    test)
+      command -v nginx >/dev/null 2>&1 || die "Nginx 未安装"
+      nginx -t
+      ;;
+    status)
+      printf 'CONFIG=%s\n' "${NGINX_CONFIG}"
+      printf 'LISTEN=%s:%s\n' "${API_BIND}" "${API_PORT}"
+      printf 'ACTIVE=%s\n' "$(systemctl is-active nginx.service 2>/dev/null || printf unknown)"
+      printf 'ENABLED=%s\n' "$(systemctl is-enabled nginx.service 2>/dev/null || printf unknown)"
+      ;;
+    *) die "nginx 子命令必须是 apply|test|status" ;;
+  esac
 }
 
 remove_nginx_config() {
@@ -1159,7 +1233,7 @@ cmd_status() {
 cmd_info() {
   require_root
   load_config
-  local redact=0 value public_host public_origin id state portal_inventory="" portal_inventory_status=unavailable
+  local redact=0 value public_host public_origin effective_public_origin id state portal_inventory="" portal_inventory_status=unavailable
   local portal_users="n/a" portal_groups="n/a" portal_models="n/a" portal_free="n/a"
   local portal_usage="n/a" portal_transactions="n/a" portal_audits="n/a" portal_integrity="n/a"
   case "${1:-}" in
@@ -1189,6 +1263,8 @@ cmd_info() {
       ACCOUNT_DEFAULT_QUOTA_TOKENS=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_tokens // "0"')
       ACCOUNT_QUOTA_RESET=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset // "monthly"')
       ACCOUNT_QUOTA_RESET_TIME=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset_time // "00:00"')
+      ACCOUNT_PORTAL_TITLE=$(printf '%s' "${portal_inventory}" | jq -r '.settings.portal_title // "LLMCtl"')
+      ACCOUNT_PUBLISHED_ORIGIN=$(printf '%s' "${portal_inventory}" | jq -r '.settings.published_origin // ""')
       ACCOUNT_PUBLIC_URL=$(printf '%s' "${portal_inventory}" | jq -r '.settings.public_url // ""')
       ACCOUNT_API_PUBLIC_URL=$(printf '%s' "${portal_inventory}" | jq -r '.settings.api_public_url // ""')
       SMTP_HOST=$(printf '%s' "${portal_inventory}" | jq -r '.settings.smtp_host // ""')
@@ -1207,6 +1283,7 @@ cmd_info() {
       portal_integrity=$(printf '%s' "${portal_inventory}" | jq -r '.database.quick_check')
     fi
   fi
+  effective_public_origin="${ACCOUNT_PUBLISHED_ORIGIN:-${public_origin}}"
 
   printf '\n========== LLMCtl 恢复清单 / Recovery inventory ==========\n'
   printf '生成时间 / Generated: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
@@ -1230,14 +1307,16 @@ cmd_info() {
     "$(nginx -v 2>&1 | sed 's#nginx version: ##' || printf unavailable)"
 
   printf '\n[统一公开入口 / Public front door]\n'
-  printf 'Nginx 监听: %s:%s\nAPI Base URL: %s/v1\nWeb UI: %s/ui/\n' "${API_BIND}" "${API_PORT}" "${public_origin}" "${public_origin}"
+  printf 'Nginx 监听: %s:%s\n对外发布地址: %s\nAPI Base URL: %s/v1\nWeb UI: %s/ui/\n' \
+    "${API_BIND}" "${API_PORT}" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动使用当前访问地址>}" \
+    "${effective_public_origin}" "${effective_public_origin}"
   printf 'Nginx 状态: %s；开机自启: %s；配置: %s\n' \
     "$(systemctl is-active nginx.service 2>/dev/null || printf unknown)" \
     "$(systemctl is-enabled nginx.service 2>/dev/null || printf unknown)" "${NGINX_CONFIG}"
   printf 'TLS: 未由 LLMCtl 自动配置；如由现有 Nginx 站点终止 TLS，请以站点配置为准\n'
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
     printf '企业门户: %s/ui/\n门户管理 API: %s/portal-api/\nOmniRoute 原生 UI: %s/base_ui/\n' \
-      "${public_origin}" "${public_origin}" "${public_origin}"
+      "${effective_public_origin}" "${effective_public_origin}" "${effective_public_origin}"
   else
     printf '原生网关 UI: %s/ui/\n' "${public_origin}"
   fi
@@ -1285,9 +1364,10 @@ cmd_info() {
   fi
 
   printf '\n[注册、额度与 SMTP / Registration, quota and SMTP]\n'
-  printf '允许注册: %s\n允许邮箱后缀: %s\n默认 Token 赠额: %s\n重置: %s @ %s\n门户公开 URL: %s\nAPI 公开 URL: %s\n' \
-    "${ACCOUNT_REGISTRATION_ENABLED}" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-<empty>}" "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" \
-    "${ACCOUNT_QUOTA_RESET}" "${ACCOUNT_QUOTA_RESET_TIME}" "${ACCOUNT_PUBLIC_URL:-${public_origin}/ui/}" "${ACCOUNT_API_PUBLIC_URL:-${public_origin}}"
+  printf '门户品牌名称: %s\n允许注册: %s\n允许邮箱后缀: %s\n默认 Token 赠额: %s\n重置: %s @ %s\n对外发布地址: %s\n门户公开 URL: %s\nAPI 公开 URL: %s\n' \
+    "${ACCOUNT_PORTAL_TITLE}" "${ACCOUNT_REGISTRATION_ENABLED}" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-<empty>}" "${ACCOUNT_DEFAULT_QUOTA_TOKENS}" \
+    "${ACCOUNT_QUOTA_RESET}" "${ACCOUNT_QUOTA_RESET_TIME}" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动>}" \
+    "${effective_public_origin}/ui/" "${effective_public_origin}"
   printf 'SMTP: %s:%s (%s)\nSMTP 用户名: %s\nSMTP 密码: %s\n发件人: %s\n' \
     "${SMTP_HOST:-<empty>}" "${SMTP_PORT}" "${SMTP_SECURITY}" "${SMTP_USERNAME:-<empty>}" "$(secret_value "${SMTP_PASSWORD}")" "${SMTP_FROM:-<empty>}"
 
@@ -1604,8 +1684,10 @@ cmd_account() {
     stop) systemctl stop llm-account.service ;;
     status) systemctl status llm-account.service --no-pager || true ;;
     url)
-      printf 'PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-$(account_local_base_url)}"
-      printf 'OMNIROUTE_URL=%s\n' "${ACCOUNT_API_PUBLIC_URL:-$(router_local_base_url)}"
+      local public_account_origin
+      public_account_origin=$(effective_account_origin)
+      printf 'PORTAL_URL=%s/ui/\n' "${public_account_origin}"
+      printf 'OMNIROUTE_URL=%s\n' "${public_account_origin}"
       ;;
     *) die "account 子命令必须是 start|stop|restart|status|url" ;;
   esac
@@ -2485,9 +2567,14 @@ cmd_key() {
   require_root; load_config
   case "${1:-show}" in
     show)
-      local api_host="${API_BIND}"
-      [[ "${api_host}" == 0.0.0.0 || "${api_host}" == :: ]] && api_host='<服务器IP>'
-      printf 'OPENAI_BASE_URL=http://%s:%s/v1\n' "${api_host}" "${API_PORT}"
+      local api_host="${API_BIND}" api_origin=""
+      if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+        api_origin=$(effective_account_origin)
+      else
+        [[ "${api_host}" == 0.0.0.0 || "${api_host}" == :: ]] && api_host='<服务器IP>'
+        api_origin="http://${api_host}:${API_PORT}"
+      fi
+      printf 'OPENAI_BASE_URL=%s/v1\n' "${api_origin%/}"
       printf 'OPENAI_MODEL=%s\n' "${SERVED_MODEL_NAME}"
       printf 'OPENAI_API_KEY=%s\n' "${GATEWAY_API_KEY}"
       ;;
@@ -2622,8 +2709,10 @@ cmd_admin() {
       fi
       printf 'GATEWAY_UI_PASSWORD=%s\n' "${UI_PASSWORD}"
       if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-        printf 'ACCOUNT_PORTAL_URL=%s\n' "${ACCOUNT_PUBLIC_URL:-http://${ui_host}:${API_PORT}/ui/}"
-        printf 'OMNIROUTE_BASE_UI_URL=http://%s:%s/base_ui/\n' "${ui_host}" "${API_PORT}"
+        local public_account_origin
+        public_account_origin=$(effective_account_origin)
+        printf 'ACCOUNT_PORTAL_URL=%s/ui/\n' "${public_account_origin}"
+        printf 'OMNIROUTE_BASE_UI_URL=%s/base_ui/\n' "${public_account_origin}"
         printf 'ACCOUNT_PORTAL_ADMIN=%s\n' "${ACCOUNT_ADMIN_USERNAME}"
         printf 'ACCOUNT_PORTAL_PASSWORD=%s\n' "${ACCOUNT_ADMIN_PASSWORD}"
       fi
@@ -3442,6 +3531,7 @@ main() {
     router) cmd_router "$@" ;;
     database) cmd_database "$@" ;;
     account) cmd_account "$@" ;;
+    nginx) cmd_nginx "$@" ;;
     logs) cmd_logs "$@" ;;
     smoke) cmd_smoke "$@" ;;
     ocr) cmd_ocr "$@" ;;

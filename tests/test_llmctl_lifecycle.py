@@ -67,10 +67,27 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn("location ^~ /ui/", output)
         self.assertIn("location ^~ /portal-api/", output)
         self.assertIn("location ^~ /base_ui/", output)
+        self.assertIn("location = /portal-api/auth/login", output)
+        self.assertIn("limit_req zone=llmctl_auth", output)
+        self.assertIn("limit_req_zone $binary_remote_addr", output)
+        self.assertIn("proxy_set_header X-Forwarded-For $remote_addr", output)
+        self.assertNotIn("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for", output)
+        self.assertIn('add_header X-Content-Type-Options "nosniff" always', output)
         api = output.split("location ^~ /v1/", 1)[1].split("}", 1)[0]
         self.assertIn("127.0.0.1:18000", api)
         self.assertIn("proxy_buffering off", api)
         self.assertNotIn("127.0.0.1:8001", api)
+
+    def test_public_nginx_apply_command_reuses_transactional_install(self):
+        output = run_bash(
+            r"""
+            require_root() { :; }
+            load_config() { :; }
+            cmd_nginx_install() { printf 'nginx-applied\n'; }
+            cmd_nginx apply
+            """
+        )
+        self.assertEqual(output.strip(), "nginx-applied")
 
     def test_default_logs_aggregate_router_database_and_active_workers(self):
         output = run_bash(

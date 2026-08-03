@@ -552,6 +552,102 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(captured[0][0].smtp_password, "preview-password")
         self.assertEqual(captured[0][1], "admin@example.com")
 
+    def test_optional_published_origin_overrides_links_and_can_be_cleared(self):
+        client, jar = self.login_admin_api()
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/settings",
+            {
+                "scope": "publishing",
+                "portal_title": "守护者 AI",
+                "published_origin": "https://LLM.ZJGUARDIAN.COM:443/",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["portal_title"], "守护者 AI")
+        self.assertEqual(body["published_origin"], "https://llm.zjguardian.com")
+        self.assertEqual(body["portal_public_url"], "https://llm.zjguardian.com/ui")
+        self.assertEqual(body["api_public_url"], "https://llm.zjguardian.com")
+
+        status, raw, _ = self.get(client, "/portal-api/public")
+        self.assertEqual(status, 200)
+        public = json.loads(raw)
+        self.assertEqual(public["portal_title"], "守护者 AI")
+        self.assertEqual(public["portal_public_url"], "https://llm.zjguardian.com/ui")
+        self.assertEqual(public["api_public_url"], "https://llm.zjguardian.com")
+        mail = portal.effective_mail_config(self.config, self.server.db.settings())
+        self.assertEqual(mail.public_url, "https://llm.zjguardian.com/ui")
+
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/settings",
+            {
+                "scope": "publishing",
+                "portal_title": "LLMCtl",
+                "published_origin": "",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["published_origin"], "")
+        self.assertEqual(body["api_public_url"], "https://llm.example.test")
+
+        status, _, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/settings",
+            {
+                "scope": "publishing",
+                "portal_title": "守护者 AI",
+                "published_origin": "https://llm.zjguardian.com",
+            },
+        )
+        self.assertEqual(status, 200)
+        status, _, session_headers = self.get(client, "/portal-api/session")
+        self.assertEqual(status, 200)
+        upgraded = session_headers.get_all("Set-Cookie") or []
+        self.assertTrue(
+            any(portal.SESSION_COOKIE in item and "; Secure" in item for item in upgraded)
+        )
+
+        fresh_client, fresh_jar = self.opener()
+        status, _, _ = self.get(fresh_client, "/portal-api/public")
+        self.assertEqual(status, 200)
+        csrf_cookie = next(
+            cookie for cookie in fresh_jar if cookie.name == portal.CSRF_COOKIE
+        )
+        self.assertTrue(csrf_cookie.secure)
+
+    def test_published_origin_rejects_paths_credentials_queries_and_controls(self):
+        client, jar = self.login_admin_api()
+        for value in (
+            "https://llm.example.com/not-ui",
+            "https://user:password@llm.example.com",
+            "https://llm.example.com?next=evil",
+            "https://llm.example.com/#fragment",
+            "https://bad host.example.com",
+            "https://llm.example.com\nX-Test: injected",
+        ):
+            status, body, _ = self.json_post(
+                client,
+                jar,
+                "/portal-api/admin/settings",
+                {"scope": "publishing", "published_origin": value},
+            )
+            self.assertEqual(status, 400, value)
+            self.assertIn("error", body)
+
+        for value in ("", "x" * 41, "LLMCtl\nInjected"):
+            status, body, _ = self.json_post(
+                client,
+                jar,
+                "/portal-api/admin/settings",
+                {"scope": "publishing", "portal_title": value},
+            )
+            self.assertEqual(status, 400, value)
+            self.assertIn("error", body)
+
     def insert_control_user_and_model(self, *, paid=False, source_kind="combo", upstream_free=0):
         stamp = portal.now()
         with self.server.db.connect() as connection:

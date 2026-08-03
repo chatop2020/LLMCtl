@@ -26,7 +26,11 @@ import {
 import { writeClipboardText } from "./clipboard.js";
 
 const session = ref(null);
-const publicConfig = ref({ registration_enabled: false, allowed_domains: [] });
+const publicConfig = ref({
+  registration_enabled: false,
+  allowed_domains: [],
+  portal_title: "LLMCtl",
+});
 const dashboard = ref(null);
 const admin = ref(null);
 const busy = ref(false);
@@ -129,6 +133,12 @@ const modelEdit = reactive({
   access: [{ type: "all", id: "" }],
 });
 const settings = reactive({});
+const portalTitle = computed(
+  () => settings.portal_title || publicConfig.value.portal_title || "LLMCtl",
+);
+const portalInitial = computed(
+  () => Array.from(portalTitle.value.trim())[0]?.toUpperCase() || "L",
+);
 const smtpTestRecipient = ref("");
 const showHiddenFreeResources = ref(false);
 const stressPlan = reactive({
@@ -392,7 +402,7 @@ const nav = computed(() =>
         ["groups", "用户组"],
         ["billing", "账单"],
         ["stress", "性能压测"],
-        ["settings", "注册与 SMTP"],
+        ["settings", "发布、注册与 SMTP"],
         ["audit", "审计"],
       ]
     : [
@@ -491,6 +501,8 @@ function applyAdminSnapshot(snapshot) {
   if (!selectedStressRunId.value && snapshot.stress_runs?.length)
     selectedStressRunId.value = snapshot.stress_runs[0].id;
   Object.assign(settings, snapshot.settings);
+  settings.portal_title ||= publicConfig.value.portal_title || "LLMCtl";
+  settings.published_origin ||= "";
   if (!smtpTestRecipient.value)
     smtpTestRecipient.value = settings.smtp_from || "";
   const currentOrigin = location.origin;
@@ -880,6 +892,14 @@ watch(
     for (const key of Object.keys(listFilters)) pages[key] = 1;
   },
   { deep: true },
+);
+
+watch(
+  portalTitle,
+  (title) => {
+    document.title = `${title} 模型服务门户`;
+  },
+  { immediate: true },
 );
 
 async function loadUsagePage(nextPage = 1) {
@@ -1446,6 +1466,14 @@ function registrationPayload() {
   };
 }
 
+function publishingPayload() {
+  return {
+    scope: "publishing",
+    portal_title: settings.portal_title || "LLMCtl",
+    published_origin: settings.published_origin || "",
+  };
+}
+
 function smtpPayload() {
   return {
     scope: "smtp",
@@ -1467,6 +1495,20 @@ async function saveRegistration() {
       }),
     "注册设置已保存",
     { key: "registration-save", pending: "正在验证并保存注册设置…" },
+  );
+}
+
+async function savePublishing() {
+  await action(
+    () =>
+      api("admin/settings", {
+        method: "POST",
+        body: JSON.stringify(publishingPayload()),
+      }),
+    settings.published_origin
+      ? "对外发布地址已启用"
+      : "已恢复自动使用当前访问地址",
+    { key: "publishing-save", pending: "正在验证并保存对外发布地址…" },
   );
 }
 
@@ -1536,9 +1578,9 @@ onBeforeUnmount(() => {
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark">L</span>
+        <span class="brand-mark">{{ portalInitial }}</span>
         <div>
-          <strong>LLMCtl 模型服务门户</strong
+          <strong>{{ portalTitle }} 模型服务门户</strong
           ><small>模型访问 · API Key · 额度与用量</small>
         </div>
       </div>
@@ -1559,7 +1601,7 @@ onBeforeUnmount(() => {
 
     <main v-if="!session?.authenticated" class="auth-page">
       <section class="auth-copy">
-        <h1>LLMCtl<br /><em>模型服务门户</em></h1>
+        <h1>{{ portalTitle }}<br /><em>模型服务门户</em></h1>
         <p>查看已授权模型、管理调用凭据，并核对额度、价格与请求用量。</p>
         <div class="trust-row">
           <span>✓ OpenAI 兼容 API</span><span>✓ 细粒度模型授权</span
@@ -1593,7 +1635,7 @@ onBeforeUnmount(() => {
           v-else
           @submit.prevent="authMode === 'login' ? login() : register()"
         >
-          <h2>{{ authMode === "login" ? "欢迎回来" : "创建 LLMCtl 账户" }}</h2>
+          <h2>{{ authMode === "login" ? "欢迎回来" : `创建 ${portalTitle} 账户` }}</h2>
           <p class="muted" v-if="authMode === 'register'">
             允许域名：{{
               publicConfig.allowed_domains?.join(", ") || "管理员尚未配置"
@@ -1640,7 +1682,7 @@ onBeforeUnmount(() => {
     <div v-else class="workspace">
       <aside class="sidebar">
         <div class="role-pill">
-          {{ isAdmin ? "LLMCtl 管理台" : "用户工作台" }}
+          {{ isAdmin ? `${portalTitle} 管理台` : "用户工作台" }}
         </div>
         <nav>
           <button
@@ -3614,14 +3656,108 @@ onBeforeUnmount(() => {
           <section v-if="section === 'settings'" class="page">
             <div class="page-head">
               <div>
-                <span class="eyebrow">ONBOARDING</span>
-                <h1>注册与 SMTP</h1>
+                <span class="eyebrow">PUBLISHING &amp; ONBOARDING</span>
+                <h1>发布、注册与 SMTP</h1>
                 <p>
-                  注册策略和邮件服务分别保存，修改其中一项不会被另一项阻塞。
+                  对外地址、注册策略和邮件服务分别保存，修改其中一项不会被另一项阻塞。
                 </p>
               </div>
             </div>
             <div class="settings-grid">
+              <section class="panel form-stack settings-publish">
+                <div class="panel-head">
+                  <div>
+                    <h2>对外发布地址</h2>
+                    <p class="muted setting-note">
+                      配置后，门户链接、邮箱验证链接、API 地址和 curl
+                      示例统一使用该地址；留空则继续使用当前访问地址或安装时地址。
+                    </p>
+                  </div>
+                  <span
+                    class="status"
+                    :class="
+                      settings.published_origin?.startsWith('https://')
+                        ? 'ok'
+                        : settings.published_origin
+                          ? 'warn'
+                          : ''
+                    "
+                    >{{
+                      settings.published_origin
+                        ? settings.published_origin.startsWith("https://")
+                          ? "HTTPS 已启用"
+                          : "建议改用 HTTPS"
+                        : "自动"
+                    }}</span
+                  >
+                </div>
+                <label
+                  >门户品牌名称<input
+                    v-model.trim="settings.portal_title"
+                    type="text"
+                    maxlength="40"
+                    autocomplete="organization"
+                    placeholder="LLMCtl"
+                /></label>
+                <p class="muted setting-note">
+                  用于登录页、页眉和浏览器标题；默认值为 LLMCtl。
+                </p>
+                <label
+                  >公开访问源（可选）<input
+                    v-model.trim="settings.published_origin"
+                    type="url"
+                    inputmode="url"
+                    autocomplete="url"
+                    placeholder="https://llm.zjguardian.com"
+                /></label>
+                <div class="publish-preview">
+                  <span
+                    ><small>门户</small><code>{{
+                        settings.published_origin
+                          ? `${settings.published_origin.replace(/\/$/, '')}/ui/`
+                          : settings.effective_public_url || `${location.origin}/ui`
+                      }}</code></span
+                  >
+                  <span
+                    ><small>API Base</small><code>{{
+                        settings.published_origin
+                          ? `${settings.published_origin.replace(/\/$/, '')}/v1`
+                          : `${settings.effective_api_public_url || location.origin}/v1`
+                      }}</code></span
+                  >
+                </div>
+                <p class="muted setting-note">
+                  此设置只生成公开链接并决定 HTTPS 会话安全属性，不修改 Nginx
+                  监听、DNS、证书、端口映射或 Worker。
+                </p>
+                <details class="advanced-settings">
+                  <summary>查看自动回退地址</summary>
+                  <div class="form-grid compact">
+                    <label
+                      >门户回退 URL<input
+                        v-model="settings.public_url"
+                        placeholder="http://server:8000/ui"
+                    /></label>
+                    <label
+                      >API 回退 URL<input
+                        v-model="settings.api_public_url"
+                        placeholder="http://server:8000"
+                    /></label>
+                  </div>
+                </details>
+                <button
+                  type="button"
+                  class="primary"
+                  :disabled="busy"
+                  @click="savePublishing"
+                >
+                  {{
+                    operation === "publishing-save"
+                      ? "保存中…"
+                      : "保存发布地址"
+                  }}
+                </button>
+              </section>
               <section class="panel form-stack">
                 <h2>注册策略</h2>
                 <label class="switch"
@@ -3652,14 +3788,6 @@ onBeforeUnmount(() => {
                   >重置时间<input
                     v-model="settings.default_quota_reset_time"
                     type="time" /></label
-                ><label
-                  >门户公开 URL<input
-                    v-model="settings.public_url"
-                    placeholder="http://server:8000/ui" /></label
-                ><label
-                  >API 公开 URL<input
-                    v-model="settings.api_public_url"
-                    placeholder="http://server:8000" /></label
                 ><button
                   type="button"
                   class="primary"

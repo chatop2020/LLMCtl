@@ -166,6 +166,8 @@ sudo bash install-llm-cluster.sh \
 
 白名单按 `@` 后完整域名匹配；允许 `example.com` 不会自动允许 `evil-example.com` 或 `dept.example.com`。注册和验证两个阶段都会重新检查。门户管理员可在线配置并测试 SMTP、关闭/开启注册、调整白名单和新用户默认赠额，也可禁用用户、分组、增减金额余额、发放通用或指定模型的额外 token。赠额支持 `daily`、`weekly`、`monthly` 及指定重置时间；后台会独立执行到期重置，即使额度耗尽导致 key 已关闭也能按时恢复。
 
+管理员还可在“发布、注册与 SMTP”中单独保存门户品牌名称和公开访问源。公开访问源只能是无路径、无凭据、无 query/fragment 的 `http(s)` origin，例如 `https://llm.zjguardian.com`。配置后，它优先于安装期回退地址，用于验证邮件、页内链接、API Base、curl 示例、`llmctl account url`、`llmctl admin show`、`llmctl key show` 和 `llmctl info`；留空不改变原有访问方式。HTTPS origin 会让新签发的门户会话 Cookie 带 `Secure`，已有有效会话在首次从 HTTPS 域名访问时也会原地升级；配置后不要再从明文 HTTP 地址使用门户。品牌名称为 1–40 个可见字符，用于页眉、登录页和浏览器标题。
+
 模型管理页把公开 ID（例如 `gdn-inside`）通过 OmniRoute 原生 Combo mapping/model alias 映射到实际 `ornith-1.0-35b-fp8`。用户 key 只授权公开 ID，不授权底层模型或 Combo ID。管理员可为每个模型分别设置输入、输出、缓存读取和思考 token 的 `$/1M` 价格，并按“全体、多个用户组、多个指定用户”发布；token 赠额优先消耗，超出部分才扣金额余额。价格会按版本快照进账本，历史调用不会被新价格重算。
 
 免费资源页读取 OmniRoute 的免费目录和已配置/当前可用排名。一个资源只有在“已发现、Provider 已配置、当前可用、门户真实请求测试成功、管理员明确发布”全部满足后才能开放。门户每 15 分钟复测已发布免费模型；连续三次失败会先关闭用户 key、撤销 OmniRoute 映射，再从授权目录中下线，避免免费上游消失后继续暴露失效模型。
@@ -184,6 +186,15 @@ sudo llmctl logs account -f
 OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显示降级告警，并允许查看用户、SMTP、账本和审计；依赖网关的模型、Key、权限和实时对账操作会明确失败，不会伪装成功。`llmctl startup status` 会把这种状态标为 `degraded`，而完整启动验收仍要求门户 `/ready` 与 OmniRoute 一起恢复。
 
 生产环境只需保护公开 `8000`，并在现有 Nginx/TLS 站点或上游负载均衡器终止 HTTPS；不要公开回环 `8001/18000/810x`。`--account-public-url` 可使用公开 origin 或其 `/ui` 路径，`--account-api-public-url` 使用无路径 origin。SMTP 密码和管理 key 位于 root-only 配置；当前门户 SQLite 也会保存运行期 SMTP 设置，因此应按敏感文件备份和保护，不要把凭据写入命令历史。
+
+公网发布前执行以下安全清单：
+
+1. 防火墙只允许外部进入 TLS 入口和所需的 Nginx 统一端口；用 `ss -ltnp` 确认账户门户、OmniRoute 和 Worker 仍只监听 `127.0.0.1`。
+2. 使用受信任证书并强制用户从 HTTPS 域名访问；在门户管理端保存相同的“公开访问源”。LLMCtl 不自动申请证书，也不修改你的边缘端口映射。
+3. 升级控制面后运行 `sudo llmctl nginx apply && sudo llmctl nginx test`。生成器先备份旧 LLMCtl 配置并执行 `nginx -t`，失败自动回滚；该配置覆盖客户端伪造的 `X-Forwarded-For`、限制登录/注册/验证请求，并增加 `nosniff`、Referrer 和 Permissions Policy 响应头。
+4. `/base_ui/` 及其原生网关管理 API 仅供排障。公网域名应在最外层反向代理对该路径使用 VPN、IP ACL 或独立管理认证；普通用户只需要 `/ui/`、`/portal-api/` 和 `/v1/`。
+5. 不要公开或复制 `/etc/llm-cluster/secrets.env`、两个 SQLite 文件和未脱敏的 `llmctl info`。工单中只使用 `sudo llmctl info --redact`。
+6. 开启企业注册时保留精确邮箱后缀白名单和 SMTP 验证；定期检查门户审计、失败登录和 Nginx 429 日志，并备份两个 SQLite 文件。
 
 ## OpenAI 兼容 API
 
@@ -345,6 +356,8 @@ sudo llmctl upgrade
 ```
 
 命令会询问是否从 GitHub 获取 `main` 最新提交。它同时预检 GitHub API 和 ZIP 归档下载站点；预检后真实下载仍可能失败，此时会自动检查已保存维护代理，仍不可用就询问新的代理并重试。升级内容限于 `llmctl` 与 `/usr/local/lib/llm-cluster/` 下由升级清单声明的控制面程序；当前模型、Worker、网关运行数据、配置、密钥、数据库和 Nginx 均保留。账户门户正在运行时会短暂停止并验收，失败自动从 `/var/backups/llmctl/` 回滚。
+
+升级不会自动重写 Nginx。需要应用新版公网安全配置时再执行 `sudo llmctl nginx apply`；它只更新 LLMCtl 自己的 `/etc/nginx/conf.d/llm-cluster.conf`，不会重启 GPU Worker。
 
 ```bash
 sudo llmctl upgrade --proxy http://192.168.9.104:1082 --save-proxy

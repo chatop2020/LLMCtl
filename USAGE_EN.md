@@ -166,6 +166,8 @@ sudo bash install-llm-cluster.sh \
 
 The allowlist matches the complete part after `@`; allowing `example.com` does not allow `evil-example.com` or `dept.example.com`. It is checked at both registration and verification. Administrators can configure and test SMTP online, enable/disable registration, change the allowlist and welcome grant, disable users, manage groups, adjust money balances, and issue generic or model-specific token grants. Grants support `daily`, `weekly`, and `monthly` resets at an explicit time. A background reset runs independently, so an exhausted and disabled key can become eligible again on schedule.
 
+The administrator can also save the portal brand and published origin independently under **Publishing, registration & SMTP**. The origin must be a path-free, credential-free `http(s)` origin with no query or fragment, such as `https://llm.zjguardian.com`. When configured, it overrides the installation fallback for verification mail, page links, API Base, curl examples, `llmctl account url`, `llmctl admin show`, `llmctl key show`, and `llmctl info`; blank preserves the existing access behavior. An HTTPS origin marks newly issued portal session cookies `Secure`, and an existing valid session is upgraded in place on its first visit through that HTTPS domain. Do not continue using the portal over plaintext HTTP after configuring it. The brand is 1–40 visible characters and is used in the header, sign-in page, and browser title.
+
 The model page maps a public ID such as `gdn-inside` to `ornith-1.0-35b-fp8` with OmniRoute's native Combo mapping or model alias. User keys authorize only the public ID—not the underlying model or Combo ID. Each model can have separate input, output, cache-read, and reasoning-token prices per million tokens and multiple `all`, group, or individual access rules. Token grants are consumed first; only the excess debits the money balance. Prices are versioned and snapshotted into the ledger, so later edits never reprice old calls.
 
 The free-resource page reads OmniRoute's catalog plus configured/currently-available provider rankings. A resource can be published only after discovery, provider configuration, current availability, a real portal live test, and explicit administrator approval. Published free models are retested every 15 minutes. After three consecutive failures the portal disables keys first, withdraws the native mapping, and removes the model from effective permissions.
@@ -184,6 +186,15 @@ The administration console's **Performance benchmark** is executed by server-sid
 If OmniRoute is temporarily unavailable, the portal's local administration pages remain accessible with a degradation warning so users, SMTP settings, ledgers, and audits can still be inspected. Operations that depend on the gateway—models, keys, permissions, and live reconciliation—fail explicitly rather than reporting false success. `llmctl startup status` reports this state as `degraded`, while full startup acceptance still requires the portal `/ready` endpoint and OmniRoute to recover together.
 
 In production, protect only public port `8000` and terminate HTTPS in an existing Nginx/TLS site or upstream load balancer; never expose loopback ports `8001`, `18000`, or `810x`. `--account-public-url` may be the public origin or its `/ui` path, while `--account-api-public-url` is a path-free origin. SMTP and management credentials are in root-only configuration; the portal SQLite file also stores runtime SMTP settings and must be backed up and protected as a sensitive file.
+
+Complete this security checklist before Internet publication:
+
+1. Allow inbound traffic only to the TLS edge and required Nginx front-door port. Use `ss -ltnp` to confirm that the portal, OmniRoute, and workers still bind only to `127.0.0.1`.
+2. Use a trusted certificate, force users through the HTTPS domain, and save the same **Published origin** in the portal. LLMCtl does not obtain certificates or alter edge port mappings.
+3. After a control-plane upgrade, run `sudo llmctl nginx apply && sudo llmctl nginx test`. The generator backs up the LLMCtl site and runs `nginx -t` before reload, rolling back on failure. The generated site overwrites spoofable client `X-Forwarded-For`, throttles login/registration/verification, and adds `nosniff`, Referrer, and Permissions Policy headers.
+4. `/base_ui/` and the native gateway management API are troubleshooting surfaces. Restrict them at the outer reverse proxy with a VPN, IP ACL, or separate administration authentication. Ordinary users need only `/ui/`, `/portal-api/`, and `/v1/`.
+5. Never publish or paste `/etc/llm-cluster/secrets.env`, either SQLite file, or an unredacted `llmctl info`. Use `sudo llmctl info --redact` in tickets.
+6. Keep the exact email-domain allowlist and SMTP verification enabled for company registration. Review portal audit events, failed sign-ins, and Nginx 429 logs, and back up both SQLite files regularly.
 
 ## OpenAI-Compatible API
 
@@ -345,6 +356,8 @@ sudo llmctl upgrade
 ```
 
 The command asks whether to fetch the latest `main` commit from GitHub. It preflights both the GitHub API and the ZIP archive host. If a real transfer still fails after preflight, it tries the saved maintenance proxy and then offers a new proxy before retrying. The upgrade is limited to `llmctl` and control-plane programs declared under `/usr/local/lib/llm-cluster/`. Models, workers, gateway runtime data, configuration, secrets, databases, and Nginx are preserved. A running account portal is stopped briefly for acceptance and automatically restored from `/var/backups/llmctl/` on failure.
+
+An upgrade does not rewrite Nginx automatically. Run `sudo llmctl nginx apply` when you want the newer public-edge hardening; it changes only LLMCtl's `/etc/nginx/conf.d/llm-cluster.conf` and does not restart GPU workers.
 
 ```bash
 sudo llmctl upgrade --proxy http://192.168.9.104:1082 --save-proxy
