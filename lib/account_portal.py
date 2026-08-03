@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "2.8.3"
+APP_VERSION = "2.9.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -495,6 +495,54 @@ def micros_to_money(value: int) -> str:
     return f"{sign}{value // 1_000_000}.{value % 1_000_000:06d}".rstrip("0").rstrip(".")
 
 
+def price_usage(
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int,
+    reasoning_tokens: int,
+    prices: dict[str, Any] | sqlite3.Row,
+    available_grant_tokens: int = 0,
+) -> dict[str, int]:
+    """Price one request and apply token grants without losing price fidelity.
+
+    Model prices are expressed in micro-USD per one million tokens. A raw
+    token grant cannot be prorated across the request total because cached,
+    input, output and reasoning tokens can have different prices. We therefore
+    assign grants to the highest-priced billable token classes first. Free
+    token classes never consume a grant.
+    """
+    total_input = max(0, int(input_tokens))
+    total_output = max(0, int(output_tokens))
+    cached = min(total_input, max(0, int(cached_tokens)))
+    reasoning = min(total_output, max(0, int(reasoning_tokens)))
+    categories = [
+        (total_input - cached, int(prices["input_price_micros"])),
+        (cached, int(prices["cached_price_micros"])),
+        (total_output - reasoning, int(prices["output_price_micros"])),
+        (reasoning, int(prices["reasoning_price_micros"])),
+    ]
+    gross_numerator = sum(count * max(0, unit_price) for count, unit_price in categories)
+    remaining_grant = max(0, int(available_grant_tokens))
+    grant_numerator = 0
+    granted_tokens = 0
+    for count, unit_price in sorted(categories, key=lambda item: item[1], reverse=True):
+        if remaining_grant <= 0 or count <= 0 or unit_price <= 0:
+            continue
+        take = min(count, remaining_grant)
+        granted_tokens += take
+        remaining_grant -= take
+        grant_numerator += take * unit_price
+    net_numerator = max(0, gross_numerator - grant_numerator)
+    gross = (gross_numerator + 999_999) // 1_000_000
+    amount = (net_numerator + 999_999) // 1_000_000
+    return {
+        "gross_amount_micros": gross,
+        "grant_amount_micros": gross - amount,
+        "amount_micros": amount,
+        "granted_tokens": granted_tokens,
+    }
+
+
 def positive_int_or_none(value: Any, label: str, maximum: int = 10_000_000) -> int | None:
     """Parse an optional positive model limit without silently accepting bad input."""
     if value is None or str(value).strip() == "":
@@ -576,6 +624,31 @@ def normalize_max_sessions(value: Any, label: str = "API Key 活跃会话上限"
     if not 0 <= result <= 10000:
         raise ValueError(f"{label}必须在 0-10000 之间")
     return result
+
+
+def normalize_request_limit(value: Any, label: str) -> int:
+    """Normalize a native OmniRoute request-count limit (0 disables it)."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label}必须是整数") from error
+    if not 0 <= result <= 10_000_000:
+        raise ValueError(f"{label}必须在 0-10000000 之间")
+    return result
+
+
+def request_rate_limits(requests_per_minute: int, requests_per_day: int) -> list[dict[str, int]]:
+    """Build OmniRoute's per-key fixed-window request rules.
+
+    Keep this separate from maxSessions: maxSessions is a conversation/session
+    sharing signal, whereas these rules cap actual HTTP requests.
+    """
+    rules: list[dict[str, int]] = []
+    if requests_per_minute:
+        rules.append({"limit": requests_per_minute, "window": 60})
+    if requests_per_day:
+        rules.append({"limit": requests_per_day, "window": 86_400})
+    return rules
 
 
 def effective_public_urls(config: "Config", settings: dict[str, str]) -> tuple[str, str]:
@@ -700,8 +773,8 @@ class Config:
             raise SystemExit("ACCOUNT_PORT must be 1-65535")
         if not 1 <= smtp_port <= 65535:
             raise SystemExit("SMTP_PORT must be 1-65535")
-        if not 1 <= initial_quota <= 10**12:
-            raise SystemExit("ACCOUNT_DEFAULT_QUOTA_TOKENS must be 1-1000000000000")
+        if not 0 <= initial_quota <= 10**12:
+            raise SystemExit("ACCOUNT_DEFAULT_QUOTA_TOKENS must be 0-1000000000000")
         if not 300 <= verification_ttl <= 7 * 86400:
             raise SystemExit("ACCOUNT_VERIFICATION_TTL must be 300-604800 seconds")
         if smtp_from:
@@ -782,6 +855,8 @@ CREATE TABLE IF NOT EXISTS users (
   quota_reset TEXT NOT NULL,
   quota_reset_time TEXT NOT NULL,
   max_sessions INTEGER NOT NULL DEFAULT 0,
+  requests_per_minute INTEGER NOT NULL DEFAULT 0,
+  requests_per_day INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   verified_at INTEGER,
   last_login_at INTEGER
@@ -938,6 +1013,8 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
   cached_tokens INTEGER NOT NULL,
   reasoning_tokens INTEGER NOT NULL,
   granted_tokens INTEGER NOT NULL,
+  gross_amount_micros INTEGER NOT NULL DEFAULT 0,
+  grant_amount_micros INTEGER NOT NULL DEFAULT 0,
   amount_micros INTEGER NOT NULL,
   price_snapshot_json TEXT NOT NULL,
   occurred_at INTEGER NOT NULL,
@@ -989,6 +1066,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage_ledger(public_model_id,
 CREATE INDEX IF NOT EXISTS idx_usage_model_fk ON usage_ledger(model_id,id);
 CREATE INDEX IF NOT EXISTS idx_balance_user_time ON balance_transactions(user_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_grants_user_status ON token_grants(user_id,status);
+CREATE INDEX IF NOT EXISTS idx_grants_active_balance ON token_grants(user_id,status,expires_at) WHERE tokens_remaining>0;
 CREATE INDEX IF NOT EXISTS idx_stress_runs_created ON stress_runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_stress_runs_status ON stress_runs(status,updated_at DESC);
 """
@@ -1024,6 +1102,8 @@ class Database:
                 "default_quota_reset": self.config.initial_reset,
                 "default_quota_reset_time": self.config.initial_reset_time,
                 "default_max_sessions": "1",
+                "default_requests_per_minute": "30",
+                "default_requests_per_day": "2000",
                 "portal_title": "LLMCtl",
                 "published_origin": "",
                 "public_url": self.config.public_url,
@@ -1060,6 +1140,14 @@ class Database:
                 # use default_max_sessions (1 by default).
                 connection.execute(
                     "ALTER TABLE users ADD COLUMN max_sessions INTEGER NOT NULL DEFAULT 0"
+                )
+            if "requests_per_minute" not in user_columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN requests_per_minute INTEGER NOT NULL DEFAULT 0"
+                )
+            if "requests_per_day" not in user_columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN requests_per_day INTEGER NOT NULL DEFAULT 0"
                 )
             connection.execute(
                 "UPDATE users SET login_name=email WHERE login_name IS NULL OR TRIM(login_name)=''"
@@ -1106,6 +1194,45 @@ class Database:
                 connection.execute(
                     "ALTER TABLE token_grants ADD COLUMN reset_time TEXT NOT NULL DEFAULT '00:00'"
                 )
+            usage_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(usage_ledger)")
+            }
+            rebuild_usage_prices = False
+            if "gross_amount_micros" not in usage_columns:
+                connection.execute(
+                    "ALTER TABLE usage_ledger ADD COLUMN gross_amount_micros INTEGER NOT NULL DEFAULT 0"
+                )
+                rebuild_usage_prices = True
+            if "grant_amount_micros" not in usage_columns:
+                connection.execute(
+                    "ALTER TABLE usage_ledger ADD COLUMN grant_amount_micros INTEGER NOT NULL DEFAULT 0"
+                )
+                rebuild_usage_prices = True
+            # Historical rows only stored the wallet debit. Reconstruct the
+            # list-price charge from the immutable price snapshot so upgraded
+            # installations immediately show an honest billing breakdown.
+            if rebuild_usage_prices:
+                for usage in connection.execute(
+                    "SELECT id,input_tokens,output_tokens,cached_tokens,reasoning_tokens,"
+                    "amount_micros,price_snapshot_json FROM usage_ledger"
+                ).fetchall():
+                    try:
+                        prices = json.loads(usage["price_snapshot_json"] or "{}")
+                        priced = price_usage(
+                            int(usage["input_tokens"]),
+                            int(usage["output_tokens"]),
+                            int(usage["cached_tokens"]),
+                            int(usage["reasoning_tokens"]),
+                            prices,
+                        )
+                        gross = priced["gross_amount_micros"]
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        gross = int(usage["amount_micros"])
+                    gross = max(gross, int(usage["amount_micros"]))
+                    connection.execute(
+                        "UPDATE usage_ledger SET gross_amount_micros=?,grant_amount_micros=? WHERE id=?",
+                        (gross, gross - int(usage["amount_micros"]), usage["id"]),
+                    )
             admin = connection.execute(
                 "SELECT id FROM users WHERE role='admin' LIMIT 1"
             ).fetchone()
@@ -1481,6 +1608,8 @@ class OmniRouteClient:
         allowed_combos: list[str],
         active: bool,
         max_sessions: int = 0,
+        requests_per_minute: int = 0,
+        requests_per_day: int = 0,
     ) -> None:
         self.request(
             "PATCH",
@@ -1491,6 +1620,9 @@ class OmniRouteClient:
                 "isActive": active,
                 "noLog": False,
                 "maxSessions": max_sessions,
+                "rateLimits": request_rate_limits(
+                    requests_per_minute, requests_per_day
+                ),
             },
         )
 
@@ -2299,6 +2431,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         default_max_sessions = normalize_max_sessions(
             settings.get("default_max_sessions", "1"), "默认活跃会话上限"
         )
+        default_rpm = normalize_request_limit(
+            settings.get("default_requests_per_minute", "30"), "默认每分钟请求数"
+        )
+        default_rpd = normalize_request_limit(
+            settings.get("default_requests_per_day", "2000"), "默认每日请求数"
+        )
         with self.app.db.connect() as connection:
             user = connection.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             if user and user["status"] != "pending":
@@ -2315,14 +2453,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 user_id = str(uuid.uuid4())
             if not ignored_reason and user:
                 connection.execute(
-                    "UPDATE users SET login_name=?,password_hash=?,max_sessions=? WHERE id=?",
-                    (email, password_hash, default_max_sessions, user_id),
+                    "UPDATE users SET login_name=?,password_hash=?,max_sessions=?,requests_per_minute=?,requests_per_day=? WHERE id=?",
+                    (email, password_hash, default_max_sessions, default_rpm, default_rpd, user_id),
                 )
                 connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             elif not ignored_reason:
                 connection.execute(
-                    "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, stamp),
+                    "INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,requests_per_minute,requests_per_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, default_rpm, default_rpd, stamp),
                 )
             if not ignored_reason:
                 connection.execute(
@@ -2455,6 +2593,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if user["role"] != "user":
             raise ValueError("only user API keys can be rotated here")
         old_id = str(user["api_key_id"] or "")
+        old_limit_id = str(user["token_limit_id"] or "")
         new_id, raw_key = self.app.omni.create_user_key(
             user["id"], user["email"], int(user["max_sessions"])
         )
@@ -2463,7 +2602,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 connection.execute("UPDATE users SET api_key_id=?,token_limit_id=NULL WHERE id=?", (new_id, user["id"]))
             self.app.control.sync_user(user["id"])
             if old_id:
-                self.app.omni.delete_key(old_id)
+                self.app.omni.delete_key_and_limit(old_id, old_limit_id)
         except Exception:
             with self.app.db.connect() as connection:
                 connection.execute("UPDATE users SET api_key_id=? WHERE id=?", (old_id or None, user["id"]))
@@ -2566,13 +2705,27 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             ),
             "默认活跃会话上限",
         )
+        default_rpm = normalize_request_limit(
+            payload.get(
+                "default_requests_per_minute",
+                current.get("default_requests_per_minute", "30"),
+            ),
+            "默认每分钟请求数",
+        )
+        default_rpd = normalize_request_limit(
+            payload.get(
+                "default_requests_per_day",
+                current.get("default_requests_per_day", "2000"),
+            ),
+            "默认每日请求数",
+        )
         reset = str(payload.get("default_quota_reset", current.get("default_quota_reset", "monthly")))
         reset_time = str(payload.get("default_quota_reset_time", current.get("default_quota_reset_time", "00:00")))
         currency = str(payload.get("currency", current.get("currency", "USD"))).strip().upper()
         if enabled and not domains:
             raise ValueError("开放注册前请至少配置一个允许的邮箱域名")
-        if not 1 <= quota <= 10**12:
-            raise ValueError("默认 Token 额度必须在 1-1000000000000 之间")
+        if not 0 <= quota <= 10**12:
+            raise ValueError("默认赠送 Token 必须在 0-1000000000000 之间")
         if reset not in {"daily", "weekly", "monthly"}:
             raise ValueError("额度重置周期无效")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
@@ -2609,6 +2762,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 "default_quota_reset": reset,
                 "default_quota_reset_time": reset_time,
                 "default_max_sessions": str(default_max_sessions),
+                "default_requests_per_minute": str(default_rpm),
+                "default_requests_per_day": str(default_rpd),
                 "published_origin": published_origin,
                 "public_url": public_url,
                 "api_public_url": api_url,
@@ -2730,7 +2885,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             )
             provisioned = bool(item["api_key_id"])
             controls = (
-                f'''<form method="post" action="/admin/user"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="user_id" value="{html.escape(item["id"])}"><label>Token quota</label><input name="quota" value="{item["quota_tokens"]}" inputmode="numeric"><label>API Key active sessions (0 = unlimited)</label><input name="max_sessions" type="number" min="0" max="10000" value="{item["max_sessions"]}"><label>Reset</label><select name="reset"><option {"selected" if item["quota_reset"]=="monthly" else ""}>monthly</option><option {"selected" if item["quota_reset"]=="weekly" else ""}>weekly</option><option {"selected" if item["quota_reset"]=="daily" else ""}>daily</option></select><input name="reset_time" value="{html.escape(item["quota_reset_time"])}"><label>Status</label><select name="status">{status_options}</select><p><button class="secondary">保存 / Save</button></p></form>'''
+                f'''<form method="post" action="/admin/user"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="user_id" value="{html.escape(item["id"])}"><label>Token quota (0 = none)</label><input name="quota" value="{item["quota_tokens"]}" inputmode="numeric"><label>API Key active sessions (0 = unlimited)</label><input name="max_sessions" type="number" min="0" max="10000" value="{item["max_sessions"]}"><label>Requests per minute (0 = unlimited)</label><input name="requests_per_minute" type="number" min="0" max="10000000" value="{item["requests_per_minute"]}"><label>Requests per day (0 = unlimited)</label><input name="requests_per_day" type="number" min="0" max="10000000" value="{item["requests_per_day"]}"><label>Reset</label><select name="reset"><option {"selected" if item["quota_reset"]=="monthly" else ""}>monthly</option><option {"selected" if item["quota_reset"]=="weekly" else ""}>weekly</option><option {"selected" if item["quota_reset"]=="daily" else ""}>daily</option></select><input name="reset_time" value="{html.escape(item["quota_reset_time"])}"><label>Status</label><select name="status">{status_options}</select><p><button class="secondary">保存 / Save</button></p></form>'''
                 if provisioned
                 else '<span class="muted">等待邮箱验证 / Pending email verification</span>'
             )
@@ -2738,7 +2893,11 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         audit_rows = "".join(f'<tr><td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["created_at"]))}</td><td>{html.escape(a["actor"])}</td><td>{html.escape(a["action"])}</td><td>{html.escape(a["status"])}</td><td>{html.escape(a["detail"])}</td></tr>' for a in audits)
         checked = "checked" if settings.get("registration_enabled") == "1" else ""
         flash = f'<div class="flash {"error" if error else ""}">{html.escape(message)}</div>' if message else ""
-        body = f'''{flash}<div class="grid"><section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许注册的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 API Key 活跃会话上限（0 = 不限制）</label><input name="max_sessions" type="number" min="0" max="10000" value="{html.escape(settings.get("default_max_sessions", "1"))}"><label>默认 Token 额度</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "1000000"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">新用户默认限制为 1 个接入层原生活跃会话；会话闲置后由网关自动释放。</p></section><section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(api_public_url)}">{html.escape(api_public_url)}</a></p><p>LLMCtl: {html.escape(portal_public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section><section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section><section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section></div>'''
+        registration = f'''<section class="card"><h2>注册策略 / Registration</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="__CSRF__"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {checked}> 允许新用户注册</label><label>允许注册的邮箱后缀（逗号分隔）</label><input name="domains" value="{html.escape(settings.get("allowed_domains", ""))}"><label>默认 API Key 活跃会话上限（0 = 不限制）</label><input name="max_sessions" type="number" min="0" max="10000" value="{html.escape(settings.get("default_max_sessions", "1"))}"><label>默认每分钟请求数（0 = 不限制）</label><input name="requests_per_minute" type="number" min="0" max="10000000" value="{html.escape(settings.get("default_requests_per_minute", "30"))}"><label>默认每日请求数（0 = 不限制）</label><input name="requests_per_day" type="number" min="0" max="10000000" value="{html.escape(settings.get("default_requests_per_day", "2000"))}"><label>默认 Token 额度（0 = 不赠送）</label><input name="quota" value="{html.escape(settings.get("default_quota_tokens", "0"))}" inputmode="numeric"><label>重置周期</label><select name="reset"><option {"selected" if settings.get("default_quota_reset")=="monthly" else ""}>monthly</option><option {"selected" if settings.get("default_quota_reset")=="weekly" else ""}>weekly</option><option {"selected" if settings.get("default_quota_reset")=="daily" else ""}>daily</option></select><label>重置时间</label><input name="reset_time" value="{html.escape(settings.get("default_quota_reset_time", "00:00"))}"><p><button>保存策略 / Save</button></p></form><p class="small muted">会话上限用于抑制长期共享；RPM 和每日请求数用于限制调用频率。</p></section>'''
+        endpoints = f'''<section class="card"><h2>服务入口</h2><p>API: <a href="{html.escape(api_public_url)}">{html.escape(api_public_url)}</a></p><p>LLMCtl: {html.escape(portal_public_url)}</p><p class="muted">账户策略由 LLMCtl 统一管理并同步到当前 AI 接入层。</p></section>'''
+        users_section = f'''<section class="card wide"><h2>用户 / Users</h2><div style="overflow:auto"><table><tr><th>Email</th><th>Status</th><th>Quota / status</th></tr>{''.join(rows) or '<tr><td colspan="3">暂无用户</td></tr>'}</table></div></section>'''
+        audit_section = f'''<section class="card wide"><h2>门户审计 / Portal audit</h2><div style="overflow:auto"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Detail</th></tr>{audit_rows}</table></div></section>'''
+        body = f'''{flash}<div class="grid">{registration}{endpoints}{users_section}{audit_section}</div>'''
         self.response(200, page("Admin", body, user), user)
 
     def handle_login(self, form: dict[str, str]) -> None:
@@ -2834,6 +2993,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         default_max_sessions = normalize_max_sessions(
             settings.get("default_max_sessions", "1"), "默认活跃会话上限"
         )
+        default_rpm = normalize_request_limit(
+            settings.get("default_requests_per_minute", "30"), "默认每分钟请求数"
+        )
+        default_rpd = normalize_request_limit(
+            settings.get("default_requests_per_day", "2000"), "默认每日请求数"
+        )
         duplicate_active = False
         throttled = False
         with self.app.db.connect() as connection:
@@ -2850,13 +3015,13 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     throttled = True
                 else:
                     connection.execute(
-                        "UPDATE users SET login_name=?,password_hash=?,max_sessions=? WHERE id=?",
-                        (email, password_hash, default_max_sessions, user_id),
+                        "UPDATE users SET login_name=?,password_hash=?,max_sessions=?,requests_per_minute=?,requests_per_day=? WHERE id=?",
+                        (email, password_hash, default_max_sessions, default_rpm, default_rpd, user_id),
                     )
                     connection.execute("DELETE FROM verification_tokens WHERE user_id=?", (user_id,))
             else:
                 user_id = str(uuid.uuid4())
-                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, now()))
+                connection.execute("INSERT INTO users(id,email,login_name,password_hash,role,status,quota_tokens,quota_reset,quota_reset_time,max_sessions,requests_per_minute,requests_per_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (user_id, email, email, password_hash, "user", "pending", int(settings["default_quota_tokens"]), settings["default_quota_reset"], settings["default_quota_reset_time"], default_max_sessions, default_rpm, default_rpd, now()))
             if not duplicate_active and not throttled:
                 connection.execute("INSERT INTO verification_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", (token_hash(raw_token), user_id, now() + self.app.config.verification_ttl, now()))
         if duplicate_active or throttled:
@@ -2885,6 +3050,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.response(410, page("Expired", '<div class="card error">验证链接已失效 / Verification link expired.</div>'))
             return
         settings = self.app.db.settings()
+        key_id = ""
+        grant_id = ""
         try:
             _, domain = normalize_email(record["email"])
             if domain not in normalize_domains(settings.get("allowed_domains", "")):
@@ -2892,24 +3059,87 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             key_id, raw_key = self.app.omni.create_user_key(
                 record["user_id"], record["email"], int(record["max_sessions"])
             )
-            limit_id = ""
-            try:
-                limit_id = self.app.omni.set_limit(key_id, record["quota_tokens"], record["quota_reset"], record["quota_reset_time"])
-            except Exception:
-                with contextlib.suppress(Exception):
-                    self.app.omni.delete_key_and_limit(key_id, limit_id)
-                raise
-            try:
-                with self.app.db.connect() as connection:
-                    changed = connection.execute("UPDATE verification_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL", (now(), token_hash(raw_token))).rowcount
-                    if changed != 1:
-                        raise RuntimeError("verification token was already consumed")
-                    connection.execute("UPDATE users SET status='active',verified_at=?,api_key_id=?,token_limit_id=? WHERE id=?", (now(), key_id, limit_id, record["user_id"]))
-            except Exception:
-                with contextlib.suppress(Exception):
-                    self.app.omni.delete_key_and_limit(key_id, limit_id)
-                raise
+            stamp = now()
+            with self.app.db.connect() as connection:
+                changed = connection.execute(
+                    "UPDATE verification_tokens SET used_at=? "
+                    "WHERE token_hash=? AND used_at IS NULL",
+                    (stamp, token_hash(raw_token)),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("verification token was already consumed")
+                connection.execute(
+                    "UPDATE users SET status='active',verified_at=?,api_key_id=?,"
+                    "token_limit_id=NULL WHERE id=?",
+                    (stamp, key_id, record["user_id"]),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO billing_accounts"
+                    "(user_id,balance_micros,suspended,updated_at) VALUES(?,0,0,?)",
+                    (record["user_id"], stamp),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO user_group_members"
+                    "(user_id,group_id,created_at) VALUES(?,'default',?)",
+                    (record["user_id"], stamp),
+                )
+                quota = int(settings.get("default_quota_tokens", "0") or 0)
+                if quota:
+                    reset = settings.get("default_quota_reset", "monthly")
+                    grant_id = str(uuid.uuid4())
+                    connection.execute(
+                        """INSERT INTO token_grants(
+                             id,user_id,label,tokens_initial,tokens_remaining,
+                             reset_interval,reset_time,reset_at,status,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            grant_id,
+                            record["user_id"],
+                            "Welcome recurring grant",
+                            quota,
+                            quota,
+                            reset,
+                            settings.get("default_quota_reset_time", "00:00"),
+                            next_reset_at(
+                                reset,
+                                reset_time=settings.get(
+                                    "default_quota_reset_time", "00:00"
+                                ),
+                            ),
+                            "active",
+                            stamp,
+                            stamp,
+                        ),
+                    )
+            self.app.control.sync_user(record["user_id"])
         except Exception as error:
+            if key_id:
+                with contextlib.suppress(Exception):
+                    self.app.omni.delete_key(key_id)
+            with self.app.db.connect() as connection:
+                if grant_id:
+                    connection.execute("DELETE FROM token_grants WHERE id=?", (grant_id,))
+                connection.execute(
+                    "DELETE FROM permission_sync WHERE user_id=?", (record["user_id"],)
+                )
+                connection.execute(
+                    "DELETE FROM user_group_members WHERE user_id=?", (record["user_id"],)
+                )
+                connection.execute(
+                    "DELETE FROM billing_accounts WHERE user_id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM balance_transactions WHERE user_id=?) AND NOT EXISTS "
+                    "(SELECT 1 FROM usage_ledger WHERE user_id=?)",
+                    (record["user_id"], record["user_id"], record["user_id"]),
+                )
+                connection.execute(
+                    "UPDATE users SET status='pending',verified_at=NULL,api_key_id=NULL,"
+                    "token_limit_id=NULL WHERE id=?",
+                    (record["user_id"],),
+                )
+                connection.execute(
+                    "UPDATE verification_tokens SET used_at=NULL WHERE token_hash=?",
+                    (token_hash(raw_token),),
+                )
             self.app.db.audit(record["email"], "verify.provision", record["user_id"], "failed", self.client_address[0], type(error).__name__)
             self.response(503, page("Provisioning failed", '<div class="card error">账户开通失败，未保留半成品 API Key；请重试或联系管理员。<br>Provisioning failed and the partial key was revoked.</div>'))
             return
@@ -2941,16 +3171,15 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             new_id, raw_key = self.app.omni.create_user_key(
                 user["id"], user["email"], int(user["max_sessions"])
             )
-            limit_id = ""
             try:
-                limit_id = self.app.omni.set_limit(new_id, user["quota_tokens"], user["quota_reset"], user["quota_reset_time"])
                 if old_id:
                     self.app.omni.activate_key(old_id, False)
                 with self.app.db.connect() as connection:
-                    connection.execute("UPDATE users SET api_key_id=?,token_limit_id=? WHERE id=?", (new_id, limit_id, user["id"]))
+                    connection.execute("UPDATE users SET api_key_id=?,token_limit_id=NULL WHERE id=?", (new_id, user["id"]))
+                self.app.control.sync_user(user["id"])
             except Exception:
                 with contextlib.suppress(Exception):
-                    self.app.omni.delete_key_and_limit(new_id, limit_id)
+                    self.app.omni.delete_key(new_id)
                 if old_id:
                     with contextlib.suppress(Exception):
                         self.app.omni.activate_key(old_id, True)
@@ -2980,10 +3209,16 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             default_max_sessions = normalize_max_sessions(
                 form.get("max_sessions", "1"), "默认活跃会话上限"
             )
+            default_rpm = normalize_request_limit(
+                form.get("requests_per_minute", "30"), "默认每分钟请求数"
+            )
+            default_rpd = normalize_request_limit(
+                form.get("requests_per_day", "2000"), "默认每日请求数"
+            )
             reset = form.get("reset", "")
             reset_time = form.get("reset_time", "")
             enabled = form.get("enabled") == "1"
-            if (enabled and not domains) or quota <= 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
+            if (enabled and not domains) or quota < 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
                 raise ValueError("invalid registration settings")
             if enabled and (
                 not self.app.config.public_url
@@ -2993,7 +3228,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 raise ValueError(
                     "public portal URL and SMTP must be configured before registration can be enabled"
                 )
-            values = {"registration_enabled": "1" if enabled else "0", "allowed_domains": ",".join(domains), "default_quota_tokens": str(quota), "default_quota_reset": reset, "default_quota_reset_time": reset_time, "default_max_sessions": str(default_max_sessions)}
+            values = {"registration_enabled": "1" if enabled else "0", "allowed_domains": ",".join(domains), "default_quota_tokens": str(quota), "default_quota_reset": reset, "default_quota_reset_time": reset_time, "default_max_sessions": str(default_max_sessions), "default_requests_per_minute": str(default_rpm), "default_requests_per_day": str(default_rpd)}
             with self.app.db.connect() as connection:
                 for key, value in values.items():
                     connection.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, value, now()))
@@ -3015,7 +3250,13 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             reset, reset_time = form.get("reset", ""), form.get("reset_time", "")
             target_status = form.get("status", "")
             max_sessions = normalize_max_sessions(form.get("max_sessions", "0"))
-            if quota <= 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or target_status not in {"active", "disabled"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
+            rpm = normalize_request_limit(
+                form.get("requests_per_minute", "0"), "每分钟请求数"
+            )
+            rpd = normalize_request_limit(
+                form.get("requests_per_day", "0"), "每日请求数"
+            )
+            if quota < 0 or quota > 10**12 or reset not in {"daily", "weekly", "monthly"} or target_status not in {"active", "disabled"} or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reset_time):
                 raise ValueError("invalid user settings")
             with self.app.db.connect() as connection:
                 target = connection.execute("SELECT * FROM users WHERE id=? AND role='user'", (form.get("user_id", ""),)).fetchone()
@@ -3024,9 +3265,19 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.app.omni.activate_key(target["api_key_id"], target_status == "active")
             try:
                 self.app.omni.set_key_max_sessions(target["api_key_id"], max_sessions)
-                limit_id = self.app.omni.set_limit(target["api_key_id"], quota, reset, reset_time, target["token_limit_id"])
                 with self.app.db.connect() as connection:
-                    connection.execute("UPDATE users SET status=?,quota_tokens=?,quota_reset=?,quota_reset_time=?,max_sessions=?,token_limit_id=? WHERE id=?", (target_status, quota, reset, reset_time, max_sessions, limit_id, target["id"]))
+                    connection.execute(
+                        "UPDATE users SET status=?,quota_tokens=?,quota_reset=?,quota_reset_time=?,"
+                        "max_sessions=?,requests_per_minute=?,requests_per_day=?,token_limit_id=NULL "
+                        "WHERE id=?",
+                        (
+                            target_status, quota, reset, reset_time, max_sessions,
+                            rpm, rpd, target["id"],
+                        ),
+                    )
+                if target["token_limit_id"]:
+                    self.app.omni.delete_limit(target["token_limit_id"])
+                self.app.control.sync_user(target["id"])
             except Exception:
                 with contextlib.suppress(Exception):
                     self.app.omni.activate_key(target["api_key_id"], target["status"] == "active")
@@ -3034,21 +3285,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     self.app.omni.set_key_max_sessions(
                         target["api_key_id"], int(target["max_sessions"])
                     )
-                if target["token_limit_id"]:
-                    with contextlib.suppress(Exception):
-                        self.app.omni.set_limit(
-                            target["api_key_id"],
-                            target["quota_tokens"],
-                            target["quota_reset"],
-                            target["quota_reset_time"],
-                            target["token_limit_id"],
-                        )
                 raise
         except Exception as error:
             self.app.db.audit(admin["email"], "user.update", form.get("user_id", ""), "failed", self.client_address[0], type(error).__name__)
             self.show_admin(str(error), True)
             return
-        self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "quota": quota, "reset": reset, "max_sessions": max_sessions})
+        self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "quota": quota, "reset": reset, "max_sessions": max_sessions, "requests_per_minute": rpm, "requests_per_day": rpd})
         self.show_admin("用户设置已保存 / User settings saved")
 
 
@@ -3364,6 +3606,27 @@ class PortalControlPlane:
             user = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not user or not user["api_key_id"]:
             return
+        # Older LLMCtl releases mirrored promotional grants into an OmniRoute
+        # global token limit. That made a positive cash balance unusable as soon
+        # as the grant was exhausted. Retire that legacy hard limit before
+        # publishing the current LLMCtl billing policy. The key stays disabled
+        # if either deletion or the following policy sync fails.
+        if user["token_limit_id"]:
+            self.omni.activate_key(str(user["api_key_id"]), False)
+            try:
+                self.omni.delete_limit(str(user["token_limit_id"]))
+            except RuntimeError as error:
+                if "HTTP 404" not in str(error):
+                    raise
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE users SET token_limit_id=NULL WHERE id=?",
+                    (user_id,),
+                )
+            with self.db.connect() as connection:
+                user = connection.execute(
+                    "SELECT * FROM users WHERE id=?", (user_id,)
+                ).fetchone()
         models = self.effective_models(user_id) if user["status"] == "active" else []
         allowed_models: list[str] = []
         allowed_combos: list[str] = []
@@ -3381,6 +3644,8 @@ class PortalControlPlane:
                 user["api_key_id"], allowed_models, allowed_combos,
                 user["status"] == "active" and bool(models),
                 int(user["max_sessions"]),
+                int(user["requests_per_minute"]),
+                int(user["requests_per_day"]),
             )
             sync_status, error = "synced", ""
         except Exception as exc:
@@ -4108,29 +4373,29 @@ class PortalControlPlane:
                         "SELECT * FROM token_grants WHERE user_id=? AND status='active' AND tokens_remaining>0 AND (model_id IS NULL OR model_id=?) AND (expires_at IS NULL OR expires_at>?) ORDER BY expires_at IS NULL,expires_at,created_at",
                         (user["id"], model["id"], stamp),
                     ).fetchall()
-                    total_tokens = max(0, input_tokens + output_tokens)
-                    remaining, granted = total_tokens, 0
+                    priced = price_usage(
+                        input_tokens,
+                        output_tokens,
+                        cached_tokens,
+                        reasoning_tokens,
+                        price,
+                        sum(int(grant["tokens_remaining"]) for grant in grants),
+                    )
+                    remaining_grant = priced["granted_tokens"]
                     for grant in grants:
-                        take = min(remaining, int(grant["tokens_remaining"]))
+                        take = min(remaining_grant, int(grant["tokens_remaining"]))
                         if take:
                             connection.execute(
                                 "UPDATE token_grants SET tokens_remaining=tokens_remaining-?,updated_at=? WHERE id=?",
                                 (take, stamp, grant["id"]),
                             )
-                            granted += take
-                            remaining -= take
-                        if remaining == 0:
+                            remaining_grant -= take
+                        if remaining_grant == 0:
                             break
-                    noncached = max(0, input_tokens - cached_tokens)
-                    nonreasoning = max(0, output_tokens - reasoning_tokens)
-                    gross_numerator = (
-                        noncached * int(price["input_price_micros"]) +
-                        cached_tokens * int(price["cached_price_micros"]) +
-                        nonreasoning * int(price["output_price_micros"]) +
-                        reasoning_tokens * int(price["reasoning_price_micros"])
-                    )
-                    gross = (gross_numerator + 999_999) // 1_000_000
-                    amount = 0 if total_tokens == 0 else (gross * remaining + total_tokens - 1) // total_tokens
+                    gross = priced["gross_amount_micros"]
+                    grant_amount = priced["grant_amount_micros"]
+                    amount = priced["amount_micros"]
+                    granted = priced["granted_tokens"]
                     account = connection.execute(
                         "SELECT * FROM billing_accounts WHERE user_id=?", (user["id"],)
                     ).fetchone()
@@ -4141,12 +4406,13 @@ class PortalControlPlane:
                         (user["id"], balance, stamp),
                     )
                     cursor = connection.execute(
-                        """INSERT INTO usage_ledger(request_id,user_id,api_key_id,model_id,public_model_id,provider,resolved_model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,granted_tokens,amount_micros,price_snapshot_json,occurred_at,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        """INSERT INTO usage_ledger(request_id,user_id,api_key_id,model_id,public_model_id,provider,resolved_model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,granted_tokens,gross_amount_micros,grant_amount_micros,amount_micros,price_snapshot_json,occurred_at,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             request_id, user["id"], user["api_key_id"], model["id"], model["public_model_id"],
                             str(item.get("provider", "")), str(item.get("model", "")), input_tokens,
-                            output_tokens, cached_tokens, reasoning_tokens, granted, amount,
+                            output_tokens, cached_tokens, reasoning_tokens, granted, gross,
+                            grant_amount, amount,
                             json.dumps({key: int(price[key]) for key in ("input_price_micros", "output_price_micros", "cached_price_micros", "reasoning_price_micros")}),
                             occurred, stamp,
                         ),
@@ -4679,7 +4945,24 @@ class PortalControlPlane:
             self.refresh_free_resource_visibility()
             self.free_visibility_reconciled_at = stamp
         with self.db.connect() as connection:
-            users = self.rows(connection.execute("SELECT u.*,b.balance_micros,b.suspended,p.status permission_status,p.error permission_error FROM users u LEFT JOIN billing_accounts b ON b.user_id=u.id LEFT JOIN permission_sync p ON p.user_id=u.id ORDER BY u.created_at DESC").fetchall())
+            users = self.rows(
+                connection.execute(
+                    """SELECT u.*,b.balance_micros,b.suspended,
+                              p.status permission_status,p.error permission_error,
+                              COALESCE((
+                                SELECT SUM(g.tokens_remaining)
+                                FROM token_grants g
+                                WHERE g.user_id=u.id AND g.status='active'
+                                  AND g.tokens_remaining>0
+                                  AND (g.expires_at IS NULL OR g.expires_at>?)
+                              ),0) active_grant_tokens
+                       FROM users u
+                       LEFT JOIN billing_accounts b ON b.user_id=u.id
+                       LEFT JOIN permission_sync p ON p.user_id=u.id
+                       ORDER BY u.created_at DESC""",
+                    (stamp,),
+                ).fetchall()
+            )
             groups = self.rows(connection.execute("SELECT g.*,COUNT(m.user_id) member_count FROM user_groups g LEFT JOIN user_group_members m ON m.group_id=g.id GROUP BY g.id ORDER BY g.name").fetchall())
             memberships = self.rows(connection.execute("SELECT * FROM user_group_members").fetchall())
             models = self.rows(connection.execute("SELECT * FROM published_models ORDER BY public_model_id").fetchall())
@@ -4736,6 +5019,7 @@ class PortalControlPlane:
             raise ValueError("invalid groups")
         group_ids = list(dict.fromkeys(str(item) for item in raw_group_ids))
         grant_tokens = int(payload.get("grant_tokens", 0) or 0)
+        disable_active_grants = payload.get("disable_active_grants") is True
         grant_reset = str(payload.get("grant_reset", "none"))
         if grant_tokens < 0 or grant_tokens > 10**12 or grant_reset not in {"none", "daily", "weekly", "monthly"}:
             raise ValueError("invalid token grant")
@@ -4755,6 +5039,14 @@ class PortalControlPlane:
                 raise ValueError("user not found")
             max_sessions = normalize_max_sessions(
                 payload.get("max_sessions", user["max_sessions"])
+            )
+            rpm = normalize_request_limit(
+                payload.get("requests_per_minute", user["requests_per_minute"]),
+                "每分钟请求数",
+            )
+            rpd = normalize_request_limit(
+                payload.get("requests_per_day", user["requests_per_day"]),
+                "每日请求数",
             )
             if group_ids:
                 placeholders = ",".join("?" for _ in group_ids)
@@ -4776,8 +5068,8 @@ class PortalControlPlane:
         try:
             with self.db.connect() as connection:
                 connection.execute(
-                    "UPDATE users SET status=?,max_sessions=? WHERE id=?",
-                    (status, max_sessions, user_id),
+                    "UPDATE users SET status=?,max_sessions=?,requests_per_minute=?,requests_per_day=? WHERE id=?",
+                    (status, max_sessions, rpm, rpd, user_id),
                 )
                 connection.execute("DELETE FROM user_group_members WHERE user_id=?", (user_id,))
                 for group_id in group_ids:
@@ -4796,6 +5088,12 @@ class PortalControlPlane:
                     connection.execute(
                         "INSERT INTO balance_transactions(user_id,kind,amount_micros,balance_after_micros,actor,note,created_at) VALUES(?,?,?,?,?,?,?)",
                         (user_id, "adjustment", balance_delta, after, actor, str(payload.get("note", "Admin adjustment")), stamp),
+                    )
+                if disable_active_grants:
+                    connection.execute(
+                        "UPDATE token_grants SET status='disabled',updated_at=? "
+                        "WHERE user_id=? AND status='active'",
+                        (stamp, user_id),
                     )
                 if grant_tokens:
                     connection.execute(
@@ -4848,6 +5146,16 @@ class PortalControlPlane:
         return group_id
 
     def background_tick(self) -> None:
+        # This also migrates legacy OmniRoute token limits that incorrectly
+        # coupled promotional grants to the cash billing path.
+        try:
+            self.sync_all_users()
+        except Exception as error:
+            print(
+                f"[account-portal] permission sync warning: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
         try:
             self.reset_due_grants()
         except Exception as error:
@@ -4906,7 +5214,7 @@ class PortalServer:
         self.httpd.app = self  # type: ignore[attr-defined]
 
     def maintenance_loop(self) -> None:
-        if self.stop_event.wait(30):
+        if self.stop_event.wait(2):
             return
         while not self.stop_event.is_set():
             try:

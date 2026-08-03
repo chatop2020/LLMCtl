@@ -41,6 +41,8 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("default_max_sessions");
     expect(source).toContain("userEdit.max_sessions");
     expect(source).toContain("原生 maxSessions");
+    expect(source).toContain("default_requests_per_minute");
+    expect(source).toContain("userEdit.requests_per_minute");
     expect(source).toContain("允许注册邮箱");
     expect(source).toContain("allowedRegistrationEmails");
   });
@@ -117,6 +119,9 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("模型输出 <small>仅管理员可见</small>");
     expect(source).toContain("response_messages");
     expect(source).toContain("该请求没有保留可显示的文本内容");
+    expect(source).toContain("现金余额");
+    expect(source).toContain("有效 Token 赠额");
+    expect(source).toContain("cashTokenCapacity");
   });
 
   it("keeps local administration visible when the AI gateway is degraded", () => {

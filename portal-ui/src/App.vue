@@ -94,6 +94,8 @@ const userEdit = reactive({
   user_id: "",
   status: "active",
   max_sessions: 0,
+  requests_per_minute: 0,
+  requests_per_day: 0,
   balance_delta: "0",
   group_ids: [],
   grant_tokens: 0,
@@ -101,6 +103,7 @@ const userEdit = reactive({
   grant_reset_time: "00:00",
   grant_model_id: "",
   grant_label: "",
+  disable_active_grants: false,
 });
 const groupEdit = reactive({
   id: "",
@@ -277,7 +280,13 @@ const filterFields = {
     "free_type",
     "test_error",
   ],
-  "admin-users": ["email", "status", "permission_status"],
+  "admin-users": [
+    "email",
+    "status",
+    "permission_status",
+    "balance",
+    "active_grant_tokens",
+  ],
   "admin-groups": ["name", "description", "status"],
   "admin-billing": ["user_email", "user_id", "kind", "note"],
   "admin-stress": ["public_model_id", "status", "created_by", "error"],
@@ -807,7 +816,16 @@ async function copy(value, options = {}) {
 }
 
 function money(micros) {
-  return `$${(Number(micros || 0) / 1_000_000).toFixed(4)}`;
+  const fixed = (Number(micros || 0) / 1_000_000).toFixed(6);
+  const [whole, fraction] = fixed.split(".");
+  return `$${whole}.${fraction.replace(/0+$/, "").padEnd(4, "0")}`;
+}
+function cashTokenCapacity(pricePerMillion) {
+  const balance = Number(dashboard.value?.balance || 0);
+  const price = Number(pricePerMillion || 0);
+  if (price <= 0) return "不扣现金余额";
+  if (!Number.isFinite(balance) || balance <= 0) return "0 Token";
+  return `${Math.floor((balance * 1_000_000) / price).toLocaleString()} Token`;
 }
 function statusLabel(value) {
   return (
@@ -1252,6 +1270,8 @@ function editUser(user) {
     user_id: user.id,
     status: user.status,
     max_sessions: Number(user.max_sessions ?? 0),
+    requests_per_minute: Number(user.requests_per_minute ?? 0),
+    requests_per_day: Number(user.requests_per_day ?? 0),
     balance_delta: "0",
     group_ids: admin.value.memberships
       .filter((m) => m.user_id === user.id)
@@ -1261,6 +1281,7 @@ function editUser(user) {
     grant_reset_time: admin.value.settings.default_quota_reset_time || "00:00",
     grant_model_id: "",
     grant_label: "",
+    disable_active_grants: false,
   });
   document.querySelector("#user-editor")?.showModal();
 }
@@ -1469,6 +1490,8 @@ function registrationPayload() {
     default_quota_reset: settings.default_quota_reset,
     default_quota_reset_time: settings.default_quota_reset_time,
     default_max_sessions: settings.default_max_sessions,
+    default_requests_per_minute: settings.default_requests_per_minute,
+    default_requests_per_day: settings.default_requests_per_day,
     public_url: settings.public_url,
     api_public_url: settings.api_public_url,
   };
@@ -1761,8 +1784,7 @@ onBeforeUnmount(() => {
                       <th>时间</th>
                       <th>模型</th>
                       <th>输入 / 输出</th>
-                      <th>赠额</th>
-                      <th>金额</th>
+                      <th>标价 / 赠额 / 扣款</th>
                       <th>请求内容</th>
                     </tr>
                   </thead>
@@ -1778,8 +1800,11 @@ onBeforeUnmount(() => {
                         <td>
                           {{ row.input_tokens }} / {{ row.output_tokens }}
                         </td>
-                        <td>{{ row.granted_tokens }}</td>
-                        <td>{{ money(row.amount_micros) }}</td>
+                        <td>
+                          {{ money(row.gross_amount_micros) }} /
+                          {{ money(row.grant_amount_micros) }} /
+                          {{ money(row.amount_micros) }}
+                        </td>
                         <td>
                           <button
                             class="ghost"
@@ -1799,7 +1824,7 @@ onBeforeUnmount(() => {
                         v-if="requestDetails[row.request_id]?.expanded"
                         class="request-detail-row"
                       >
-                        <td colspan="6">
+                        <td colspan="5">
                           <div
                             v-if="requestDetails[row.request_id].error"
                             class="error-text"
@@ -1952,6 +1977,11 @@ onBeforeUnmount(() => {
                     }}</strong></span
                   >
                 </div>
+                <p class="muted">
+                  当前现金余额折算：纯输入
+                  {{ cashTokenCapacity(model.input_price) }}；纯输出
+                  {{ cashTokenCapacity(model.output_price) }}。实际扣款按本次请求的输入、输出、缓存和思考 Token 分项计算。
+                </p>
                 <details>
                   <summary>查看 curl 示例</summary>
                   <pre>{{ curlFor(model) }}</pre>
@@ -2250,7 +2280,7 @@ onBeforeUnmount(() => {
               <div>
                 <span class="eyebrow">USAGE & BILLING</span>
                 <h1>用量与账单</h1>
-                <p>赠送 Token 先消耗，超出部分按模型价格扣减金额余额。</p>
+                <p>先按模型分类价格计算标价金额；赠送 Token 精确抵扣对应金额，剩余部分扣减现金余额。</p>
               </div>
               <button
                 class="ghost"
@@ -2359,8 +2389,10 @@ onBeforeUnmount(() => {
                       <th>时间</th>
                       <th>模型</th>
                       <th>输入 / 输出</th>
+                      <th>赠送 Token</th>
+                      <th>标价</th>
                       <th>赠额抵扣</th>
-                      <th>金额</th>
+                      <th>余额扣款</th>
                       <th>请求内容</th>
                     </tr>
                   </thead>
@@ -2375,6 +2407,8 @@ onBeforeUnmount(() => {
                           {{ row.input_tokens }} / {{ row.output_tokens }}
                         </td>
                         <td>{{ row.granted_tokens }}</td>
+                        <td>{{ money(row.gross_amount_micros) }}</td>
+                        <td>{{ money(row.grant_amount_micros) }}</td>
                         <td>{{ money(row.amount_micros) }}</td>
                         <td>
                           <button
@@ -2395,7 +2429,7 @@ onBeforeUnmount(() => {
                         v-if="requestDetails[row.request_id]?.expanded"
                         class="request-detail-row"
                       >
-                        <td colspan="6">
+                        <td colspan="8">
                           <div
                             v-if="requestDetails[row.request_id].error"
                             class="error-text"
@@ -2436,7 +2470,7 @@ onBeforeUnmount(() => {
                       </tr></template
                     >
                     <tr v-if="!dashboard.usage.length">
-                      <td colspan="6" class="empty">尚无请求用量</td>
+                      <td colspan="8" class="empty">尚无请求用量</td>
                     </tr>
                   </tbody>
                 </table>
@@ -3023,8 +3057,9 @@ onBeforeUnmount(() => {
                   <tr>
                     <th>用户</th>
                     <th>状态</th>
-                    <th>余额</th>
-                    <th>Key 活跃会话</th>
+                    <th>现金余额</th>
+                    <th>有效 Token 赠额</th>
+                    <th>调用策略</th>
                     <th>权限同步</th>
                     <th></th>
                   </tr>
@@ -3052,8 +3087,11 @@ onBeforeUnmount(() => {
                       >
                     </td>
                     <td>${{ user.balance }}</td>
+                    <td>{{ Number(user.active_grant_tokens || 0).toLocaleString() }}</td>
                     <td>
-                      {{ Number(user.max_sessions) === 0 ? "不限制" : user.max_sessions }}
+                      <small>会话 {{ Number(user.max_sessions) === 0 ? "不限" : user.max_sessions }}</small>
+                      <small>RPM {{ Number(user.requests_per_minute) === 0 ? "不限" : user.requests_per_minute }}</small>
+                      <small>每日 {{ Number(user.requests_per_day) === 0 ? "不限" : user.requests_per_day }}</small>
                     </td>
                     <td>
                       <span
@@ -3216,7 +3254,7 @@ onBeforeUnmount(() => {
               <div class="panel-head">
                 <div>
                   <h2>请求用量</h2>
-                  <p>包含赠额抵扣与实际金额扣费。</p>
+                  <p>标价金额、赠额抵扣金额与现金余额扣款分别记录，三者可逐笔核对。</p>
                 </div>
               </div>
               <div class="list-filter" role="search">
@@ -3262,8 +3300,10 @@ onBeforeUnmount(() => {
                       <th>用户</th>
                       <th>模型</th>
                       <th>输入 / 输出</th>
-                      <th>赠额</th>
-                      <th>金额</th>
+                      <th>赠送 Token</th>
+                      <th>标价</th>
+                      <th>赠额抵扣</th>
+                      <th>余额扣款</th>
                       <th>内容</th>
                     </tr>
                   </thead>
@@ -3279,6 +3319,8 @@ onBeforeUnmount(() => {
                           {{ row.input_tokens }} / {{ row.output_tokens }}
                         </td>
                         <td>{{ row.granted_tokens }}</td>
+                        <td>{{ money(row.gross_amount_micros) }}</td>
+                        <td>{{ money(row.grant_amount_micros) }}</td>
                         <td>{{ money(row.amount_micros) }}</td>
                         <td>
                           <button
@@ -3299,7 +3341,7 @@ onBeforeUnmount(() => {
                         v-if="requestDetails[row.request_id]?.expanded"
                         class="request-detail-row"
                       >
-                        <td colspan="7">
+                        <td colspan="9">
                           <div
                             v-if="requestDetails[row.request_id].error"
                             class="error-text"
@@ -3361,7 +3403,7 @@ onBeforeUnmount(() => {
                       </tr></template
                     >
                     <tr v-if="!admin.usage.length">
-                      <td colspan="7" class="empty">
+                      <td colspan="9" class="empty">
                         尚无请求用量；点击“同步用量”从当前接入层读取记录。
                       </td>
                     </tr>
@@ -3793,12 +3835,30 @@ onBeforeUnmount(() => {
                     min="0"
                     max="10000" /></label
                 ><p class="muted">
-                  默认 1；0 表示不限制。由当前 AI 接入层的原生 maxSessions 执行，闲置会话约 15 分钟后释放。
-                </p><label
-                  >默认赠送 Token<input
-                    v-model="settings.default_quota_tokens"
-                    type="number" /></label
+                  原生 maxSessions 是防止 Key 长期共享的会话指纹限制，不是 HTTP 并发数；0 表示不限制。
+                </p><div class="form-grid"><label
+                  >默认每分钟请求数（RPM）<input
+                    v-model.number="settings.default_requests_per_minute"
+                    type="number"
+                    min="0"
+                    max="10000000" /></label
                 ><label
+                  >默认每日请求数<input
+                    v-model.number="settings.default_requests_per_day"
+                    type="number"
+                    min="0"
+                    max="10000000" /></label
+                ></div><p class="muted">
+                  由 AI 接入层按 API Key 原生执行；0 表示不限制。RPM 控制突发调用，每日上限控制持续滥用。
+                </p><label
+                  >默认赠送 Token（0 = 不赠送）<input
+                    v-model="settings.default_quota_tokens"
+                    type="number"
+                    min="0"
+                    max="1000000000000" /></label
+                ><p class="muted">
+                  赠送 Token 属于优惠额度，会先抵扣对应模型的用量；设为 0 时，新用户直接按模型各项单价从金额余额扣费。
+                </p><label
                   >重置周期<select v-model="settings.default_quota_reset">
                     <option value="daily">每日</option>
                     <option value="weekly">每周</option>
@@ -3985,7 +4045,26 @@ onBeforeUnmount(() => {
             max="10000"
         /></label>
         <p class="muted">
-          建议设为 1，降低 Key 被多人共享的风险；0 表示不限制。该值直接同步到当前 AI 接入层的原生 maxSessions。它按模型、首条消息等识别会话，闲置约 15 分钟释放，不是 HTTP 并发请求数。
+          用于识别长期共享 Key；0 表示不限制。它不是 HTTP 并发请求数，不能代替请求频率限制。
+        </p>
+        <div class="form-grid">
+          <label
+            >每分钟请求数（RPM）<input
+              v-model.number="userEdit.requests_per_minute"
+              type="number"
+              min="0"
+              max="10000000"
+          /></label>
+          <label
+            >每日请求数<input
+              v-model.number="userEdit.requests_per_day"
+              type="number"
+              min="0"
+              max="10000000"
+          /></label>
+        </div>
+        <p class="muted">
+          这两项按 API Key 在 AI 接入层执行，超限直接返回 429；0 表示不限制。
         </p>
         <fieldset class="choice-group">
           <legend>所属用户组</legend>
@@ -4038,6 +4117,14 @@ onBeforeUnmount(() => {
             v-model="userEdit.grant_reset_time"
             type="time" /></label
         ><label>说明<input v-model="userEdit.grant_label" /></label
+        ><label class="switch danger-switch"
+          ><input
+            v-model="userEdit.disable_active_grants"
+            type="checkbox"
+          /><span></span>停用该用户现有的全部有效赠额</label
+        ><p class="muted">
+          停用后不删除历史记录；后续请求将按模型单价直接扣减金额余额。需要恢复优惠时可重新发放赠送 Token。
+        </p
         ><button
           type="button"
           class="primary"

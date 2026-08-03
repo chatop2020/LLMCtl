@@ -31,6 +31,7 @@ class FakeOmniRoute:
         self.activated = []
         self.permissions = []
         self.session_limits = []
+        self.rate_limits = []
         self.deleted_aliases = []
         self.logs = []
         self.test_error = None
@@ -68,6 +69,9 @@ class FakeOmniRoute:
 
     def delete_key_and_limit(self, key_id, limit_id=""):
         self.deleted.append((key_id, limit_id))
+
+    def delete_limit(self, limit_id):
+        self.deleted.append(("", limit_id))
 
     def activate_key(self, key_id, active):
         self.activated.append((key_id, active))
@@ -136,10 +140,14 @@ class FakeOmniRoute:
         self.output_updates.append((provider, model_id, value))
 
     def patch_key_permissions(
-        self, key_id, allowed_models, allowed_combos, active, max_sessions=0
+        self, key_id, allowed_models, allowed_combos, active, max_sessions=0,
+        requests_per_minute=0, requests_per_day=0
     ):
         self.permissions.append((key_id, allowed_models, allowed_combos, active))
         self.session_limits.append((key_id, max_sessions, "permissions"))
+        self.rate_limits.append(
+            (key_id, requests_per_minute, requests_per_day, "permissions")
+        )
 
     def call_logs(self, key_id, limit=200, offset=0):
         return self.logs[offset : offset + limit]
@@ -345,7 +353,7 @@ class PortalIntegrationTests(unittest.TestCase):
             audit_actions = {
                 item[0] for item in connection.execute("SELECT action FROM audit_events")
             }
-        self.assertEqual(row, ("active", "key-1", "limit-key-1", 1))
+        self.assertEqual(row, ("active", "key-1", None, 1))
         self.assertIn("register.email", audit_actions)
         self.assertIn("verify.provision", audit_actions)
 
@@ -575,6 +583,8 @@ class PortalIntegrationTests(unittest.TestCase):
                 "default_quota_reset": "weekly",
                 "default_quota_reset_time": "00:00",
                 "default_max_sessions": 1,
+                "default_requests_per_minute": 45,
+                "default_requests_per_day": 3000,
             },
         )
         self.assertEqual(status, 200)
@@ -584,6 +594,25 @@ class PortalIntegrationTests(unittest.TestCase):
                 "SELECT value FROM settings WHERE key='default_max_sessions'"
             ).fetchone()["value"]
         self.assertEqual(value, "1")
+        with self.server.db.connect() as connection:
+            values = {
+                row["key"]: row["value"]
+                for row in connection.execute(
+                    "SELECT key,value FROM settings WHERE key IN "
+                    "('default_requests_per_minute','default_requests_per_day')"
+                )
+            }
+        self.assertEqual(values["default_requests_per_minute"], "45")
+        self.assertEqual(values["default_requests_per_day"], "3000")
+
+        status, body, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/settings",
+            {"scope": "registration", "default_quota_tokens": 0},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
 
         status, body, _ = self.json_post(
             client,
@@ -990,14 +1019,20 @@ class PortalIntegrationTests(unittest.TestCase):
         second = self.server.control.reconcile_usage()
         with self.server.db.connect() as connection:
             rows = connection.execute(
-                "SELECT request_id,public_model_id,input_tokens,output_tokens FROM usage_ledger"
+                "SELECT request_id,public_model_id,input_tokens,output_tokens,"
+                "gross_amount_micros,grant_amount_micros,amount_micros "
+                "FROM usage_ledger"
             ).fetchall()
+            balance = connection.execute(
+                "SELECT balance_micros FROM billing_accounts WHERE user_id='policy-user'"
+            ).fetchone()["balance_micros"]
         self.assertEqual(first["processed"], 1)
         self.assertEqual(second["processed"], 0)
         self.assertEqual(
             [tuple(row) for row in rows],
-            [("request-complete", "gdn-inside", 100, 20)],
+            [("request-complete", "gdn-inside", 100, 20, 140, 0, 140)],
         )
+        self.assertEqual(balance, 999_860)
         self.assertIn(("policy-key", False), self.fake_omni.activated)
         self.assertTrue(self.fake_omni.permissions[-1][-1])
 
@@ -1105,6 +1140,8 @@ class PortalIntegrationTests(unittest.TestCase):
                 "user_id": "policy-user",
                 "status": "active",
                 "max_sessions": 1,
+                "requests_per_minute": 60,
+                "requests_per_day": 5000,
                 "group_ids": ["default"],
                 "balance_delta": "0",
                 "grant_tokens": 0,
@@ -1117,6 +1154,73 @@ class PortalIntegrationTests(unittest.TestCase):
             ).fetchone()["max_sessions"]
         self.assertEqual(value, 1)
         self.assertIn(("policy-key", 1, "permissions"), self.fake_omni.session_limits)
+        self.assertIn(
+            ("policy-key", 60, 5000, "permissions"), self.fake_omni.rate_limits
+        )
+
+    def test_policy_sync_retires_legacy_native_token_limit(self):
+        self.insert_control_user_and_model(paid=True)
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "UPDATE users SET token_limit_id='legacy-limit' WHERE id='policy-user'"
+            )
+        self.server.control.sync_user("policy-user")
+        with self.server.db.connect() as connection:
+            token_limit_id = connection.execute(
+                "SELECT token_limit_id FROM users WHERE id='policy-user'"
+            ).fetchone()["token_limit_id"]
+        self.assertIsNone(token_limit_id)
+        self.assertIn(("", "legacy-limit"), self.fake_omni.deleted)
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertTrue(self.fake_omni.permissions[-1][3])
+
+    def test_disabling_old_grants_keeps_new_grant_and_reports_both_balances(self):
+        self.insert_control_user_and_model(paid=True)
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO token_grants(
+                     id,user_id,label,tokens_initial,tokens_remaining,
+                     reset_interval,reset_time,status,created_at,updated_at)
+                   VALUES('old-grant','policy-user','Legacy grant',500,500,
+                          'none','00:00','active',?,?)""",
+                (stamp - 10, stamp - 10),
+            )
+        self.server.control.update_user(
+            {
+                "user_id": "policy-user",
+                "status": "active",
+                "group_ids": ["default"],
+                "balance_delta": "0",
+                "grant_tokens": 100,
+                "grant_label": "Replacement grant",
+                "disable_active_grants": True,
+            },
+            "admin@example.com",
+        )
+        with self.server.db.connect() as connection:
+            grants = {
+                row["label"]: (row["status"], row["tokens_remaining"])
+                for row in connection.execute(
+                    "SELECT label,status,tokens_remaining FROM token_grants "
+                    "WHERE user_id='policy-user'"
+                )
+            }
+        self.assertEqual(grants["Legacy grant"], ("disabled", 500))
+        self.assertEqual(grants["Replacement grant"], ("active", 100))
+        user = next(
+            row
+            for row in self.server.control.admin_snapshot()["users"]
+            if row["id"] == "policy-user"
+        )
+        self.assertEqual(user["balance"], "1")
+        self.assertEqual(user["active_grant_tokens"], 100)
+        with self.server.db.connect() as connection:
+            indexes = {
+                row["name"]
+                for row in connection.execute("PRAGMA index_list(token_grants)")
+            }
+        self.assertIn("idx_grants_active_balance", indexes)
 
     def test_invalid_active_session_limit_is_rejected_before_key_is_disabled(self):
         self.insert_control_user_and_model()
@@ -1321,6 +1425,57 @@ class PortalIntegrationTests(unittest.TestCase):
 
 
 class PortalUnitTests(unittest.TestCase):
+    def test_usage_price_separates_list_price_grant_discount_and_wallet_debit(self):
+        prices = {
+            "input_price_micros": 1_000_000,
+            "output_price_micros": 4_000_000,
+            "cached_price_micros": 200_000,
+            "reasoning_price_micros": 6_000_000,
+        }
+        result = portal.price_usage(
+            input_tokens=100,
+            output_tokens=20,
+            cached_tokens=40,
+            reasoning_tokens=5,
+            prices=prices,
+            available_grant_tokens=10,
+        )
+        # Gross: input 60 + cache 8 + output 60 + reasoning 30 = 158 micro-USD.
+        # Ten grants cover the five reasoning and five output tokens first:
+        # 30 + 20 = 50 micro-USD, leaving 108 micro-USD for the wallet.
+        self.assertEqual(result["gross_amount_micros"], 158)
+        self.assertEqual(result["grant_amount_micros"], 50)
+        self.assertEqual(result["amount_micros"], 108)
+        self.assertEqual(result["granted_tokens"], 10)
+
+    def test_free_token_classes_do_not_burn_promotional_grants(self):
+        result = portal.price_usage(
+            100, 20, 0, 0,
+            {
+                "input_price_micros": 0,
+                "output_price_micros": 0,
+                "cached_price_micros": 0,
+                "reasoning_price_micros": 0,
+            },
+            1000,
+        )
+        self.assertEqual(result["granted_tokens"], 0)
+        self.assertEqual(result["amount_micros"], 0)
+
+    def test_usage_price_clamps_invalid_cache_and_reasoning_subtotals(self):
+        result = portal.price_usage(
+            10, 5, 50, 20,
+            {
+                "input_price_micros": 1_000_000,
+                "output_price_micros": 2_000_000,
+                "cached_price_micros": 100_000,
+                "reasoning_price_micros": 3_000_000,
+            },
+        )
+        # Cache and reasoning are subsets of input/output, not extra tokens.
+        self.assertEqual(result["gross_amount_micros"], 16)
+        self.assertEqual(result["amount_micros"], 16)
+
     def test_native_key_payload_and_policy_patch_include_max_sessions(self):
         config = mock.Mock(
             gateway_manage_key="sk-management-test",
@@ -1340,9 +1495,13 @@ class PortalUnitTests(unittest.TestCase):
 
         client.request = request
         client.create_user_key("user-1", "user@example.com", 1)
-        client.patch_key_permissions("key-1", ["model-a"], [], True, 3)
+        client.patch_key_permissions("key-1", ["model-a"], [], True, 3, 60, 5000)
         self.assertEqual(calls[0][2]["maxSessions"], 1)
         self.assertEqual(calls[1][2]["maxSessions"], 3)
+        self.assertEqual(
+            calls[1][2]["rateLimits"],
+            [{"limit": 60, "window": 60}, {"limit": 5000, "window": 86400}],
+        )
 
     def test_existing_key_reveal_enables_omniroute_native_flag_without_restart(self):
         config = mock.Mock(
