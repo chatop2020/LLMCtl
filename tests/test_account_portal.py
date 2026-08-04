@@ -1202,6 +1202,8 @@ class PortalIntegrationTests(unittest.TestCase):
         self.insert_control_user_and_model(paid=True, source_kind="model")
         stamp = portal.now()
         self.insert_disabled_underlying_model(stamp - 100)
+        activations_before = list(self.fake_omni.activated)
+        permissions_before = list(self.fake_omni.permissions)
         self.fake_omni.logs = [
             {
                 "id": "request-live", "status": 200, "active": False,
@@ -1229,14 +1231,16 @@ class PortalIntegrationTests(unittest.TestCase):
                 "SELECT balance_micros FROM billing_accounts WHERE user_id='policy-user'"
             ).fetchone()["balance_micros"]
         self.assertEqual(first["processed"], 1)
+        self.assertEqual(first["users"], 1)
+        self.assertEqual(first["policy_updates"], 0)
         self.assertEqual(second["processed"], 0)
         self.assertEqual(
             [tuple(row) for row in rows],
             [("request-complete", "gdn-inside", 100, 20, 140, 0, 140)],
         )
         self.assertEqual(balance, 999_860)
-        self.assertIn(("policy-key", False), self.fake_omni.activated)
-        self.assertTrue(self.fake_omni.permissions[-1][-1])
+        self.assertEqual(self.fake_omni.activated, activations_before)
+        self.assertEqual(self.fake_omni.permissions, permissions_before)
 
         self.fake_omni.call_log_details["request-complete"] = {
             "detailState": "ready",
@@ -1497,8 +1501,9 @@ class PortalIntegrationTests(unittest.TestCase):
                 "WHERE user_id='policy-user'"
             ).fetchone()["balance_micros"]
         self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["policy_updates"], 1)
         self.assertEqual(balance, -40)
-        self.assertIn(("policy-key", False), self.fake_omni.activated)
+        self.assertNotIn(("policy-key", False), self.fake_omni.activated)
         self.assertEqual(self.fake_omni.permissions[-1][-1], False)
 
     def test_exact_zero_balance_removes_paid_model_permission(self):
@@ -1532,8 +1537,42 @@ class PortalIntegrationTests(unittest.TestCase):
                 "WHERE user_id='policy-user'"
             ).fetchone()["balance_micros"]
         self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["policy_updates"], 1)
         self.assertEqual(balance, 0)
+        self.assertNotIn(("policy-key", False), self.fake_omni.activated)
         self.assertEqual(self.fake_omni.permissions[-1][-1], False)
+
+    def test_exhausted_balance_sync_failure_fails_closed(self):
+        self.insert_control_user_and_model(paid=True)
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "UPDATE billing_accounts SET balance_micros=100 "
+                "WHERE user_id='policy-user'"
+            )
+        self.fake_omni.logs = [
+            {
+                "id": "request-exhausts-before-sync-failure",
+                "status": 200,
+                "active": False,
+                "detailState": "persisted",
+                "requestedModel": "gdn-inside",
+                "model": "ornith-1.0-35b-fp8",
+                "provider": "local",
+                "tokens": {"in": 100, "out": 20},
+                "timestamp": stamp,
+            }
+        ]
+        with mock.patch.object(
+            self.fake_omni,
+            "patch_key_permissions",
+            side_effect=RuntimeError("permission patch unavailable"),
+        ):
+            result = self.server.control.reconcile_usage(user_id="policy-user")
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["policy_updates"], 1)
+        self.assertEqual(result["sync_failed"], 1)
+        self.assertIn(("policy-key", False), self.fake_omni.activated)
 
     def test_invalid_active_session_limit_is_rejected_before_key_is_disabled(self):
         self.insert_control_user_and_model()

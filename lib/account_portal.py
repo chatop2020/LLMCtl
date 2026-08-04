@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.2"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -4391,6 +4391,7 @@ class PortalControlPlane:
                     "processed": 0,
                     "skipped": 0,
                     "users": 0,
+                    "policy_updates": 0,
                     "sync_failed": 0,
                     "relabeled": 0,
                     "throttled": 1,
@@ -4513,7 +4514,8 @@ class PortalControlPlane:
 
     def _reconcile_usage(self, user_id: str | None = None) -> dict[str, int]:
         processed = skipped = 0
-        changed_users: set[str] = set()
+        settled_users: set[str] = set()
+        policy_users: set[str] = set()
         with self.db.connect() as connection:
             if user_id:
                 users = connection.execute(
@@ -4525,6 +4527,9 @@ class PortalControlPlane:
                     "SELECT id,api_key_id FROM users WHERE role='user' AND api_key_id IS NOT NULL"
                 ).fetchall()
             relabeled = self._repair_usage_model_ids(connection, user_id=user_id)
+        key_ids_by_user = {
+            str(user["id"]): str(user["api_key_id"]) for user in users
+        }
         for user in users:
             logs: list[dict[str, Any]] = []
             reached_checkpoint = False
@@ -4571,11 +4576,6 @@ class PortalControlPlane:
                 skipped += len(logs)
                 continue
 
-            # Reconciliation changes money/token entitlement. Disable the key
-            # first, commit every completed request, then atomically publish its
-            # new allowlists and active state through sync_user().
-            self.omni.activate_key(str(user["api_key_id"]), False)
-            changed_users.add(str(user["id"]))
             for item in reversed(billable_logs):
                 request_id = str(item.get("id", ""))
                 status_code = int(item.get("status", 0) or 0)
@@ -4647,22 +4647,35 @@ class PortalControlPlane:
                             (user["id"], "debit", -amount, balance_after, "system", request_id, cursor.lastrowid, stamp),
                         )
                 processed += 1
+                settled_users.add(str(user["id"]))
+                # Positive-balance settlement does not change effective
+                # permissions, so it must never toggle the externally visible
+                # key. If the debit exhausts the balance, sync_user publishes
+                # the reduced allowlist and active state in one OmniRoute PATCH.
+                if amount > 0 and balance_after <= 0:
+                    policy_users.add(str(user["id"]))
         sync_failed = 0
-        for user_id in changed_users:
+        for user_id in policy_users:
             try:
                 self.sync_user(user_id)
             except RuntimeError as error:
                 sync_failed += 1
+                fail_closed = "applied"
+                try:
+                    self.omni.activate_key(key_ids_by_user[user_id], False)
+                except Exception as disable_error:
+                    fail_closed = f"failed: {disable_error}"
                 print(
                     f"[account-portal] post-billing permission sync warning "
-                    f"(user={user_id}): {error}",
+                    f"(user={user_id}, fail_closed={fail_closed}): {error}",
                     file=sys.stderr,
                     flush=True,
                 )
         return {
             "processed": processed,
             "skipped": skipped,
-            "users": len(changed_users),
+            "users": len(settled_users),
+            "policy_updates": len(policy_users),
             "sync_failed": sync_failed,
             "relabeled": relabeled,
             "throttled": 0,
