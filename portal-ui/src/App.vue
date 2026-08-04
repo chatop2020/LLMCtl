@@ -34,6 +34,10 @@ const publicConfig = ref({
 const dashboard = ref(null);
 const admin = ref(null);
 const adminAnalytics = ref(null);
+const workflow = ref(null);
+const workflowLoading = ref(false);
+const workflowSaving = ref(false);
+const workflowPublishing = ref(false);
 const analyticsLoading = ref(false);
 const busy = ref(false);
 const operation = ref("");
@@ -125,6 +129,21 @@ const groupEdit = reactive({
   name: "",
   description: "",
   status: "active",
+});
+const workflowNewPool = reactive({ id: "", strategy: "p2c-least-inflight" });
+const workflowNewRoute = reactive({
+  id: "",
+  base_model: "",
+  pool: "",
+  mode: "transparent",
+});
+const workflowNewAdapter = reactive({
+  id: "",
+  endpoint: "",
+  secret_env: "",
+  function_name: "",
+  description: "",
+  allowed_purposes: "",
 });
 const modelEdit = reactive({
   id: "",
@@ -471,6 +490,7 @@ const nav = computed(() =>
         ["users", "用户"],
         ["groups", "用户组"],
         ["billing", "账单"],
+        ["workflow", "能力编排"],
         ["stress", "性能压测"],
         ["settings", "发布、注册与 SMTP"],
         ["audit", "审计"],
@@ -547,6 +567,7 @@ function clearAuthenticatedClientState() {
   dashboard.value = null;
   admin.value = null;
   adminAnalytics.value = null;
+  workflow.value = null;
   selectedUserIds.value = [];
   section.value = "overview";
   usageFilters.user = "";
@@ -701,7 +722,9 @@ async function syncUsageAndRefresh(options = {}) {
 async function selectSection(nextSection) {
   section.value = nextSection;
   try {
-    if (nextSection === "billing") {
+    if (nextSection === "workflow" && isAdmin.value) {
+      await Promise.all([refreshWorkspace(), loadWorkflow()]);
+    } else if (nextSection === "billing") {
       await syncUsageAndRefresh({ preservePage: false });
     } else {
       await refreshWorkspace();
@@ -709,6 +732,238 @@ async function selectSection(nextSection) {
   } catch (error) {
     notify(`页面数据更新失败：${error.message}`, "bad");
   }
+}
+
+async function loadWorkflow(options = {}) {
+  if (!isAdmin.value || !session.value?.authenticated) return;
+  workflowLoading.value = true;
+  try {
+    const result = await api("admin/workflow");
+    workflow.value = {
+      available: true,
+      revision: result.revision,
+      config: structuredClone(result.config),
+    };
+    if (!workflowNewRoute.pool) {
+      workflowNewRoute.pool = Object.keys(workflow.value.config.pools || {})[0] || "";
+    }
+  } catch (error) {
+    workflow.value = { available: false, error: error.message };
+    if (!options.silent) notify(`工作流读取失败：${error.message}`, "bad");
+  } finally {
+    workflowLoading.value = false;
+  }
+}
+
+async function saveWorkflow() {
+  if (!workflow.value?.available || workflowSaving.value) return;
+  workflowSaving.value = true;
+  try {
+    const result = await api("admin/workflow/config", {
+      method: "POST",
+      body: JSON.stringify({
+        revision: workflow.value.revision,
+        config: workflow.value.config,
+      }),
+    });
+    workflow.value = {
+      available: true,
+      revision: result.revision,
+      config: structuredClone(result.config),
+    };
+    notify("能力编排配置已校验、保存并热加载");
+  } catch (error) {
+    notify(`能力编排保存失败：${error.message}`, "bad");
+    if (/changed|冲突|版本/i.test(error.message)) await loadWorkflow({ silent: true });
+  } finally {
+    workflowSaving.value = false;
+  }
+}
+
+async function publishWorkflow() {
+  if (!workflow.value?.available || workflowPublishing.value) return;
+  workflowPublishing.value = true;
+  try {
+    const result = await api("admin/workflow/publish", {
+      method: "POST",
+      body: "{}",
+    });
+    const routes = (result.published || []).map((item) => item.combo).join("、");
+    notify(`已同步到 AI 网关${routes ? `：${routes}` : ""}`);
+    await loadAdmin({ silent: true });
+  } catch (error) {
+    notify(`同步 AI 网关失败：${error.message}`, "bad");
+  } finally {
+    workflowPublishing.value = false;
+  }
+}
+
+function workflowIdentifier(value) {
+  return String(value || "").trim();
+}
+
+function addWorkflowPool() {
+  const id = workflowIdentifier(workflowNewPool.id);
+  if (!id || workflow.value.config.pools[id]) {
+    notify("请输入未使用的资源池 ID", "bad");
+    return;
+  }
+  workflow.value.config.pools[id] = {
+    strategy: workflowNewPool.strategy,
+    targets: [
+      {
+        id: "target-1",
+        base_url: "http://127.0.0.1:8000/v1",
+        api_key_env: "BACKEND_API_KEY",
+      },
+    ],
+  };
+  if (!workflowNewRoute.pool) workflowNewRoute.pool = id;
+  workflowNewPool.id = "";
+}
+
+function removeWorkflowPool(id) {
+  const used = Object.values(workflow.value.config.models).some(
+    (route) => route.pool === id,
+  );
+  if (used) {
+    notify("该资源池仍被模型路由使用，不能删除", "bad");
+    return;
+  }
+  delete workflow.value.config.pools[id];
+}
+
+function addWorkflowTarget(pool) {
+  pool.targets.push({
+    id: `target-${pool.targets.length + 1}`,
+    base_url: "http://127.0.0.1:8000/v1",
+    api_key_env: "BACKEND_API_KEY",
+  });
+}
+
+function removeWorkflowTarget(pool, index) {
+  if (pool.targets.length <= 1) {
+    notify("每个资源池至少需要保留一个 Worker / 资源实例", "bad");
+    return;
+  }
+  pool.targets.splice(index, 1);
+}
+
+function addWorkflowRoute() {
+  const id = workflowIdentifier(workflowNewRoute.id);
+  if (!id || workflow.value.config.models[id]) {
+    notify("请输入未使用的公开模型 ID", "bad");
+    return;
+  }
+  if (!workflowNewRoute.pool) {
+    notify("请先选择资源池", "bad");
+    return;
+  }
+  if (!workflowIdentifier(workflowNewRoute.base_model)) {
+    notify("请输入底层模型 ID", "bad");
+    return;
+  }
+  workflow.value.config.models[id] = {
+    enabled: false,
+    mode: workflowNewRoute.mode,
+    base_model: workflowIdentifier(workflowNewRoute.base_model),
+    pool: workflowNewRoute.pool,
+    tools: [],
+    max_tool_rounds: 4,
+    system_prompt: "",
+  };
+  workflowNewRoute.id = "";
+  workflowNewRoute.base_model = "";
+}
+
+function removeWorkflowRoute(id) {
+  if (Object.keys(workflow.value.config.models).length <= 1) {
+    notify("至少需要保留一个模型路由", "bad");
+    return;
+  }
+  delete workflow.value.config.models[id];
+}
+
+function toggleWorkflowTool(route, adapterId, enabled) {
+  const values = new Set(Array.isArray(route.tools) ? route.tools : []);
+  if (enabled) values.add(adapterId);
+  else values.delete(adapterId);
+  route.tools = [...values];
+}
+
+function workflowToolParameters(adapter) {
+  return JSON.stringify(
+    adapter?.tool_definition?.function?.parameters || {
+      type: "object",
+      additionalProperties: true,
+    },
+    null,
+    2,
+  );
+}
+
+function updateWorkflowToolParameters(adapter, raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+      throw new Error("参数 Schema 必须是 JSON 对象");
+    }
+    adapter.tool_definition ||= { type: "function", function: {} };
+    adapter.tool_definition.function ||= {};
+    adapter.tool_definition.function.parameters = parsed;
+  } catch (error) {
+    notify(`工具参数 Schema 无效：${error.message}`, "bad");
+  }
+}
+
+function addWorkflowAdapter() {
+  const id = workflowIdentifier(workflowNewAdapter.id);
+  const functionName = workflowIdentifier(workflowNewAdapter.function_name);
+  if (!id || workflow.value.config.adapters[id]) {
+    notify("请输入未使用的适配器 ID", "bad");
+    return;
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(functionName)) {
+    notify("工具函数名只能包含字母、数字、下划线和连字符", "bad");
+    return;
+  }
+  if (!/^https?:\/\/[^\s]+$/i.test(workflowIdentifier(workflowNewAdapter.endpoint))) {
+    notify("请输入有效的 HTTP(S) 适配器地址", "bad");
+    return;
+  }
+  workflow.value.config.adapters[id] = {
+    kind: "http-json",
+    endpoint: workflowIdentifier(workflowNewAdapter.endpoint),
+    secret_env: workflowIdentifier(workflowNewAdapter.secret_env),
+    timeout_ms: 60000,
+    result_max_bytes: 4194304,
+    allowed_purposes: workflowNewAdapter.allowed_purposes
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+    tool_definition: {
+      type: "function",
+      function: {
+        name: functionName,
+        description: workflowIdentifier(workflowNewAdapter.description),
+        parameters: { type: "object", additionalProperties: true },
+      },
+    },
+  };
+  Object.assign(workflowNewAdapter, {
+    id: "",
+    endpoint: "",
+    secret_env: "",
+    function_name: "",
+    description: "",
+    allowed_purposes: "",
+  });
+}
+
+function removeWorkflowAdapter(id) {
+  for (const route of Object.values(workflow.value.config.models))
+    route.tools = (route.tools || []).filter((tool) => tool !== id);
+  delete workflow.value.config.adapters[id];
 }
 
 function replaceStressRun(run) {
@@ -3907,6 +4162,284 @@ onBeforeUnmount(() => {
                 "
               />
             </section>
+          </section>
+
+          <section v-if="section === 'workflow'" class="page workflow-page">
+            <div class="page-head">
+              <div>
+                <span class="eyebrow">PLUGGABLE ORCHESTRATION</span>
+                <h1>能力编排</h1>
+                <p>
+                  配置公开模型路由、远程资源池与工具适配器。推理和流式响应由 Go
+                  数据面处理，不经过门户 Python 进程。
+                </p>
+              </div>
+              <div class="button-row">
+                <button class="ghost" :disabled="workflowLoading" @click="loadWorkflow()">
+                  {{ workflowLoading ? "读取中…" : "重新读取" }}
+                </button>
+                <button
+                  class="primary"
+                  :disabled="!workflow?.available || workflowSaving"
+                  @click="saveWorkflow"
+                >
+                  {{ workflowSaving ? "校验并保存中…" : "校验、保存并热加载" }}
+                </button>
+                <button
+                  class="primary"
+                  :disabled="!workflow?.available || workflowPublishing || workflowSaving"
+                  @click="publishWorkflow"
+                >
+                  {{ workflowPublishing ? "同步中…" : "同步到 AI 网关" }}
+                </button>
+              </div>
+            </div>
+
+            <section v-if="workflowLoading && !workflow" class="panel empty-state">
+              正在读取本机 Go 工作流数据面…
+            </section>
+            <section v-else-if="!workflow?.available" class="panel workflow-unavailable">
+              <h2>工作流数据面尚未启用</h2>
+              <p>{{ workflow?.error || "没有可用的工作流管理接口。" }}</p>
+              <p>
+                先由维护人员执行 <code>llmctl workflow init</code>，配置并启用一条路由后运行
+                <code>llmctl workflow enable</code>。该过程不会重启现有 Router 或 GPU Worker。
+              </p>
+            </section>
+
+            <template v-else>
+              <section class="panel workflow-summary">
+                <div>
+                  <small>内部监听</small><strong>{{ workflow.config.listen }}</strong>
+                </div>
+                <div>
+                  <small>模型路由</small><strong>{{ Object.keys(workflow.config.models).length }}</strong>
+                </div>
+                <div>
+                  <small>资源池</small><strong>{{ Object.keys(workflow.config.pools).length }}</strong>
+                </div>
+                <div>
+                  <small>适配器</small><strong>{{ Object.keys(workflow.config.adapters).length }}</strong>
+                </div>
+              </section>
+
+              <section class="panel workflow-gateway-publish">
+                <div>
+                  <h2>AI 网关接入地址</h2>
+                  <p class="muted">
+                    这是当前 AI 接入层访问 Go 数据面的内部或跨主机地址，不是用户公网 API 地址。保存配置不会改变现有网关；只有点击“同步到 AI 网关”才会创建独立的
+                    <code>llmctl-workflow-*</code> 路由组合。
+                  </p>
+                </div>
+                <label>
+                  OpenAI 兼容 Base URL
+                  <input
+                    v-model.trim="workflow.config.gateway_base_url"
+                    placeholder="http://127.0.0.1:18100/v1"
+                  />
+                </label>
+                <p class="muted">
+                  同步后，仍需在“模型、映射与定价”中显式将所需公开 ID（例如
+                  <code>gdn-inside</code>）指向生成的路由组合。LLMCtl 不会自动覆盖当前生产映射。
+                </p>
+                <details class="workflow-advanced-settings">
+                  <summary>运行时高级设置</summary>
+                  <div class="form-grid">
+                    <label>
+                      单次请求体上限（字节）
+                      <input
+                        v-model.number="workflow.config.request_body_limit_bytes"
+                        type="number"
+                        min="1048576"
+                        max="268435456"
+                      />
+                    </label>
+                    <label>
+                      上游响应头超时（毫秒）
+                      <input
+                        v-model.number="workflow.config.upstream_timeout_ms"
+                        type="number"
+                        min="1000"
+                        max="86400000"
+                      />
+                    </label>
+                    <label>
+                      共享密钥环境变量
+                      <input v-model.trim="workflow.config.shared_secret_env" />
+                    </label>
+                  </div>
+                  <p class="muted">
+                    内部监听地址 <code>{{ workflow.config.listen }}</code> 的变更需要维护人员修改配置并重启
+                    <code>llm-workflow.service</code>；密钥值只保存在受限环境文件中。
+                  </p>
+                </details>
+              </section>
+
+              <section class="panel workflow-section">
+                <div class="panel-head">
+                  <div>
+                    <h2>公开模型路由</h2>
+                    <p class="muted">路由 ID、底层模型、资源池及可调用工具均可独立调整。</p>
+                  </div>
+                </div>
+                <article
+                  v-for="[routeId, route] in Object.entries(workflow.config.models)"
+                  :key="routeId"
+                  class="workflow-editor-card"
+                >
+                  <div class="workflow-card-title">
+                    <div><strong>{{ routeId }}</strong><small>公开模型 ID</small></div>
+                    <label class="switch compact-switch">
+                      <input v-model="route.enabled" class="switch-control" type="checkbox" />
+                      <span aria-hidden="true"></span>{{ route.enabled ? "已启用" : "已停用" }}
+                    </label>
+                    <button class="danger subtle" type="button" @click="removeWorkflowRoute(routeId)">
+                      删除
+                    </button>
+                  </div>
+                  <div class="form-grid workflow-route-fields">
+                    <label>底层模型 ID<input v-model.trim="route.base_model" /></label>
+                    <label>资源池<select v-model="route.pool">
+                      <option v-for="poolId in Object.keys(workflow.config.pools)" :key="poolId" :value="poolId">
+                        {{ poolId }}
+                      </option>
+                    </select></label>
+                    <label>执行模式<select v-model="route.mode">
+                      <option value="transparent">透明转发</option>
+                      <option value="agent">工具编排</option>
+                    </select></label>
+                    <label>最大工具轮数<input v-model.number="route.max_tool_rounds" type="number" min="1" max="12" /></label>
+                  </div>
+                  <label>系统提示词<textarea v-model="route.system_prompt" rows="3" placeholder="可留空"></textarea></label>
+                  <div v-if="Object.keys(workflow.config.adapters).length" class="workflow-tool-list">
+                    <span>允许调用的适配器</span>
+                    <label v-for="adapterId in Object.keys(workflow.config.adapters)" :key="adapterId" class="check-chip">
+                      <input
+                        type="checkbox"
+                        :checked="(route.tools || []).includes(adapterId)"
+                        @change="toggleWorkflowTool(route, adapterId, $event.target.checked)"
+                      />{{ adapterId }}
+                    </label>
+                  </div>
+                </article>
+                <div class="workflow-add-row">
+                  <input v-model.trim="workflowNewRoute.id" placeholder="新公开模型 ID" />
+                  <input v-model.trim="workflowNewRoute.base_model" placeholder="底层模型 ID" />
+                  <select v-model="workflowNewRoute.pool">
+                    <option value="">选择资源池</option>
+                    <option v-for="poolId in Object.keys(workflow.config.pools)" :key="poolId" :value="poolId">{{ poolId }}</option>
+                  </select>
+                  <select v-model="workflowNewRoute.mode">
+                    <option value="transparent">透明转发</option>
+                    <option value="agent">工具编排</option>
+                  </select>
+                  <button class="ghost" type="button" @click="addWorkflowRoute">增加路由</button>
+                </div>
+              </section>
+
+              <section class="panel workflow-section">
+                <div class="panel-head">
+                  <div>
+                    <h2>资源池与 Worker</h2>
+                    <p class="muted">
+                      Worker 是显式 HTTP(S) 地址，可以位于本机、另一台服务器或独立 GPU 集群；不依赖 Docker 自动发现。
+                    </p>
+                  </div>
+                </div>
+                <article
+                  v-for="[poolId, pool] in Object.entries(workflow.config.pools)"
+                  :key="poolId"
+                  class="workflow-editor-card"
+                >
+                  <div class="workflow-card-title">
+                    <div><strong>{{ poolId }}</strong><small>资源池</small></div>
+                    <label>调度策略<select v-model="pool.strategy">
+                      <option value="p2c-least-inflight">P2C 最少在途</option>
+                      <option value="round-robin">轮询</option>
+                    </select></label>
+                    <button class="danger subtle" type="button" @click="removeWorkflowPool(poolId)">删除</button>
+                  </div>
+                  <div v-for="(target, index) in pool.targets" :key="`${poolId}-${index}`" class="workflow-target-row">
+                    <label>目标 ID<input v-model.trim="target.id" /></label>
+                    <label class="target-url">OpenAI 兼容 Base URL<input v-model.trim="target.base_url" placeholder="http://10.0.0.20:8000/v1" /></label>
+                    <label>密钥环境变量<input v-model.trim="target.api_key_env" placeholder="BACKEND_API_KEY" /></label>
+                    <button class="danger subtle" type="button" @click="removeWorkflowTarget(pool, index)">移除</button>
+                  </div>
+                  <button class="ghost" type="button" @click="addWorkflowTarget(pool)">增加 Worker / 资源实例</button>
+                </article>
+                <div class="workflow-add-row compact-add-row">
+                  <input v-model.trim="workflowNewPool.id" placeholder="新资源池 ID" />
+                  <select v-model="workflowNewPool.strategy">
+                    <option value="p2c-least-inflight">P2C 最少在途</option>
+                    <option value="round-robin">轮询</option>
+                  </select>
+                  <button class="ghost" type="button" @click="addWorkflowPool">增加资源池</button>
+                </div>
+              </section>
+
+              <section class="panel workflow-section">
+                <div class="panel-head">
+                  <div>
+                    <h2>工具与多模态适配器</h2>
+                    <p class="muted">
+                      搜索、生图、图片编辑、音频和视频能力都以 HTTP JSON 适配器接入；密钥值只能由
+                      <code>llmctl workflow secret set</code> 写入，不在页面显示。
+                    </p>
+                  </div>
+                </div>
+                <article
+                  v-for="[adapterId, adapter] in Object.entries(workflow.config.adapters)"
+                  :key="adapterId"
+                  class="workflow-editor-card"
+                >
+                  <div class="workflow-card-title">
+                    <div><strong>{{ adapterId }}</strong><small>{{ adapter.tool_definition?.function?.name || "工具" }}</small></div>
+                    <button class="danger subtle" type="button" @click="removeWorkflowAdapter(adapterId)">删除</button>
+                  </div>
+                  <div class="form-grid">
+                    <label>适配器地址<input v-model.trim="adapter.endpoint" /></label>
+                    <label>密钥环境变量<input v-model.trim="adapter.secret_env" placeholder="可留空" /></label>
+                    <label>超时（毫秒）<input v-model.number="adapter.timeout_ms" type="number" min="100" max="7200000" /></label>
+                    <label>最大结果字节<input v-model.number="adapter.result_max_bytes" type="number" min="1024" max="67108864" /></label>
+                    <label>工具函数名<input v-model.trim="adapter.tool_definition.function.name" /></label>
+                  </div>
+                  <label>工具说明<input v-model.trim="adapter.tool_definition.function.description" /></label>
+                  <label>允许用途（逗号分隔）<input
+                    :value="(adapter.allowed_purposes || []).join(',')"
+                    @change="adapter.allowed_purposes = $event.target.value.split(',').map((v) => v.trim()).filter(Boolean)"
+                    placeholder="text-to-image,image-edit"
+                  /></label>
+                  <label>
+                    工具参数 JSON Schema
+                    <textarea
+                      :value="workflowToolParameters(adapter)"
+                      rows="8"
+                      spellcheck="false"
+                      @change="updateWorkflowToolParameters(adapter, $event.target.value)"
+                    ></textarea>
+                  </label>
+                </article>
+                <div class="workflow-adapter-new">
+                  <input v-model.trim="workflowNewAdapter.id" placeholder="适配器 ID" />
+                  <input v-model.trim="workflowNewAdapter.endpoint" placeholder="HTTP(S) 接口地址" />
+                  <input v-model.trim="workflowNewAdapter.secret_env" placeholder="密钥环境变量（可空）" />
+                  <input v-model.trim="workflowNewAdapter.function_name" placeholder="工具函数名" />
+                  <input v-model.trim="workflowNewAdapter.description" placeholder="给模型看的工具说明" />
+                  <input v-model.trim="workflowNewAdapter.allowed_purposes" placeholder="允许用途（逗号分隔，可空）" />
+                  <button class="ghost" type="button" @click="addWorkflowAdapter">增加适配器</button>
+                </div>
+              </section>
+
+              <section class="panel workflow-save-footer">
+                <div>
+                  <strong>保存前由 Go 运行时执行完整校验</strong>
+                  <p class="muted">版本冲突、空资源池、无效 URL、缺失密钥和错误工具定义都会被拒绝，原配置继续运行。</p>
+                </div>
+                <button class="primary" :disabled="workflowSaving" @click="saveWorkflow">
+                  {{ workflowSaving ? "保存中…" : "保存并热加载" }}
+                </button>
+              </section>
+            </template>
           </section>
 
           <section v-if="section === 'stress'" class="page stress-page">

@@ -24,8 +24,14 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/gateway_config.py",
             "lib/account_portal.py",
             "lib/llm_benchmark.py",
+            "lib/workflow_config.py",
+            "lib/workflowd/llm-workflowd",
+            "lib/workflowd/llm-workflowd-linux-amd64",
+            "lib/workflowd/llm-workflowd-linux-arm64",
+            "lib/workflowd/checksums.env",
             "systemd/llm-keepwarm.service",
             "systemd/llm-keepwarm.timer",
+            "systemd/llm-workflow.service",
         ]
         files.extend(
             str(path.relative_to(ROOT))
@@ -34,7 +40,10 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         )
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
             for relative in files:
-                handle.write(ROOT / relative, f"LLMCtl-main/{relative}")
+                source = ROOT / relative
+                info = zipfile.ZipInfo.from_file(source, f"LLMCtl-main/{relative}")
+                info.compress_type = zipfile.ZIP_DEFLATED
+                handle.writestr(info, source.read_bytes())
 
     def test_manifest_is_limited_to_control_plane_paths(self):
         entries = []
@@ -57,6 +66,8 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
                 or destination.startswith("/usr/local/lib/llm-cluster/")
             )
             self.assertNotIn("llm-worker@", destination.lower())
+            self.assertNotIn("/etc/llm-cluster/workflow", destination)
+            self.assertNotIn("/var/lib/llm-cluster/workflow", destination)
             self.assertRegex(mode, r"^0[0-7]{3}$")
             self.assertIn(restart, {"none", "account"})
 
@@ -106,6 +117,9 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("configure_keepwarm_timer", source)
         self.assertIn("load_saved_proxy()", source)
         self.assertIn("prompt_new_proxy()", source)
+        self.assertIn("refresh_workflow_unit_if_installed()", source)
+        self.assertIn('[[ -e "${WORKFLOW_SERVICE_UNIT}" ]] || return 0', source)
+        self.assertNotIn("systemctl enable --now llm-workflow", source)
 
     def test_local_zip_check_validates_without_deploying(self):
         with tempfile.TemporaryDirectory() as temporary:

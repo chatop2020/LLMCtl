@@ -30,6 +30,7 @@
 - systemd 开机自启；Worker 可分批并行加载，SSH 断开不影响后台启动。
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
+- 可选的 Go 工作流数据面支持把联网搜索、图片/音频/视频等 HTTP 适配器叠加到显式发布的模型；资源池使用可编辑的本机或远程 URL，普通模型请求继续走原有网关与 Worker 路径。详见 [WORKFLOW.md](WORKFLOW.md)。
 - `llmctl info` 提供分门别类的完整灾备清单：公开/内部入口、硬件、镜像、服务、自启、Worker、数据库、管理员、全部密钥/密码、SMTP、代理、模型与文件路径；默认仅供可信 root 终端明文查看，分享时用 `--redact`。
 - `llmctl optimize` 可采集流式 TTFT/ITL/E2E、聚合吞吐、GPU/显存/温度、CPU/内存/Swap 和 vLLM KV Cache/排队/抢占/前缀缓存指标；先解释候选原因、代价和边界，经用户确认后才备份配置、逐项重启试验、自动择优、完整冒烟，并在失败或中断时回滚。
 
@@ -50,12 +51,15 @@
 | `lib/gateway_config.py` | 四种接入层的无密钥配置生成及 New API/OmniRoute 状态同步 |
 | `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、预付余额和模型目录 |
 | `lib/llm_benchmark.py` | 门户管理端的后台并发压测与流式性能指标执行器 |
+| `workflowd/` / `lib/workflowd/` | 可选 Go 工作流源码及 macOS 交叉编译的 Linux amd64/arm64 静态运行时 |
+| `lib/workflow_config.py` | 显式远程资源池、模型路由和适配器配置助手 |
 | `portal-ui/` | Vue 3 企业门户源码与前端测试 |
 | `lib/account_portal_ui/` | 已构建、安装时直接复制的门户静态资源 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
 | `tests/test_runtime_optimizer.py` | 调优建议、评分、指标解析与流式时延测试 |
 | `README.md` / `README_EN.md` | 中英文项目说明 |
 | `USAGE.md` / `USAGE_EN.md` | 中英文日常使用、API 和故障排查手册 |
+| `WORKFLOW.md` / `WORKFLOW_EN.md` | 中英文可插拔工作流、远程 Worker 和升级兼容手册 |
 
 ## 默认值
 
@@ -219,7 +223,7 @@ sudo bash install-llm-cluster.sh --force-reconfigure
 
 `llmctl models search --source all|huggingface` 同样先测试网络：优先直连，其次验证保存的维护代理，仍失败才重新询问。健康检查、状态查询和离线推理不会因为没有国际网络而弹出代理问题。
 
-代理只用于安装、模型下载或显式维护命令。安装结束前脚本会：
+安装/维护代理只用于安装、模型下载或显式维护命令，和推理运行时代理严格分离。安装结束前脚本会：
 
 1. 清除当前进程的代理变量。
 2. 删除 Docker 的临时 proxy drop-in。
@@ -233,6 +237,15 @@ sudo llmctl proxy set 10.1.0.6 7890 http
 sudo llmctl proxy test
 sudo llmctl proxy show
 sudo llmctl proxy clear
+```
+
+如联网搜索或外部多媒体适配器需要国际出口，可另行启用运行时代理。该配置只注入当前 Router（包括 OmniRoute）与可选 Go Workflow，默认绕过回环及 RFC1918 内网，不注入 vLLM Worker。设置或清除时只短暂重启正在运行的 Router/Workflow，不重启 Docker 或 GPU Worker：
+
+```bash
+sudo llmctl runtime-proxy set 192.168.9.104 1082 http
+sudo llmctl runtime-proxy test
+sudo llmctl runtime-proxy show
+sudo llmctl runtime-proxy clear
 ```
 
 Hugging Face 私有或 gated 模型需要在运行安装器时提供 `HF_TOKEN` 并先接受模型许可。ModelScope 私有模型使用 `MODELSCOPE_API_TOKEN`。令牌不会被写入集群配置。

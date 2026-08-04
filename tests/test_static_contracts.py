@@ -210,6 +210,29 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertNotIn("HTTP_PROXY", unit)
         self.assertNotIn("HTTPS_PROXY", unit)
 
+    def test_runtime_proxy_is_scoped_to_router_and_optional_workflow(self):
+        gateway_start = MANAGER.split("cmd_gateway_start() {", 1)[1].split(
+            "cmd_worker_start() {", 1
+        )[0]
+        worker_start = MANAGER.split("cmd_worker_start() {", 1)[1].split(
+            "image_supports_architecture() {", 1
+        )[0]
+        runtime_proxy = MANAGER.split("load_runtime_proxy() {", 1)[1].split(
+            "load_saved_proxy() {", 1
+        )[0]
+        workflow_unit = (ROOT / "systemd" / "llm-workflow.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("runtime_proxy_docker_args runtime_proxy_args", gateway_start)
+        self.assertEqual(gateway_start.count('"${runtime_proxy_args[@]}"'), 4)
+        self.assertNotIn("RUNTIME_HTTP_PROXY", worker_start)
+        self.assertNotIn("runtime-proxy.env", worker_start)
+        self.assertIn("GPU Worker=未重启", runtime_proxy)
+        self.assertNotIn("systemctl restart docker", runtime_proxy)
+        self.assertIn(
+            "EnvironmentFile=-/etc/llm-cluster/runtime-proxy.env", workflow_unit
+        )
+
     def test_runtime_optimizer_is_installed_and_modelscope_uses_real_cli(self):
         self.assertIn(
             'install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py',

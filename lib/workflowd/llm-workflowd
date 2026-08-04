@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+runtime_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "$(uname -m)" in
+  x86_64|amd64) binary="${runtime_dir}/llm-workflowd-linux-amd64" ;;
+  aarch64|arm64) binary="${runtime_dir}/llm-workflowd-linux-arm64" ;;
+  *)
+    printf 'llm-workflowd: unsupported Linux architecture: %s\n' "$(uname -m)" >&2
+    exit 2
+    ;;
+esac
+
+[ -x "${binary}" ] || {
+  printf 'llm-workflowd: runtime binary is missing or not executable: %s\n' "${binary}" >&2
+  exit 2
+}
+exec "${binary}" "$@"

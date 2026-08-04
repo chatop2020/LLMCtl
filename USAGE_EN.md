@@ -110,6 +110,12 @@ sudo journalctl -u llm-keepwarm.service -u llm-keepwarm.timer -f
 
 Shorter intervals usually make the first request after idleness more consistent, but increase standby power. Workers that are deactivated or absent from the active set are neither started nor probed by the timer.
 
+### Pluggable workflows and remote Workers
+
+`llmctl workflow` is an independent Go data plane that is disabled by default. Upgrading an existing deployment installs runtime files only: it does not create a service, change public model mappings, or operate existing GPU Workers. A workflow model uses this path only after target discovery, validation, explicit enablement, and publication; ordinary model traffic is unchanged.
+
+It supports explicit vLLM, image, audio, video, and search endpoints on other servers and allows models or adapters to be replaced online later. See [WORKFLOW_EN.md](WORKFLOW_EN.md) for configuration, proxies, security boundaries, macOS cross-compilation, and 3.2.x upgrade compatibility.
+
 Configure startup parallelism:
 
 ```bash
@@ -401,6 +407,15 @@ sudo llmctl proxy set 10.1.0.6 7890 http
 sudo llmctl update --vllm-image vllm/vllm-openai:v0.22.1
 sudo llmctl update --gateway-image calciumion/new-api:v1.0.0-rc.22
 sudo llmctl proxy clear
+```
+
+The commands above manage the maintenance proxy used by downloads and upgrades. Configure the separate runtime proxy when OmniRoute, web search, or external workflow adapters need international access. It is not injected into vLLM Workers and does not restart GPU Workers:
+
+```bash
+sudo llmctl runtime-proxy set 192.168.9.104 1082 http
+sudo llmctl runtime-proxy test
+sudo llmctl runtime-proxy show
+sudo llmctl runtime-proxy clear
 ```
 
 The installer defaults to the published OmniRoute image `diegosouzapw/omniroute:3.8.48`. If an image tag is absent or the registry is unreachable, the installer preserves Docker's original error and prints the corresponding `--*-image` override instead of reporting only a script line number. For example:

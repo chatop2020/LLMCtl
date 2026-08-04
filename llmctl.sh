@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.2.2"
+readonly CTL_VERSION="3.3.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -13,6 +13,7 @@ readonly RETAINED_SECRETS="${STATE_DIR}/retained-secrets.env"
 readonly CLUSTER_ENV="${CONFIG_DIR}/cluster.env"
 readonly SECRETS_ENV="${CONFIG_DIR}/secrets.env"
 readonly PROXY_ENV="${CONFIG_DIR}/proxy.env"
+readonly RUNTIME_PROXY_ENV="${CONFIG_DIR}/runtime-proxy.env"
 readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm.yaml"
 readonly BIFROST_DIR="${CONFIG_DIR}/bifrost"
 readonly BIFROST_CONFIG="${BIFROST_DIR}/config.json"
@@ -37,6 +38,13 @@ readonly KEEPWARM_LOCK_FILE="${KEEPWARM_STATE_DIR}/run.lock"
 readonly KEEPWARM_UNIT_SOURCE_DIR="${LLM_KEEPWARM_UNIT_SOURCE_DIR:-/usr/local/lib/llm-cluster/systemd}"
 readonly KEEPWARM_SERVICE_UNIT="/etc/systemd/system/llm-keepwarm.service"
 readonly KEEPWARM_TIMER_UNIT="/etc/systemd/system/llm-keepwarm.timer"
+readonly WORKFLOW_STATE_DIR="${STATE_DIR}/workflow"
+readonly WORKFLOW_CONFIG="${WORKFLOW_STATE_DIR}/workflow.json"
+readonly WORKFLOW_ENV="${CONFIG_DIR}/workflow.env"
+readonly WORKFLOW_HELPER="${LLM_WORKFLOW_HELPER:-/usr/local/lib/llm-cluster/workflow_config.py}"
+readonly WORKFLOW_RUNTIME="${LLM_WORKFLOW_RUNTIME:-/usr/local/lib/llm-cluster/workflowd/llm-workflowd}"
+readonly WORKFLOW_UNIT_SOURCE="${LLM_WORKFLOW_UNIT_SOURCE:-/usr/local/lib/llm-cluster/systemd/llm-workflow.service}"
+readonly WORKFLOW_SERVICE_UNIT="/etc/systemd/system/llm-workflow.service"
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
@@ -80,6 +88,12 @@ load_config() {
   KEEPWARM_ENABLED="${KEEPWARM_ENABLED:-0}"
   KEEPWARM_INTERVAL_SECONDS="${KEEPWARM_INTERVAL_SECONDS:-300}"
   KEEPWARM_TIMEOUT_SECONDS="${KEEPWARM_TIMEOUT_SECONDS:-90}"
+  # Workflow routing is an optional, separately managed data plane. Existing
+  # 3.2.x deployments intentionally remain disabled after a control-plane
+  # upgrade until an administrator runs `llmctl workflow init/enable`.
+  WORKFLOW_ENABLED="${WORKFLOW_ENABLED:-0}"
+  WORKFLOW_LISTEN="${WORKFLOW_LISTEN:-127.0.0.1:18100}"
+  WORKFLOW_ROUTE_MODEL="${WORKFLOW_ROUTE_MODEL:-llmctl-workflow-${SERVED_MODEL_NAME:-gdn-inside}}"
   MODEL_HUB="${MODEL_HUB:-huggingface}"
   MODEL_ARCHITECTURE="${MODEL_ARCHITECTURE:-Qwen3_5MoeForConditionalGeneration}"
   MODEL_TASK="${MODEL_TASK:-vision}"
@@ -183,13 +197,16 @@ load_config() {
   [[ "${KEEPWARM_ENABLED}" == 0 || "${KEEPWARM_ENABLED}" == 1 ]] || die "KEEPWARM_ENABLED 必须是 0 或 1"
   [[ "${KEEPWARM_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_INTERVAL_SECONDS >= 60 && KEEPWARM_INTERVAL_SECONDS <= 86400 )) || die "KEEPWARM_INTERVAL_SECONDS 范围 60-86400"
   [[ "${KEEPWARM_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_TIMEOUT_SECONDS >= 5 && KEEPWARM_TIMEOUT_SECONDS <= 300 )) || die "KEEPWARM_TIMEOUT_SECONDS 范围 5-300"
+  [[ "${WORKFLOW_ENABLED}" == 0 || "${WORKFLOW_ENABLED}" == 1 ]] || die "WORKFLOW_ENABLED 必须是 0 或 1"
 }
 
 cmd_gateway_start() {
   require_root
   load_config
   local name
+  local -a runtime_proxy_args=()
   name=$(gateway_display_name)
+  runtime_proxy_docker_args runtime_proxy_args
   export UI_USERNAME UI_PASSWORD
   log "启动 ${name}：镜像=${GATEWAY_IMAGE}，内部入口=127.0.0.1:${GATEWAY_INTERNAL_PORT}，公开入口由 Nginx ${API_BIND}:${API_PORT} 提供。"
   ensure_docker_network
@@ -198,7 +215,7 @@ cmd_gateway_start() {
       docker volume create llm-cluster-gateway-data >/dev/null
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
+        --env-file "${SECRETS_ENV}" "${runtime_proxy_args[@]}" -e UI_USERNAME -e UI_PASSWORD \
         -e "PORT=${GATEWAY_INTERNAL_PORT}" -e "TZ=${TZ:-Asia/Shanghai}" \
         -e ERROR_LOG_ENABLED=true -e BATCH_UPDATE_ENABLED=true \
         -v llm-cluster-gateway-data:/data \
@@ -207,7 +224,7 @@ cmd_gateway_start() {
     litellm)
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
+        --env-file "${SECRETS_ENV}" "${runtime_proxy_args[@]}" -e UI_USERNAME -e UI_PASSWORD \
         -v "${LITELLM_CONFIG}:/app/config.yaml:ro" \
         "${GATEWAY_IMAGE}" --config /app/config.yaml --host 0.0.0.0 --port "${GATEWAY_INTERNAL_PORT}"
       ;;
@@ -215,7 +232,7 @@ cmd_gateway_start() {
       docker volume create llm-cluster-gateway-data >/dev/null
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
+        --env-file "${SECRETS_ENV}" "${runtime_proxy_args[@]}" -e UI_USERNAME -e UI_PASSWORD \
         -e APP_DIR=/app/data -e APP_HOST=0.0.0.0 -e "APP_PORT=${GATEWAY_INTERNAL_PORT}" \
         -v llm-cluster-gateway-data:/app/data \
         -v "${BIFROST_CONFIG}:/app/data/config.json:ro" \
@@ -225,7 +242,7 @@ cmd_gateway_start() {
       install -d -m 770 -o 1000 -g 1000 "${STATE_DIR}/omniroute/gateway"
       exec /usr/bin/docker run --rm --name llm-router --network "${DOCKER_NETWORK}" \
         -p "127.0.0.1:${GATEWAY_INTERNAL_PORT}:${GATEWAY_INTERNAL_PORT}" \
-        --env-file "${SECRETS_ENV}" -e UI_USERNAME -e UI_PASSWORD \
+        --env-file "${SECRETS_ENV}" "${runtime_proxy_args[@]}" -e UI_USERNAME -e UI_PASSWORD \
         -e HOST=0.0.0.0 -e API_HOST=0.0.0.0 \
         -e "PORT=${GATEWAY_INTERNAL_PORT}" -e "DASHBOARD_PORT=${GATEWAY_INTERNAL_PORT}" -e "API_PORT=${GATEWAY_INTERNAL_PORT}" \
         -e "INITIAL_PASSWORD=${UI_PASSWORD}" -e "JWT_SECRET=${OMNIROUTE_JWT_SECRET}" \
@@ -321,6 +338,15 @@ usage() {
   llmctl keepwarm enable [间隔秒数]             启用周期保活（60-86400 秒）并立即预热
   llmctl keepwarm disable                      关闭周期保活，不停止 Worker
   llmctl keepwarm interval <秒数>               在线修改保活间隔，无需重启 Worker
+  llmctl workflow init [选项]                  初始化默认关闭的可插拔工作流；可导入本机或填写远程 Worker URL
+  llmctl workflow target add <池> <ID> <URL> [密钥环境变量]
+  llmctl workflow target remove <池> <ID>      在线维护显式资源端点，不依赖本机 Docker
+  llmctl workflow target discover <URL> [密钥环境变量] [模型ID]
+  llmctl workflow model set <公开ID> <底层ID> <池> [transparent|agent] [工具ID列表]
+  llmctl workflow adapter set <ID> <URL> <工具定义JSON> [密钥环境变量]
+  llmctl workflow secret set <环境变量> [值]   写入独立、root-only 的工作流密钥文件
+  llmctl workflow <enable|disable|reload|check|status|show|health|logs>
+                                                独立管理 Go 数据面；默认不修改现有网关映射
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
@@ -332,6 +358,7 @@ usage() {
   llmctl logs router [-f]                     所选接入层日志
   llmctl logs database [-f]                   PostgreSQL 日志
   llmctl logs account [-f]                    OmniRoute 账户门户日志
+  llmctl logs workflow [-f]                   可插拔 Go 工作流日志
   llmctl smoke [--worker ID] [--full]         文本/思考/工具；--full 另测 OCR/单请求6图
   llmctl ocr <图片文件> [提示词]               通过集群入口执行 OCR
   llmctl bench [--concurrency N] [--requests N] [--max-tokens N]
@@ -362,6 +389,9 @@ usage() {
   llmctl admin set-gateway-password [PASSWORD] 仅修改原生网关密码
   llmctl proxy set <IP> <端口> [http|https]    保存“仅维护使用”的代理
   llmctl proxy show|clear|test                 查看/清除/测试维护代理
+  llmctl runtime-proxy set <IP> <端口> [http|https] [NO_PROXY]
+                                                配置网关与工作流的国际出口；不注入 Worker
+  llmctl runtime-proxy show|clear|test|apply   查看、清除、测试或重新应用运行时代理
 
   llmctl models hardware                       显示 GPU 与显存
   llmctl models search [QUERY] [--source all|huggingface|modelscope]
@@ -463,6 +493,308 @@ set_env_value() {
   chmod --reference="${file}" "${tmp}" 2>/dev/null || chmod 600 "${tmp}"
   chown --reference="${file}" "${tmp}" 2>/dev/null || true
   mv -f "${tmp}" "${file}"
+}
+
+ensure_workflow_identity() {
+  getent group llm-workflow >/dev/null 2>&1 || groupadd --system llm-workflow
+  if ! getent passwd llm-workflow >/dev/null 2>&1; then
+    useradd --system --gid llm-workflow --home-dir /nonexistent --shell /usr/sbin/nologin llm-workflow
+  fi
+  install -d -m 0750 -o llm-workflow -g llm-workflow "${WORKFLOW_STATE_DIR}"
+}
+
+ensure_workflow_env() {
+  ensure_workflow_identity
+  if [[ ! -e "${WORKFLOW_ENV}" ]]; then
+    install -m 0640 -o root -g llm-workflow /dev/null "${WORKFLOW_ENV}"
+  fi
+  chmod 0640 "${WORKFLOW_ENV}"
+  chown root:llm-workflow "${WORKFLOW_ENV}"
+  local shared_secret
+  shared_secret=$(
+    set +u
+    set -a
+    # shellcheck disable=SC1090
+    source "${SECRETS_ENV}"
+    # shellcheck disable=SC1090
+    source "${WORKFLOW_ENV}"
+    set +a
+    printf '%s' "${LLM_WORKFLOW_SHARED_SECRET:-}"
+  )
+  [[ -n "${shared_secret}" ]] || shared_secret=$(openssl rand -hex 32)
+  set_env_value "${SECRETS_ENV}" LLM_WORKFLOW_SHARED_SECRET "${shared_secret}"
+  set_env_value "${WORKFLOW_ENV}" LLM_WORKFLOW_SHARED_SECRET "${shared_secret}"
+  if ! awk -F= '$1 == "BACKEND_API_KEY" {found=1} END {exit !found}' "${WORKFLOW_ENV}"; then
+    set_env_value "${WORKFLOW_ENV}" BACKEND_API_KEY "${BACKEND_API_KEY}"
+  fi
+}
+
+refresh_account_workflow_credential() {
+  if systemctl is-active --quiet llm-account.service; then
+    systemctl restart llm-account.service
+    log "账户门户已重新载入本机工作流管理凭据；Router 与 Worker 未重启。"
+  fi
+}
+
+workflow_with_env() {
+  [[ -r "${WORKFLOW_ENV}" ]] || die "缺少 ${WORKFLOW_ENV}；请先运行 llmctl workflow init"
+  (
+    set -a
+    # shellcheck disable=SC1090
+    source "${SECRETS_ENV}"
+    # shellcheck disable=SC1090
+    source "${WORKFLOW_ENV}"
+    set +a
+    exec "$@"
+  )
+}
+
+workflow_helper() {
+  [[ -x "${WORKFLOW_HELPER}" ]] || die "工作流配置助手不可执行：${WORKFLOW_HELPER}"
+  workflow_with_env python3 "${WORKFLOW_HELPER}" --config "${WORKFLOW_CONFIG}" "$@"
+}
+
+workflow_check_config() {
+  [[ -x "${WORKFLOW_RUNTIME}" ]] || die "Go 工作流运行时不可执行：${WORKFLOW_RUNTIME}"
+  [[ -r "${WORKFLOW_CONFIG}" ]] || die "缺少 ${WORKFLOW_CONFIG}；请先运行 llmctl workflow init"
+  workflow_with_env "${WORKFLOW_RUNTIME}" --config "${WORKFLOW_CONFIG}" --check-config
+}
+
+workflow_mutate() {
+  local backup=""
+  if [[ -e "${WORKFLOW_CONFIG}" ]]; then
+    backup=$(mktemp "${WORKFLOW_CONFIG}.backup.XXXXXX")
+    cp -a "${WORKFLOW_CONFIG}" "${backup}"
+  fi
+  if ! workflow_helper "$@" || ! workflow_check_config >/dev/null; then
+    if [[ -n "${backup}" ]]; then mv -f "${backup}" "${WORKFLOW_CONFIG}"; fi
+    die "工作流配置未通过校验，已恢复修改前版本"
+  fi
+  [[ -z "${backup}" ]] || rm -f "${backup}"
+  chown root:llm-workflow "${WORKFLOW_CONFIG}"
+  chmod 0640 "${WORKFLOW_CONFIG}"
+  if systemctl is-active --quiet llm-workflow.service; then
+    systemctl reload llm-workflow.service
+  fi
+}
+
+workflow_http_origin() {
+  python3 - "${WORKFLOW_CONFIG}" <<'PY'
+import json,sys
+listen=json.load(open(sys.argv[1], encoding="utf-8"))["listen"]
+if listen.startswith("["):
+    host,port=listen[1:].rsplit("]:",1)
+else:
+    host,port=listen.rsplit(":",1)
+if host in {"", "0.0.0.0", "::", "[::]"}:
+    host="127.0.0.1"
+if ":" in host:
+    host=f"[{host}]"
+print(f"http://{host}:{port}")
+PY
+}
+
+wait_workflow_ready() {
+  local origin elapsed=0
+  origin=$(workflow_http_origin)
+  while (( elapsed < 30 )); do
+    if systemctl is-active --quiet llm-workflow.service && \
+       curl --noproxy '*' -fsS --max-time 2 "${origin}/readyz" >/dev/null; then
+      log "Go 工作流数据面已就绪：${origin}"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+    log "等待工作流就绪：${elapsed}s/30s"
+  done
+  journalctl -u llm-workflow.service -n 80 --no-pager >&2 || true
+  return 1
+}
+
+cmd_workflow_init() {
+  local listen="${WORKFLOW_LISTEN}" route_model="${WORKFLOW_ROUTE_MODEL}" base_model="${SERVED_MODEL_NAME}"
+  local pool="text-generation" api_key_env="BACKEND_API_KEY" local_ids="" gateway_base_url="" force=0 arg
+  local -a targets=()
+  while (( $# )); do
+    arg="$1"
+    case "${arg}" in
+      --listen|--gateway-base-url|--route-model|--base-model|--pool|--target|--api-key-env|--local-worker-ids)
+        (( $# >= 2 )) || die "${arg} 缺少值"
+        case "${arg}" in
+          --listen) listen="$2" ;;
+          --gateway-base-url) gateway_base_url="$2" ;;
+          --route-model) route_model="$2" ;;
+          --base-model) base_model="$2" ;;
+          --pool) pool="$2" ;;
+          --target) targets+=(--target "$2") ;;
+          --api-key-env) api_key_env="$2" ;;
+          --local-worker-ids) local_ids="$2" ;;
+        esac
+        shift 2
+        ;;
+      --force) force=1; shift ;;
+      *) die "未知 workflow init 参数：${arg}" ;;
+    esac
+  done
+  [[ "${listen}" == *:* ]] || die "--listen 必须是 HOST:PORT"
+  if ((${#targets[@]} == 0)) && [[ -z "${local_ids}" ]]; then local_ids="${ACTIVE_WORKERS}"; fi
+  ensure_workflow_env
+  local -a helper_args=(init --listen "${listen}" --route-model "${route_model}" --base-model "${base_model}" --pool "${pool}" --api-key-env "${api_key_env}")
+  [[ -z "${gateway_base_url}" ]] || helper_args+=(--gateway-base-url "${gateway_base_url}")
+  [[ -z "${local_ids}" ]] || helper_args+=(--local-worker-ids "${local_ids}" --worker-base-port "${WORKER_BASE_PORT}")
+  helper_args+=("${targets[@]}")
+  (( force == 0 )) || helper_args+=(--force)
+  workflow_helper "${helper_args[@]}"
+  workflow_check_config >/dev/null
+  chown root:llm-workflow "${WORKFLOW_CONFIG}"
+  chmod 0640 "${WORKFLOW_CONFIG}"
+  set_env_value "${CLUSTER_ENV}" WORKFLOW_LISTEN "${listen}"
+  set_env_value "${CLUSTER_ENV}" WORKFLOW_ROUTE_MODEL "${route_model}"
+  set_env_value "${CLUSTER_ENV}" WORKFLOW_ENABLED 0
+  refresh_account_workflow_credential
+  log "工作流配置已创建并保持关闭；现有 Worker、Router 和公开模型映射均未改变。"
+  log "先运行 llmctl workflow model enable ${route_model}，再执行 llmctl workflow check 和 llmctl workflow enable。"
+}
+
+cmd_workflow_secret() {
+  [[ "${1:-}" == set ]] || die "用法：llmctl workflow secret set <环境变量> [值]"
+  local key="${2:-}" value="${3-}"
+  [[ "${key}" =~ ^[A-Z][A-Z0-9_]{1,127}$ ]] || die "无效的密钥环境变量名：${key}"
+  if [[ -z "${value}" ]]; then
+    [[ -t 0 ]] || die "非交互模式必须直接提供密钥值"
+    read -r -s -p "请输入 ${key}: " value
+    printf '\n'
+  fi
+  [[ -n "${value}" ]] || die "密钥值不能为空"
+  if [[ "${key}" == LLM_WORKFLOW_SHARED_SECRET && ${#value} -lt 24 ]]; then
+    die "LLM_WORKFLOW_SHARED_SECRET 至少需要 24 个字符"
+  fi
+  ensure_workflow_env
+  local backup
+  backup=$(mktemp "${WORKFLOW_ENV}.backup.XXXXXX")
+  cp -a "${WORKFLOW_ENV}" "${backup}"
+  set_env_value "${WORKFLOW_ENV}" "${key}" "${value}"
+  chmod 0640 "${WORKFLOW_ENV}"; chown root:llm-workflow "${WORKFLOW_ENV}"
+  if [[ -r "${WORKFLOW_CONFIG}" ]] && ! workflow_check_config >/dev/null; then
+    mv -f "${backup}" "${WORKFLOW_ENV}"
+    die "新密钥配置未通过校验，已恢复修改前版本"
+  fi
+  rm -f "${backup}"
+  if systemctl is-active --quiet llm-workflow.service; then systemctl restart llm-workflow.service; wait_workflow_ready; fi
+  [[ "${key}" != LLM_WORKFLOW_SHARED_SECRET ]] || refresh_account_workflow_credential
+  log "${key} 已写入独立工作流密钥文件；值未回显。"
+}
+
+cmd_workflow_target() {
+  local action="${1:-}"; shift || true
+  case "${action}" in
+    add)
+      (( $# >= 3 && $# <= 4 )) || die "用法：llmctl workflow target add <池> <ID> <URL> [密钥环境变量]"
+      workflow_mutate target-add --pool "$1" --id "$2" --base-url "$3" --api-key-env "${4:-BACKEND_API_KEY}"
+      ;;
+    remove)
+      (( $# == 2 )) || die "用法：llmctl workflow target remove <池> <ID>"
+      workflow_mutate target-remove --pool "$1" --id "$2"
+      ;;
+    discover)
+      (( $# >= 1 && $# <= 3 )) || die "用法：llmctl workflow target discover <URL> [密钥环境变量] [期望模型ID]"
+      local -a args=(discover --base-url "$1" --api-key-env "${2:-BACKEND_API_KEY}")
+      [[ -z "${3:-}" ]] || args+=(--expected-model "$3")
+      workflow_helper "${args[@]}"
+      ;;
+    *) die "workflow target 子命令必须是 add|remove|discover" ;;
+  esac
+}
+
+cmd_workflow_model() {
+  local action="${1:-}"; shift || true
+  case "${action}" in
+    set)
+      (( $# >= 3 && $# <= 5 )) || die "用法：llmctl workflow model set <公开ID> <底层ID> <池> [transparent|agent] [工具ID列表]"
+      workflow_mutate model-set --route-model "$1" --base-model "$2" --pool "$3" --mode "${4:-transparent}" --tools "${5:-}" --enabled
+      ;;
+    enable|disable)
+      (( $# == 1 )) || die "用法：llmctl workflow model ${action} <公开ID>"
+      if [[ "${action}" == enable ]]; then
+        workflow_mutate model-enable --route-model "$1" --enabled
+      else
+        workflow_mutate model-enable --route-model "$1" --no-enabled
+      fi
+      ;;
+    *) die "workflow model 子命令必须是 set|enable|disable" ;;
+  esac
+}
+
+cmd_workflow_adapter() {
+  [[ "${1:-}" == set ]] || die "用法：llmctl workflow adapter set <ID> <URL> <工具定义JSON文件> [密钥环境变量]"
+  shift
+  (( $# >= 3 && $# <= 4 )) || die "用法：llmctl workflow adapter set <ID> <URL> <工具定义JSON文件> [密钥环境变量]"
+  workflow_mutate adapter-set --id "$1" --endpoint "$2" --tool-definition "$3" --secret-env "${4:-}"
+}
+
+cmd_workflow() {
+  require_root; load_config
+  local action="${1:-status}"; shift || true
+  case "${action}" in
+    init) cmd_workflow_init "$@" ;;
+    secret) cmd_workflow_secret "$@" ;;
+    target) cmd_workflow_target "$@" ;;
+    model) cmd_workflow_model "$@" ;;
+    adapter) cmd_workflow_adapter "$@" ;;
+    check)
+      workflow_check_config
+      workflow_helper check-targets | jq .
+      workflow_helper show | jq '{version,listen,models,pools,adapters:(.adapters|keys)}'
+      ;;
+    enable)
+      ensure_workflow_env
+      workflow_check_config
+      jq -e '[.models[]|select(.enabled == true)]|length > 0' "${WORKFLOW_CONFIG}" >/dev/null || \
+        die "没有已启用的工作流路由；请先运行 llmctl workflow model enable <公开ID>"
+      workflow_helper check-targets | jq .
+      [[ -r "${WORKFLOW_UNIT_SOURCE}" ]] || die "缺少工作流 systemd 模板：${WORKFLOW_UNIT_SOURCE}"
+      install -m 0644 "${WORKFLOW_UNIT_SOURCE}" "${WORKFLOW_SERVICE_UNIT}"
+      systemctl daemon-reload
+      if ! systemctl enable --now llm-workflow.service || ! wait_workflow_ready; then
+        systemctl disable --now llm-workflow.service >/dev/null 2>&1 || true
+        set_env_value "${CLUSTER_ENV}" WORKFLOW_ENABLED 0
+        die "工作流未能在 30 秒内就绪；服务已停止并取消自启，原有 Router 与 Worker 未受影响"
+      fi
+      set_env_value "${CLUSTER_ENV}" WORKFLOW_ENABLED 1
+      log "工作流已启用；没有自动替换现有 ${SERVED_MODEL_NAME} 或修改 OmniRoute 映射。"
+      ;;
+    disable)
+      systemctl disable --now llm-workflow.service >/dev/null 2>&1 || true
+      set_env_value "${CLUSTER_ENV}" WORKFLOW_ENABLED 0
+      log "工作流已关闭；配置、资源池和密钥已保留。"
+      ;;
+    reload)
+      workflow_check_config >/dev/null
+      systemctl reload llm-workflow.service
+      wait_workflow_ready
+      ;;
+    health)
+      local origin; origin=$(workflow_http_origin)
+      curl --noproxy '*' -fsS --max-time 3 "${origin}/healthz" | jq .
+      curl --noproxy '*' -fsS --max-time 3 "${origin}/readyz" | jq .
+      ;;
+    status)
+      printf 'LLMCtl workflow: configured=%s enabled=%s active=%s\n' \
+        "$([[ -r "${WORKFLOW_CONFIG}" ]] && printf yes || printf no)" \
+        "$(systemctl is-enabled llm-workflow.service 2>/dev/null || printf disabled)" \
+        "$(systemctl is-active llm-workflow.service 2>/dev/null || printf inactive)"
+      [[ ! -x "${WORKFLOW_RUNTIME}" ]] || "${WORKFLOW_RUNTIME}" --version
+      if [[ -r "${WORKFLOW_CONFIG}" ]]; then
+        workflow_helper show | jq '{listen,models,pools,adapters:(.adapters|keys)}'
+      fi
+      ;;
+    show) workflow_helper show ;;
+    logs)
+      local follow=""; [[ "${1:-}" == -f ]] && follow=-f
+      journalctl -u llm-workflow.service ${follow} -n 300 --no-pager
+      ;;
+    *) die "workflow 子命令必须是 init|secret|target|model|adapter|check|enable|disable|reload|health|status|show|logs" ;;
+  esac
 }
 
 worker_port() { printf '%s\n' "$((WORKER_BASE_PORT + $1))"; }
@@ -1572,9 +1904,12 @@ cmd_info() {
     "${SMTP_HOST:-<empty>}" "${SMTP_PORT}" "${SMTP_SECURITY}" "${SMTP_USERNAME:-<empty>}" "$(secret_value "${SMTP_PASSWORD}")" "${SMTP_FROM:-<empty>}"
 
   load_saved_proxy
+  load_runtime_proxy
   printf '\n[维护网络 / Maintenance networking]\n'
-  printf '国际网络预检: 安装启动和 Hugging Face 模型搜索前自动执行\n保存的维护代理: %s\nNO_PROXY: %s\n代理配置文件: %s\n' \
+  printf '国际网络预检: 安装启动和 Hugging Face 模型搜索前自动执行\n保存的维护代理: %s\n维护 NO_PROXY: %s\n维护代理配置文件: %s\n' \
     "$(secret_value "${MAINTENANCE_PROXY:-}")" "${MAINTENANCE_NO_PROXY:-127.0.0.1,localhost,::1}" "${PROXY_ENV}"
+  printf '推理运行时代理: %s\n运行时 NO_PROXY: %s\n运行时代理配置文件: %s\n作用范围: Router + 可选 Workflow；GPU Worker=不注入\n' \
+    "$(secret_value "${RUNTIME_HTTPS_PROXY:-}")" "${RUNTIME_NO_PROXY}" "${RUNTIME_PROXY_ENV}"
 
   printf '\n[模型与推理 / Model and inference]\n'
   printf 'Hub/模型/revision: %s / %s @ %s\n本地目录: %s/current\n模型服务 ID: %s\n架构/精度/任务: %s / %s / %s\n' \
@@ -1600,6 +1935,17 @@ cmd_info() {
     "$(systemctl is-enabled llm-keepwarm.timer 2>/dev/null || printf unknown)" \
     "$([[ -r "${KEEPWARM_STATE_FILE}" ]] && jq -r '"\(.finished_at) requested=\(.summary.requested) succeeded=\(.summary.succeeded) failed=\(.summary.failed)"' "${KEEPWARM_STATE_FILE}" 2>/dev/null || printf never)" \
     "${KEEPWARM_STATE_FILE}"
+  printf '可插拔工作流: configured=%s；enabled=%s；service=%s/%s\n配置: %s；密钥: %s；运行时: %s\n' \
+    "$([[ -r "${WORKFLOW_CONFIG}" ]] && printf yes || printf no)" "${WORKFLOW_ENABLED}" \
+    "$(systemctl is-active llm-workflow.service 2>/dev/null || printf inactive)" \
+    "$(systemctl is-enabled llm-workflow.service 2>/dev/null || printf disabled)" \
+    "${WORKFLOW_CONFIG}" "${WORKFLOW_ENV}" "${WORKFLOW_RUNTIME}"
+  if [[ -r "${WORKFLOW_CONFIG}" ]]; then
+    printf '工作流监听/路由/资源池: %s / %s / %s\n' \
+      "$(jq -r '.listen // "unknown"' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)" \
+      "$(jq -r '[.models|to_entries[]|select(.value.enabled)|.key]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)" \
+      "$(jq -r '[.pools|to_entries[]|"\(.key)=\(.value.targets|length)"]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)"
+  fi
   [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemctl is-active llm-account.service 2>/dev/null || printf unknown)"
   [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemctl is-active llm-database.service 2>/dev/null || printf unknown)"
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
@@ -1644,6 +1990,15 @@ cmd_health() {
   else
     warn "统一 Web UI /ui/: unhealthy"
     failures=$((failures + 1))
+  fi
+  if [[ "${WORKFLOW_ENABLED}" == 1 || -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
+    if [[ -r "${WORKFLOW_CONFIG}" ]] && systemctl is-active --quiet llm-workflow.service && \
+       curl --noproxy '*' -fsS --max-time 3 "$(workflow_http_origin)/readyz" >/dev/null; then
+      log "Go 工作流数据面: healthy"
+    else
+      warn "Go 工作流数据面: unhealthy"
+      failures=$((failures + 1))
+    fi
   fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
     if worker_is_active "${id}"; then
@@ -1935,7 +2290,11 @@ cmd_logs() {
       [[ "${2:-}" == "-f" ]] && follow="-f"
       journalctl -u llm-account.service ${follow} -n 200 --no-pager
       ;;
-    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f] | logs account [-f]" ;;
+    workflow)
+      [[ "${2:-}" == "-f" ]] && follow="-f"
+      journalctl -u llm-workflow.service ${follow} -n 300 --no-pager
+      ;;
+    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f] | logs account [-f] | logs workflow [-f]" ;;
   esac
 }
 
@@ -2976,6 +3335,96 @@ proxy_url_from_args() {
   printf '%s://%s:%s\n' "${scheme}" "${ip}" "${port}"
 }
 
+load_runtime_proxy() {
+  RUNTIME_HTTP_PROXY=""
+  RUNTIME_HTTPS_PROXY=""
+  RUNTIME_NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  if [[ -r "${RUNTIME_PROXY_ENV}" ]]; then
+    # This file is root-owned and generated by `llmctl runtime-proxy set`.
+    # shellcheck disable=SC1090
+    source "${RUNTIME_PROXY_ENV}"
+  fi
+  RUNTIME_HTTP_PROXY="${RUNTIME_HTTP_PROXY:-${RUNTIME_HTTPS_PROXY:-}}"
+  RUNTIME_HTTPS_PROXY="${RUNTIME_HTTPS_PROXY:-${RUNTIME_HTTP_PROXY:-}}"
+  RUNTIME_NO_PROXY="${RUNTIME_NO_PROXY:-127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
+}
+
+runtime_proxy_docker_args() {
+  local -n output_args="${1:?缺少输出数组}"
+  load_runtime_proxy
+  [[ -n "${RUNTIME_HTTPS_PROXY}" ]] || return 0
+  output_args+=(
+    -e "HTTP_PROXY=${RUNTIME_HTTP_PROXY}" -e "HTTPS_PROXY=${RUNTIME_HTTPS_PROXY}"
+    -e "NO_PROXY=${RUNTIME_NO_PROXY}"
+    -e "http_proxy=${RUNTIME_HTTP_PROXY}" -e "https_proxy=${RUNTIME_HTTPS_PROXY}"
+    -e "no_proxy=${RUNTIME_NO_PROXY}"
+  )
+}
+
+apply_runtime_proxy() {
+  load_config
+  local router_active=0 workflow_active=0
+  systemctl is-active --quiet llm-router.service && router_active=1 || true
+  systemctl is-active --quiet llm-workflow.service && workflow_active=1 || true
+
+  if (( router_active )); then
+    log "正在重新载入 $(gateway_display_name) 运行时代理；GPU Worker 保持运行。"
+    systemctl restart llm-router.service
+    wait_gateway_process || die "$(gateway_display_name) 重新载入运行时代理失败；请运行 llmctl logs router"
+  fi
+  if (( workflow_active )); then
+    if [[ -r "${WORKFLOW_UNIT_SOURCE}" && -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
+      install -m 0644 "${WORKFLOW_UNIT_SOURCE}" "${WORKFLOW_SERVICE_UNIT}"
+      systemctl daemon-reload
+    fi
+    systemctl restart llm-workflow.service
+    wait_workflow_ready || die "工作流重新载入运行时代理失败；请运行 llmctl logs workflow"
+  fi
+  log "运行时代理已应用：Router=$([[ ${router_active} == 1 ]] && printf restarted || printf inactive)，Workflow=$([[ ${workflow_active} == 1 ]] && printf restarted || printf inactive)，GPU Worker=未重启。"
+}
+
+cmd_runtime_proxy() {
+  require_root
+  local action="${1:-show}" url no_proxy
+  case "${action}" in
+    set)
+      url=$(proxy_url_from_args "${2:?缺少 IP}" "${3:?缺少端口}" "${4:-http}")
+      no_proxy="${5:-127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
+      [[ -n "${no_proxy}" && ${#no_proxy} -le 2048 && "${no_proxy}" != *$'\n'* && "${no_proxy}" != *$'\r'* && "${no_proxy}" != *[[:space:]]* ]] || \
+        die "NO_PROXY 必须是无空格、无换行的逗号分隔主机/IP/CIDR，且不超过 2048 字符"
+      install -d -m 750 "${CONFIG_DIR}"
+      umask 077
+      printf 'RUNTIME_HTTP_PROXY=%q\nRUNTIME_HTTPS_PROXY=%q\nRUNTIME_NO_PROXY=%q\n' \
+        "${url}" "${url}" "${no_proxy}" >"${RUNTIME_PROXY_ENV}"
+      chmod 600 "${RUNTIME_PROXY_ENV}"
+      log "运行时代理已保存；将应用到 Router 与可选 Workflow，本地/内网和 GPU Worker 流量不会使用该代理。"
+      apply_runtime_proxy
+      ;;
+    show)
+      load_runtime_proxy
+      if [[ -n "${RUNTIME_HTTPS_PROXY}" ]]; then
+        printf 'proxy=%s\nno_proxy=%s\nfile=%s\n' "${RUNTIME_HTTPS_PROXY}" "${RUNTIME_NO_PROXY}" "${RUNTIME_PROXY_ENV}"
+      else
+        printf '未设置\n'
+      fi
+      ;;
+    clear)
+      rm -f "${RUNTIME_PROXY_ENV}"
+      log "运行时代理配置已清除，正在让相关服务恢复直连。"
+      apply_runtime_proxy
+      ;;
+    test)
+      load_runtime_proxy
+      [[ -n "${RUNTIME_HTTPS_PROXY}" ]] || die "尚未设置运行时代理"
+      curl --proxy "${RUNTIME_HTTPS_PROXY}" --noproxy '' -fsS --connect-timeout 10 --max-time 20 \
+        -o /dev/null https://huggingface.co || die "运行时代理国际出口测试失败"
+      log "运行时代理国际出口测试通过。"
+      ;;
+    apply) apply_runtime_proxy ;;
+    *) die "runtime-proxy 子命令必须是 set|show|clear|test|apply" ;;
+  esac
+}
+
 load_saved_proxy() {
   if [[ -r "${PROXY_ENV}" ]]; then
     # shellcheck disable=SC1090
@@ -3504,13 +3953,14 @@ cmd_uninstall() {
   # become silent while systemd waits for a probe or container.
   systemctl disable llm-keepwarm.timer 2>/dev/null || true
   systemctl disable llm-cluster.service 2>/dev/null || true
+  systemctl disable llm-workflow.service 2>/dev/null || true
   log "卸载 2/4：并发停止 Router、数据库和 ${INSTANCE_COUNT} 个 Worker。"
   stop_managed_services_with_progress 180 || \
     die "LLM 服务未能在限定时间内安全停止；配置尚未删除，请根据上方单位/容器状态检查"
   log "卸载 3/4：删除 systemd 单元和可再生成数据；配置保留到最后一步。"
   remove_nginx_config
   remove_tree_with_progress "${NGINX_STATE_DIR}" "可再生成的 Nginx 回滚缓存" 2
-  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer
+  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer /etc/systemd/system/llm-workflow.service
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
   clear_temporary_proxy
@@ -3559,6 +4009,13 @@ cmd_uninstall() {
     rm -f "${RETAINED_SECRETS}"
   else
     log "接入层 PostgreSQL/SQLite 状态和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装相同接入层时可继续使用。"
+  fi
+  if getent passwd llm-workflow 2>/dev/null | awk -F: '$6=="/nonexistent" && $7=="/usr/sbin/nologin" {found=1} END{exit !found}'; then
+    [[ "${WORKFLOW_STATE_DIR}" == /var/lib/llm-cluster/workflow ]] || die "工作流状态路径安全检查失败"
+    remove_tree_with_progress "${WORKFLOW_STATE_DIR}" "工作流路由配置" 2
+    userdel llm-workflow 2>/dev/null || true
+    groupdel llm-workflow 2>/dev/null || true
+    log "工作流专用系统用户 llm-workflow 已清理。"
   fi
   if (( purge_model )); then
     local normalized_root="${MODEL_ROOT%/}"
@@ -3624,7 +4081,7 @@ running_managed_containers() {
 
 active_managed_units() {
   local unit state out=""
-  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer llm-workflow.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
@@ -3654,7 +4111,7 @@ wait_managed_services_stopped() {
 
 force_stop_managed_services() {
   local names name
-  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-workflow.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
@@ -3669,7 +4126,7 @@ force_stop_managed_services() {
 
 stop_managed_services_with_progress() {
   local timeout="${1:-180}" id
-  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer llm-workflow.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
   systemctl stop --no-block "${units[@]}" 2>/dev/null || true
@@ -3746,6 +4203,7 @@ main() {
     scale) cmd_scale "$@" ;;
     autostart) cmd_autostart "$@" ;;
     keepwarm) cmd_keepwarm "$@" ;;
+    workflow) cmd_workflow "$@" ;;
     router) cmd_router "$@" ;;
     database) cmd_database "$@" ;;
     account) cmd_account "$@" ;;
@@ -3759,6 +4217,7 @@ main() {
     key) cmd_key "$@" ;;
     admin) cmd_admin "$@" ;;
     proxy) cmd_proxy "$@" ;;
+    runtime-proxy) cmd_runtime_proxy "$@" ;;
     models) cmd_models "$@" ;;
     timezone) cmd_timezone "$@" ;;
     download) cmd_download "$@" ;;

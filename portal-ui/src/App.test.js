@@ -195,6 +195,27 @@ describe("LLMCtl portal contracts", () => {
     expect(style).toContain(".selection-column");
   });
 
+  it("keeps pluggable orchestration explicit, remote-capable and off the Python data path", () => {
+    for (const marker of [
+      "admin/workflow",
+      "admin/workflow/config",
+      "admin/workflow/publish",
+      "gateway_base_url",
+      "同步到 AI 网关",
+      "llmctl-workflow-*",
+      "另一台服务器或独立 GPU 集群",
+      "allowed_purposes",
+      "工具参数 JSON Schema",
+      "request_body_limit_bytes",
+      "upstream_timeout_ms",
+      "密钥环境变量",
+      "推理和流式响应由 Go",
+      "不会自动覆盖当前生产映射",
+    ])
+      expect(source).toContain(marker);
+    expect(source).toContain("await Promise.all([refreshWorkspace(), loadWorkflow()])");
+  });
+
   it("uses readable analytics tables and consistent accessible choice controls", () => {
     expect(source).toContain('class="table-wrap active-users-table"');
     expect(source).not.toContain('class="table-wrap compact-table">\n                    <table>\n                      <thead>\n                        <tr>\n                          <th>用户</th>');

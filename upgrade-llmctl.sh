@@ -21,6 +21,8 @@ readonly DEFAULT_NO_PROXY="127.0.0.1,localhost,::1"
 readonly KEEPWARM_UNIT_SOURCE_DIR="/usr/local/lib/llm-cluster/systemd"
 readonly KEEPWARM_SERVICE_UNIT="/etc/systemd/system/llm-keepwarm.service"
 readonly KEEPWARM_TIMER_UNIT="/etc/systemd/system/llm-keepwarm.timer"
+readonly WORKFLOW_UNIT_SOURCE="/usr/local/lib/llm-cluster/systemd/llm-workflow.service"
+readonly WORKFLOW_SERVICE_UNIT="/etc/systemd/system/llm-workflow.service"
 
 LANG_CODE=""
 LOCAL_ZIP=""
@@ -38,6 +40,7 @@ SOURCE_ROOT=""
 SOURCE_COMMIT=""
 BACKUP_DIR=""
 ACCOUNT_WAS_ACTIVE=0
+WORKFLOW_WAS_ACTIVE=0
 DEPLOYMENT_STARTED=0
 DEPLOYMENT_COMPLETE=0
 UPGRADE_CANCELLED=0
@@ -144,7 +147,7 @@ restore_control_plane() {
       fi
     done <"${BACKUP_DIR}/manifest.tsv"
   fi
-  restore_keepwarm_systemd_units >/dev/null 2>&1 || true
+  restore_managed_systemd_units >/dev/null 2>&1 || true
   if [[ -e "${BACKUP_DIR}/control-plane-version.env" ]]; then
     install -d -m 0755 "$(dirname "${RELEASE_ENV}")"
     cp -a "${BACKUP_DIR}/control-plane-version.env" "${RELEASE_ENV}"
@@ -152,6 +155,9 @@ restore_control_plane() {
     rm -f -- "${RELEASE_ENV}"
   fi
   if (( ACCOUNT_WAS_ACTIVE )); then systemctl start "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true; fi
+  if (( WORKFLOW_WAS_ACTIVE )) && [[ -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
+    systemctl start llm-workflow.service >/dev/null 2>&1 || true
+  fi
   warn "$(l10n "已从 ${BACKUP_DIR} 恢复；Worker、模型、网关和数据库始终未修改。" "Restored from ${BACKUP_DIR}; workers, models, gateway, and databases were never modified.")"
 }
 
@@ -417,6 +423,11 @@ for item in infos:
         target.parent.mkdir(parents=True, exist_ok=True)
         with handle.open(item) as source, target.open("wb") as output:
             shutil.copyfileobj(source, output)
+        # The hardened extractor deliberately avoids extractall(), but still has
+        # to preserve the executable bit carried by GitHub archives.  Ignore
+        # ownership/special bits and apply only rwx permission bits.
+        permissions = (item.external_attr >> 16) & 0o777
+        os.chmod(target, permissions or 0o644)
 handle.close()
 PY
   local -a manifests=()
@@ -458,7 +469,10 @@ validate_source() {
     "${SOURCE_ROOT}/lib/runtime_optimizer.py" \
     "${SOURCE_ROOT}/lib/gateway_config.py" \
     "${SOURCE_ROOT}/lib/account_portal.py" \
-    "${SOURCE_ROOT}/lib/llm_benchmark.py"
+    "${SOURCE_ROOT}/lib/llm_benchmark.py" \
+    "${SOURCE_ROOT}/lib/workflow_config.py"
+  grep -q '^ExecStart=/usr/local/lib/llm-cluster/workflowd/llm-workflowd ' "${SOURCE_ROOT}/systemd/llm-workflow.service" || die "$(l10n '工作流 service 单元无效' 'Invalid workflow service unit')"
+  [[ -x "${SOURCE_ROOT}/lib/workflowd/llm-workflowd" && -x "${SOURCE_ROOT}/lib/workflowd/llm-workflowd-linux-amd64" && -x "${SOURCE_ROOT}/lib/workflowd/llm-workflowd-linux-arm64" ]] || die "$(l10n '工作流运行时不完整' 'The workflow runtime is incomplete')"
   python3 - "${SOURCE_ROOT}/lib/account_portal_ui" <<'PY'
 import re, sys
 from pathlib import Path
@@ -502,15 +516,35 @@ configure_keepwarm_timer() {
   apply_keepwarm_timer_state
 }
 
-restore_keepwarm_systemd_units() {
+restore_managed_systemd_units() {
   local unit
-  rm -f -- "${KEEPWARM_SERVICE_UNIT}" "${KEEPWARM_TIMER_UNIT}"
-  for unit in llm-keepwarm.service llm-keepwarm.timer; do
+  rm -f -- "${KEEPWARM_SERVICE_UNIT}" "${KEEPWARM_TIMER_UNIT}" "${WORKFLOW_SERVICE_UNIT}"
+  for unit in llm-keepwarm.service llm-keepwarm.timer llm-workflow.service; do
     if [[ -e "${BACKUP_DIR}/systemd/${unit}" ]]; then
       cp -a "${BACKUP_DIR}/systemd/${unit}" "/etc/systemd/system/${unit}"
     fi
   done
+  systemctl daemon-reload
   apply_keepwarm_timer_state
+}
+
+# Keep the historical function name as a compatibility seam for deployments,
+# tests and operator tooling written before the optional workflow unit existed.
+restore_keepwarm_systemd_units() {
+  restore_managed_systemd_units
+}
+
+refresh_workflow_unit_if_installed() {
+  [[ -e "${WORKFLOW_SERVICE_UNIT}" ]] || return 0
+  [[ -r "${WORKFLOW_UNIT_SOURCE}" ]] || die "$(l10n '已启用工作流，但升级包缺少 service 模板' 'The workflow is installed but its upgraded service template is missing')"
+  local was_active=0
+  systemctl is-active --quiet llm-workflow.service && was_active=1 || true
+  install -m 0644 "${WORKFLOW_UNIT_SOURCE}" "${WORKFLOW_SERVICE_UNIT}"
+  systemctl daemon-reload
+  if (( was_active )); then
+    systemctl restart llm-workflow.service
+    systemctl is-active --quiet llm-workflow.service || die "$(l10n '升级后的工作流服务未能恢复运行' 'The workflow service failed to return after upgrade')"
+  fi
 }
 
 wait_for_account_portal() {
@@ -556,7 +590,7 @@ backup_control_plane() {
     fi
   done <"${SOURCE_ROOT}/upgrade-manifest.tsv"
   install -d -m 0700 "${BACKUP_DIR}/systemd"
-  for unit in llm-keepwarm.service llm-keepwarm.timer; do
+  for unit in llm-keepwarm.service llm-keepwarm.timer llm-workflow.service; do
     [[ ! -e "/etc/systemd/system/${unit}" ]] || cp -a "/etc/systemd/system/${unit}" "${BACKUP_DIR}/systemd/${unit}"
   done
   [[ ! -e "${RELEASE_ENV}" ]] || cp -a "${RELEASE_ENV}" "${BACKUP_DIR}/control-plane-version.env"
@@ -577,6 +611,8 @@ install_control_plane() {
   workers_before=$(systemctl list-units 'llm-worker@*.service' --state=running --no-legend 2>/dev/null | wc -l | tr -d ' ')
   systemctl is-active --quiet "${ACCOUNT_SERVICE}" && ACCOUNT_WAS_ACTIVE=1 || ACCOUNT_WAS_ACTIVE=0
   systemctl cat "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || ACCOUNT_WAS_ACTIVE=0
+  systemctl is-active --quiet llm-workflow.service && WORKFLOW_WAS_ACTIVE=1 || WORKFLOW_WAS_ACTIVE=0
+  systemctl cat llm-workflow.service >/dev/null 2>&1 || WORKFLOW_WAS_ACTIVE=0
 
   DEPLOYMENT_STARTED=1
   if (( ACCOUNT_WAS_ACTIVE )); then
@@ -595,6 +631,7 @@ install_control_plane() {
 
   /usr/local/sbin/llmctl version >/dev/null
   configure_keepwarm_timer
+  refresh_workflow_unit_if_installed
   if (( ACCOUNT_WAS_ACTIVE && restart_account )); then
     systemctl start "${ACCOUNT_SERVICE}"
     account_port=$(read_cluster_value ACCOUNT_PORT 8001)

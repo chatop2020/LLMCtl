@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.2.2"
+APP_VERSION = "3.3.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -55,6 +55,10 @@ STRESS_REQUEST_MULTIPLIER_CHOICES = (1, 2, 3, 4)
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+$")
 DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 DUMMY_PASSWORD_HASH = "pbkdf2_sha256$600000$bGxtY3RsLWR1bW15LXNhbHQ$O5LpuYky-CKHcJaJEAX3-3B1rSxvRmdsFnyMXd5fUrg"
+WORKFLOW_GATEWAY_NODE_NAME = "LLMCtl workflow data plane"
+WORKFLOW_GATEWAY_CONNECTION_NAME = "LLMCtl workflow"
+WORKFLOW_GATEWAY_PREFIX = "llmctl-workflow"
+WORKFLOW_GATEWAY_MANAGED_DESCRIPTION = "Managed by LLMCtl workflow data plane"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1791,6 +1795,194 @@ class OmniRouteClient:
     def combos(self) -> list[dict[str, Any]]:
         return self.items(self.request("GET", "/api/combos?limit=1000"), "combos")
 
+    def sync_workflow_routes(
+        self, workflow_config: dict[str, Any], workflow_secret: str
+    ) -> dict[str, Any]:
+        """Publish enabled Go workflow routes as an explicit OmniRoute provider.
+
+        This is intentionally opt-in.  Saving a workflow configuration never
+        changes the production gateway, and upgrades never call this method.
+        Public aliases such as ``gdn-inside`` remain owned by the portal's
+        normal model publishing screen; this method creates collision-free
+        ``llmctl-workflow-*`` combo targets for an administrator to select.
+        """
+        if len(workflow_secret) < 24:
+            raise ValueError("工作流共享密钥尚未配置")
+        raw_base_url = str(workflow_config.get("gateway_base_url", "")).strip().rstrip("/")
+        parsed = urllib.parse.urlparse(raw_base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("工作流 gateway_base_url 必须是无内嵌凭据的 HTTP(S) URL")
+        routes = {
+            str(route_id).strip(): route
+            for route_id, route in dict(workflow_config.get("models") or {}).items()
+            if str(route_id).strip()
+            and isinstance(route, dict)
+            and route.get("enabled") is True
+        }
+        if not routes:
+            raise ValueError("没有已启用的工作流模型路由")
+
+        # Fail before mutating provider state if an administrator already owns
+        # one of the deterministic combo names.  This keeps an explicit sync
+        # transactional from the operator's point of view: a naming conflict
+        # cannot leave a new node/connection/model set behind.
+        combos = self.combos()
+        existing_combos = {
+            str(item.get("name", "")): item for item in combos if item.get("name")
+        }
+        for route_id in sorted(routes):
+            combo_name = f"llmctl-workflow-{route_id}"
+            existing_combo = existing_combos.get(combo_name)
+            if (
+                existing_combo
+                and existing_combo.get("description")
+                != WORKFLOW_GATEWAY_MANAGED_DESCRIPTION
+            ):
+                raise RuntimeError(
+                    f"OmniRoute 路由组合 {combo_name!r} 已存在且不由 LLMCtl 管理"
+                )
+
+        nodes = self.items(
+            self.request("GET", "/api/provider-nodes?limit=1000"), "nodes"
+        )
+        matches = [item for item in nodes if item.get("name") == WORKFLOW_GATEWAY_NODE_NAME]
+        node_payload = {
+            "name": WORKFLOW_GATEWAY_NODE_NAME,
+            "prefix": WORKFLOW_GATEWAY_PREFIX,
+            "apiType": "chat",
+            "type": "openai-compatible",
+            "baseUrl": raw_base_url,
+            "chatPath": "/chat/completions",
+            "modelsPath": "/models",
+        }
+        if matches:
+            node_id = str(matches[0].get("id", ""))
+            response = self.request(
+                "PUT",
+                f"/api/provider-nodes/{urllib.parse.quote(node_id, safe='')}",
+                node_payload,
+            )
+            node = response.get("node", matches[0]) if isinstance(response, dict) else matches[0]
+        else:
+            response = self.request("POST", "/api/provider-nodes", node_payload)
+            node = response.get("node", {}) if isinstance(response, dict) else {}
+        node_id = str(node.get("id", ""))
+        if not node_id:
+            raise RuntimeError("OmniRoute 未返回工作流 Provider Node ID")
+
+        connections = self.items(
+            self.request("GET", "/api/providers?limit=1000"), "connections"
+        )
+        connection_matches = [item for item in connections if item.get("provider") == node_id]
+        first_model = sorted(routes)[0]
+        connection_payload = {
+            "name": WORKFLOW_GATEWAY_CONNECTION_NAME,
+            "apiKey": workflow_secret,
+            "priority": 1,
+            "maxConcurrent": 512,
+            "defaultModel": first_model,
+            "isActive": True,
+            "testStatus": "success",
+        }
+        if connection_matches:
+            connection_id = str(connection_matches[0].get("id", ""))
+            response = self.request(
+                "PUT",
+                f"/api/providers/{urllib.parse.quote(connection_id, safe='')}",
+                connection_payload,
+            )
+            connection = (
+                response.get("connection", connection_matches[0])
+                if isinstance(response, dict)
+                else connection_matches[0]
+            )
+        else:
+            response = self.request(
+                "POST", "/api/providers", {"provider": node_id, **connection_payload}
+            )
+            connection = response.get("connection", {}) if isinstance(response, dict) else {}
+        connection_id = str(connection.get("id", ""))
+        if not connection_id:
+            raise RuntimeError("OmniRoute 未返回工作流 Connection ID")
+
+        existing_models = self.items(
+            self.request(
+                "GET",
+                f"/api/provider-models?provider={urllib.parse.quote(node_id, safe='')}",
+            ),
+            "models",
+        )
+        existing_model_ids = {
+            str(item.get("modelId") or item.get("id") or "") for item in existing_models
+        }
+        for route_id in sorted(routes):
+            model_payload = {
+                "provider": node_id,
+                "modelId": route_id,
+                "modelName": route_id,
+                "source": WORKFLOW_GATEWAY_MANAGED_DESCRIPTION,
+                "apiFormat": "chat-completions",
+                "supportedEndpoints": ["chat"],
+                "targetFormat": "openai",
+            }
+            self.request(
+                "PUT" if route_id in existing_model_ids else "POST",
+                "/api/provider-models",
+                model_payload,
+            )
+
+        published: list[dict[str, str]] = []
+        for route_id in sorted(routes):
+            combo_name = f"llmctl-workflow-{route_id}"
+            existing_combo = existing_combos.get(combo_name)
+            combo_payload = {
+                "name": combo_name,
+                "description": WORKFLOW_GATEWAY_MANAGED_DESCRIPTION,
+                "models": [
+                    {
+                        "kind": "model",
+                        "provider": node_id,
+                        "model": route_id,
+                        "connectionId": connection_id,
+                        "label": WORKFLOW_GATEWAY_CONNECTION_NAME,
+                    }
+                ],
+                "strategy": "round-robin",
+                "config": {
+                    "disableSessionStickiness": True,
+                    "stickyRoundRobinLimit": 1,
+                    "healthCheckEnabled": True,
+                    "maxRetries": 1,
+                    "failoverBeforeRetry": True,
+                },
+            }
+            if existing_combo:
+                combo_id = str(existing_combo.get("id", ""))
+                self.request(
+                    "PUT",
+                    f"/api/combos/{urllib.parse.quote(combo_id, safe='')}",
+                    combo_payload,
+                )
+            else:
+                self.request("POST", "/api/combos", combo_payload)
+            published.append({"route_model": route_id, "combo": combo_name})
+        return {
+            "ok": True,
+            "gateway_base_url": raw_base_url,
+            "provider_node": node_id,
+            "connection": connection_id,
+            "published": published,
+            "next_step": "在模型、映射与定价中把所需公开模型 ID 指向生成的工作流路由组合",
+        }
+
     def combo_builder_options(self) -> dict[str, Any]:
         response = self.request("GET", "/api/combos/builder/options")
         return response if isinstance(response, dict) else {}
@@ -2513,6 +2705,21 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as error:
                     self.json_response(502, {"error": str(error)})
             return
+        if path == "/portal-api/admin/workflow":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    self.json_response(200, self.app.workflow.config())
+                except Exception as error:
+                    self.json_response(
+                        503,
+                        {
+                            "error": str(error),
+                            "available": False,
+                            "setup_command": "llmctl workflow init",
+                        },
+                    )
+            return
         if path == "/portal-api/admin":
             user, _ = self.api_require(admin=True)
             if user:
@@ -2617,6 +2824,13 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.control.start_stress_run(payload, user_identity(user))
             elif path == "/portal-api/admin/stress/cancel":
                 result = self.app.control.cancel_stress_run(str(payload.get("id", "")))
+            elif path == "/portal-api/admin/workflow/config":
+                result = self.app.workflow.replace_config(payload)
+            elif path == "/portal-api/admin/workflow/publish":
+                workflow = self.app.workflow.config()
+                result = self.app.omni.sync_workflow_routes(
+                    workflow["config"], self.app.workflow.secret
+                )
             elif path == "/portal-api/admin/settings":
                 result = self.api_update_settings(payload)
             elif path == "/portal-api/admin/smtp/test":
@@ -3548,6 +3762,70 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             return
         self.app.db.audit(admin["email"], "user.update", target["email"], "success", self.client_address[0], {"status": target_status, "balance_delta": form.get("balance_delta", "0"), "max_sessions": max_sessions, "requests_per_minute": rpm, "requests_per_day": rpd})
         self.show_admin("用户设置已保存 / User settings saved")
+
+
+class WorkflowClient:
+    """Local, authenticated control client for the optional Go data plane."""
+
+    def __init__(self) -> None:
+        self.base_url = os.environ.get(
+            "LLM_WORKFLOW_CONTROL_URL", "http://127.0.0.1:18100"
+        ).strip().rstrip("/")
+        self.secret = os.environ.get("LLM_WORKFLOW_SHARED_SECRET", "").strip()
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def request(self, method: str, path: str, payload: Any = None) -> Any:
+        if len(self.secret) < 24:
+            raise RuntimeError(
+                "工作流尚未初始化；请先运行 llmctl workflow init"
+            )
+        data = None
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.secret}",
+        }
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(data) > 2 << 20:
+                raise ValueError("工作流配置超过 2 MiB")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with self.opener.open(request, timeout=10) as response:
+                raw = response.read(3 << 20)
+        except urllib.error.HTTPError as error:
+            detail = error.read(2000).decode(errors="replace")
+            try:
+                parsed = json.loads(detail)
+                detail = str(parsed.get("error", {}).get("message", detail))
+            except (AttributeError, json.JSONDecodeError):
+                pass
+            raise RuntimeError(
+                f"工作流控制接口 HTTP {error.code}: {detail[:1000]}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"工作流控制接口不可用：{error.reason}") from error
+        try:
+            return json.loads(raw) if raw else {}
+        except json.JSONDecodeError as error:
+            raise RuntimeError("工作流控制接口返回了无效 JSON") from error
+
+    def config(self) -> dict[str, Any]:
+        result = self.request("GET", "/admin/config")
+        if not isinstance(result, dict) or not isinstance(result.get("config"), dict):
+            raise RuntimeError("工作流控制接口缺少配置")
+        return result
+
+    def replace_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        revision = str(payload.get("revision", "")).strip()
+        config = payload.get("config")
+        if len(revision) != 64 or not isinstance(config, dict):
+            raise ValueError("工作流配置或版本号无效，请刷新后重试")
+        return self.request(
+            "PUT", "/admin/config", {"revision": revision, "config": config}
+        )
 
 
 class PortalControlPlane:
@@ -5802,6 +6080,7 @@ class PortalServer:
         self.db = Database(config)
         self.db.initialize()
         self.omni = OmniRouteClient(config)
+        self.workflow = WorkflowClient()
         self.control = PortalControlPlane(config, self.db, self.omni)
         try:
             self.control.seed_managed_model()

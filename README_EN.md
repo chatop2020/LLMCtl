@@ -30,6 +30,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
+- Optionally compose web search, image/audio/video HTTP adapters, and explicit local or remote URL pools behind a published model through the Go workflow data plane. Ordinary models retain the existing gateway-to-Worker path. See [WORKFLOW_EN.md](WORKFLOW_EN.md).
 - Use `llmctl info` as a categorized recovery inventory covering public/internal endpoints, hardware, images, services, autostart, workers, databases, administrators, every key/password, SMTP, proxy state, model details, and file paths. Plaintext is the root-terminal default; use `--redact` before sharing it.
 - Use `llmctl optimize` to collect streaming TTFT/ITL/E2E, aggregate throughput, GPU/VRAM/temperature, CPU/memory/swap, and vLLM KV-cache/queue/preemption/prefix-cache metrics. It explains every candidate's rationale, tradeoffs, and boundaries before consent, then backs up configuration, restarts and tests candidates, selects the objective-specific winner, runs full smoke acceptance, and rolls back on failure or interruption.
 
@@ -50,12 +51,15 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `lib/gateway_config.py` | Secret-free configuration for all four gateways and New API/OmniRoute reconciliation |
 | `lib/account_portal.py` | OmniRoute company account portal, verification, prepaid billing, and model catalog |
 | `lib/llm_benchmark.py` | Backend concurrent load generator and streaming performance metrics for the administration console |
+| `workflowd/` / `lib/workflowd/` | Optional Go workflow source plus macOS-cross-compiled Linux amd64/arm64 static runtimes |
+| `lib/workflow_config.py` | Explicit remote pools, model routes, and adapter configuration helper |
 | `portal-ui/` | Vue 3 company-portal source and frontend tests |
 | `lib/account_portal_ui/` | Built portal assets copied directly by the installer |
 | `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
 | `tests/test_runtime_optimizer.py` | Tuning advice, scoring, metrics parsing, and streaming-latency tests |
 | `README.md` / `README_EN.md` | Chinese and English project overview |
 | `USAGE.md` / `USAGE_EN.md` | Chinese and English operations, API, and troubleshooting manual |
+| `WORKFLOW.md` / `WORKFLOW_EN.md` | Chinese and English workflow, remote-Worker, and upgrade-compatibility manuals |
 
 ## Defaults
 
@@ -219,7 +223,7 @@ Immediately after language selection—and before gateway or model selection—t
 
 `llmctl models search --source all|huggingface` performs the same preflight: direct access first, then a validated saved maintenance proxy, then a new prompt if needed. Health, status, and offline inference commands never prompt merely because international access is absent.
 
-A proxy is used only for installation, model downloads, or explicit maintenance commands. Before installation finishes, the script:
+The installation/maintenance proxy is strictly separate from the inference runtime proxy and is used only for installation, model downloads, or explicit maintenance commands. Before installation finishes, the script:
 
 1. Clears proxy variables from the current process.
 2. Removes Docker's temporary proxy drop-in.
@@ -233,6 +237,15 @@ sudo llmctl proxy set 10.1.0.6 7890 http
 sudo llmctl proxy test
 sudo llmctl proxy show
 sudo llmctl proxy clear
+```
+
+When web search or external media adapters require international access, enable the separate runtime proxy. It is injected only into the selected Router (including OmniRoute) and the optional Go Workflow, bypasses loopback and RFC1918 networks by default, and is never injected into vLLM Workers. Setting or clearing it briefly restarts only a running Router/Workflow—not Docker or GPU Workers:
+
+```bash
+sudo llmctl runtime-proxy set 192.168.9.104 1082 http
+sudo llmctl runtime-proxy test
+sudo llmctl runtime-proxy show
+sudo llmctl runtime-proxy clear
 ```
 
 Private or gated Hugging Face models require `HF_TOKEN` when the installer runs, and you must accept the model license first. Private ModelScope models use `MODELSCOPE_API_TOKEN`. Tokens are not written to the cluster configuration.

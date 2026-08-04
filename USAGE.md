@@ -110,6 +110,12 @@ sudo journalctl -u llm-keepwarm.service -u llm-keepwarm.timer -f
 
 间隔越短，空闲后的首请求通常越稳定，但待机功耗越高。已被 `deactivate` 或未列入激活清单的 Worker 不会被定时器启动或保活。
 
+### 可插拔工作流与远程 Worker
+
+`llmctl workflow` 是默认关闭的独立 Go 数据面。升级现有部署只会安装运行时文件，不会创建服务、修改公开模型映射或操作现有 GPU Worker。只有管理员完成目标发现、配置校验、启用并显式发布后，对应工作流模型才进入该路径；普通模型调用完全不变。
+
+它支持显式添加其他服务器上的 vLLM、图片、音频、视频或搜索端点，并允许以后在线更换模型和适配器。完整配置、代理、安全边界、macOS 交叉编译和 3.2.x 升级兼容说明见 [WORKFLOW.md](WORKFLOW.md)。
+
 并行启动数量：
 
 ```bash
@@ -401,6 +407,15 @@ sudo llmctl proxy set 10.1.0.6 7890 http
 sudo llmctl update --vllm-image vllm/vllm-openai:v0.22.1
 sudo llmctl update --gateway-image calciumion/new-api:v1.0.0-rc.22
 sudo llmctl proxy clear
+```
+
+上面是下载/升级使用的维护代理。若 OmniRoute、联网搜索或外部工作流适配器需要国际出口，应单独配置运行时代理；它不会注入 vLLM Worker，也不会重启 GPU Worker：
+
+```bash
+sudo llmctl runtime-proxy set 192.168.9.104 1082 http
+sudo llmctl runtime-proxy test
+sudo llmctl runtime-proxy show
+sudo llmctl runtime-proxy clear
 ```
 
 安装器默认使用已发布的 OmniRoute `diegosouzapw/omniroute:3.8.48`。若镜像标签不存在或仓库不可达，安装器会保留 Docker 的原始错误并给出对应的 `--*-image` 覆盖参数，不会只报告一个脚本行号。例如可显式指定：

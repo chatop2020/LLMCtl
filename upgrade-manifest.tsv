@@ -5,7 +5,10 @@ file    lib/runtime_optimizer.py       /usr/local/lib/llm-cluster/runtime_optimi
 file    lib/gateway_config.py          /usr/local/lib/llm-cluster/gateway_config.py            0755  none
 file    lib/account_portal.py          /usr/local/lib/llm-cluster/account_portal.py            0755  account
 file    lib/llm_benchmark.py           /usr/local/lib/llm-cluster/llm_benchmark.py              0755  account
+file    lib/workflow_config.py         /usr/local/lib/llm-cluster/workflow_config.py             0755  none
+dir     lib/workflowd                  /usr/local/lib/llm-cluster/workflowd                      0755  none
 dir     lib/account_portal_ui          /usr/local/lib/llm-cluster/account_portal_ui             0755  account
 file    upgrade-llmctl.sh              /usr/local/lib/llm-cluster/upgrade-llmctl.sh             0755  none
 file    systemd/llm-keepwarm.service   /usr/local/lib/llm-cluster/systemd/llm-keepwarm.service  0644  none
 file    systemd/llm-keepwarm.timer     /usr/local/lib/llm-cluster/systemd/llm-keepwarm.timer    0644  none
+file    systemd/llm-workflow.service   /usr/local/lib/llm-cluster/systemd/llm-workflow.service  0644  none

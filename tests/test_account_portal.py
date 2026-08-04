@@ -193,6 +193,112 @@ class FakeOmniRoute:
         return public_id
 
 
+class RecordingWorkflowGateway(portal.OmniRouteClient):
+    def __init__(self, combos=None):
+        self.calls = []
+        self.recorded_combos = combos or []
+
+    def request(self, method, path, payload=None):
+        self.calls.append((method, path, payload))
+        if (method, path) == ("GET", "/api/provider-nodes?limit=1000"):
+            return {"nodes": []}
+        if (method, path) == ("POST", "/api/provider-nodes"):
+            return {"node": {"id": "workflow-node", **payload}}
+        if (method, path) == ("GET", "/api/providers?limit=1000"):
+            return {"connections": []}
+        if (method, path) == ("POST", "/api/providers"):
+            return {"connection": {"id": "workflow-connection", **payload}}
+        if method == "GET" and path.startswith("/api/provider-models?"):
+            return {"models": []}
+        if method == "POST" and path == "/api/provider-models":
+            return {"model": payload}
+        if (method, path) == ("GET", "/api/combos?limit=1000"):
+            return {"combos": self.recorded_combos}
+        if method == "POST" and path == "/api/combos":
+            return {"combo": {"id": "workflow-combo", **payload}}
+        raise AssertionError((method, path, payload))
+
+
+class WorkflowGatewayPublishingTests(unittest.TestCase):
+    def test_publishing_is_explicit_collision_free_and_does_not_replace_public_alias(self):
+        client = RecordingWorkflowGateway()
+        result = client.sync_workflow_routes(
+            {
+                "gateway_base_url": "http://10.0.0.12:18100/v1",
+                "models": {
+                    "gdn-inside-workflow": {
+                        "enabled": True,
+                        "mode": "agent",
+                        "base_model": "ornith-internal",
+                    },
+                    "disabled-route": {"enabled": False},
+                },
+            },
+            "workflow-secret-with-at-least-24-characters",
+        )
+        self.assertEqual(
+            [{"route_model": "gdn-inside-workflow", "combo": "llmctl-workflow-gdn-inside-workflow"}],
+            result["published"],
+        )
+        node_payload = next(
+            payload
+            for method, path, payload in client.calls
+            if (method, path) == ("POST", "/api/provider-nodes")
+        )
+        self.assertEqual("http://10.0.0.12:18100/v1", node_payload["baseUrl"])
+        combo_payload = next(
+            payload
+            for method, path, payload in client.calls
+            if (method, path) == ("POST", "/api/combos")
+        )
+        self.assertEqual("llmctl-workflow-gdn-inside-workflow", combo_payload["name"])
+        self.assertFalse(any("alias" in path for _, path, _ in client.calls))
+
+    def test_publishing_requires_an_enabled_route(self):
+        with self.assertRaisesRegex(ValueError, "没有已启用"):
+            RecordingWorkflowGateway().sync_workflow_routes(
+                {
+                    "gateway_base_url": "http://127.0.0.1:18100/v1",
+                    "models": {"off": {"enabled": False}},
+                },
+                "workflow-secret-with-at-least-24-characters",
+            )
+
+    def test_publishing_rejects_query_credentials_before_gateway_calls(self):
+        client = RecordingWorkflowGateway()
+        with self.assertRaisesRegex(ValueError, "gateway_base_url"):
+            client.sync_workflow_routes(
+                {
+                    "gateway_base_url": "https://workflow.example/v1?token=secret",
+                    "models": {"route-a": {"enabled": True}},
+                },
+                "workflow-secret-with-at-least-24-characters",
+            )
+        self.assertEqual([], client.calls)
+
+    def test_unmanaged_combo_collision_fails_before_any_gateway_mutation(self):
+        client = RecordingWorkflowGateway(
+            combos=[
+                {
+                    "id": "owned-by-someone-else",
+                    "name": "llmctl-workflow-route-a",
+                    "description": "manually managed",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "不由 LLMCtl 管理"):
+            client.sync_workflow_routes(
+                {
+                    "gateway_base_url": "http://127.0.0.1:18100/v1",
+                    "models": {"route-a": {"enabled": True}},
+                },
+                "workflow-secret-with-at-least-24-characters",
+            )
+        self.assertEqual(
+            [("GET", "/api/combos?limit=1000", None)], client.calls
+        )
+
+
 class PortalIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
