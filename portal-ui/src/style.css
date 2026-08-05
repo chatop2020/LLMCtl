@@ -2864,6 +2864,286 @@ td {
 .workflow-save-footer p {
   margin: 3px 0 0;
 }
+
+/* System monitor: compact operational telemetry, not a decorative dashboard. */
+.monitor-page {
+  max-width: 1680px;
+}
+.monitor-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 11px;
+  color: #267d69;
+  background: #edf9f4;
+  border: 1px solid #b8dfd1;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.monitor-live i {
+  width: 7px;
+  height: 7px;
+  background: #1ca879;
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px #1ca87918;
+}
+.monitor-live.paused {
+  color: #8b651b;
+  background: #fff8e9;
+  border-color: #efd79c;
+}
+.monitor-live.paused i {
+  background: #c78d20;
+  box-shadow: none;
+}
+.monitor-loading {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+.monitor-context {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  padding: 15px 18px;
+}
+.monitor-context > div {
+  min-width: 0;
+}
+.monitor-context > div strong,
+.monitor-context > div span {
+  display: block;
+}
+.monitor-context > div strong {
+  font-size: 18px;
+}
+.monitor-context > div span {
+  max-width: 540px;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.monitor-context dl {
+  display: flex;
+  gap: 26px;
+  margin: 0;
+}
+.monitor-context dl div {
+  min-width: 84px;
+}
+.monitor-context dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+.monitor-context dd {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.monitor-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.monitor-metrics .panel {
+  min-height: 132px;
+  margin: 0;
+  padding: 16px;
+}
+.monitor-metrics span,
+.monitor-metrics small {
+  display: block;
+}
+.monitor-metrics span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.monitor-metrics strong {
+  display: block;
+  margin: 10px 0 3px;
+  font-size: 25px;
+  letter-spacing: -.03em;
+}
+.monitor-metrics small {
+  min-height: 30px;
+  line-height: 1.45;
+}
+.meter,
+.mini-meter {
+  height: 5px;
+  margin-top: 11px;
+  overflow: hidden;
+  background: #e7f0f4;
+  border-radius: 999px;
+}
+.meter i,
+.mini-meter i {
+  display: block;
+  height: 100%;
+  max-width: 100%;
+  background: #168dc0;
+  border-radius: inherit;
+  transition: width .35s ease;
+}
+.meter.gpu i {
+  background: #3aa881;
+}
+.meter i.warning {
+  background: #d99024;
+}
+.monitor-trends {
+  padding-bottom: 15px;
+}
+.trend-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.trend-legend .cpu { color: #168dc0; }
+.trend-legend .memory { color: #846bc3; }
+.trend-legend .gpu { color: #2d9b76; }
+.trend-chart {
+  position: relative;
+  height: 130px;
+  margin-top: 12px;
+  padding: 15px 44px 15px 8px;
+  border: 1px solid #d7e5eb;
+  border-radius: 10px;
+  background:
+    linear-gradient(#d9e8ee70 1px, transparent 1px) 0 0 / 100% 25%,
+    #fbfdfe;
+}
+.trend-chart svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.trend-chart polyline {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.trend-chart polyline.cpu { stroke: #168dc0; }
+.trend-chart polyline.memory { stroke: #846bc3; }
+.trend-chart polyline.gpu { stroke: #2d9b76; }
+.trend-ceiling,
+.trend-floor {
+  position: absolute;
+  right: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.trend-ceiling { top: 9px; }
+.trend-floor { bottom: 9px; }
+.network-rate-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  padding: 12px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.network-rate-summary strong {
+  margin-left: 5px;
+  color: var(--text);
+}
+.monitor-table td {
+  vertical-align: middle;
+}
+.monitor-table td > strong,
+.monitor-table td > small {
+  display: block;
+}
+.gpu-table td:first-child {
+  min-width: 150px;
+}
+.gpu-table .mini-meter {
+  width: 92px;
+  margin-top: 5px;
+}
+.monitor-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, .8fr) minmax(520px, 1.2fr);
+  gap: 18px;
+}
+.monitor-resource-list {
+  display: grid;
+  gap: 13px;
+}
+.monitor-resource-list article {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 18px;
+}
+.monitor-resource-list article small {
+  margin-top: 2px;
+}
+.monitor-resource-list article > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.monitor-resource-list .meter {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+}
+.compact-monitor-table table {
+  min-width: 620px;
+}
+.monitor-process-filter {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(190px, .3fr) auto;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px;
+  background: #f6fafc;
+  border: 1px solid #d7e5eb;
+  border-radius: 10px;
+}
+.monitor-process-filter .filter-count {
+  align-self: center;
+}
+.process-table {
+  min-width: 940px;
+}
+.process-table th:nth-child(1),
+.process-table td:nth-child(1) { width: 76px; }
+.process-table th:nth-child(3),
+.process-table td:nth-child(3) { width: 66px; }
+.process-table th:nth-child(4),
+.process-table td:nth-child(4),
+.process-table th:nth-child(5),
+.process-table td:nth-child(5),
+.process-table th:nth-child(6),
+.process-table td:nth-child(6) { width: 92px; }
+.command-line {
+  max-width: 680px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.monitor-footnote {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.monitor-warning {
+  display: grid;
+  gap: 5px;
+}
 @media (max-width: 1100px) {
   .workflow-summary,
   .workflow-gateway-publish,
@@ -2874,6 +3154,17 @@ td {
   .workflow-adapter-new,
   .workflow-target-row {
     grid-template-columns: 1fr 1fr;
+  }
+  .monitor-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .monitor-context,
+  .monitor-context dl {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .monitor-detail-grid {
+    grid-template-columns: 1fr;
   }
 }
 @media (max-width: 700px) {
@@ -2918,6 +3209,23 @@ td {
   .workflow-target-row,
   .compact-add-row {
     grid-template-columns: 1fr;
+  }
+  .monitor-metrics,
+  .monitor-process-filter {
+    grid-template-columns: 1fr;
+  }
+  .monitor-context {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .monitor-context dl {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .monitor-page .page-head,
+  .monitor-page .page-head .button-row {
+    align-items: stretch;
+    flex-direction: column;
   }
   .workflow-card-title,
   .workflow-save-footer {

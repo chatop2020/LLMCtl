@@ -333,6 +333,114 @@ class WorkflowGatewayPublishingTests(unittest.TestCase):
         )
 
 
+class SystemMonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.proc = pathlib.Path(self.tempdir.name) / "proc"
+        (self.proc / "net").mkdir(parents=True)
+        (self.proc / "self").mkdir()
+        (self.proc / "self" / "mountinfo").write_text("")
+        (self.proc / "uptime").write_text("86461.00 0.00\n")
+        (self.proc / "loadavg").write_text("1.00 2.00 3.00 1/100 123\n")
+        (self.proc / "cpuinfo").write_text("model name\t: Test CPU 96-Core\n")
+        (self.proc / "meminfo").write_text(
+            "MemTotal:       1000000 kB\n"
+            "MemAvailable:    400000 kB\n"
+            "MemFree:         100000 kB\n"
+            "Buffers:          10000 kB\n"
+            "Cached:          200000 kB\n"
+            "SReclaimable:     20000 kB\n"
+            "SwapTotal:       100000 kB\n"
+            "SwapFree:         75000 kB\n"
+        )
+        self.write_cpu(100, 0, 50, 850)
+        self.write_network(1024, 2048)
+        self.write_process(123, ticks=150)
+        self.clock = iter([100.0, 102.0])
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def write_cpu(self, user, nice, system, idle):
+        (self.proc / "stat").write_text(
+            f"cpu  {user} {nice} {system} {idle} 0 0 0 0 0 0\n"
+        )
+
+    def write_network(self, received, transmitted):
+        (self.proc / "net" / "dev").write_text(
+            "Inter-| Receive | Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+            f"  eth0: {received} 1 0 0 0 0 0 0 {transmitted} 1 0 0 0 0 0 0\n"
+            "    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n"
+        )
+
+    def write_process(self, pid, ticks):
+        directory = self.proc / str(pid)
+        directory.mkdir(exist_ok=True)
+        fields = ["0"] * 22
+        fields[0] = "R"
+        fields[11] = str(ticks)
+        fields[12] = "0"
+        fields[19] = "1000"
+        fields[21] = "10"
+        (directory / "stat").write_text(f"{pid} (python worker) {' '.join(fields)}\n")
+        (directory / "cmdline").write_bytes(
+            b"python\0serve.py\0--api-key\0sk-super-secret-value-123456789\0--port=8100\0"
+        )
+
+    @staticmethod
+    def nvidia_runner(arguments):
+        if any("query-compute-apps" in item for item in arguments):
+            return "GPU-test, 321, vllm, 2048\n"
+        return (
+            "0, NVIDIA Test GPU, GPU-test, 00000000:01:00.0, 595.84, "
+            "55, 87, 25, 4096, 8192, 220, 600, P0\n"
+        )
+
+    def test_snapshot_calculates_deltas_redacts_secrets_and_collects_gpu(self):
+        monitor = portal.SystemMonitor(
+            self.proc,
+            cache_seconds=0,
+            monotonic=lambda: next(self.clock),
+            command_runner=self.nvidia_runner,
+        )
+        first = monitor.snapshot()
+        self.assertIsNone(first["cpu"]["usage_percent"])
+        self.assertIsNone(first["network"]["rx_bytes_per_second"])
+        self.assertEqual(first["memory"]["used_percent"], 60.0)
+        self.assertTrue(first["gpu"]["available"])
+        self.assertEqual(first["gpu"]["gpus"][0]["process_count"], 1)
+        self.assertEqual(first["gpu"]["gpus"][0]["driver_version"], "595.84")
+        self.assertEqual(first["gpu"]["gpus"][0]["pci_bus_id"], "00000000:01:00.0")
+        self.assertNotIn("sk-super-secret", first["processes"][0]["command_line"])
+        self.assertIn("<redacted>", first["processes"][0]["command_line"])
+
+        self.write_cpu(200, 0, 100, 900)
+        self.write_network(3072, 6144)
+        self.write_process(123, ticks=250)
+        second = monitor.snapshot()
+        self.assertEqual(second["cpu"]["usage_percent"], 75.0)
+        self.assertEqual(second["network"]["rx_bytes_per_second"], 1024.0)
+        self.assertEqual(second["network"]["tx_bytes_per_second"], 2048.0)
+        self.assertGreater(second["processes"][0]["cpu_percent"], 0)
+
+    def test_command_redaction_handles_inline_and_bearer_secrets(self):
+        rendered = portal.SystemMonitor.redact_command_line(
+            [
+                "worker",
+                "PASSWORD=hunter2",
+                "Authorization:secret",
+                "Bearer",
+                "token-value",
+                "postgres://portal:database-secret@127.0.0.1/portal",
+            ]
+        )
+        self.assertNotIn("hunter2", rendered)
+        self.assertNotIn("token-value", rendered)
+        self.assertNotIn("database-secret", rendered)
+        self.assertIn("PASSWORD=<redacted>", rendered)
+
+
 class PortalIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -1250,6 +1358,25 @@ class PortalIntegrationTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(event["status"], "success")
         self.assertIn('"requests_per_minute":100', event["detail"])
+
+    def test_system_monitor_http_route_is_admin_only_and_uses_shared_sampler(self):
+        anonymous, _ = self.opener()
+        status, raw, _ = self.get(anonymous, "/portal-api/admin/system-monitor")
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(raw)["error"], "authentication required")
+
+        sampler = mock.Mock()
+        sampler.snapshot.return_value = {
+            "sampled_at": 1234567890,
+            "cpu": {"usage_percent": 12.5},
+            "processes": [],
+        }
+        self.server.monitor = sampler
+        client, _ = self.login_admin_api()
+        status, raw, _ = self.get(client, "/portal-api/admin/system-monitor")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["cpu"]["usage_percent"], 12.5)
+        sampler.snapshot.assert_called_once_with()
 
     def test_combo_metadata_uses_conservative_limits_and_syncs_every_target(self):
         self.fake_omni.combo_items = [

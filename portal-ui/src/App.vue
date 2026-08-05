@@ -34,11 +34,14 @@ const publicConfig = ref({
 const dashboard = ref(null);
 const admin = ref(null);
 const adminAnalytics = ref(null);
+const systemMonitor = ref(null);
 const workflow = ref(null);
 const workflowLoading = ref(false);
 const workflowSaving = ref(false);
 const workflowPublishing = ref(false);
 const analyticsLoading = ref(false);
+const monitorLoading = ref(false);
+const monitorPaused = ref(false);
 const busy = ref(false);
 const operation = ref("");
 const workspaceRefreshing = ref(false);
@@ -49,7 +52,9 @@ let workspaceLoadVersion = 0;
 let usageRefreshTimer = null;
 let stressRefreshTimer = null;
 let analyticsRefreshTimer = null;
+let monitorRefreshTimer = null;
 let analyticsLoadVersion = 0;
+let monitorLoadVersion = 0;
 const authMode = ref(
   location.hash.startsWith("#/register")
     ? "register"
@@ -114,6 +119,20 @@ const analyticsFilters = reactive({
   model: "",
   user: "",
   active_page: 1,
+});
+const monitorHistory = reactive({
+  sampledAt: [],
+  cpu: [],
+  memory: [],
+  gpu: [],
+  receive: [],
+  transmit: [],
+});
+const monitorProcess = reactive({
+  query: "",
+  sort: "cpu",
+  page: 1,
+  pageSize: 20,
 });
 const bulkPolicy = reactive({
   scope: "filtered",
@@ -366,6 +385,38 @@ const selectedUserAnalyticsMaxTokens = computed(() =>
     ),
   ),
 );
+const monitoredGpuAverage = computed(() => {
+  const rows = systemMonitor.value?.gpu?.gpus || [];
+  if (!rows.length) return null;
+  return rows.reduce((sum, row) => sum + Number(row.utilization_percent || 0), 0) / rows.length;
+});
+const monitoredGpuMemory = computed(() => {
+  const rows = systemMonitor.value?.gpu?.gpus || [];
+  const used = rows.reduce((sum, row) => sum + Number(row.memory_used_bytes || 0), 0);
+  const total = rows.reduce((sum, row) => sum + Number(row.memory_total_bytes || 0), 0);
+  return { used, total, percent: total ? (used * 100) / total : null };
+});
+const filteredMonitorProcesses = computed(() => {
+  const query = monitorProcess.query.trim().toLocaleLowerCase();
+  const rows = (systemMonitor.value?.processes || []).filter((row) =>
+    !query || [row.pid, row.user, row.command, row.command_line]
+      .some((value) => String(value ?? "").toLocaleLowerCase().includes(query)),
+  );
+  const key = monitorProcess.sort;
+  return [...rows].sort((left, right) => {
+    if (key === "memory") return Number(right.rss_bytes || 0) - Number(left.rss_bytes || 0);
+    if (key === "pid") return Number(left.pid || 0) - Number(right.pid || 0);
+    return Number(right.cpu_percent || 0) - Number(left.cpu_percent || 0);
+  });
+});
+const monitorProcessPages = computed(() =>
+  Math.max(1, Math.ceil(filteredMonitorProcesses.value.length / monitorProcess.pageSize)),
+);
+const currentMonitorProcesses = computed(() => {
+  const page = Math.min(monitorProcess.page, monitorProcessPages.value);
+  const offset = (page - 1) * monitorProcess.pageSize;
+  return filteredMonitorProcesses.value.slice(offset, offset + monitorProcess.pageSize);
+});
 const PaginationBar = (props, { emit }) =>
   props.pages <= 1
     ? null
@@ -490,6 +541,7 @@ const nav = computed(() =>
         ["users", "用户"],
         ["groups", "用户组"],
         ["billing", "账单"],
+        ["monitoring", "系统监控"],
         ["workflow", "能力编排"],
         ["stress", "性能压测"],
         ["settings", "发布、注册与 SMTP"],
@@ -567,6 +619,8 @@ function clearAuthenticatedClientState() {
   dashboard.value = null;
   admin.value = null;
   adminAnalytics.value = null;
+  systemMonitor.value = null;
+  for (const values of Object.values(monitorHistory)) values.splice(0);
   workflow.value = null;
   selectedUserIds.value = [];
   section.value = "overview";
@@ -603,6 +657,47 @@ async function loadAdminAnalytics(activePage = analyticsFilters.active_page, opt
 async function changeAnalyticsFilters() {
   analyticsFilters.active_page = 1;
   await loadAdminAnalytics(1);
+}
+
+function appendMonitorHistory(snapshot) {
+  if (!snapshot?.sampled_at) return;
+  const last = monitorHistory.sampledAt.at(-1);
+  if (last === snapshot.sampled_at) return;
+  const gpuRows = snapshot.gpu?.gpus || [];
+  const gpuAverage = gpuRows.length
+    ? gpuRows.reduce((sum, row) => sum + Number(row.utilization_percent || 0), 0) /
+      gpuRows.length
+    : null;
+  const points = {
+    sampledAt: snapshot.sampled_at,
+    cpu: snapshot.cpu?.usage_percent,
+    memory: snapshot.memory?.used_percent,
+    gpu: gpuAverage,
+    receive: snapshot.network?.rx_bytes_per_second,
+    transmit: snapshot.network?.tx_bytes_per_second,
+  };
+  for (const [key, value] of Object.entries(points)) {
+    monitorHistory[key].push(value);
+    if (monitorHistory[key].length > 60) monitorHistory[key].shift();
+  }
+}
+
+async function loadSystemMonitor(options = {}) {
+  if (!isAdmin.value || !session.value?.authenticated || monitorLoading.value) return;
+  const version = ++monitorLoadVersion;
+  monitorLoading.value = true;
+  try {
+    const result = await api("admin/system-monitor");
+    if (version !== monitorLoadVersion) return;
+    systemMonitor.value = result;
+    appendMonitorHistory(result);
+    if (monitorProcess.page > monitorProcessPages.value)
+      monitorProcess.page = monitorProcessPages.value;
+  } catch (error) {
+    if (!options.silent) notify(`系统监控读取失败：${error.message}`, "bad");
+  } finally {
+    if (version === monitorLoadVersion) monitorLoading.value = false;
+  }
 }
 
 function applyAdminSnapshot(snapshot) {
@@ -722,7 +817,9 @@ async function syncUsageAndRefresh(options = {}) {
 async function selectSection(nextSection) {
   section.value = nextSection;
   try {
-    if (nextSection === "workflow" && isAdmin.value) {
+    if (nextSection === "monitoring" && isAdmin.value) {
+      await Promise.all([refreshWorkspace(), loadSystemMonitor()]);
+    } else if (nextSection === "workflow" && isAdmin.value) {
       await Promise.all([refreshWorkspace(), loadWorkflow()]);
     } else if (nextSection === "billing") {
       await syncUsageAndRefresh({ preservePage: false });
@@ -1042,6 +1139,61 @@ function formatTokens(value) {
   return Number(value || 0).toLocaleString();
 }
 
+function formatBytes(value, digits = 1) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (number === 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  const index = Math.min(
+    units.length - 1,
+    Math.max(0, Math.floor(Math.log(Math.abs(number)) / Math.log(1024))),
+  );
+  const scaled = number / 1024 ** index;
+  return `${scaled.toFixed(index === 0 ? 0 : digits)} ${units[index]}`;
+}
+
+function formatRate(value) {
+  return value === null || value === undefined ? "采样中" : `${formatBytes(value)}/s`;
+}
+
+function formatMonitorPercent(value, digits = 1) {
+  return value === null || value === undefined || !Number.isFinite(Number(value))
+    ? "采样中"
+    : `${Number(value).toFixed(digits)}%`;
+}
+
+function formatUptime(value) {
+  let seconds = Math.max(0, Math.floor(Number(value || 0)));
+  const days = Math.floor(seconds / 86400);
+  seconds %= 86400;
+  const hours = Math.floor(seconds / 3600);
+  seconds %= 3600;
+  const minutes = Math.floor(seconds / 60);
+  return [days ? `${days} 天` : "", hours ? `${hours} 小时` : "", `${minutes} 分钟`]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function monitorTrendPoints(values, maximum = 100) {
+  if (!values.length) return "";
+  const width = 300;
+  const height = 72;
+  const valid = values.filter((value) => Number.isFinite(Number(value)));
+  const ceiling = Math.max(maximum || 0, ...valid.map(Number), 1);
+  return values
+    .map((value, index) => {
+      const x = values.length === 1 ? width : (index / (values.length - 1)) * width;
+      const number = Number.isFinite(Number(value)) ? Number(value) : 0;
+      const y = height - Math.max(0, Math.min(height, (number / ceiling) * height));
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function setMonitorProcessPage(page) {
+  monitorProcess.page = Math.max(1, Math.min(monitorProcessPages.value, page));
+}
+
 function analyticsSegmentHeight(value, maximum) {
   return `${Math.max(0, (Number(value || 0) / Math.max(1, maximum)) * 100)}%`;
 }
@@ -1282,6 +1434,13 @@ watch(
     for (const key of Object.keys(listFilters)) pages[key] = 1;
   },
   { deep: true },
+);
+
+watch(
+  () => [monitorProcess.query, monitorProcess.sort],
+  () => {
+    monitorProcess.page = 1;
+  },
 );
 
 watch(
@@ -2021,6 +2180,17 @@ onMounted(async () => {
         return;
       loadAdminAnalytics(analyticsFilters.active_page, { silent: true });
     }, 30_000);
+    monitorRefreshTimer = window.setInterval(() => {
+      if (
+        !isAdmin.value ||
+        section.value !== "monitoring" ||
+        document.hidden ||
+        monitorPaused.value ||
+        monitorLoading.value
+      )
+        return;
+      loadSystemMonitor({ silent: true });
+    }, 2_000);
   } catch (error) {
     notify(error.message, "bad");
   }
@@ -2030,6 +2200,7 @@ onBeforeUnmount(() => {
   if (usageRefreshTimer) window.clearInterval(usageRefreshTimer);
   if (stressRefreshTimer) window.clearInterval(stressRefreshTimer);
   if (analyticsRefreshTimer) window.clearInterval(analyticsRefreshTimer);
+  if (monitorRefreshTimer) window.clearInterval(monitorRefreshTimer);
   if (chatTimer) window.clearInterval(chatTimer);
   if (toastTimer) window.clearTimeout(toastTimer);
 });
@@ -4162,6 +4333,156 @@ onBeforeUnmount(() => {
                 "
               />
             </section>
+          </section>
+
+          <section v-if="section === 'monitoring'" class="page monitor-page">
+            <div class="page-head">
+              <div>
+                <span class="eyebrow">HOST TELEMETRY</span>
+                <h1>系统监控</h1>
+                <p>CPU、内存、GPU、网络、磁盘和进程的实时运行状态。</p>
+              </div>
+              <div class="button-row">
+                <span class="monitor-live" :class="{ paused: monitorPaused }">
+                  <i></i>{{ monitorPaused ? "已暂停" : "2 秒刷新" }}
+                </span>
+                <button class="ghost" type="button" @click="monitorPaused = !monitorPaused">
+                  {{ monitorPaused ? "继续采样" : "暂停采样" }}
+                </button>
+                <button class="primary" type="button" :disabled="monitorLoading" @click="loadSystemMonitor()">
+                  {{ monitorLoading ? "读取中…" : "立即刷新" }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="!systemMonitor" class="panel monitor-loading">
+              {{ monitorLoading ? "正在采集系统状态…" : "暂无系统监控数据。" }}
+            </div>
+            <template v-else>
+              <div class="monitor-context panel">
+                <div>
+                  <strong>{{ systemMonitor.host.hostname }}</strong>
+                  <span>{{ systemMonitor.host.cpu_model }}</span>
+                </div>
+                <dl>
+                  <div><dt>内核</dt><dd>{{ systemMonitor.host.kernel }}</dd></div>
+                  <div><dt>逻辑 CPU</dt><dd>{{ systemMonitor.host.logical_cpus }}</dd></div>
+                  <div><dt>运行时间</dt><dd>{{ formatUptime(systemMonitor.host.uptime_seconds) }}</dd></div>
+                  <div><dt>最后采样</dt><dd>{{ date(systemMonitor.sampled_at) }}</dd></div>
+                </dl>
+              </div>
+
+              <div class="monitor-metrics">
+                <article class="panel">
+                  <span>CPU 使用率</span>
+                  <strong>{{ formatMonitorPercent(systemMonitor.cpu.usage_percent) }}</strong>
+                  <small>负载 {{ systemMonitor.host.load_average.map((value) => Number(value).toFixed(2)).join(" / ") }}</small>
+                  <div class="meter"><i :style="{ width: `${systemMonitor.cpu.usage_percent || 0}%` }"></i></div>
+                </article>
+                <article class="panel">
+                  <span>内存</span>
+                  <strong>{{ formatMonitorPercent(systemMonitor.memory.used_percent) }}</strong>
+                  <small>{{ formatBytes(systemMonitor.memory.used_bytes) }} / {{ formatBytes(systemMonitor.memory.total_bytes) }}</small>
+                  <div class="meter"><i :style="{ width: `${systemMonitor.memory.used_percent || 0}%` }"></i></div>
+                </article>
+                <article class="panel">
+                  <span>GPU 平均负载</span>
+                  <strong>{{ systemMonitor.gpu.available ? formatMonitorPercent(monitoredGpuAverage) : "不可用" }}</strong>
+                  <small v-if="systemMonitor.gpu.available">{{ systemMonitor.gpu.gpus.length }} 张 GPU · 显存 {{ formatMonitorPercent(monitoredGpuMemory.percent) }}</small>
+                  <small v-else>{{ systemMonitor.gpu.error }}</small>
+                  <div class="meter gpu"><i :style="{ width: `${monitoredGpuAverage || 0}%` }"></i></div>
+                </article>
+                <article class="panel">
+                  <span>网络吞吐</span>
+                  <strong>↓ {{ formatRate(systemMonitor.network.rx_bytes_per_second) }}</strong>
+                  <small>↑ {{ formatRate(systemMonitor.network.tx_bytes_per_second) }}</small>
+                </article>
+                <article class="panel">
+                  <span>进程</span>
+                  <strong>{{ systemMonitor.process_summary.total }}</strong>
+                  <small>运行 {{ systemMonitor.process_summary.running }} · 不可中断 {{ systemMonitor.process_summary.uninterruptible }} · 僵尸 {{ systemMonitor.process_summary.zombie }}</small>
+                </article>
+              </div>
+
+              <section class="panel monitor-trends">
+                <div class="panel-head">
+                  <div><h2>资源趋势</h2><p>当前 {{ monitorHistory.sampledAt.length }} 次采样，最多保留 60 次；离开本页即停止请求数据。</p></div>
+                  <div class="trend-legend"><span class="cpu">● CPU</span><span class="memory">● 内存</span><span class="gpu">● GPU</span></div>
+                </div>
+                <div class="trend-chart" aria-label="CPU、内存和 GPU 使用率趋势">
+                  <span class="trend-ceiling">100%</span><span class="trend-floor">0%</span>
+                  <svg viewBox="0 0 300 72" preserveAspectRatio="none" role="img">
+                    <polyline class="cpu" :points="monitorTrendPoints(monitorHistory.cpu)" />
+                    <polyline class="memory" :points="monitorTrendPoints(monitorHistory.memory)" />
+                    <polyline class="gpu" :points="monitorTrendPoints(monitorHistory.gpu)" />
+                  </svg>
+                </div>
+                <div class="network-rate-summary">
+                  <span>当前下行 <strong>{{ formatRate(systemMonitor.network.rx_bytes_per_second) }}</strong></span>
+                  <span>当前上行 <strong>{{ formatRate(systemMonitor.network.tx_bytes_per_second) }}</strong></span>
+                  <span>Swap <strong>{{ formatBytes(systemMonitor.memory.swap_used_bytes) }} / {{ formatBytes(systemMonitor.memory.swap_total_bytes) }}</strong></span>
+                </div>
+              </section>
+
+              <section class="panel" v-if="systemMonitor.gpu.available">
+                <div class="panel-head"><div><h2>GPU 状态</h2><p>利用率、显存、温度、功耗与计算进程。</p></div><span class="filter-count">{{ systemMonitor.gpu.gpus.length }} 张</span></div>
+                <div class="table-wrap">
+                  <table class="monitor-table gpu-table">
+                    <thead><tr><th>GPU</th><th>利用率</th><th>显存</th><th>显存控制器</th><th>温度</th><th>功耗</th><th>性能状态</th><th>计算进程</th></tr></thead>
+                    <tbody><tr v-for="gpu in systemMonitor.gpu.gpus" :key="gpu.index">
+                      <td><strong>GPU {{ gpu.index }}</strong><small>{{ gpu.name }}</small><small>驱动 {{ gpu.driver_version }} · PCI {{ gpu.pci_bus_id }}</small></td>
+                      <td><strong>{{ formatMonitorPercent(gpu.utilization_percent) }}</strong><div class="mini-meter"><i :style="{ width: `${gpu.utilization_percent || 0}%` }"></i></div></td>
+                      <td>{{ formatBytes(gpu.memory_used_bytes) }} / {{ formatBytes(gpu.memory_total_bytes) }}</td>
+                      <td>{{ formatMonitorPercent(gpu.memory_utilization_percent) }}</td>
+                      <td>{{ gpu.temperature_c == null ? "—" : `${gpu.temperature_c}°C` }}</td>
+                      <td>{{ gpu.power_watts == null ? "—" : `${gpu.power_watts.toFixed(0)} / ${gpu.power_limit_watts?.toFixed(0) || "—"} W` }}</td>
+                      <td><code>{{ gpu.pstate }}</code></td>
+                      <td>{{ gpu.process_count }} 个 · {{ formatBytes(gpu.process_memory_bytes) }}</td>
+                    </tr></tbody>
+                  </table>
+                </div>
+              </section>
+
+              <div class="monitor-detail-grid">
+                <section class="panel">
+                  <div class="panel-head"><div><h2>磁盘</h2><p>本地持久文件系统使用情况。</p></div></div>
+                  <div class="monitor-resource-list">
+                    <article v-for="disk in systemMonitor.disks" :key="`${disk.source}:${disk.mount_point}`">
+                      <div><strong>{{ disk.mount_point }}</strong><small>{{ disk.source }} · {{ disk.filesystem }}</small></div>
+                      <span>{{ formatBytes(disk.used_bytes) }} / {{ formatBytes(disk.total_bytes) }}</span>
+                      <div class="meter"><i :class="{ warning: disk.used_percent >= 85 }" :style="{ width: `${disk.used_percent || 0}%` }"></i></div>
+                    </article>
+                    <p v-if="!systemMonitor.disks.length" class="empty">未读取到可见的本地文件系统。</p>
+                  </div>
+                </section>
+                <section class="panel">
+                  <div class="panel-head"><div><h2>网络接口</h2><p>速率由相邻两次系统计数器差值计算。</p></div></div>
+                  <div class="table-wrap compact-monitor-table"><table class="monitor-table"><thead><tr><th>接口</th><th>下行</th><th>上行</th><th>累计接收</th><th>累计发送</th></tr></thead>
+                    <tbody><tr v-for="item in systemMonitor.network.interfaces" :key="item.name"><td><code>{{ item.name }}</code><small v-if="item.loopback">本机回环</small></td><td>{{ formatRate(item.rx_bytes_per_second) }}</td><td>{{ formatRate(item.tx_bytes_per_second) }}</td><td>{{ formatBytes(item.rx_bytes) }}</td><td>{{ formatBytes(item.tx_bytes) }}</td></tr></tbody>
+                  </table></div>
+                </section>
+              </div>
+
+              <section class="panel monitor-process-panel">
+                <div class="panel-head"><div><h2>进程</h2><p>类似 top 的只读视图；命令参数中的 Key、Token 和密码会自动脱敏。</p></div><span class="filter-count">显示候选 {{ systemMonitor.process_summary.returned }} / {{ systemMonitor.process_summary.total }}</span></div>
+                <div class="monitor-process-filter">
+                  <input v-model="monitorProcess.query" type="search" placeholder="搜索 PID、用户、进程或命令" aria-label="搜索系统进程" />
+                  <select v-model="monitorProcess.sort" aria-label="进程排序"><option value="cpu">CPU 从高到低</option><option value="memory">内存从高到低</option><option value="pid">PID 从小到大</option></select>
+                  <span class="filter-count">{{ filteredMonitorProcesses.length }} 条</span>
+                </div>
+                <div class="table-wrap"><table class="monitor-table process-table"><thead><tr><th>PID</th><th>用户</th><th>状态</th><th>CPU</th><th>内存</th><th>RSS</th><th>命令</th></tr></thead>
+                  <tbody><tr v-for="row in currentMonitorProcesses" :key="row.pid"><td><code>{{ row.pid }}</code></td><td>{{ row.user }}</td><td><code>{{ row.state }}</code></td><td><strong>{{ row.cpu_percent.toFixed(1) }}%</strong></td><td>{{ row.memory_percent.toFixed(2) }}%</td><td>{{ formatBytes(row.rss_bytes) }}</td><td><strong>{{ row.command }}</strong><small class="command-line" :title="row.command_line">{{ row.command_line }}</small></td></tr>
+                    <tr v-if="!currentMonitorProcesses.length"><td colspan="7" class="empty">没有符合条件的进程。</td></tr>
+                  </tbody></table></div>
+                <PaginationBar :page="monitorProcess.page" :pages="monitorProcessPages" :total="filteredMonitorProcesses.length" @previous="setMonitorProcessPage(monitorProcess.page - 1)" @next="setMonitorProcessPage(monitorProcess.page + 1)" />
+                <p class="monitor-footnote">进程 CPU 是相邻采样间的占用率，多线程进程可超过 100%；首次打开页面时需等待下一次采样才会出现准确的 CPU 和网络速率。</p>
+              </section>
+
+              <div v-if="Object.keys(systemMonitor.errors || {}).length" class="warning monitor-warning">
+                <strong>部分指标不可用。</strong>
+                <span v-for="(message, name) in systemMonitor.errors" :key="name"><code>{{ name }}</code> {{ message }}</span>
+              </div>
+            </template>
           </section>
 
           <section v-if="section === 'workflow'" class="page workflow-page">

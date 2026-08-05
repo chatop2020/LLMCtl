@@ -195,6 +195,24 @@ describe("LLMCtl portal contracts", () => {
     expect(style).toContain(".selection-column");
   });
 
+  it("offers an admin-only read-only system monitor without continuous background polling", () => {
+    for (const marker of [
+      '["monitoring", "系统监控"]',
+      'api("admin/system-monitor")',
+      'section.value !== "monitoring"',
+      "monitorPaused.value",
+      "最多保留 60 次",
+      "命令参数中的 Key、Token 和密码会自动脱敏",
+      ':pages="monitorProcessPages"',
+      "GPU 状态",
+      "网络接口",
+      "本地持久文件系统使用情况",
+    ])
+      expect(source).toContain(marker);
+    expect(source).toContain("monitorRefreshTimer = window.setInterval");
+    expect(source).toContain("document.hidden");
+  });
+
   it("keeps pluggable orchestration explicit, remote-capable and off the Python data path", () => {
     for (const marker of [
       "admin/workflow",
