@@ -100,6 +100,12 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             'install -m 644 "${KEEPWARM_SERVICE_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-keepwarm.service',
             INSTALLER,
         )
+        self.assertIn("cmd_responses() {", MANAGER)
+        self.assertIn('responses) cmd_responses "$@"', MANAGER)
+        self.assertIn("account_helper reconcile-public-routes", MANAGER)
+        self.assertIn("仅短暂停止账户门户", MANAGER)
+        self.assertIn("workflow_require_runtime()", MANAGER)
+        self.assertIn("llmctl upgrade --force", MANAGER)
 
     def test_upgrader_preserves_runtime_and_only_refreshes_managed_nginx(self):
         source = UPGRADER.read_text(encoding="utf-8")
@@ -125,6 +131,9 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("refresh_workflow_unit_if_installed()", source)
         self.assertIn('[[ -e "${WORKFLOW_SERVICE_UNIT}" ]] || return 0', source)
         self.assertNotIn("systemctl enable --now llm-workflow", source)
+        self.assertIn("validate_installed_workflow_runtime()", source)
+        self.assertIn('"${WORKFLOW_RUNTIME}" --version >/dev/null', source)
+        self.assertIn("validate_installed_workflow_runtime", normal_upgrade)
 
     def test_upgrade_backup_and_explicit_rollback_cover_runtime_sqlite(self):
         source = UPGRADER.read_text(encoding="utf-8")

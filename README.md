@@ -254,6 +254,8 @@ Hugging Face 私有或 gated 模型需要在运行安装器时提供 `HF_TOKEN` 
 
 `llmctl upgrade` 只升级 LLMCtl 自身程序：管理命令、模型目录/调优/网关配置工具，以及账户门户后端和 Vue 静态资源。它不会重跑安装器，也不会修改或重启模型 Worker、Docker、模型权重、Worker 配置或密钥。若新版本需要兼容性数据迁移（例如把公开模型 ID 升级为 OmniRoute 原生 Combo 以同时支持 `/v1/chat/completions` 与 `/v1/responses`），账户门户会先使用 SQLite 在线备份 API 保存门户库、OmniRoute 库和旧路由记录，备份失败则拒绝迁移。若存在 LLMCtl 自己生成的 Nginx 入口配置，升级验收完成后会事务式刷新并平滑 reload Nginx；其他站点保持不变。
 
+升级后可运行 `llmctl responses status` 检查公开模型 ID 的原生 Responses 路由。若状态未就绪，运行 `llmctl responses repair`：该命令会先为门户与 OmniRoute SQLite 数据创建一致性快照，只短停账户门户，随后建立同名原生 Combo 并重新同步用户权限；OmniRoute、Nginx、Docker、GPU Worker 与推理 API 均保持运行。可选 Go 工作流运行时已包含在控制面升级包中，不需要通过 apt 安装；若旧升级器曾漏装它，执行 `llmctl upgrade --force` 即可补齐。
+
 ```bash
 sudo llmctl upgrade
 ```

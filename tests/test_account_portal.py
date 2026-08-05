@@ -1357,6 +1357,9 @@ class PortalIntegrationTests(unittest.TestCase):
                 "models": [{"kind": "model", "providerId": "local", "modelId": "ornith"}],
             }
         ]
+        before = self.server.control.public_combo_route_status()
+        self.assertFalse(before["ready"])
+        self.assertEqual(before["routes"][0]["reason"], "native combo missing")
         result = self.server.control.reconcile_public_combo_routes()
         self.assertEqual(result, {"migrated": 1, "unchanged": 0, "failed": 0})
         self.assertEqual(self.fake_omni.deleted_combo_mappings, ["mapping-1"])
@@ -1395,6 +1398,10 @@ class PortalIntegrationTests(unittest.TestCase):
         )
         self.server.control.sync_user("policy-user")
         self.assertEqual(self.fake_omni.permissions[-1], ("policy-key", [], ["gdn-inside"], True))
+        after = self.server.control.public_combo_route_status()
+        self.assertTrue(after["ready"])
+        self.assertEqual(after["ready_count"], 1)
+        self.assertEqual(after["routes"][0]["mapping_kind"], "native-combo")
 
     def test_portal_server_defers_route_migration_until_upgrade_acceptance_window(self):
         self.insert_control_user_and_model()
@@ -1412,6 +1419,22 @@ class PortalIntegrationTests(unittest.TestCase):
         self.server.reconcile_public_routes_after_acceptance()
         self.assertTrue(self.server.route_migration_finished)
         self.assertEqual(len(self.fake_omni.combo_upserts), 1)
+
+    def test_delayed_route_migration_retries_per_model_failure(self):
+        self.server.route_migration_due = 0
+        with mock.patch.object(
+            self.server.control,
+            "reconcile_public_combo_routes",
+            return_value={"migrated": 0, "unchanged": 0, "failed": 1},
+        ) as reconcile:
+            self.server.reconcile_public_routes_after_acceptance()
+            self.assertFalse(self.server.route_migration_finished)
+            self.assertGreater(self.server.route_migration_due, portal.time.monotonic())
+            self.server.route_migration_due = 0
+            reconcile.return_value = {"migrated": 1, "unchanged": 0, "failed": 0}
+            self.server.reconcile_public_routes_after_acceptance()
+        self.assertTrue(self.server.route_migration_finished)
+        self.assertEqual(reconcile.call_count, 2)
 
     def test_unmanaged_native_combo_collision_leaves_legacy_route_untouched(self):
         self.insert_control_user_and_model()

@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -63,6 +63,7 @@ PUBLIC_COMBO_MANAGED_DESCRIPTION = "Managed by LLMCtl account portal public mode
 PUBLIC_COMBO_MIGRATION_NAME = "responses-native-public-combo-v1"
 PUBLIC_COMBO_BACKUP_MAX_AGE_SECONDS = 15 * 60
 PUBLIC_COMBO_MIGRATION_DELAY_SECONDS = 15
+PUBLIC_COMBO_MIGRATION_RETRY_SECONDS = 60
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -4426,6 +4427,65 @@ class PortalControlPlane:
                 )
         return {"migrated": migrated, "unchanged": unchanged, "failed": failed}
 
+    def public_combo_route_status(self) -> dict[str, Any]:
+        """Compare portal-published combo IDs with OmniRoute's live combos."""
+        combos = self.omni.combos()
+        by_name = {str(item.get("name", "")): item for item in combos}
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT public_model_id,source_ref,source_model,mapping_kind,"
+                "mapping_id,status FROM published_models WHERE source_kind='combo' "
+                "ORDER BY public_model_id"
+            ).fetchall()
+        routes: list[dict[str, Any]] = []
+        for row in rows:
+            public_id = str(row["public_model_id"] or "")
+            mapping_kind = str(row["mapping_kind"] or "")
+            mapping_id = str(row["mapping_id"] or "")
+            live = by_name.get(public_id)
+            live_id = str(live.get("id", "")) if live else ""
+            description = str(live.get("description", "")) if live else ""
+            identity_route = (
+                public_id == str(row["source_model"] or "")
+                and live_id == str(row["source_ref"] or "")
+            )
+            managed_route = description == PUBLIC_COMBO_MANAGED_DESCRIPTION
+            ready = bool(live) and (
+                (mapping_kind == "native-combo" and managed_route and mapping_id == live_id)
+                or (mapping_kind == "source-combo" and identity_route and mapping_id == live_id)
+            )
+            if not live:
+                reason = "native combo missing"
+            elif mapping_kind not in {"native-combo", "source-combo"}:
+                reason = f"legacy mapping kind: {mapping_kind or 'unset'}"
+            elif mapping_id != live_id:
+                reason = "portal mapping id does not match live combo"
+            elif mapping_kind == "native-combo" and not managed_route:
+                reason = "live combo is not managed by LLMCtl"
+            elif mapping_kind == "source-combo" and not identity_route:
+                reason = "source combo identity does not match"
+            else:
+                reason = "ready"
+            routes.append(
+                {
+                    "public_model_id": public_id,
+                    "published": str(row["status"] or "") == "published",
+                    "mapping_kind": mapping_kind or "legacy",
+                    "mapping_id": mapping_id,
+                    "live_combo_id": live_id,
+                    "source_model": str(row["source_model"] or ""),
+                    "ready": ready,
+                    "reason": reason,
+                }
+            )
+        ready_count = sum(1 for route in routes if route["ready"])
+        return {
+            "ready": ready_count == len(routes),
+            "ready_count": ready_count,
+            "total": len(routes),
+            "routes": routes,
+        }
+
     def effective_models(self, user_id: str) -> list[dict[str, Any]]:
         with self.db.connect() as connection:
             account = connection.execute(
@@ -6449,14 +6509,24 @@ class PortalServer:
         except Exception as error:
             # Keep the legacy routes serving traffic and retry later.  The
             # backup routine fails closed before any gateway route is changed.
-            self.route_migration_due = time.monotonic() + 60
+            self.route_migration_due = (
+                time.monotonic() + PUBLIC_COMBO_MIGRATION_RETRY_SECONDS
+            )
             print(
                 f"[account-portal] delayed public combo migration warning: {error}",
                 file=sys.stderr,
                 flush=True,
             )
             return
-        self.route_migration_finished = True
+        # A per-model failure is not completion.  Marking the entire migration
+        # finished here used to leave /v1/responses permanently rewriting a
+        # missing bare combo to codex/<public-id>.  Chat traffic remains on the
+        # legacy route while the portal retries after a bounded delay.
+        self.route_migration_finished = route_migration["failed"] == 0
+        if not self.route_migration_finished:
+            self.route_migration_due = (
+                time.monotonic() + PUBLIC_COMBO_MIGRATION_RETRY_SECONDS
+            )
         if route_migration["migrated"] or route_migration["failed"]:
             print(
                 "[account-portal] public combo reconciliation: "
@@ -6514,6 +6584,8 @@ def main() -> None:
             "set-admin-username",
             "reset-admin-password",
             "dump-config",
+            "public-route-status",
+            "reconcile-public-routes",
         ),
         default="serve",
     )
@@ -6576,6 +6648,27 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+        return
+    if args.command in {"public-route-status", "reconcile-public-routes"}:
+        database = Database(config)
+        database.initialize()
+        control = PortalControlPlane(config, database, OmniRouteClient(config))
+        result: dict[str, Any] = {}
+        if args.command == "reconcile-public-routes":
+            # Keep stdout machine-readable for llmctl while retaining the
+            # snapshot path and per-model diagnostics on stderr.
+            with contextlib.redirect_stdout(sys.stderr):
+                result["reconciliation"] = control.reconcile_public_combo_routes()
+                if result["reconciliation"]["failed"] == 0:
+                    result["permission_sync"] = control.sync_all_users()
+                else:
+                    result["permission_sync"] = {"synced": 0, "failed": 0}
+        result["status"] = control.public_combo_route_status()
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        failed = int(result.get("reconciliation", {}).get("failed", 0))
+        permission_failed = int(result.get("permission_sync", {}).get("failed", 0))
+        if failed or permission_failed or not result["status"]["ready"]:
+            raise SystemExit(2)
         return
     PortalServer(config).serve()
 

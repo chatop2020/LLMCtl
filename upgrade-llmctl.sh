@@ -24,6 +24,8 @@ readonly KEEPWARM_SERVICE_UNIT="/etc/systemd/system/llm-keepwarm.service"
 readonly KEEPWARM_TIMER_UNIT="/etc/systemd/system/llm-keepwarm.timer"
 readonly WORKFLOW_UNIT_SOURCE="/usr/local/lib/llm-cluster/systemd/llm-workflow.service"
 readonly WORKFLOW_SERVICE_UNIT="/etc/systemd/system/llm-workflow.service"
+readonly WORKFLOW_RUNTIME_DIR="/usr/local/lib/llm-cluster/workflowd"
+readonly WORKFLOW_RUNTIME="${WORKFLOW_RUNTIME_DIR}/llm-workflowd"
 
 LANG_CODE=""
 LOCAL_ZIP=""
@@ -622,6 +624,15 @@ refresh_workflow_unit_if_installed() {
   fi
 }
 
+validate_installed_workflow_runtime() {
+  [[ -x "${WORKFLOW_RUNTIME}" && \
+     -x "${WORKFLOW_RUNTIME_DIR}/llm-workflowd-linux-amd64" && \
+     -x "${WORKFLOW_RUNTIME_DIR}/llm-workflowd-linux-arm64" ]] || \
+    die "$(l10n '升级后的 Go 工作流运行时安装不完整；正在恢复旧控制面' 'The upgraded Go workflow runtime is incomplete; restoring the previous control plane')"
+  "${WORKFLOW_RUNTIME}" --version >/dev/null || \
+    die "$(l10n '升级后的 Go 工作流运行时无法在本机执行；正在恢复旧控制面' 'The upgraded Go workflow runtime cannot execute on this host; restoring the previous control plane')"
+}
+
 wait_for_account_portal() {
   local port="$1" elapsed=0
   while (( elapsed < 30 )); do
@@ -705,6 +716,7 @@ install_control_plane() {
   done <"${SOURCE_ROOT}/upgrade-manifest.tsv"
 
   /usr/local/sbin/llmctl version >/dev/null
+  validate_installed_workflow_runtime
   configure_keepwarm_timer
   refresh_workflow_unit_if_installed
   if (( ACCOUNT_WAS_ACTIVE && restart_account )); then

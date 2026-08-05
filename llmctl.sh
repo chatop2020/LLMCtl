@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.3.0"
+readonly CTL_VERSION="3.3.1"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -347,6 +347,8 @@ usage() {
   llmctl workflow secret set <环境变量> [值]   写入独立、root-only 的工作流密钥文件
   llmctl workflow <enable|disable|reload|check|status|show|health|logs>
                                                 独立管理 Go 数据面；默认不修改现有网关映射
+  llmctl responses status                      检查公开模型 ID 是否可被 Responses API 原生解析
+  llmctl responses repair                      备份数据并修复 Responses API 原生 Combo 与用户权限
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
@@ -555,8 +557,18 @@ workflow_helper() {
   workflow_with_env python3 "${WORKFLOW_HELPER}" --config "${WORKFLOW_CONFIG}" "$@"
 }
 
+workflow_require_runtime() {
+  local runtime_dir
+  runtime_dir=$(dirname "${WORKFLOW_RUNTIME}")
+  if [[ ! -x "${WORKFLOW_RUNTIME}" || \
+        ! -x "${runtime_dir}/llm-workflowd-linux-amd64" || \
+        ! -x "${runtime_dir}/llm-workflowd-linux-arm64" ]]; then
+    die "Go 工作流运行时未安装完整：${runtime_dir}。它随 LLMCtl 控制面提供，不需要 apt 安装；请先运行 llmctl upgrade --force。现有 OmniRoute、Worker 和普通 API 不受影响。"
+  fi
+}
+
 workflow_check_config() {
-  [[ -x "${WORKFLOW_RUNTIME}" ]] || die "Go 工作流运行时不可执行：${WORKFLOW_RUNTIME}"
+  workflow_require_runtime
   [[ -r "${WORKFLOW_CONFIG}" ]] || die "缺少 ${WORKFLOW_CONFIG}；请先运行 llmctl workflow init"
   workflow_with_env "${WORKFLOW_RUNTIME}" --config "${WORKFLOW_CONFIG}" --check-config
 }
@@ -637,6 +649,9 @@ cmd_workflow_init() {
       *) die "未知 workflow init 参数：${arg}" ;;
     esac
   done
+  # Fail before creating workflow.json when an older installed upgrader did
+  # not yet copy the bundled Go runtime into the control-plane directory.
+  workflow_require_runtime
   [[ "${listen}" == *:* ]] || die "--listen 必须是 HOST:PORT"
   if ((${#targets[@]} == 0)) && [[ -z "${local_ids}" ]]; then local_ids="${ACTIVE_WORKERS}"; fi
   ensure_workflow_env
@@ -655,6 +670,43 @@ cmd_workflow_init() {
   refresh_account_workflow_credential
   log "工作流配置已创建并保持关闭；现有 Worker、Router 和公开模型映射均未改变。"
   log "先运行 llmctl workflow model enable ${route_model}，再执行 llmctl workflow check 和 llmctl workflow enable。"
+}
+
+cmd_responses() {
+  require_root
+  load_config
+  [[ "${GATEWAY_KIND}" == omniroute ]] || \
+    die "responses status/repair 仅适用于 OmniRoute 接入层"
+  local action="${1:-status}" output="" repair_status=0 was_active=0
+  shift || true
+  (( $# == 0 )) || die "用法：llmctl responses <status|repair>"
+  case "${action}" in
+    status)
+      account_helper public-route-status | jq .
+      ;;
+    repair)
+      systemctl is-active --quiet llm-account.service && was_active=1 || true
+      if (( was_active )); then
+        log "仅短暂停止账户门户以创建一致性快照并修复 Responses 路由；OmniRoute、Nginx、Docker 和 GPU Worker 保持运行。"
+        systemctl stop llm-account.service
+      fi
+      set +e
+      output=$(account_helper reconcile-public-routes)
+      repair_status=$?
+      set -e
+      if (( was_active )); then
+        systemctl start llm-account.service
+        wait_account_portal
+      fi
+      if [[ -n "${output}" ]]; then
+        if ! jq . <<<"${output}"; then printf '%s\n' "${output}"; fi
+      fi
+      (( repair_status == 0 )) || \
+        die "Responses 路由修复未完成；在线 API 未停止。请运行 llmctl responses status 和 llmctl logs account 查看具体模型原因。"
+      log "Responses API 原生 Combo 与用户权限已对账；Router 和 Worker 未重启。"
+      ;;
+    *) die "用法：llmctl responses <status|repair>" ;;
+  esac
 }
 
 cmd_workflow_secret() {
@@ -4216,6 +4268,7 @@ main() {
     autostart) cmd_autostart "$@" ;;
     keepwarm) cmd_keepwarm "$@" ;;
     workflow) cmd_workflow "$@" ;;
+    responses) cmd_responses "$@" ;;
     router) cmd_router "$@" ;;
     database) cmd_database "$@" ;;
     account) cmd_account "$@" ;;

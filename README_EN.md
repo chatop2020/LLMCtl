@@ -254,6 +254,8 @@ Private or gated Hugging Face models require `HF_TOKEN` when the installer runs,
 
 `llmctl upgrade` upgrades only LLMCtl's own programs: the manager, model-catalog/runtime-optimization/gateway helpers, and the account-portal backend and built Vue assets. It does not rerun the installer or modify/restart model workers, Docker, model weights, worker configuration, or secrets. If a release needs a compatibility data migration (for example, promoting a public model ID to a native OmniRoute Combo so both `/v1/chat/completions` and `/v1/responses` work), the portal first uses SQLite's online backup API to snapshot the portal database, the OmniRoute database, and the legacy route records; migration is refused if that snapshot fails. If LLMCtl's generated Nginx front-door file exists, it is transactionally refreshed after acceptance and Nginx is gracefully reloaded; all other sites remain untouched.
 
+After an upgrade, run `llmctl responses status` to verify that every published public model ID has a native Responses route. If it is not ready, run `llmctl responses repair`. The repair first creates consistent portal and OmniRoute SQLite snapshots, stops only the account portal briefly, creates the same-name native Combo, and resynchronizes user permissions. OmniRoute, Nginx, Docker, GPU workers, and the inference API remain online. The optional Go workflow runtime is bundled with the control-plane archive and is not an apt package; if an older updater omitted it, `llmctl upgrade --force` installs the complete runtime.
+
 ```bash
 sudo llmctl upgrade
 ```
