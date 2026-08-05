@@ -1310,13 +1310,11 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(
             public_combo["models"],
             [
-                {
-                    "kind": "combo-ref",
-                    "comboName": "ornith-cluster",
-                    "label": "LLMCtl public model → ornith-cluster",
-                }
+                {"kind": "model", "providerId": "local-a", "modelId": "ornith-a"},
+                {"kind": "model", "providerId": "local-b", "modelId": "ornith-b"},
             ],
         )
+        self.assertEqual(public_combo["strategy"], "round-robin")
         with self.server.db.connect() as connection:
             route = connection.execute(
                 "SELECT source_ref,source_model,mapping_kind,mapping_id "
@@ -1354,7 +1352,25 @@ class PortalIntegrationTests(unittest.TestCase):
                 "id": "combo-internal",
                 "name": "ornith-1.0-35b-fp8",
                 "description": "worker pool",
-                "models": [{"kind": "model", "providerId": "local", "modelId": "ornith"}],
+                "models": [
+                    {
+                        "kind": "model",
+                        "providerId": "local-0",
+                        "modelId": "ornith",
+                        "connectionId": "worker-0",
+                    },
+                    {
+                        "kind": "model",
+                        "providerId": "local-1",
+                        "modelId": "ornith",
+                        "connectionId": "worker-1",
+                    },
+                ],
+                "strategy": "round-robin",
+                "config": {
+                    "disableSessionStickiness": True,
+                    "stickyRoundRobinLimit": 1,
+                },
             }
         ]
         before = self.server.control.public_combo_route_status()
@@ -1365,7 +1381,9 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(self.fake_omni.deleted_combo_mappings, ["mapping-1"])
         self.assertEqual(self.fake_omni.combo_items[0]["id"], "combo-internal")
         public = next(item for item in self.fake_omni.combo_items if item["name"] == "gdn-inside")
-        self.assertEqual(public["models"][0]["comboName"], "ornith-1.0-35b-fp8")
+        self.assertEqual(public["models"], self.fake_omni.combo_items[0]["models"])
+        self.assertEqual(public["strategy"], "round-robin")
+        self.assertEqual(public["config"]["disableSessionStickiness"], True)
         backup_dir = self.server.control.public_combo_backup_dir
         self.assertIsNotNone(backup_dir)
         manifest = json.loads(
@@ -1402,6 +1420,63 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertTrue(after["ready"])
         self.assertEqual(after["ready_count"], 1)
         self.assertEqual(after["routes"][0]["mapping_kind"], "native-combo")
+        self.assertEqual(after["routes"][0]["member_count"], 2)
+        self.assertEqual(after["routes"][0]["source_member_count"], 2)
+
+    def test_nested_public_combo_is_repaired_to_direct_worker_members(self):
+        self.insert_control_user_and_model()
+        source_members = [
+            {
+                "kind": "model",
+                "providerId": f"local-{index}",
+                "modelId": "ornith-1.0-35b-fp8",
+                "connectionId": f"worker-{index}",
+            }
+            for index in range(8)
+        ]
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-internal",
+                "name": "ornith-1.0-35b-fp8",
+                "description": "worker pool",
+                "models": source_members,
+                "strategy": "round-robin",
+                "config": {"disableSessionStickiness": True},
+            },
+            {
+                "id": "public-combo-existing",
+                "name": "gdn-inside",
+                "description": portal.PUBLIC_COMBO_MANAGED_DESCRIPTION,
+                "models": [
+                    {
+                        "kind": "combo-ref",
+                        "comboName": "ornith-1.0-35b-fp8",
+                    }
+                ],
+                "strategy": "priority",
+            },
+        ]
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "UPDATE published_models SET mapping_kind='native-combo',"
+                "mapping_id='public-combo-existing' WHERE id='model-1'"
+            )
+
+        before = self.server.control.public_combo_route_status()
+        self.assertFalse(before["ready"])
+        self.assertEqual(
+            before["routes"][0]["reason"],
+            "native combo does not mirror source members",
+        )
+        result = self.server.control.reconcile_public_combo_routes()
+        self.assertEqual(result, {"migrated": 1, "unchanged": 0, "failed": 0})
+        public = next(item for item in self.fake_omni.combo_items if item["name"] == "gdn-inside")
+        self.assertEqual(public["models"], source_members)
+        self.assertEqual(public["strategy"], "round-robin")
+        self.assertEqual(public["config"], {"disableSessionStickiness": True})
+        after = self.server.control.public_combo_route_status()
+        self.assertTrue(after["ready"])
+        self.assertEqual(after["routes"][0]["member_count"], 8)
 
     def test_portal_server_defers_route_migration_until_upgrade_acceptance_window(self):
         self.insert_control_user_and_model()
@@ -1410,7 +1485,9 @@ class PortalIntegrationTests(unittest.TestCase):
                 "id": "combo-internal",
                 "name": "ornith-1.0-35b-fp8",
                 "description": "worker pool",
-                "models": [],
+                "models": [
+                    {"kind": "model", "providerId": "local", "modelId": "ornith"}
+                ],
             }
         ]
         self.server.reconcile_public_routes_after_acceptance()
@@ -1419,6 +1496,34 @@ class PortalIntegrationTests(unittest.TestCase):
         self.server.reconcile_public_routes_after_acceptance()
         self.assertTrue(self.server.route_migration_finished)
         self.assertEqual(len(self.fake_omni.combo_upserts), 1)
+
+    def test_route_audit_repairs_a_public_combo_after_source_members_change(self):
+        self.insert_control_user_and_model()
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-internal",
+                "name": "ornith-1.0-35b-fp8",
+                "models": [
+                    {"kind": "model", "providerId": "local-0", "modelId": "ornith"}
+                ],
+            }
+        ]
+        self.server.route_migration_due = 0
+        self.server.reconcile_public_routes_after_acceptance()
+        self.assertTrue(self.server.route_migration_finished)
+        source = next(
+            item for item in self.fake_omni.combo_items if item["id"] == "combo-internal"
+        )
+        source["models"].append(
+            {"kind": "model", "providerId": "local-1", "modelId": "ornith"}
+        )
+        self.server.route_migration_due = 0
+        self.server.reconcile_public_routes_after_acceptance()
+        public = next(
+            item for item in self.fake_omni.combo_items if item["name"] == "gdn-inside"
+        )
+        self.assertEqual(public["models"], source["models"])
+        self.assertTrue(self.server.route_migration_finished)
 
     def test_delayed_route_migration_retries_per_model_failure(self):
         self.server.route_migration_due = 0

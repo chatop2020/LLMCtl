@@ -44,7 +44,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -60,10 +60,12 @@ WORKFLOW_GATEWAY_CONNECTION_NAME = "LLMCtl workflow"
 WORKFLOW_GATEWAY_PREFIX = "llmctl-workflow"
 WORKFLOW_GATEWAY_MANAGED_DESCRIPTION = "Managed by LLMCtl workflow data plane"
 PUBLIC_COMBO_MANAGED_DESCRIPTION = "Managed by LLMCtl account portal public model"
-PUBLIC_COMBO_MIGRATION_NAME = "responses-native-public-combo-v1"
+PUBLIC_COMBO_MIGRATION_NAME = "responses-native-public-combo-v2"
+PUBLIC_COMBO_MIGRATION_SETTING = "public_combo_migration"
 PUBLIC_COMBO_BACKUP_MAX_AGE_SECONDS = 15 * 60
 PUBLIC_COMBO_MIGRATION_DELAY_SECONDS = 15
 PUBLIC_COMBO_MIGRATION_RETRY_SECONDS = 60
+PUBLIC_COMBO_AUDIT_SECONDS = 60
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2770,7 +2772,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                         {
                             "error": str(error),
                             "available": False,
-                            "setup_command": "llmctl workflow init",
+                            "setup_command": "llmctl workflow status",
+                            "recovery_commands": [
+                                "llmctl workflow status",
+                                "llmctl workflow init",
+                                "llmctl workflow model enable <公开ID>",
+                                "llmctl workflow check",
+                                "llmctl workflow enable",
+                            ],
                         },
                     )
             return
@@ -3927,15 +3936,17 @@ class PortalControlPlane:
         return destination
 
     def prepare_public_combo_migration_backup(self) -> pathlib.Path | None:
-        """Snapshot both SQLite control stores before the first route migration."""
+        """Snapshot both SQLite control stores before the current route migration."""
         if self.public_combo_backup_dir is not None:
             return self.public_combo_backup_dir
+        if self.db.settings().get(PUBLIC_COMBO_MIGRATION_SETTING) == PUBLIC_COMBO_MIGRATION_NAME:
+            return None
         with self.db.connect() as connection:
             legacy_rows = self.rows(
                 connection.execute(
                     "SELECT id,public_model_id,source_ref,source_model,mapping_kind,"
                     "mapping_id,status FROM published_models WHERE source_kind='combo' "
-                    "AND mapping_kind NOT IN ('native-combo','source-combo') ORDER BY created_at,id"
+                    "ORDER BY created_at,id"
                 ).fetchall()
             )
         if not legacy_rows:
@@ -3945,8 +3956,26 @@ class PortalControlPlane:
         data_dir = backup_dir / "runtime-data"
         manifest_path = data_dir / "runtime-data.json"
         if manifest_path.is_file():
-            self.public_combo_backup_dir = backup_dir
-            return backup_dir
+            try:
+                existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                existing_manifest = {}
+            if existing_manifest.get("migration") == PUBLIC_COMBO_MIGRATION_NAME:
+                self.public_combo_backup_dir = backup_dir
+                return backup_dir
+            # Do not overwrite another migration's rollback snapshot even when
+            # it was created inside the control-plane upgrade acceptance window.
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y%m%dT%H%M%SZ"
+            )
+            backup_dir = backup_dir.parent / f"routing-migration-{timestamp}"
+            suffix = 0
+            while backup_dir.exists():
+                suffix += 1
+                backup_dir = backup_dir.parent / f"routing-migration-{timestamp}-{suffix}"
+            backup_dir.mkdir(mode=0o700)
+            data_dir = backup_dir / "runtime-data"
+            manifest_path = data_dir / "runtime-data.json"
         data_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(data_dir, 0o700)
         entries: list[dict[str, Any]] = []
@@ -4286,6 +4315,73 @@ class PortalControlPlane:
             None,
         )
 
+    @staticmethod
+    def _combo_member_signatures(combo: dict[str, Any] | None) -> list[str]:
+        """Return schema-tolerant identities for the direct members of a combo."""
+        if not combo:
+            return []
+        members = combo.get("models", combo.get("targets", []))
+        if not isinstance(members, list):
+            return []
+        signatures: list[str] = []
+        for member in members:
+            if isinstance(member, str):
+                identity: dict[str, Any] = {"member": member}
+            elif isinstance(member, dict):
+                identity = {
+                    "kind": str(member.get("kind", "model")),
+                    "provider": str(
+                        member.get("provider", member.get("providerId", ""))
+                    ),
+                    "model": str(
+                        member.get(
+                            "model",
+                            member.get(
+                                "modelId",
+                                member.get("qualifiedModel", member.get("id", "")),
+                            ),
+                        )
+                    ),
+                    "connection": str(
+                        member.get(
+                            "connectionId",
+                            member.get("providerConnectionId", member.get("connection", "")),
+                        )
+                    ),
+                    "combo": str(
+                        member.get(
+                            "comboName",
+                            member.get("comboId", member.get("combo_id", "")),
+                        )
+                    ),
+                }
+            else:
+                continue
+            signatures.append(json.dumps(identity, sort_keys=True, separators=(",", ":")))
+        return sorted(signatures)
+
+    @classmethod
+    def _public_combo_mirrors_source(
+        cls, public_combo: dict[str, Any] | None, source_combo: dict[str, Any] | None
+    ) -> bool:
+        public_members = cls._combo_member_signatures(public_combo)
+        source_members = cls._combo_member_signatures(source_combo)
+        if not public_members or public_members != source_members:
+            return False
+        public_strategy = str((public_combo or {}).get("strategy", "round-robin"))
+        source_strategy = str((source_combo or {}).get("strategy", "round-robin"))
+        if public_strategy != source_strategy:
+            return False
+        source_config = (source_combo or {}).get("config", {})
+        public_config = (public_combo or {}).get("config", {})
+        if isinstance(source_config, dict):
+            if not isinstance(public_config, dict):
+                return False
+            for key, value in source_config.items():
+                if public_config.get(key) != value:
+                    return False
+        return True
+
     def ensure_public_combo_route(
         self,
         public_id: str,
@@ -4298,8 +4394,10 @@ class PortalControlPlane:
         OmniRoute's Responses API resolves bare model names before applying
         model-to-combo mappings. A mapping-only public ID can therefore be
         rewritten to a provider-qualified model and rejected by key policy.
-        A one-step nested combo keeps the public ID native while the original
-        combo continues to own worker discovery, health and load balancing.
+        The public combo mirrors the source combo's direct members and routing
+        configuration. OmniRoute 3.8.x accepts nested combo references but does
+        not preserve the nested round-robin cursor, which concentrates traffic
+        on one Worker under load.
         """
         combos = self.omni.combos()
         source = self._source_combo(combos, source_ref, source_model)
@@ -4326,18 +4424,20 @@ class PortalControlPlane:
             raise RuntimeError(
                 f"OmniRoute combo {public_id!r} already exists and is not managed by LLMCtl"
             )
+        source_models = source.get("models", source.get("targets", []))
+        if not isinstance(source_models, list) or not source_models:
+            raise RuntimeError("source combo has no routable members")
         payload: dict[str, Any] = {
             "name": public_id,
             "description": PUBLIC_COMBO_MANAGED_DESCRIPTION,
-            "models": [
-                {
-                    "kind": "combo-ref",
-                    "comboName": source_name,
-                    "label": f"LLMCtl public model → {source_name}",
-                }
-            ],
-            "strategy": "priority",
+            # JSON round-trip provides a schema-safe deep copy without sharing
+            # mutable member/config objects with the fetched source response.
+            "models": json.loads(json.dumps(source_models)),
+            "strategy": str(source.get("strategy", "round-robin")) or "round-robin",
         }
+        source_config = source.get("config")
+        if isinstance(source_config, dict):
+            payload["config"] = json.loads(json.dumps(source_config))
         context_length = source.get("context_length")
         if isinstance(context_length, int) and context_length >= 1000:
             payload["context_length"] = context_length
@@ -4352,6 +4452,9 @@ class PortalControlPlane:
             "source_ref": source_id,
             "source_model": source_name,
             "created": created,
+            "updated": bool(existing) and not self._public_combo_mirrors_source(
+                existing, source
+            ),
         }
 
     def _delete_published_route(
@@ -4391,6 +4494,7 @@ class PortalControlPlane:
                     or old_id != new_id
                     or str(row["source_ref"] or "") != str(route["source_ref"])
                     or str(row["source_model"] or "") != str(route["source_model"])
+                    or bool(route.get("updated"))
                 )
                 # The native route is already live. Retire only the superseded
                 # portal-owned route; user keys keep the same allowed combo ID.
@@ -4425,6 +4529,10 @@ class PortalControlPlane:
                     file=sys.stderr,
                     flush=True,
                 )
+        if failed == 0:
+            self.db.update_settings(
+                {PUBLIC_COMBO_MIGRATION_SETTING: PUBLIC_COMBO_MIGRATION_NAME}
+            )
         return {"migrated": migrated, "unchanged": unchanged, "failed": failed}
 
     def public_combo_route_status(self) -> dict[str, Any]:
@@ -4445,13 +4553,24 @@ class PortalControlPlane:
             live = by_name.get(public_id)
             live_id = str(live.get("id", "")) if live else ""
             description = str(live.get("description", "")) if live else ""
+            source = self._source_combo(
+                combos,
+                str(row["source_ref"] or ""),
+                str(row["source_model"] or ""),
+            )
             identity_route = (
                 public_id == str(row["source_model"] or "")
                 and live_id == str(row["source_ref"] or "")
             )
             managed_route = description == PUBLIC_COMBO_MANAGED_DESCRIPTION
+            mirrored_route = self._public_combo_mirrors_source(live, source)
             ready = bool(live) and (
-                (mapping_kind == "native-combo" and managed_route and mapping_id == live_id)
+                (
+                    mapping_kind == "native-combo"
+                    and managed_route
+                    and mirrored_route
+                    and mapping_id == live_id
+                )
                 or (mapping_kind == "source-combo" and identity_route and mapping_id == live_id)
             )
             if not live:
@@ -4462,6 +4581,8 @@ class PortalControlPlane:
                 reason = "portal mapping id does not match live combo"
             elif mapping_kind == "native-combo" and not managed_route:
                 reason = "live combo is not managed by LLMCtl"
+            elif mapping_kind == "native-combo" and not mirrored_route:
+                reason = "native combo does not mirror source members"
             elif mapping_kind == "source-combo" and not identity_route:
                 reason = "source combo identity does not match"
             else:
@@ -4474,6 +4595,8 @@ class PortalControlPlane:
                     "mapping_id": mapping_id,
                     "live_combo_id": live_id,
                     "source_model": str(row["source_model"] or ""),
+                    "member_count": len(self._combo_member_signatures(live)),
+                    "source_member_count": len(self._combo_member_signatures(source)),
                     "ready": ready,
                     "reason": reason,
                 }
@@ -6502,8 +6625,27 @@ class PortalServer:
         self.httpd.app = self  # type: ignore[attr-defined]
 
     def reconcile_public_routes_after_acceptance(self) -> None:
-        if self.route_migration_finished or time.monotonic() < self.route_migration_due:
+        current = time.monotonic()
+        if current < self.route_migration_due:
             return
+        if self.route_migration_finished:
+            try:
+                status = self.control.public_combo_route_status()
+            except Exception as error:
+                self.route_migration_due = current + PUBLIC_COMBO_MIGRATION_RETRY_SECONDS
+                print(
+                    f"[account-portal] public combo audit warning: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+            if status["ready"]:
+                self.route_migration_due = current + PUBLIC_COMBO_AUDIT_SECONDS
+                return
+            # The source worker set or routing strategy changed after the last
+            # successful migration. Repair the public mirror without waiting
+            # for another control-plane upgrade.
+            self.route_migration_finished = False
         try:
             route_migration = self.control.reconcile_public_combo_routes()
         except Exception as error:
@@ -6523,10 +6665,11 @@ class PortalServer:
         # missing bare combo to codex/<public-id>.  Chat traffic remains on the
         # legacy route while the portal retries after a bounded delay.
         self.route_migration_finished = route_migration["failed"] == 0
-        if not self.route_migration_finished:
-            self.route_migration_due = (
-                time.monotonic() + PUBLIC_COMBO_MIGRATION_RETRY_SECONDS
-            )
+        self.route_migration_due = time.monotonic() + (
+            PUBLIC_COMBO_AUDIT_SECONDS
+            if self.route_migration_finished
+            else PUBLIC_COMBO_MIGRATION_RETRY_SECONDS
+        )
         if route_migration["migrated"] or route_migration["failed"]:
             print(
                 "[account-portal] public combo reconciliation: "

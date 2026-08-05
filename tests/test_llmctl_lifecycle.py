@@ -31,6 +31,64 @@ def run_bash(body: str) -> str:
 
 
 class LlmctlLifecycleTests(unittest.TestCase):
+    def test_workflow_init_preserves_existing_config_and_prints_recovery_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = pathlib.Path(directory) / "state"
+            config_dir = pathlib.Path(directory) / "config"
+            workflow_dir = state_dir / "workflow"
+            workflow_dir.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            workflow_config = workflow_dir / "workflow.json"
+            original = {
+                "version": 1,
+                "listen": "127.0.0.1:18100",
+                "models": {
+                    "gdn-inside-workflow": {
+                        "enabled": False,
+                        "base_model": "gdn-inside",
+                        "pool": "text-generation",
+                    }
+                },
+                "pools": {"text-generation": {"targets": []}},
+                "adapters": {},
+            }
+            workflow_config.write_text(json.dumps(original), encoding="utf-8")
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_STATE_DIR={state_dir!s}
+                export LLM_CLUSTER_CONFIG_DIR={config_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                workflow_require_runtime() {{ :; }}
+                ensure_workflow_env() {{ :; }}
+                workflow_check_config() {{ :; }}
+                systemctl() {{
+                  [[ "$1" == is-active ]] && printf 'inactive\n'
+                  return 0
+                }}
+                WORKFLOW_LISTEN=127.0.0.1:18100
+                WORKFLOW_ROUTE_MODEL=gdn-inside-workflow
+                SERVED_MODEL_NAME=gdn-inside
+                ACTIVE_WORKERS=0,1
+                WORKER_BASE_PORT=8100
+                cmd_workflow_init
+                printf '%s\n' '---CONFIG---'
+                cat {workflow_config!s}
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        output, saved = completed.stdout.split("---CONFIG---\n", 1)
+        self.assertIn("已有工作流配置已保留并通过校验", output)
+        self.assertIn("workflow model enable gdn-inside-workflow", output)
+        self.assertIn("workflow check && llmctl workflow enable", output)
+        self.assertEqual(json.loads(saved), original)
+
     def test_huggingface_model_search_runs_network_preflight_before_catalog(self):
         output = run_bash(
             r"""

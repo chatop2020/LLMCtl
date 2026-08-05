@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.3.1"
+readonly CTL_VERSION="3.3.2"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -652,9 +652,30 @@ cmd_workflow_init() {
   # Fail before creating workflow.json when an older installed upgrader did
   # not yet copy the bundled Go runtime into the control-plane directory.
   workflow_require_runtime
+  ensure_workflow_env
+  if [[ -e "${WORKFLOW_CONFIG}" ]] && (( force == 0 )); then
+    workflow_check_config >/dev/null
+    local configured_models enabled_models first_model service_state
+    configured_models=$(jq -r '.models | keys | join(", ")' "${WORKFLOW_CONFIG}")
+    enabled_models=$(jq -r '[.models | to_entries[] | select(.value.enabled == true) | .key] | join(", ")' "${WORKFLOW_CONFIG}")
+    first_model=$(jq -r '.models | keys[0] // empty' "${WORKFLOW_CONFIG}")
+    service_state=$(systemctl is-active llm-workflow.service 2>/dev/null || true)
+    log "已有工作流配置已保留并通过校验：${WORKFLOW_CONFIG}"
+    log "已配置路由：${configured_models:-无}；已启用路由：${enabled_models:-无}；服务：${service_state:-inactive}。"
+    if [[ -z "${first_model}" ]]; then
+      die "现有工作流配置没有模型路由；请使用 llmctl workflow model set 添加路由，或确认后使用 workflow init --force 重建"
+    elif [[ -z "${enabled_models}" ]]; then
+      log "下一步：llmctl workflow model enable ${first_model}"
+      log "然后运行：llmctl workflow check && llmctl workflow enable"
+    elif [[ "${service_state}" != active ]]; then
+      log "下一步：llmctl workflow check && llmctl workflow enable"
+    else
+      log "工作流数据面已在运行；无需重复初始化。"
+    fi
+    return 0
+  fi
   [[ "${listen}" == *:* ]] || die "--listen 必须是 HOST:PORT"
   if ((${#targets[@]} == 0)) && [[ -z "${local_ids}" ]]; then local_ids="${ACTIVE_WORKERS}"; fi
-  ensure_workflow_env
   local -a helper_args=(init --listen "${listen}" --route-model "${route_model}" --base-model "${base_model}" --pool "${pool}" --api-key-env "${api_key_env}")
   [[ -z "${gateway_base_url}" ]] || helper_args+=(--gateway-base-url "${gateway_base_url}")
   [[ -z "${local_ids}" ]] || helper_args+=(--local-worker-ids "${local_ids}" --worker-base-port "${WORKER_BASE_PORT}")
