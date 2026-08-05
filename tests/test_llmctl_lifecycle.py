@@ -89,6 +89,110 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn("workflow check && llmctl workflow enable", output)
         self.assertEqual(json.loads(saved), original)
 
+    def test_workflow_status_normalizes_missing_unit_without_duplicate_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = pathlib.Path(directory) / "state"
+            config_dir = pathlib.Path(directory) / "config"
+            workflow_dir = state_dir / "workflow"
+            workflow_dir.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            (workflow_dir / "workflow.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "listen": "127.0.0.1:18100",
+                        "models": {},
+                        "pools": {},
+                        "adapters": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_STATE_DIR={state_dir!s}
+                export LLM_CLUSTER_CONFIG_DIR={config_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                require_root() {{ :; }}
+                load_config() {{ :; }}
+                systemctl() {{
+                  case "$1" in
+                    is-enabled) printf 'not-found\n'; return 1 ;;
+                    is-active) printf 'inactive\n'; return 3 ;;
+                  esac
+                }}
+                workflow_helper() {{
+                  [[ "$1" == show ]] && printf '%s\n' '{{"listen":"127.0.0.1:18100","models":{{}},"pools":{{}},"adapters":{{}}}}'
+                }}
+                cmd_workflow status
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        lines = completed.stdout.splitlines()
+        self.assertEqual(
+            lines[0],
+            "LLMCtl workflow: configured=yes enabled=not-installed active=inactive",
+        )
+        self.assertNotIn("disabled active=inactive", completed.stdout)
+
+    def test_workflow_enable_names_the_disabled_route_in_recovery_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = pathlib.Path(directory) / "state"
+            config_dir = pathlib.Path(directory) / "config"
+            workflow_dir = state_dir / "workflow"
+            workflow_dir.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            (workflow_dir / "workflow.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "listen": "127.0.0.1:18100",
+                        "models": {
+                            "llmctl-workflow-ornith-1.0-35b-fp8": {
+                                "enabled": False,
+                                "base_model": "ornith-1.0-35b-fp8",
+                                "pool": "text-generation",
+                            }
+                        },
+                        "pools": {"text-generation": {"targets": []}},
+                        "adapters": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_STATE_DIR={state_dir!s}
+                export LLM_CLUSTER_CONFIG_DIR={config_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                require_root() {{ :; }}
+                load_config() {{ :; }}
+                ensure_workflow_env() {{ :; }}
+                workflow_check_config() {{ :; }}
+                cmd_workflow enable
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "llmctl workflow model enable llmctl-workflow-ornith-1.0-35b-fp8",
+            completed.stderr,
+        )
+
     def test_huggingface_model_search_runs_network_preflight_before_catalog(self):
         output = run_bash(
             r"""

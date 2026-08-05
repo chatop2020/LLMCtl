@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.3.2"
+readonly CTL_VERSION="3.3.3"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -823,8 +823,12 @@ cmd_workflow() {
     enable)
       ensure_workflow_env
       workflow_check_config
+      local first_disabled_model
+      first_disabled_model=$(jq -r \
+        '[.models | to_entries[] | select(.value.enabled != true) | .key][0] // empty' \
+        "${WORKFLOW_CONFIG}")
       jq -e '[.models[]|select(.enabled == true)]|length > 0' "${WORKFLOW_CONFIG}" >/dev/null || \
-        die "没有已启用的工作流路由；请先运行 llmctl workflow model enable <公开ID>"
+        die "没有已启用的工作流路由；请先运行：llmctl workflow model enable ${first_disabled_model:-<公开ID>}"
       workflow_helper check-targets | jq .
       [[ -r "${WORKFLOW_UNIT_SOURCE}" ]] || die "缺少工作流 systemd 模板：${WORKFLOW_UNIT_SOURCE}"
       install -m 0644 "${WORKFLOW_UNIT_SOURCE}" "${WORKFLOW_SERVICE_UNIT}"
@@ -853,10 +857,18 @@ cmd_workflow() {
       curl --noproxy '*' -fsS --max-time 3 "${origin}/readyz" | jq .
       ;;
     status)
+      local workflow_enabled_state workflow_active_state
+      workflow_enabled_state=$(systemctl is-enabled llm-workflow.service 2>/dev/null || true)
+      workflow_active_state=$(systemctl is-active llm-workflow.service 2>/dev/null || true)
+      case "${workflow_enabled_state}" in
+        enabled|enabled-runtime|static|indirect|disabled|masked) ;;
+        not-found|"") workflow_enabled_state=not-installed ;;
+      esac
+      [[ -n "${workflow_active_state}" ]] || workflow_active_state=inactive
       printf 'LLMCtl workflow: configured=%s enabled=%s active=%s\n' \
         "$([[ -r "${WORKFLOW_CONFIG}" ]] && printf yes || printf no)" \
-        "$(systemctl is-enabled llm-workflow.service 2>/dev/null || printf disabled)" \
-        "$(systemctl is-active llm-workflow.service 2>/dev/null || printf inactive)"
+        "${workflow_enabled_state}" \
+        "${workflow_active_state}"
       [[ ! -x "${WORKFLOW_RUNTIME}" ]] || "${WORKFLOW_RUNTIME}" --version
       if [[ -r "${WORKFLOW_CONFIG}" ]]; then
         workflow_helper show | jq '{listen,models,pools,adapters:(.adapters|keys)}'

@@ -4204,7 +4204,9 @@ onBeforeUnmount(() => {
               <p>
                 先由维护人员执行 <code>llmctl workflow status</code>。若
                 <code>configured=yes</code> 但服务为 <code>inactive</code>，不要使用
-                <code>--force</code> 覆盖配置；启用所需路由后依次执行
+                <code>--force</code> 覆盖配置。若状态中的模型为
+                <code>enabled: false</code>，先复制该模型 ID 并执行
+                <code>llmctl workflow model enable &lt;模型ID&gt;</code>，再依次执行
                 <code>llmctl workflow check</code> 与 <code>llmctl workflow enable</code>。
                 仅在 <code>configured=no</code> 时执行 <code>llmctl workflow init</code>。
                 这些操作不会重启现有 Router 或 GPU Worker。
