@@ -252,13 +252,21 @@ Private or gated Hugging Face models require `HF_TOKEN` when the installer runs,
 
 ## Upgrade the LLMCtl Control Plane
 
-`llmctl upgrade` upgrades only LLMCtl's own programs: the manager, model-catalog/runtime-optimization/gateway helpers, and the account-portal backend and built Vue assets. It does not rerun the installer or modify/restart model workers, the router, Docker, model weights, runtime configuration, secrets, or databases. If LLMCtl's own generated Nginx front-door file exists, it is transactionally refreshed after acceptance and Nginx is gracefully reloaded; all other sites remain untouched.
+`llmctl upgrade` upgrades only LLMCtl's own programs: the manager, model-catalog/runtime-optimization/gateway helpers, and the account-portal backend and built Vue assets. It does not rerun the installer or modify/restart model workers, Docker, model weights, worker configuration, or secrets. If a release needs a compatibility data migration (for example, promoting a public model ID to a native OmniRoute Combo so both `/v1/chat/completions` and `/v1/responses` work), the portal first uses SQLite's online backup API to snapshot the portal database, the OmniRoute database, and the legacy route records; migration is refused if that snapshot fails. If LLMCtl's generated Nginx front-door file exists, it is transactionally refreshed after acceptance and Nginx is gracefully reloaded; all other sites remain untouched.
 
 ```bash
 sudo llmctl upgrade
 ```
 
-The command first asks whether to fetch the latest `chatop2020/LLMCtl` `main` from GitHub, then pins the download to one exact commit. Its preflight checks both the GitHub API and the archive download host. Even after preflight succeeds, a real metadata or ZIP transfer failure triggers the saved maintenance proxy and then an interactive new-proxy prompt before retrying. The proxy is limited to this maintenance operation and may optionally be saved; it is never injected into inference services. The entire old control plane is backed up before replacement. If the account portal is running, only that service is stopped briefly for health acceptance, with automatic rollback on failure.
+The command first asks whether to fetch the latest `chatop2020/LLMCtl` `main` from GitHub, then pins the download to one exact commit. Its preflight checks both the GitHub API and the archive download host. Even after preflight succeeds, a real metadata or ZIP transfer failure triggers the saved maintenance proxy and then an interactive new-proxy prompt before retrying. The proxy is limited to this maintenance operation and may optionally be saved; it is never injected into inference services. The entire old control plane is backed up before replacement. If the account portal is running, only that service is stopped briefly for health acceptance. A failed acceptance automatically restores both the control plane and any runtime-data snapshot created by this upgrade. A normal upgrade does not restart the router or GPU workers.
+
+The upgrade output prints the exact backup directory. To roll back manually, run:
+
+```bash
+sudo llmctl rollback /var/backups/llmctl/control-plane-YYYYMMDDTHHMMSSZ
+```
+
+Rollback asks for confirmation and creates a `pre-rollback-*` safety copy of the current portal/gateway databases first. The router is stopped briefly only when an OmniRoute data snapshot must be restored; GPU workers and models remain untouched. Because rollback reverts portal and gateway configuration changes made after the snapshot, use the exact directory printed by the corresponding upgrade.
 
 For a fully offline server, upload a repository ZIP and run:
 

@@ -404,6 +404,7 @@ usage() {
   llmctl upgrade [--yes] [--proxy URL] [--save-proxy]
                                                 从 GitHub 升级 LLMCtl 控制面，不重启 Worker
   llmctl upgrade --from-zip FILE                从本地 ZIP 离线升级 LLMCtl 控制面
+  llmctl rollback <备份目录>                    恢复控制面及可用的门户/网关数据快照
   llmctl offline export <目录>                 导出镜像、模型和清单
   llmctl offline import <目录>                 从离线包导入
 
@@ -3733,6 +3734,17 @@ cmd_upgrade() {
   exec "${CONTROL_PLANE_UPDATER}" --lang "${language}" "$@"
 }
 
+cmd_rollback() {
+  require_root
+  require_installed
+  [[ $# == 1 ]] || die "用法：llmctl rollback /var/backups/llmctl/control-plane-TIMESTAMP"
+  [[ -x "${CONTROL_PLANE_UPDATER}" ]] || \
+    die "未找到控制面升级器 ${CONTROL_PLANE_UPDATER}"
+  local language="zh"
+  if [[ -r "${CLUSTER_ENV}" ]] && grep -Eq '^INTERFACE_LANGUAGE=en$' "${CLUSTER_ENV}"; then language="en"; fi
+  exec "${CONTROL_PLANE_UPDATER}" --lang "${language}" --rollback "$1"
+}
+
 cmd_update() {
   require_root; load_config
   local new_vllm="${VLLM_IMAGE}" new_gateway="${GATEWAY_IMAGE}" new_postgres="${POSTGRES_IMAGE}" was_cluster_active=0 stopped_for_proxy=0
@@ -4223,6 +4235,7 @@ main() {
     download) cmd_download "$@" ;;
     update) cmd_update "$@" ;;
     upgrade) cmd_upgrade "$@" ;;
+    rollback) cmd_rollback "$@" ;;
     offline) cmd_offline "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     _worker-start) cmd_worker_start "$@" ;;

@@ -59,6 +59,10 @@ WORKFLOW_GATEWAY_NODE_NAME = "LLMCtl workflow data plane"
 WORKFLOW_GATEWAY_CONNECTION_NAME = "LLMCtl workflow"
 WORKFLOW_GATEWAY_PREFIX = "llmctl-workflow"
 WORKFLOW_GATEWAY_MANAGED_DESCRIPTION = "Managed by LLMCtl workflow data plane"
+PUBLIC_COMBO_MANAGED_DESCRIPTION = "Managed by LLMCtl account portal public model"
+PUBLIC_COMBO_MIGRATION_NAME = "responses-native-public-combo-v1"
+PUBLIC_COMBO_BACKUP_MAX_AGE_SECONDS = 15 * 60
+PUBLIC_COMBO_MIGRATION_DELAY_SECONDS = 15
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1794,6 +1798,55 @@ class OmniRouteClient:
 
     def combos(self) -> list[dict[str, Any]]:
         return self.items(self.request("GET", "/api/combos?limit=1000"), "combos")
+
+    def upsert_combo(
+        self, combo_id: str, payload: dict[str, Any], active: bool = True
+    ) -> tuple[str, bool]:
+        """Create or update a native OmniRoute combo and return (id, created)."""
+        if combo_id:
+            response = self.request(
+                "PUT",
+                f"/api/combos/{urllib.parse.quote(combo_id, safe='')}",
+                {**payload, "isActive": active},
+            )
+            created = False
+        else:
+            response = self.request("POST", "/api/combos", payload)
+            created = True
+        combo = response.get("combo", response) if isinstance(response, dict) else {}
+        result = str(combo.get("id", combo_id)) if isinstance(combo, dict) else combo_id
+        if not result:
+            # OmniRoute releases have returned both a raw combo and a wrapped
+            # combo. Refetching by name keeps the client compatible with both.
+            result = str(
+                next(
+                    (
+                        item.get("id", "")
+                        for item in self.combos()
+                        if str(item.get("name", "")) == str(payload.get("name", ""))
+                    ),
+                    "",
+                )
+            )
+        if not result:
+            raise RuntimeError("OmniRoute did not return the combo id")
+        if created and not active:
+            self.request(
+                "PUT",
+                f"/api/combos/{urllib.parse.quote(result, safe='')}",
+                {"isActive": False},
+            )
+        return result, created
+
+    def set_combo_active(self, combo_id: str, active: bool) -> None:
+        self.request(
+            "PUT",
+            f"/api/combos/{urllib.parse.quote(combo_id, safe='')}",
+            {"isActive": active},
+        )
+
+    def delete_combo(self, combo_id: str) -> None:
+        self.request("DELETE", f"/api/combos/{urllib.parse.quote(combo_id, safe='')}")
 
     def sync_workflow_routes(
         self, workflow_config: dict[str, Any], workflow_secret: str
@@ -3836,6 +3889,126 @@ class PortalControlPlane:
         self.lock = threading.RLock()
         self.usage_reconciled_at: dict[str, int] = {}
         self.free_visibility_reconciled_at = 0
+        self.public_combo_backup_dir: pathlib.Path | None = None
+
+    @staticmethod
+    def _sqlite_online_backup(source: pathlib.Path, destination: pathlib.Path) -> None:
+        """Create a standalone SQLite snapshot while the source may be live."""
+        if not source.is_file():
+            raise RuntimeError(f"SQLite source does not exist: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(source), timeout=30) as source_db:
+            with sqlite3.connect(str(destination), timeout=30) as backup_db:
+                source_db.backup(backup_db)
+                result = backup_db.execute("PRAGMA quick_check").fetchone()
+                if not result or result[0] != "ok":
+                    raise RuntimeError(f"SQLite backup quick_check failed: {destination}")
+        os.chmod(destination, 0o600)
+
+    def _migration_backup_directory(self) -> pathlib.Path:
+        configured = os.environ.get("LLMCTL_BACKUP_ROOT", "").strip()
+        production = str(self.config.db_path).startswith("/var/lib/llm-cluster/")
+        root = pathlib.Path(
+            configured or ("/var/backups/llmctl" if production else self.config.db_path.parent / "backups")
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        os.chmod(root, 0o700)
+        candidates = sorted(
+            (path for path in root.glob("control-plane-*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates and time.time() - candidates[0].stat().st_mtime <= PUBLIC_COMBO_BACKUP_MAX_AGE_SECONDS:
+            return candidates[0]
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = root / f"routing-migration-{timestamp}"
+        destination.mkdir(mode=0o700)
+        return destination
+
+    def prepare_public_combo_migration_backup(self) -> pathlib.Path | None:
+        """Snapshot both SQLite control stores before the first route migration."""
+        if self.public_combo_backup_dir is not None:
+            return self.public_combo_backup_dir
+        with self.db.connect() as connection:
+            legacy_rows = self.rows(
+                connection.execute(
+                    "SELECT id,public_model_id,source_ref,source_model,mapping_kind,"
+                    "mapping_id,status FROM published_models WHERE source_kind='combo' "
+                    "AND mapping_kind NOT IN ('native-combo','source-combo') ORDER BY created_at,id"
+                ).fetchall()
+            )
+        if not legacy_rows:
+            return None
+
+        backup_dir = self._migration_backup_directory()
+        data_dir = backup_dir / "runtime-data"
+        manifest_path = data_dir / "runtime-data.json"
+        if manifest_path.is_file():
+            self.public_combo_backup_dir = backup_dir
+            return backup_dir
+        data_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(data_dir, 0o700)
+        entries: list[dict[str, Any]] = []
+
+        portal_backup = data_dir / "portal" / self.config.db_path.name
+        self._sqlite_online_backup(self.config.db_path, portal_backup)
+        entries.append(
+            {
+                "role": "account-portal",
+                "source": str(self.config.db_path),
+                "backup": str(portal_backup.relative_to(backup_dir)),
+                "mode": oct(self.config.db_path.stat().st_mode & 0o777),
+            }
+        )
+
+        gateway_dir = self.config.db_path.parent.parent / "gateway"
+        gateway_databases = sorted(
+            {
+                path
+                for pattern in ("*.sqlite", "*.db")
+                for path in gateway_dir.glob(pattern)
+                if path.is_file()
+            }
+        )
+        production = str(self.config.db_path).startswith("/var/lib/llm-cluster/")
+        if production and not gateway_databases:
+            raise RuntimeError(f"OmniRoute SQLite database not found under {gateway_dir}")
+        for source in gateway_databases:
+            backup = data_dir / "gateway" / source.name
+            self._sqlite_online_backup(source, backup)
+            entries.append(
+                {
+                    "role": "omniroute",
+                    "source": str(source),
+                    "backup": str(backup.relative_to(backup_dir)),
+                    "mode": oct(source.stat().st_mode & 0o777),
+                }
+            )
+
+        temporary = manifest_path.with_suffix(".json.new")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "migration": PUBLIC_COMBO_MIGRATION_NAME,
+                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "databases": entries,
+                    "legacy_routes": legacy_rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(manifest_path)
+        self.public_combo_backup_dir = backup_dir
+        print(
+            f"[account-portal] pre-migration SQLite snapshot: {backup_dir}",
+            flush=True,
+        )
+        return backup_dir
 
     @staticmethod
     def rows(rows: Any) -> list[dict[str, Any]]:
@@ -3883,7 +4056,12 @@ class PortalControlPlane:
                     kind = str(member.get("kind", ""))
                     if kind in {"combo", "combo-ref", "combo_ref"}:
                         nested_id = str(
-                            member.get("comboId", member.get("combo_id", member.get("id", "")))
+                            member.get(
+                                "comboName",
+                                member.get(
+                                    "comboId", member.get("combo_id", member.get("id", ""))
+                                ),
+                            )
                         )
                         nested = by_id.get(nested_id) or by_name.get(nested_id)
                         if nested:
@@ -4092,6 +4270,161 @@ class PortalControlPlane:
                 "INSERT OR IGNORE INTO model_access(model_id,subject_type,subject_id,created_at) VALUES(?, 'all', '', ?)",
                 (model_id, stamp),
             )
+
+    @staticmethod
+    def _source_combo(
+        combos: list[dict[str, Any]], source_ref: str, source_model: str
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                combo
+                for combo in combos
+                if (source_ref and str(combo.get("id", "")) == source_ref)
+                or (source_model and str(combo.get("name", "")) == source_model)
+            ),
+            None,
+        )
+
+    def ensure_public_combo_route(
+        self,
+        public_id: str,
+        source_ref: str,
+        source_model: str,
+        published: bool,
+    ) -> dict[str, Any]:
+        """Expose a combo-backed public ID as an actual native combo.
+
+        OmniRoute's Responses API resolves bare model names before applying
+        model-to-combo mappings. A mapping-only public ID can therefore be
+        rewritten to a provider-qualified model and rejected by key policy.
+        A one-step nested combo keeps the public ID native while the original
+        combo continues to own worker discovery, health and load balancing.
+        """
+        combos = self.omni.combos()
+        source = self._source_combo(combos, source_ref, source_model)
+        if not source:
+            raise ValueError("combo id is required")
+        source_id = str(source.get("id", ""))
+        source_name = str(source.get("name", ""))
+        if not source_id or not source_name:
+            raise RuntimeError("OmniRoute returned an invalid source combo")
+        if public_id == source_name:
+            return {
+                "mapping_kind": "source-combo",
+                "mapping_id": source_id,
+                "source_ref": source_id,
+                "source_model": source_name,
+                "created": False,
+            }
+
+        existing = next(
+            (combo for combo in combos if str(combo.get("name", "")) == public_id),
+            None,
+        )
+        if existing and str(existing.get("description", "")) != PUBLIC_COMBO_MANAGED_DESCRIPTION:
+            raise RuntimeError(
+                f"OmniRoute combo {public_id!r} already exists and is not managed by LLMCtl"
+            )
+        payload: dict[str, Any] = {
+            "name": public_id,
+            "description": PUBLIC_COMBO_MANAGED_DESCRIPTION,
+            "models": [
+                {
+                    "kind": "combo-ref",
+                    "comboName": source_name,
+                    "label": f"LLMCtl public model → {source_name}",
+                }
+            ],
+            "strategy": "priority",
+        }
+        context_length = source.get("context_length")
+        if isinstance(context_length, int) and context_length >= 1000:
+            payload["context_length"] = context_length
+        combo_id, created = self.omni.upsert_combo(
+            str(existing.get("id", "")) if existing else "",
+            payload,
+            active=published,
+        )
+        return {
+            "mapping_kind": "native-combo",
+            "mapping_id": combo_id,
+            "source_ref": source_id,
+            "source_model": source_name,
+            "created": created,
+        }
+
+    def _delete_published_route(
+        self, mapping_kind: str, mapping_id: str, public_id: str
+    ) -> None:
+        if mapping_kind == "combo" and mapping_id:
+            self.omni.delete_combo_mapping(mapping_id)
+        elif mapping_kind == "native-combo" and mapping_id:
+            self.omni.delete_combo(mapping_id)
+        elif mapping_kind == "alias" and public_id:
+            self.omni.delete_model_alias(public_id)
+
+    def reconcile_public_combo_routes(self) -> dict[str, int]:
+        """Idempotently migrate legacy combo mappings without stopping traffic."""
+        self.prepare_public_combo_migration_backup()
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM published_models WHERE source_kind='combo' "
+                "ORDER BY created_at,id"
+            ).fetchall()
+        migrated = unchanged = failed = 0
+        for row in rows:
+            old_kind = str(row["mapping_kind"] or "")
+            old_id = str(row["mapping_id"] or "")
+            public_id = str(row["public_model_id"] or "")
+            try:
+                route = self.ensure_public_combo_route(
+                    public_id,
+                    str(row["source_ref"] or ""),
+                    str(row["source_model"] or ""),
+                    str(row["status"] or "") == "published",
+                )
+                new_kind = str(route["mapping_kind"])
+                new_id = str(route["mapping_id"])
+                changed = (
+                    old_kind != new_kind
+                    or old_id != new_id
+                    or str(row["source_ref"] or "") != str(route["source_ref"])
+                    or str(row["source_model"] or "") != str(route["source_model"])
+                )
+                # The native route is already live. Retire only the superseded
+                # portal-owned route; user keys keep the same allowed combo ID.
+                if old_kind in {"combo", "native-combo", "alias"} and (
+                    old_kind != new_kind or old_id != new_id
+                ):
+                    try:
+                        self._delete_published_route(old_kind, old_id, public_id)
+                    except RuntimeError as error:
+                        if "HTTP 404" not in str(error):
+                            raise
+                with self.db.connect() as connection:
+                    connection.execute(
+                        "UPDATE published_models SET source_ref=?,source_model=?,"
+                        "mapping_kind=?,mapping_id=?,updated_at=? WHERE id=?",
+                        (
+                            route["source_ref"],
+                            route["source_model"],
+                            new_kind,
+                            new_id,
+                            now(),
+                            row["id"],
+                        ),
+                    )
+                migrated += 1 if changed else 0
+                unchanged += 0 if changed else 1
+            except Exception as error:
+                failed += 1
+                print(
+                    f"[account-portal] public combo reconciliation warning "
+                    f"(model={public_id}): {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return {"migrated": migrated, "unchanged": unchanged, "failed": failed}
 
     def effective_models(self, user_id: str) -> list[dict[str, Any]]:
         with self.db.connect() as connection:
@@ -4402,21 +4735,24 @@ class PortalControlPlane:
         mutated_mapping = False
         try:
             if source_kind == "combo":
-                if not source_ref:
-                    combo = next(
-                        (item for item in self.omni.combos() if str(item.get("name", "")) == source_model),
-                        None,
-                    )
-                    source_ref = str(combo.get("id", "")) if combo else ""
-                if not source_ref:
-                    raise ValueError("combo id is required")
-                reuse_id = old_mapping_id if old_mapping_kind == "combo" else ""
-                mapping_id = self.omni.set_combo_mapping(
-                    public_id, source_ref, reuse_id, status == "published"
+                route = self.ensure_public_combo_route(
+                    public_id,
+                    source_ref,
+                    source_model,
+                    status == "published",
                 )
-                mapping_kind = "combo"
-                mutated_mapping = bool(reuse_id)
-                created_mapping = not mutated_mapping
+                mapping_id = str(route["mapping_id"])
+                mapping_kind = str(route["mapping_kind"])
+                source_ref = str(route["source_ref"])
+                source_model = str(route["source_model"])
+                created_mapping = bool(route["created"])
+                mutated_mapping = bool(
+                    existing
+                    and not created_mapping
+                    and old_mapping_kind == "native-combo"
+                    and old_mapping_id == mapping_id
+                    and old_public_id == public_id
+                )
             elif public_id != source_model:
                 mapping_id = self.omni.set_model_alias(public_id, source_model)
                 mapping_kind = "alias"
@@ -4524,16 +4860,15 @@ class PortalControlPlane:
             permission_sync = self.sync_all_users()
             # Remove a superseded alias/mapping only after the new OmniRoute
             # route, portal policy and user permissions have all committed.
-            if old_mapping_kind == "combo" and old_mapping_id and (
-                mapping_kind != "combo" or mapping_id != old_mapping_id
+            if old_mapping_kind in {"combo", "native-combo", "alias"} and (
+                old_mapping_kind != mapping_kind
+                or old_mapping_id != mapping_id
+                or old_public_id != public_id
             ):
                 with contextlib.suppress(Exception):
-                    self.omni.delete_combo_mapping(old_mapping_id)
-            elif old_mapping_kind == "alias" and old_public_id and (
-                mapping_kind != "alias" or old_public_id != public_id
-            ):
-                with contextlib.suppress(Exception):
-                    self.omni.delete_model_alias(old_public_id)
+                    self._delete_published_route(
+                        old_mapping_kind, old_mapping_id, old_public_id
+                    )
             return {
                 "id": model_id,
                 "public_model_id": public_id,
@@ -4548,19 +4883,18 @@ class PortalControlPlane:
         except Exception:
             if created_mapping:
                 with contextlib.suppress(Exception):
-                    if mapping_kind == "combo":
-                        self.omni.delete_combo_mapping(mapping_id)
-                    elif mapping_kind == "alias":
-                        self.omni.delete_model_alias(public_id)
+                    self._delete_published_route(
+                        mapping_kind, mapping_id, public_id
+                    )
             elif mutated_mapping and existing:
                 # Restore the last committed OmniRoute mapping when live test,
                 # policy validation, or SQLite persistence fails.
                 with contextlib.suppress(Exception):
-                    if old_mapping_kind == "combo":
-                        self.omni.set_combo_mapping(
+                    if old_mapping_kind == "native-combo":
+                        self.ensure_public_combo_route(
                             old_public_id,
                             old_source_ref,
-                            old_mapping_id,
+                            old_source_model,
                             old_status == "published",
                         )
                     elif old_mapping_kind == "alias":
@@ -4591,6 +4925,8 @@ class PortalControlPlane:
                     self.omni.set_combo_mapping(
                         model["public_model_id"], model["source_ref"], model["mapping_id"], False
                     )
+                elif model["mapping_kind"] == "native-combo" and model["mapping_id"]:
+                    self.omni.set_combo_active(str(model["mapping_id"]), False)
                 elif model["mapping_kind"] == "alias":
                     self.omni.delete_model_alias(model["public_model_id"])
             except Exception:
@@ -6082,7 +6418,17 @@ class PortalServer:
         self.omni = OmniRouteClient(config)
         self.workflow = WorkflowClient()
         self.control = PortalControlPlane(config, self.db, self.omni)
+        # The process performing the first upgrade may still be the previous
+        # release's upgrader.  Let its health acceptance and file rollback
+        # window finish before mutating OmniRoute or either SQLite database.
+        # A failed control-plane upgrade therefore cannot leave a half-applied
+        # Responses API route migration behind.
+        self.route_migration_due = (
+            time.monotonic() + PUBLIC_COMBO_MIGRATION_DELAY_SECONDS
+        )
+        self.route_migration_finished = False
         try:
+            self.control.prepare_public_combo_migration_backup()
             self.control.seed_managed_model()
             self.db.finalize_legacy_billing_migration()
         except Exception as error:
@@ -6095,15 +6441,41 @@ class PortalServer:
         self.httpd = PortalHTTPServer((config.bind, config.port), PortalHandler)
         self.httpd.app = self  # type: ignore[attr-defined]
 
+    def reconcile_public_routes_after_acceptance(self) -> None:
+        if self.route_migration_finished or time.monotonic() < self.route_migration_due:
+            return
+        try:
+            route_migration = self.control.reconcile_public_combo_routes()
+        except Exception as error:
+            # Keep the legacy routes serving traffic and retry later.  The
+            # backup routine fails closed before any gateway route is changed.
+            self.route_migration_due = time.monotonic() + 60
+            print(
+                f"[account-portal] delayed public combo migration warning: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        self.route_migration_finished = True
+        if route_migration["migrated"] or route_migration["failed"]:
+            print(
+                "[account-portal] public combo reconciliation: "
+                f"migrated={route_migration['migrated']}, "
+                f"unchanged={route_migration['unchanged']}, "
+                f"failed={route_migration['failed']}",
+                flush=True,
+            )
+
     def maintenance_loop(self) -> None:
         if self.stop_event.wait(2):
             return
         while not self.stop_event.is_set():
             try:
+                self.reconcile_public_routes_after_acceptance()
                 self.control.background_tick()
             except Exception as error:
                 print(f"[account-portal] maintenance warning: {error}", file=sys.stderr, flush=True)
-            self.stop_event.wait(60)
+            self.stop_event.wait(5 if not self.route_migration_finished else 60)
 
     def billing_loop(self) -> None:
         """Settle completed calls promptly while `/v1` stays gateway-direct."""

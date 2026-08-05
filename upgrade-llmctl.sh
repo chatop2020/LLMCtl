@@ -16,6 +16,7 @@ readonly CLUSTER_ENV="${CONFIG_DIR}/cluster.env"
 readonly RELEASE_ENV="/var/lib/llm-cluster/control-plane-version.env"
 readonly BACKUP_ROOT="/var/backups/llmctl"
 readonly ACCOUNT_SERVICE="llm-account.service"
+readonly ROUTER_SERVICE="llm-router.service"
 readonly MANAGED_NGINX_CONFIG="/etc/nginx/conf.d/llm-cluster.conf"
 readonly DEFAULT_NO_PROXY="127.0.0.1,localhost,::1"
 readonly KEEPWARM_UNIT_SOURCE_DIR="/usr/local/lib/llm-cluster/systemd"
@@ -33,6 +34,7 @@ ASSUME_YES=0
 NON_INTERACTIVE=0
 CHECK_ONLY=0
 FORCE=0
+ROLLBACK_SOURCE=""
 WORK_DIR=""
 ARCHIVE_PATH=""
 ARCHIVE_SHA256=""
@@ -58,9 +60,11 @@ usage() {
 用法 / Usage:
   sudo llmctl upgrade [选项]
   sudo llmctl upgrade --from-zip /path/to/LLMCtl.zip
+  sudo llmctl rollback /var/backups/llmctl/control-plane-TIMESTAMP
 
 选项 / Options:
   --from-zip FILE          使用本地 ZIP，不访问 GitHub
+  --rollback DIR           恢复指定控制面及其运行数据快照
   --proxy URL              本次维护代理，例如 http://192.168.1.20:7890
   --save-proxy             保存代理供后续 llmctl 维护使用
   --force                  即使提交记录相同也重新安装
@@ -86,6 +90,7 @@ parse_args() {
   while (( $# )); do
     case "$1" in
       --from-zip) need_value "$@"; LOCAL_ZIP="$2"; shift 2 ;;
+      --rollback) need_value "$@"; ROLLBACK_SOURCE="$2"; shift 2 ;;
       --proxy) need_value "$@"; PROXY_URL="$2"; shift 2 ;;
       --save-proxy) SAVE_PROXY=1; shift ;;
       --force) FORCE=1; shift ;;
@@ -133,20 +138,73 @@ cleanup_work_dir() {
   [[ -z "${WORK_DIR}" || ! -d "${WORK_DIR}" ]] || rm -rf -- "${WORK_DIR}"
 }
 
-restore_control_plane() {
-  set +e
-  warn "$(l10n '升级未通过验收，正在自动恢复旧控制面。' 'Upgrade acceptance failed; restoring the previous control plane automatically.')"
-  systemctl stop "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true
-  if [[ -r "${BACKUP_DIR}/manifest.tsv" ]]; then
-    while read -r entry_type source destination mode restart; do
-      [[ -n "${entry_type}" && "${entry_type}" != \#* ]] || continue
-      rm -rf -- "${destination}"
-      if [[ -e "${BACKUP_DIR}/files${destination}" ]]; then
-        install -d -m 0755 "$(dirname "${destination}")"
-        cp -a "${BACKUP_DIR}/files${destination}" "${destination}"
-      fi
-    done <"${BACKUP_DIR}/manifest.tsv"
-  fi
+runtime_data_manifest() {
+  printf '%s/runtime-data/runtime-data.json\n' "$1"
+}
+
+runtime_data_has_role() {
+  local backup_dir="$1" role="$2" manifest
+  manifest=$(runtime_data_manifest "${backup_dir}")
+  [[ -r "${manifest}" ]] || return 1
+  python3 - "${manifest}" "${role}" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if any(item.get("role") == sys.argv[2] for item in data.get("databases", [])) else 1)
+PY
+}
+
+restore_runtime_data() {
+  local backup_dir="$1" safety_dir="${2:-}" manifest
+  manifest=$(runtime_data_manifest "${backup_dir}")
+  [[ -r "${manifest}" ]] || return 0
+  python3 - "${backup_dir}" "${manifest}" "${safety_dir}" <<'PY'
+import json, os, pathlib, sqlite3, sys, uuid
+
+root = pathlib.Path(sys.argv[1]).resolve()
+manifest = json.load(open(sys.argv[2], encoding="utf-8"))
+safety = pathlib.Path(sys.argv[3]).resolve() if sys.argv[3] else None
+allowed = pathlib.Path("/var/lib/llm-cluster/omniroute").resolve()
+
+def online_backup(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(source), timeout=30) as source_db:
+        with sqlite3.connect(str(destination), timeout=30) as target_db:
+            source_db.backup(target_db)
+            result = target_db.execute("PRAGMA quick_check").fetchone()
+            if not result or result[0] != "ok":
+                raise SystemExit(f"SQLite snapshot failed quick_check: {destination}")
+    os.chmod(destination, 0o600)
+
+for item in manifest.get("databases", []):
+    source = pathlib.Path(str(item.get("source", ""))).resolve()
+    backup = (root / str(item.get("backup", ""))).resolve()
+    if os.path.commonpath((root, backup)) != str(root) or not backup.is_file():
+        raise SystemExit(f"unsafe or missing runtime backup: {backup}")
+    if os.path.commonpath((allowed, source)) != str(allowed):
+        raise SystemExit(f"runtime restore target is outside LLMCtl data: {source}")
+    if safety and source.is_file():
+        online_backup(source, safety / item.get("role", "database") / source.name)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    temporary = source.with_name(source.name + ".llmctl-restore-" + uuid.uuid4().hex)
+    online_backup(backup, temporary)
+    os.chmod(temporary, int(str(item.get("mode", "0o600")), 8))
+    os.replace(temporary, source)
+    for suffix in ("-wal", "-shm"):
+        with __import__("contextlib").suppress(FileNotFoundError):
+            pathlib.Path(str(source) + suffix).unlink()
+PY
+}
+
+restore_control_plane_files() {
+  [[ -r "${BACKUP_DIR}/manifest.tsv" ]] || return 0
+  while read -r entry_type source destination mode restart; do
+    [[ -n "${entry_type}" && "${entry_type}" != \#* ]] || continue
+    rm -rf -- "${destination}"
+    if [[ -e "${BACKUP_DIR}/files${destination}" ]]; then
+      install -d -m 0755 "$(dirname "${destination}")"
+      cp -a "${BACKUP_DIR}/files${destination}" "${destination}"
+    fi
+  done <"${BACKUP_DIR}/manifest.tsv"
   restore_managed_systemd_units >/dev/null 2>&1 || true
   if [[ -e "${BACKUP_DIR}/control-plane-version.env" ]]; then
     install -d -m 0755 "$(dirname "${RELEASE_ENV}")"
@@ -154,11 +212,28 @@ restore_control_plane() {
   else
     rm -f -- "${RELEASE_ENV}"
   fi
+}
+
+restore_control_plane() {
+  set +e
+  warn "$(l10n '升级未通过验收，正在自动恢复旧控制面。' 'Upgrade acceptance failed; restoring the previous control plane automatically.')"
+  systemctl stop "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true
+  if (( WORKFLOW_WAS_ACTIVE )); then
+    systemctl stop llm-workflow.service >/dev/null 2>&1 || true
+  fi
+  if runtime_data_has_role "${BACKUP_DIR}" omniroute; then
+    systemctl stop "${ROUTER_SERVICE}" >/dev/null 2>&1 || true
+  fi
+  restore_runtime_data "${BACKUP_DIR}" || true
+  restore_control_plane_files
+  if runtime_data_has_role "${BACKUP_DIR}" omniroute; then
+    systemctl start "${ROUTER_SERVICE}" >/dev/null 2>&1 || true
+  fi
   if (( ACCOUNT_WAS_ACTIVE )); then systemctl start "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true; fi
   if (( WORKFLOW_WAS_ACTIVE )) && [[ -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
     systemctl start llm-workflow.service >/dev/null 2>&1 || true
   fi
-  warn "$(l10n "已从 ${BACKUP_DIR} 恢复；Worker、模型、网关和数据库始终未修改。" "Restored from ${BACKUP_DIR}; workers, models, gateway, and databases were never modified.")"
+  warn "$(l10n "已从 ${BACKUP_DIR} 恢复控制面及可用的运行数据快照；GPU Worker 和模型未修改。" "Restored the control plane and any available runtime-data snapshot from ${BACKUP_DIR}; GPU workers and models were not modified.")"
 }
 
 on_exit() {
@@ -661,10 +736,61 @@ install_control_plane() {
   log "$(l10n "Router=${router_after}，运行 Worker=${workers_after}；两者均未重启。" "Router=${router_after}, running workers=${workers_after}; neither was restarted.")"
 }
 
+rollback_from_backup() {
+  (( EUID == 0 )) || die "$(l10n '回滚需要 root' 'Rollback requires root')"
+  command -v systemctl >/dev/null 2>&1 || die "systemctl unavailable"
+  local requested resolved root_resolved safety_dir account_port router_was_active=0
+  requested="${ROLLBACK_SOURCE}"
+  [[ -n "${requested}" && -d "${requested}" ]] || die "$(l10n "备份目录不存在：${requested}" "Backup directory does not exist: ${requested}")"
+  resolved=$(realpath -e -- "${requested}")
+  root_resolved=$(realpath -e -- "${BACKUP_ROOT}")
+  [[ "${resolved}" == "${root_resolved}"/control-plane-* || "${resolved}" == "${root_resolved}"/routing-migration-* ]] || \
+    die "$(l10n '只允许恢复 /var/backups/llmctl 下的 LLMCtl 备份目录' 'Only LLMCtl backup directories under /var/backups/llmctl may be restored')"
+  [[ -r "${resolved}/manifest.tsv" || -r "$(runtime_data_manifest "${resolved}")" ]] || \
+    die "$(l10n '备份目录既没有控制面清单，也没有运行数据清单' 'The backup contains neither a control-plane nor a runtime-data manifest')"
+  confirm "$(l10n "将恢复 ${resolved}。该快照之后的门户/网关配置变化会被回退；继续？[y/N] " "Restore ${resolved}? Portal/gateway configuration changes made after this snapshot will be reverted. Continue? [y/N] ")" 0 || {
+    log "$(l10n '用户取消回滚；没有修改任何文件或服务。' 'Rollback cancelled; no files or services were modified.')"
+    return 0
+  }
+
+  BACKUP_DIR="${resolved}"
+  systemctl is-active --quiet "${ACCOUNT_SERVICE}" && ACCOUNT_WAS_ACTIVE=1 || ACCOUNT_WAS_ACTIVE=0
+  systemctl is-active --quiet "${ROUTER_SERVICE}" && router_was_active=1 || router_was_active=0
+  systemctl is-active --quiet llm-workflow.service && WORKFLOW_WAS_ACTIVE=1 || WORKFLOW_WAS_ACTIVE=0
+  systemctl stop "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true
+  if (( WORKFLOW_WAS_ACTIVE )); then
+    systemctl stop llm-workflow.service >/dev/null 2>&1 || true
+  fi
+  if runtime_data_has_role "${BACKUP_DIR}" omniroute; then
+    systemctl stop "${ROUTER_SERVICE}"
+  fi
+  safety_dir="${BACKUP_ROOT}/pre-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 "${safety_dir}"
+  restore_runtime_data "${BACKUP_DIR}" "${safety_dir}"
+  restore_control_plane_files
+  if (( router_was_active )); then systemctl start "${ROUTER_SERVICE}"; fi
+  if (( ACCOUNT_WAS_ACTIVE )); then
+    systemctl start "${ACCOUNT_SERVICE}"
+    account_port=$(read_cluster_value ACCOUNT_PORT 8001)
+    wait_for_account_portal "${account_port}" || die "$(l10n '回滚后的账户门户未恢复健康；请检查 journalctl -u llm-account' 'The account portal is not healthy after rollback; inspect journalctl -u llm-account')"
+  fi
+  if (( WORKFLOW_WAS_ACTIVE )) && [[ -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
+    systemctl start llm-workflow.service
+  fi
+  log "$(l10n "回滚完成：${BACKUP_DIR}" "Rollback completed: ${BACKUP_DIR}")"
+  log "$(l10n "回滚前运行数据安全副本：${safety_dir}" "Pre-rollback runtime safety copy: ${safety_dir}")"
+  log "$(l10n 'GPU Worker、模型权重和 Worker 配置均未修改。' 'GPU workers, model weights, and worker configuration were not modified.')"
+}
+
 main() {
   parse_args "$@"
   select_language
   command -v python3 >/dev/null 2>&1 || die "python3 unavailable"
+  if [[ -n "${ROLLBACK_SOURCE}" ]]; then
+    [[ -z "${LOCAL_ZIP}" ]] || die "--rollback cannot be combined with --from-zip"
+    rollback_from_backup
+    return 0
+  fi
   if [[ -n "${LOCAL_ZIP}" ]]; then use_local_archive; else download_github_archive; fi
   (( UPGRADE_CANCELLED == 0 )) || return 0
   extract_archive_safely

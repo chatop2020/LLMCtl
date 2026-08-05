@@ -42,6 +42,10 @@ class FakeOmniRoute:
         self.hidden_models = {}
         self.call_log_details = {}
         self.combo_items = []
+        self.combo_upserts = []
+        self.deleted_combos = []
+        self.deleted_combo_mappings = []
+        self.combo_active_updates = []
         self.context_updates = []
         self.output_updates = []
         self.aliases = []
@@ -103,6 +107,33 @@ class FakeOmniRoute:
 
     def combos(self):
         return self.combo_items
+
+    def upsert_combo(self, combo_id, payload, active=True):
+        created = not bool(combo_id)
+        result_id = combo_id or f"public-combo-{len(self.combo_upserts) + 1}"
+        item = {"id": result_id, **payload, "isActive": active}
+        self.combo_items = [
+            existing
+            for existing in self.combo_items
+            if str(existing.get("id", "")) != result_id
+        ]
+        self.combo_items.append(item)
+        self.combo_upserts.append((result_id, payload, active, created))
+        return result_id, created
+
+    def set_combo_active(self, combo_id, active):
+        self.combo_active_updates.append((combo_id, active))
+        for combo in self.combo_items:
+            if str(combo.get("id", "")) == combo_id:
+                combo["isActive"] = active
+
+    def delete_combo(self, combo_id):
+        self.deleted_combos.append(combo_id)
+        self.combo_items = [
+            combo
+            for combo in self.combo_items
+            if str(combo.get("id", "")) != combo_id
+        ]
 
     def combo_builder_options(self):
         return {
@@ -187,6 +218,9 @@ class FakeOmniRoute:
 
     def set_combo_mapping(self, pattern, combo_id, mapping_id="", enabled=True):
         return mapping_id or "mapping-1"
+
+    def delete_combo_mapping(self, mapping_id):
+        self.deleted_combo_mappings.append(mapping_id)
 
     def set_model_alias(self, public_id, source_model):
         self.aliases.append((public_id, source_model))
@@ -1267,6 +1301,31 @@ class PortalIntegrationTests(unittest.TestCase):
             self.fake_omni.output_updates,
             [("local-a", "ornith-a", 24000), ("local-b", "ornith-b", 24000)],
         )
+        self.assertEqual(len(self.fake_omni.combo_upserts), 1)
+        public_combo = self.fake_omni.combo_upserts[0][1]
+        self.assertEqual(public_combo["name"], "gdn-inside")
+        self.assertEqual(
+            public_combo["description"], portal.PUBLIC_COMBO_MANAGED_DESCRIPTION
+        )
+        self.assertEqual(
+            public_combo["models"],
+            [
+                {
+                    "kind": "combo-ref",
+                    "comboName": "ornith-cluster",
+                    "label": "LLMCtl public model → ornith-cluster",
+                }
+            ],
+        )
+        with self.server.db.connect() as connection:
+            route = connection.execute(
+                "SELECT source_ref,source_model,mapping_kind,mapping_id "
+                "FROM published_models WHERE public_model_id='gdn-inside'"
+            ).fetchone()
+        self.assertEqual(route["source_ref"], "combo-1")
+        self.assertEqual(route["source_model"], "ornith-cluster")
+        self.assertEqual(route["mapping_kind"], "native-combo")
+        self.assertTrue(route["mapping_id"].startswith("public-combo-"))
         snapshot = self.server.control.admin_snapshot()
         model = next(item for item in snapshot["models"] if item["public_model_id"] == "gdn-inside")
         self.assertEqual(model["description"], "公司内部模型")
@@ -1282,6 +1341,92 @@ class PortalIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("ornith-1.0-35b-fp8", self.fake_omni.permissions[-1][2])
         self.assertNotIn("combo-internal", self.fake_omni.permissions[-1][2])
+
+    def test_legacy_combo_mapping_migrates_idempotently_with_sqlite_snapshot(self):
+        self.insert_control_user_and_model()
+        gateway_db = pathlib.Path(self.tempdir.name) / "gateway" / "storage.sqlite"
+        gateway_db.parent.mkdir(parents=True)
+        with sqlite3.connect(gateway_db) as connection:
+            connection.execute("CREATE TABLE route_marker(value TEXT NOT NULL)")
+            connection.execute("INSERT INTO route_marker(value) VALUES('before-migration')")
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-internal",
+                "name": "ornith-1.0-35b-fp8",
+                "description": "worker pool",
+                "models": [{"kind": "model", "providerId": "local", "modelId": "ornith"}],
+            }
+        ]
+        result = self.server.control.reconcile_public_combo_routes()
+        self.assertEqual(result, {"migrated": 1, "unchanged": 0, "failed": 0})
+        self.assertEqual(self.fake_omni.deleted_combo_mappings, ["mapping-1"])
+        self.assertEqual(self.fake_omni.combo_items[0]["id"], "combo-internal")
+        public = next(item for item in self.fake_omni.combo_items if item["name"] == "gdn-inside")
+        self.assertEqual(public["models"][0]["comboName"], "ornith-1.0-35b-fp8")
+        backup_dir = self.server.control.public_combo_backup_dir
+        self.assertIsNotNone(backup_dir)
+        manifest = json.loads(
+            (backup_dir / "runtime-data" / "runtime-data.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["migration"], portal.PUBLIC_COMBO_MIGRATION_NAME)
+        self.assertEqual(manifest["legacy_routes"][0]["mapping_id"], "mapping-1")
+        by_role = {entry["role"]: entry for entry in manifest["databases"]}
+        self.assertEqual(set(by_role), {"account-portal", "omniroute"})
+        portal_copy = backup_dir / by_role["account-portal"]["backup"]
+        with sqlite3.connect(portal_copy) as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            old = connection.execute(
+                "SELECT mapping_kind,mapping_id FROM published_models WHERE id='model-1'"
+            ).fetchone()
+        self.assertEqual(old, ("combo", "mapping-1"))
+        gateway_copy = backup_dir / by_role["omniroute"]["backup"]
+        with sqlite3.connect(gateway_copy) as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertEqual(
+                connection.execute("SELECT value FROM route_marker").fetchone()[0],
+                "before-migration",
+            )
+
+        again = self.server.control.reconcile_public_combo_routes()
+        self.assertEqual(again, {"migrated": 0, "unchanged": 1, "failed": 0})
+        self.assertEqual(
+            len([item for item in self.fake_omni.combo_items if item["name"] == "gdn-inside"]),
+            1,
+        )
+        self.server.control.sync_user("policy-user")
+        self.assertEqual(self.fake_omni.permissions[-1], ("policy-key", [], ["gdn-inside"], True))
+
+    def test_portal_server_defers_route_migration_until_upgrade_acceptance_window(self):
+        self.insert_control_user_and_model()
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-internal",
+                "name": "ornith-1.0-35b-fp8",
+                "description": "worker pool",
+                "models": [],
+            }
+        ]
+        self.server.reconcile_public_routes_after_acceptance()
+        self.assertEqual(self.fake_omni.combo_upserts, [])
+        self.server.route_migration_due = 0
+        self.server.reconcile_public_routes_after_acceptance()
+        self.assertTrue(self.server.route_migration_finished)
+        self.assertEqual(len(self.fake_omni.combo_upserts), 1)
+
+    def test_unmanaged_native_combo_collision_leaves_legacy_route_untouched(self):
+        self.insert_control_user_and_model()
+        self.fake_omni.combo_items = [
+            {"id": "combo-internal", "name": "ornith-1.0-35b-fp8", "models": []},
+            {"id": "manual-public", "name": "gdn-inside", "description": "manual"},
+        ]
+        result = self.server.control.reconcile_public_combo_routes()
+        self.assertEqual(result, {"migrated": 0, "unchanged": 0, "failed": 1})
+        self.assertEqual(self.fake_omni.deleted_combo_mappings, [])
+        with self.server.db.connect() as connection:
+            route = connection.execute(
+                "SELECT mapping_kind,mapping_id FROM published_models WHERE id='model-1'"
+            ).fetchone()
+        self.assertEqual(tuple(route), ("combo", "mapping-1"))
 
     def test_legacy_grant_cannot_reactivate_zero_balance_key(self):
         self.insert_control_user_and_model(paid=True)

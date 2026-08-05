@@ -252,13 +252,21 @@ Hugging Face 私有或 gated 模型需要在运行安装器时提供 `HF_TOKEN` 
 
 ## 升级 LLMCtl 控制面
 
-`llmctl upgrade` 只升级 LLMCtl 自身程序：管理命令、模型目录/调优/网关配置工具，以及账户门户后端和 Vue 静态资源。它不会重跑安装器，也不会修改或重启模型 Worker、Router、Docker、模型权重、运行配置、密钥或数据库。若存在 LLMCtl 自己生成的 Nginx 入口配置，升级验收完成后会事务式刷新并平滑 reload Nginx；其他站点保持不变。
+`llmctl upgrade` 只升级 LLMCtl 自身程序：管理命令、模型目录/调优/网关配置工具，以及账户门户后端和 Vue 静态资源。它不会重跑安装器，也不会修改或重启模型 Worker、Docker、模型权重、Worker 配置或密钥。若新版本需要兼容性数据迁移（例如把公开模型 ID 升级为 OmniRoute 原生 Combo 以同时支持 `/v1/chat/completions` 与 `/v1/responses`），账户门户会先使用 SQLite 在线备份 API 保存门户库、OmniRoute 库和旧路由记录，备份失败则拒绝迁移。若存在 LLMCtl 自己生成的 Nginx 入口配置，升级验收完成后会事务式刷新并平滑 reload Nginx；其他站点保持不变。
 
 ```bash
 sudo llmctl upgrade
 ```
 
-命令会先询问是否从 GitHub 获取 `chatop2020/LLMCtl` 的最新 `main`，锁定到明确提交后下载。网络预检会同时检查 GitHub API 与实际归档下载站点；即使预检通过，只要提交信息或 ZIP 的真实传输失败，也会依次尝试已保存的维护代理、询问新的代理并重试。代理只用于本次维护，可选择保存，不会注入推理服务。替换前会备份完整旧控制面；账户门户如正在运行，只短暂停止该服务并执行健康验收，失败自动回滚。
+命令会先询问是否从 GitHub 获取 `chatop2020/LLMCtl` 的最新 `main`，锁定到明确提交后下载。网络预检会同时检查 GitHub API 与实际归档下载站点；即使预检通过，只要提交信息或 ZIP 的真实传输失败，也会依次尝试已保存的维护代理、询问新的代理并重试。代理只用于本次维护，可选择保存，不会注入推理服务。替换前会备份完整旧控制面；账户门户如正在运行，只短暂停止该服务并执行健康验收，失败自动恢复控制面及本次升级产生的运行数据快照。正常升级不会重启 Router 或 GPU Worker。
+
+升级输出会打印精确备份目录。需要人工回退时执行：
+
+```bash
+sudo llmctl rollback /var/backups/llmctl/control-plane-YYYYMMDDTHHMMSSZ
+```
+
+回滚前会再次确认，并为当前门户/网关数据库再做一份 `pre-rollback-*` 安全副本。只有恢复 OmniRoute 数据快照时才会短暂停止 Router；GPU Worker 和模型始终不动。回滚会撤销该快照之后的门户与网关配置变化，因此应使用升级时打印的精确目录。
 
 服务器完全离线时，也可以上传仓库 ZIP 后执行：
 

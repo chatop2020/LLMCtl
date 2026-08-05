@@ -89,6 +89,8 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("cmd_upgrade() {", MANAGER)
         self.assertIn('exec "${CONTROL_PLANE_UPDATER}" --lang', MANAGER)
         self.assertIn('upgrade) cmd_upgrade "$@"', MANAGER)
+        self.assertIn('rollback) cmd_rollback "$@"', MANAGER)
+        self.assertIn('--rollback "$1"', MANAGER)
         self.assertIn("llmctl upgrade --from-zip FILE", MANAGER)
         self.assertIn(
             'install -m 755 "${UPGRADER_SOURCE}" /usr/local/lib/llm-cluster/upgrade-llmctl.sh',
@@ -101,9 +103,12 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
 
     def test_upgrader_preserves_runtime_and_only_refreshes_managed_nginx(self):
         source = UPGRADER.read_text(encoding="utf-8")
+        normal_upgrade = source.split("install_control_plane() {", 1)[1].split(
+            "rollback_from_backup() {", 1
+        )[0]
         self.assertIn('systemctl stop "${ACCOUNT_SERVICE}"', source)
-        self.assertNotIn("systemctl stop llm-router", source)
-        self.assertNotIn("systemctl restart llm-router", source)
+        self.assertNotIn('systemctl stop "${ROUTER_SERVICE}"', normal_upgrade)
+        self.assertNotIn('systemctl restart "${ROUTER_SERVICE}"', normal_upgrade)
         self.assertNotIn("systemctl stop llm-worker", source)
         self.assertNotIn("systemctl restart llm-worker", source)
         self.assertNotIn("systemctl restart docker", source)
@@ -120,6 +125,16 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("refresh_workflow_unit_if_installed()", source)
         self.assertIn('[[ -e "${WORKFLOW_SERVICE_UNIT}" ]] || return 0', source)
         self.assertNotIn("systemctl enable --now llm-workflow", source)
+
+    def test_upgrade_backup_and_explicit_rollback_cover_runtime_sqlite(self):
+        source = UPGRADER.read_text(encoding="utf-8")
+        self.assertIn("runtime-data/runtime-data.json", source)
+        self.assertIn("restore_runtime_data()", source)
+        self.assertIn("rollback_from_backup()", source)
+        self.assertIn('systemctl stop "${ROUTER_SERVICE}"', source)
+        self.assertIn("pre-rollback-", source)
+        self.assertIn("GPU Worker、模型权重和 Worker 配置均未修改", source)
+        self.assertGreaterEqual(source.count("systemctl stop llm-workflow.service"), 2)
 
     def test_local_zip_check_validates_without_deploying(self):
         with tempfile.TemporaryDirectory() as temporary:
