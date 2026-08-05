@@ -213,6 +213,19 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("document.hidden");
   });
 
+  it("separates CPU and memory from per-GPU small-multiple trends", () => {
+    expect(source).toContain("latestMonitorTrendValue");
+    expect(source).toContain("const verticalPadding = 2");
+    expect(source).toContain("monitorHistory.gpus");
+    expect(source).toContain("monitorGpuTrends");
+    expect(source).toContain("GPU 并行趋势");
+    expect(source).toContain('v-for="gpu in monitorGpuTrends"');
+    expect(source).not.toContain('<polyline class="gpu"');
+    expect(style).toMatch(/polyline\.cpu\s*\{[\s\S]*stroke-dasharray:\s*6 3/);
+    expect(style).toContain(".gpu-trend-grid");
+    expect(style).toContain(".gpu-mini-chart");
+  });
+
   it("keeps pluggable orchestration explicit, remote-capable and off the Python data path", () => {
     for (const marker of [
       "admin/workflow",

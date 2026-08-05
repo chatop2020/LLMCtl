@@ -3010,9 +3010,28 @@ td {
   font-size: 12px;
   font-weight: 700;
 }
+.trend-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.trend-legend span i {
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+  background: currentColor;
+}
+.trend-legend span.cpu i {
+  height: 2px;
+  background: repeating-linear-gradient(90deg, currentColor 0 6px, transparent 6px 9px);
+}
+.trend-legend small {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
 .trend-legend .cpu { color: #168dc0; }
 .trend-legend .memory { color: #846bc3; }
-.trend-legend .gpu { color: #2d9b76; }
 .trend-chart {
   position: relative;
   height: 130px;
@@ -3032,11 +3051,16 @@ td {
 .trend-chart polyline {
   fill: none;
   stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
-.trend-chart polyline.cpu { stroke: #168dc0; }
+.trend-chart polyline.cpu {
+  stroke: #168dc0;
+  stroke-width: 2.25;
+  stroke-dasharray: 6 3;
+}
 .trend-chart polyline.memory { stroke: #846bc3; }
-.trend-chart polyline.gpu { stroke: #2d9b76; }
 .trend-ceiling,
 .trend-floor {
   position: absolute;
@@ -3046,6 +3070,78 @@ td {
 }
 .trend-ceiling { top: 9px; }
 .trend-floor { bottom: 9px; }
+.gpu-trends {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #dce8ed;
+}
+.gpu-trends-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.gpu-trends-head strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+.gpu-trends-head span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.gpu-trend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+.gpu-trend-card {
+  min-width: 0;
+  padding: 10px 11px 8px;
+  border: 1px solid #d7e5eb;
+  border-radius: 9px;
+  background: #fbfdfe;
+}
+.gpu-trend-card header,
+.gpu-trend-card footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.gpu-trend-card header span,
+.gpu-trend-card header strong {
+  color: #217f63;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.gpu-trend-card footer {
+  color: var(--muted);
+  font-size: 10px;
+}
+.gpu-trend-card footer span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gpu-mini-chart {
+  height: 45px;
+  margin: 6px 0;
+  background: linear-gradient(#d9e8ee70 1px, transparent 1px) 0 0 / 100% 50%;
+}
+.gpu-mini-chart svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.gpu-mini-chart polyline {
+  fill: none;
+  stroke: #2d9b76;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
 .network-rate-summary {
   display: flex;
   flex-wrap: wrap;

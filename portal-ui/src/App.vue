@@ -124,7 +124,7 @@ const monitorHistory = reactive({
   sampledAt: [],
   cpu: [],
   memory: [],
-  gpu: [],
+  gpus: {},
   receive: [],
   transmit: [],
 });
@@ -396,6 +396,20 @@ const monitoredGpuMemory = computed(() => {
   const total = rows.reduce((sum, row) => sum + Number(row.memory_total_bytes || 0), 0);
   return { used, total, percent: total ? (used * 100) / total : null };
 });
+const monitorGpuTrends = computed(() =>
+  (systemMonitor.value?.gpu?.gpus || []).map((gpu) => {
+    const values = monitorHistory.gpus[String(gpu.index)] || [];
+    const valid = values
+      .filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)))
+      .map(Number);
+    return {
+      ...gpu,
+      values,
+      current: valid.length ? valid.at(-1) : null,
+      peak: valid.length ? Math.max(...valid) : null,
+    };
+  }),
+);
 const filteredMonitorProcesses = computed(() => {
   const query = monitorProcess.query.trim().toLocaleLowerCase();
   const rows = (systemMonitor.value?.processes || []).filter((row) =>
@@ -620,7 +634,9 @@ function clearAuthenticatedClientState() {
   admin.value = null;
   adminAnalytics.value = null;
   systemMonitor.value = null;
-  for (const values of Object.values(monitorHistory)) values.splice(0);
+  for (const key of ["sampledAt", "cpu", "memory", "receive", "transmit"])
+    monitorHistory[key].splice(0);
+  for (const key of Object.keys(monitorHistory.gpus)) delete monitorHistory.gpus[key];
   workflow.value = null;
   selectedUserIds.value = [];
   section.value = "overview";
@@ -664,21 +680,31 @@ function appendMonitorHistory(snapshot) {
   const last = monitorHistory.sampledAt.at(-1);
   if (last === snapshot.sampled_at) return;
   const gpuRows = snapshot.gpu?.gpus || [];
-  const gpuAverage = gpuRows.length
-    ? gpuRows.reduce((sum, row) => sum + Number(row.utilization_percent || 0), 0) /
-      gpuRows.length
-    : null;
+  const priorSampleCount = monitorHistory.sampledAt.length;
   const points = {
     sampledAt: snapshot.sampled_at,
     cpu: snapshot.cpu?.usage_percent,
     memory: snapshot.memory?.used_percent,
-    gpu: gpuAverage,
     receive: snapshot.network?.rx_bytes_per_second,
     transmit: snapshot.network?.tx_bytes_per_second,
   };
   for (const [key, value] of Object.entries(points)) {
     monitorHistory[key].push(value);
     if (monitorHistory[key].length > 60) monitorHistory[key].shift();
+  }
+  const sampledGpuIds = new Set();
+  for (const row of gpuRows) {
+    const key = String(row.index);
+    sampledGpuIds.add(key);
+    if (!monitorHistory.gpus[key])
+      monitorHistory.gpus[key] = Array(priorSampleCount).fill(null);
+    monitorHistory.gpus[key].push(row.utilization_percent);
+    if (monitorHistory.gpus[key].length > 60) monitorHistory.gpus[key].shift();
+  }
+  for (const [key, values] of Object.entries(monitorHistory.gpus)) {
+    if (sampledGpuIds.has(key)) continue;
+    values.push(null);
+    if (values.length > 60) values.shift();
   }
 }
 
@@ -1178,16 +1204,33 @@ function monitorTrendPoints(values, maximum = 100) {
   if (!values.length) return "";
   const width = 300;
   const height = 72;
-  const valid = values.filter((value) => Number.isFinite(Number(value)));
+  const verticalPadding = 2;
+  const drawableHeight = height - verticalPadding * 2;
+  const valid = values.filter(
+    (value) => value !== null && value !== undefined && Number.isFinite(Number(value)),
+  );
   const ceiling = Math.max(maximum || 0, ...valid.map(Number), 1);
   return values
     .map((value, index) => {
       const x = values.length === 1 ? width : (index / (values.length - 1)) * width;
       const number = Number.isFinite(Number(value)) ? Number(value) : 0;
-      const y = height - Math.max(0, Math.min(height, (number / ceiling) * height));
+      const y = height - verticalPadding -
+        Math.max(0, Math.min(drawableHeight, (number / ceiling) * drawableHeight));
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(" ");
+}
+
+function latestMonitorTrendValue(values) {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    if (
+      values[index] !== null &&
+      values[index] !== undefined &&
+      Number.isFinite(Number(values[index]))
+    )
+      return formatMonitorPercent(values[index]);
+  }
+  return "采样中";
 }
 
 function setMonitorProcessPage(page) {
@@ -4407,15 +4450,37 @@ onBeforeUnmount(() => {
               <section class="panel monitor-trends">
                 <div class="panel-head">
                   <div><h2>资源趋势</h2><p>当前 {{ monitorHistory.sampledAt.length }} 次采样，最多保留 60 次；离开本页即停止请求数据。</p></div>
-                  <div class="trend-legend"><span class="cpu">● CPU</span><span class="memory">● 内存</span><span class="gpu">● GPU</span></div>
+                  <div class="trend-legend">
+                    <span class="cpu"><i></i>CPU <small>{{ latestMonitorTrendValue(monitorHistory.cpu) }}</small></span>
+                    <span class="memory"><i></i>内存 <small>{{ latestMonitorTrendValue(monitorHistory.memory) }}</small></span>
+                  </div>
                 </div>
-                <div class="trend-chart" aria-label="CPU、内存和 GPU 使用率趋势">
+                <div class="trend-chart" aria-label="CPU 和内存使用率趋势">
                   <span class="trend-ceiling">100%</span><span class="trend-floor">0%</span>
                   <svg viewBox="0 0 300 72" preserveAspectRatio="none" role="img">
-                    <polyline class="cpu" :points="monitorTrendPoints(monitorHistory.cpu)" />
                     <polyline class="memory" :points="monitorTrendPoints(monitorHistory.memory)" />
-                    <polyline class="gpu" :points="monitorTrendPoints(monitorHistory.gpu)" />
+                    <polyline class="cpu" :points="monitorTrendPoints(monitorHistory.cpu)" />
                   </svg>
+                </div>
+                <div v-if="monitorGpuTrends.length" class="gpu-trends">
+                  <div class="gpu-trends-head">
+                    <strong>GPU 并行趋势</strong>
+                    <span>每张 GPU 独立显示，便于识别负载偏斜</span>
+                  </div>
+                  <div class="gpu-trend-grid">
+                    <article v-for="gpu in monitorGpuTrends" :key="gpu.index" class="gpu-trend-card">
+                      <header>
+                        <span>GPU {{ gpu.index }}</span>
+                        <strong>{{ formatMonitorPercent(gpu.current) }}</strong>
+                      </header>
+                      <div class="gpu-mini-chart">
+                        <svg viewBox="0 0 300 72" preserveAspectRatio="none" role="img" :aria-label="`GPU ${gpu.index} 使用率趋势`">
+                          <polyline :points="monitorTrendPoints(gpu.values)" />
+                        </svg>
+                      </div>
+                      <footer><span>{{ gpu.name }}</span><span>峰值 {{ formatMonitorPercent(gpu.peak) }}</span></footer>
+                    </article>
+                  </div>
                 </div>
                 <div class="network-rate-summary">
                   <span>当前下行 <strong>{{ formatRate(systemMonitor.network.rx_bytes_per_second) }}</strong></span>
