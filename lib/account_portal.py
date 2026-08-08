@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Small, dependency-free account portal for LLMCtl's OmniRoute mode.
+"""LLMCtl OmniRoute 模式使用的轻量、无第三方依赖账户门户。
 
-The portal owns a separate SQLite database.  It never reads or mutates
-OmniRoute's SQLite schema; all gateway operations use documented HTTP APIs.
-API key plaintext is returned once and is never persisted by the portal.
+门户使用独立的 SQLite 数据库，不读取或修改 OmniRoute 的 SQLite schema；
+所有网关操作均通过公开 HTTP API 完成。API Key 明文只返回一次，门户不持久化。
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.4.1"
+APP_VERSION = "3.5.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -775,7 +774,7 @@ def effective_public_urls(config: "Config", settings: dict[str, str]) -> tuple[s
     try:
         published = normalize_public_origin(settings.get("published_origin", ""))
     except ValueError:
-        # A manually corrupted SQLite value must not become an unsafe link.
+        # 手工损坏的 SQLite 值不能变成不安全链接。
         published = ""
     if published:
         return f"{published}/ui", published
@@ -1257,9 +1256,8 @@ class Database:
                     "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                     (key, value, now()),
                 )
-            # Older installs created blank public origins whenever registration
-            # started disabled. Repair those values so SMTP and later
-            # registration changes are not blocked by unrelated empty fields.
+            # 旧安装在注册初始关闭时会创建空公开来源；修复这些值，避免 SMTP
+            # 和后续注册变更被无关空字段阻断。
             for key in ("public_url", "api_public_url"):
                 connection.execute(
                     "UPDATE settings SET value=?,updated_at=? WHERE key=? AND TRIM(value)=''",
@@ -1271,9 +1269,8 @@ class Database:
             if "login_name" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN login_name TEXT")
             if "max_sessions" not in user_columns:
-                # Existing keys predate this control and remain unlimited until
-                # an administrator explicitly changes them. New registrations
-                # use default_max_sessions (1 by default).
+                # 既有 Key 早于此控制，管理员明确修改前保持不限；新注册使用
+                # default_max_sessions（默认 1）。
                 connection.execute(
                     "ALTER TABLE users ADD COLUMN max_sessions INTEGER NOT NULL DEFAULT 0"
                 )
@@ -1365,9 +1362,8 @@ class Database:
                     "ALTER TABLE usage_ledger ADD COLUMN grant_amount_micros INTEGER NOT NULL DEFAULT 0"
                 )
                 rebuild_usage_prices = True
-            # Historical rows only stored the wallet debit. Reconstruct the
-            # list-price charge from the immutable price snapshot so upgraded
-            # installations immediately show an honest billing breakdown.
+            # 历史记录只保存钱包扣款；根据不可变价格快照重建标价费用，让升级后
+            # 立即显示真实账单拆分。
             if rebuild_usage_prices:
                 for usage in connection.execute(
                     "SELECT id,input_tokens,output_tokens,cached_tokens,reasoning_tokens,"
@@ -1562,14 +1558,13 @@ class Database:
                 (micros_to_money(welcome), stamp),
             )
         elif blocked and not had_welcome_balance:
-            # initialize() inserted a provisional value for the new setting.
-            # Remove it so a later retry can still recognize and convert the
-            # legacy registration policy after model pricing becomes available.
+            # initialize() 为新设置写入了临时值；先删除它，使模型价格可用后的
+            # 重试仍能识别并转换旧注册策略。
             connection.execute(
                 "DELETE FROM settings WHERE key='default_welcome_balance'"
             )
         if not blocked:
-            # Retire every legacy source only after all grants were valued.
+            # 所有赠额完成估值后才停用旧来源。
             connection.execute(
                 "UPDATE token_grants SET status='disabled',converted_at=COALESCE(converted_at,?),"
                 "converted_amount_micros=COALESCE(converted_amount_micros,0),"
@@ -1712,9 +1707,8 @@ class OmniRouteClient:
             {
                 "name": f"portal:{user_id}:{email}",
                 "scopes": ["self:usage"],
-                # OmniRoute interprets empty allowlists as unrestricted. Start
-                # closed and let the portal publish the effective user/group
-                # policy before the plaintext key is returned to the user.
+                # OmniRoute 把空 allowlist 解释为不限；先关闭，门户发布有效用户/
+                # 用户组策略后才向用户返回 Key 明文。
                 "allowedModels": ["__llmctl_no_models__"],
                 "allowedCombos": ["__llmctl_no_combos__"],
                 "streamDefaultMode": "json",
@@ -1733,10 +1727,8 @@ class OmniRouteClient:
         try:
             response = self.request("GET", path)
         except RuntimeError as error:
-            # Older LLMCtl installations started OmniRoute with key reveal
-            # disabled. The native flag is hot-reloadable, so an upgraded
-            # portal can repair that state without restarting the gateway or
-            # any GPU worker.
+            # 旧 LLMCtl 安装启动 OmniRoute 时关闭了 Key 展示；原生开关可热加载，
+            # 升级门户无需重启网关或 GPU Worker 即可修复。
             if "HTTP 403" not in str(error) or "reveal is disabled" not in str(error):
                 raise
             self.request(
@@ -1849,8 +1841,8 @@ class OmniRouteClient:
         combo = response.get("combo", response) if isinstance(response, dict) else {}
         result = str(combo.get("id", combo_id)) if isinstance(combo, dict) else combo_id
         if not result:
-            # OmniRoute releases have returned both a raw combo and a wrapped
-            # combo. Refetching by name keeps the client compatible with both.
+            # 不同 OmniRoute 版本会返回原始或包装后的 Combo；按名称重新获取可
+            # 同时兼容两种形式。
             result = str(
                 next(
                     (
@@ -1916,10 +1908,8 @@ class OmniRouteClient:
         if not routes:
             raise ValueError("没有已启用的工作流模型路由")
 
-        # Fail before mutating provider state if an administrator already owns
-        # one of the deterministic combo names.  This keeps an explicit sync
-        # transactional from the operator's point of view: a naming conflict
-        # cannot leave a new node/connection/model set behind.
+        # 若管理员已占用确定性 Combo 名称，在修改 Provider 状态前失败。这样显式
+        # 同步从运维视角保持事务性，命名冲突不会残留新 Node/Connection/Model。
         combos = self.combos()
         existing_combos = {
             str(item.get("name", "")): item for item in combos if item.get("name")
@@ -2217,9 +2207,8 @@ class OmniRouteClient:
             "stream": False,
             "max_tokens": 32,
             "temperature": 0,
-            # Thinking-only output can look empty to an OpenAI-compatible
-            # gateway. Health checks need a short final answer, not a reasoning
-            # trace, so explicitly use both supported thinking-off controls.
+            # 只有思考内容的输出在 OpenAI 兼容网关看来可能为空。健康检查需要
+            # 简短最终答案而非推理轨迹，因此显式使用两种受支持的关闭思考控制。
             "reasoning_effort": "none",
             "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "user", "content": "Reply with exactly OK"}],
@@ -2874,7 +2863,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Never emit query strings: verification tokens must not enter journals.
+        # 永不输出查询字符串，验证码不得进入 journal。
         path = urllib.parse.urlsplit(self.path).path
         sys.stderr.write("[account-portal] %s %s %s\n" % (self.client_address[0], self.command, path))
 
@@ -3316,6 +3305,25 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                         },
                     )
             return
+        if path == "/portal-api/admin/model-deployments":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    self.json_response(200, self.app.models.snapshot())
+                except Exception as error:
+                    self.json_response(
+                        503,
+                        {
+                            "error": str(error),
+                            "available": False,
+                            "setup_command": "llmctl model status",
+                            "recovery_commands": [
+                                "llmctl model status",
+                                "systemctl status llm-model-control.service",
+                            ],
+                        },
+                    )
+            return
         if path == "/portal-api/admin":
             user, _ = self.api_require(admin=True)
             if user:
@@ -3403,8 +3411,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                     payload, user_identity(user)
                 )
             elif path == "/portal-api/admin/groups/save":
-                # save_group owns the fail-closed quiesce/mutate/resync cycle.
-                # Repeating it here needlessly disables every user key twice.
+                # save_group 自己负责故障关闭的静默/修改/重同步周期；此处重复会
+                # 无意义地禁用每个用户 Key 两次。
                 result = {"id": self.app.control.save_group(payload)}
             elif path == "/portal-api/admin/permissions/reconcile":
                 result = self.app.control.sync_all_users()
@@ -3427,6 +3435,22 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.omni.sync_workflow_routes(
                     workflow["config"], self.app.workflow.secret
                 )
+            elif path == "/portal-api/admin/model-deployments/plan":
+                result = self.app.models.request("plan", payload)
+            elif path == "/portal-api/admin/model-deployments/submit":
+                result = self.app.models.request("submit", payload)
+            elif path == "/portal-api/admin/model-deployments/job":
+                result = self.app.models.request(
+                    "job", {"id": str(payload.get("id", ""))}
+                )
+            elif path == "/portal-api/admin/model-deployments/cancel":
+                result = self.app.models.request(
+                    "cancel", {"id": str(payload.get("id", ""))}
+                )
+            elif path == "/portal-api/admin/model-deployments/rollback":
+                result = self.app.models.request(
+                    "rollback", {"id": str(payload.get("id", ""))}
+                )
             elif path == "/portal-api/admin/settings":
                 result = self.api_update_settings(payload)
             elif path == "/portal-api/admin/smtp/test":
@@ -3440,8 +3464,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
             self.json_response(400 if isinstance(error, ValueError) else 502, {"error": str(error)})
             return
-        # Never persist plaintext credentials in the audit ledger. The event
-        # proves that a reveal/rotation happened without copying the secret.
+        # 审计账本不持久化凭据明文；事件只证明发生展示/轮换，不复制秘密。
         audit_result = (
             {"ok": bool(result.get("ok"))}
             if path in {"/portal-api/key/reveal", "/portal-api/key/rotate"}
@@ -3647,10 +3670,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             if key_id:
                 with contextlib.suppress(Exception):
                     self.app.omni.delete_key(key_id)
-            # Provisioning spans the portal DB and OmniRoute. Restore the
-            # pending registration state if any later permission sync fails so
-            # a transient gateway error never consumes the verification link
-            # or leaves an active account backed by a deleted key.
+            # 开通跨越门户数据库和 OmniRoute；后续权限同步失败时恢复待注册状态，
+            # 避免临时网关错误消耗验证链接或留下绑定已删除 Key 的活动账户。
             with self.app.db.connect() as connection:
                 if welcome_source_ref:
                     rollback_source_credit(
@@ -4226,7 +4247,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         secure = self.secure_cookie_suffix()
         self.send_response(303)
         self.send_header("Location", "/?provisioned=1")
-        # One-time key is carried in a short-lived HttpOnly cookie only to bridge the redirect.
+        # 一次性 Key 只通过短期 HttpOnly Cookie 跨越重定向。
         self.send_header("Set-Cookie", f"{SESSION_COOKIE}={raw_session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{secure}")
         self.send_header("Set-Cookie", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax; Max-Age=604800{secure}")
         self.send_header("Set-Cookie", f"llm_key_once={urllib.parse.quote(raw_key)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=30{secure}")
@@ -4424,6 +4445,82 @@ class WorkflowClient:
         )
 
 
+class ModelDeploymentClient:
+    """通过本机 Unix Socket 调用具备 root 权限的模型部署控制服务。"""
+
+    def __init__(self) -> None:
+        self.socket_path = pathlib.Path(
+            os.environ.get(
+                "LLM_MODEL_CONTROL_SOCKET",
+                "/run/llm-cluster/model-control.sock",
+            )
+        )
+
+    def request(
+        self, operation: str, payload: dict[str, Any] | None = None
+    ) -> Any:
+        """发送白名单操作；门户进程不执行 systemctl、Docker 或文件写入。"""
+
+        if operation not in {
+            "snapshot",
+            "plan",
+            "submit",
+            "job",
+            "cancel",
+            "rollback",
+        }:
+            raise ValueError("不支持的模型部署操作")
+        encoded = json.dumps(
+            {"operation": operation, "payload": payload or {}},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        if len(encoded) > 2 << 20:
+            raise ValueError("模型部署请求超过 2 MiB")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(30)
+                client.connect(str(self.socket_path))
+                client.sendall(encoded)
+                response = b""
+                while not response.endswith(b"\n"):
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+                    if len(response) > 2 << 20:
+                        raise RuntimeError("模型部署响应超过 2 MiB")
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "模型部署控制服务尚未安装或未启动；请运行 llmctl model status"
+            ) from error
+        except PermissionError as error:
+            raise RuntimeError(
+                "账户门户无权访问模型部署控制服务，请检查 llm-account 用户组"
+            ) from error
+        except (ConnectionRefusedError, TimeoutError, socket.timeout) as error:
+            raise RuntimeError(
+                "模型部署控制服务不可用；请运行 llmctl model status"
+            ) from error
+        if not response:
+            raise RuntimeError("模型部署控制服务未返回数据")
+        try:
+            result = json.loads(response)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("模型部署控制服务返回了无效 JSON") from error
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise RuntimeError(str(result.get("error", "模型部署操作失败")))
+        return result.get("result")
+
+    def snapshot(self) -> dict[str, Any]:
+        """读取部署注册表、GPU 状态和后台任务。"""
+
+        result = self.request("snapshot")
+        if not isinstance(result, dict):
+            raise RuntimeError("模型部署快照结构无效")
+        return result
+
+
 class PortalControlPlane:
     """Business policy layered on OmniRoute's native routing and enforcement APIs."""
 
@@ -4496,8 +4593,7 @@ class PortalControlPlane:
             if existing_manifest.get("migration") == PUBLIC_COMBO_MIGRATION_NAME:
                 self.public_combo_backup_dir = backup_dir
                 return backup_dir
-            # Do not overwrite another migration's rollback snapshot even when
-            # it was created inside the control-plane upgrade acceptance window.
+            # 即使处于控制面升级验收窗口，也不覆盖另一迁移的回滚快照。
             timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
                 "%Y%m%dT%H%M%SZ"
             )
@@ -4963,8 +5059,7 @@ class PortalControlPlane:
         payload: dict[str, Any] = {
             "name": public_id,
             "description": PUBLIC_COMBO_MANAGED_DESCRIPTION,
-            # JSON round-trip provides a schema-safe deep copy without sharing
-            # mutable member/config objects with the fetched source response.
+            # JSON 往返提供符合 schema 的深拷贝，不与来源响应共享可变成员/配置。
             "models": json.loads(json.dumps(source_models)),
             "strategy": str(source.get("strategy", "round-robin")) or "round-robin",
         }
@@ -5029,8 +5124,8 @@ class PortalControlPlane:
                     or str(row["source_model"] or "") != str(route["source_model"])
                     or bool(route.get("updated"))
                 )
-                # The native route is already live. Retire only the superseded
-                # portal-owned route; user keys keep the same allowed combo ID.
+                # 原生路由已上线；只停用被替代的门户路由，用户 Key 继续使用相同的
+                # allowlist Combo ID。
                 if old_kind in {"combo", "native-combo", "alias"} and (
                     old_kind != new_kind or old_id != new_id
                 ):
@@ -5178,9 +5273,8 @@ class PortalControlPlane:
         return result
 
     def sync_user(self, user_id: str) -> None:
-        # Permission publication, usage settlement, and administrator policy
-        # changes share one lock so a maintenance tick cannot re-enable a key
-        # with a stale policy during a fail-closed update.
+        # 权限发布、用量结算和管理员策略变更共用一把锁，避免维护 tick 在故障关闭
+        # 更新期间用旧策略重新启用 Key。
         with self.lock:
             self._sync_user(user_id)
 
@@ -5189,11 +5283,9 @@ class PortalControlPlane:
             user = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not user or not user["api_key_id"]:
             return
-        # Older LLMCtl releases mirrored promotional grants into an OmniRoute
-        # global token limit. That made a positive cash balance unusable as soon
-        # as the grant was exhausted. Retire that legacy hard limit before
-        # publishing the current LLMCtl billing policy. The key stays disabled
-        # if either deletion or the following policy sync fails.
+        # 旧 LLMCtl 会把促销赠额镜像为 OmniRoute 全局 Token 限制，赠额耗尽后即使
+        # 有现金余额也无法使用。发布当前计费策略前移除该旧硬限制；删除或后续
+        # 策略同步任一步失败，Key 都保持禁用。
         if user["token_limit_id"]:
             self.omni.activate_key(str(user["api_key_id"]), False)
             try:
@@ -5214,10 +5306,9 @@ class PortalControlPlane:
         allowed_models: list[str] = []
         allowed_combos: list[str] = []
         for model in models:
-            # Only authorize the public ID. OmniRoute resolves the portal-owned
-            # combo mapping/model alias after its API-key policy check. Adding
-            # source IDs here would let users bypass the administrator's public
-            # naming and access policy by calling the underlying route directly.
+            # 只授权公开 ID。OmniRoute 在 API Key 策略检查后解析门户所有的 Combo
+            # 映射/模型别名；若加入来源 ID，用户可直接调用底层路由绕过公开命名
+            # 与访问策略。
             public_id = str(model["public_model_id"])
             target = allowed_combos if model["source_kind"] == "combo" else allowed_models
             if public_id and public_id not in target:
@@ -5256,8 +5347,7 @@ class PortalControlPlane:
                 self.omni.activate_key(key_id, False)
                 disabled.append(key_id)
         except Exception:
-            # Restore the last committed effective policy when quiescing cannot
-            # complete. The requested policy mutation has not started yet.
+            # 静默操作无法完成时恢复最后提交的有效策略，此时请求的策略修改尚未开始。
             with contextlib.suppress(Exception):
                 self.sync_all_users()
             raise RuntimeError("could not safely quiesce all user API keys")
@@ -5369,10 +5459,9 @@ class PortalControlPlane:
                 )
             raise ValueError(error)
         try:
-            # Free providers can require streaming, provider-specific endpoints,
-            # capability negotiation, or a connection selected by OmniRoute.
-            # Reuse its native dashboard probe so the portal and native UI have
-            # one testing contract instead of two subtly different adapters.
+            # 免费 Provider 可能要求流式、专用端点、能力协商或由 OmniRoute 选择
+            # Connection。复用原生仪表盘探针，让门户与原生 UI 共享同一测试契约，
+            # 避免两套略有差异的适配器。
             latency, content = self.omni.test_provider_model(
                 str(resource["provider"]), str(resource["model_id"])
             )
@@ -5574,8 +5663,7 @@ class PortalControlPlane:
                         (model_id, stamp, *current_prices, actor),
                     )
             permission_sync = self.sync_all_users()
-            # Remove a superseded alias/mapping only after the new OmniRoute
-            # route, portal policy and user permissions have all committed.
+            # 新 OmniRoute 路由、门户策略和用户权限全部提交后才删除旧别名/映射。
             if old_mapping_kind in {"combo", "native-combo", "alias"} and (
                 old_mapping_kind != mapping_kind
                 or old_mapping_id != mapping_id
@@ -5603,8 +5691,7 @@ class PortalControlPlane:
                         mapping_kind, mapping_id, public_id
                     )
             elif mutated_mapping and existing:
-                # Restore the last committed OmniRoute mapping when live test,
-                # policy validation, or SQLite persistence fails.
+                # 在线测试、策略校验或 SQLite 持久化失败时恢复最后提交的 OmniRoute 映射。
                 with contextlib.suppress(Exception):
                     if old_mapping_kind == "native-combo":
                         self.ensure_public_combo_route(
@@ -5632,9 +5719,8 @@ class PortalControlPlane:
             health = "failed" if failures >= 3 else "unknown"
         withdraw = bool(model["upstream_free"]) and health == "failed"
         if withdraw:
-            # Free upstreams can disappear without notice. Stop every portal
-            # key before withdrawing the shared route so no request can slip
-            # through between the health transition and permission refresh.
+            # 免费上游可能随时消失；撤回共享路由前先停用所有门户 Key，避免请求在
+            # 健康状态变化与权限刷新之间穿透。
             self.quiesce_all_users()
             try:
                 if model["mapping_kind"] == "combo" and model["mapping_id"]:
@@ -5646,8 +5732,7 @@ class PortalControlPlane:
                 elif model["mapping_kind"] == "alias":
                     self.omni.delete_model_alias(model["public_model_id"])
             except Exception:
-                # Keys intentionally remain disabled when native withdrawal
-                # cannot be proven. An administrator can repair and resync.
+                # 无法确认原生撤回成功时 Key 按设计保持禁用，由管理员修复并重同步。
                 with self.db.connect() as connection:
                     connection.execute(
                         "UPDATE published_models SET status='error',health_status='failed',health_error=?,last_health_at=?,health_failures=?,updated_at=? WHERE id=?",
@@ -5709,8 +5794,7 @@ class PortalControlPlane:
     def reconcile_usage(
         self, user_id: str | None = None, min_interval: int = 0
     ) -> dict[str, int]:
-        # Admin-triggered reconciliation and the maintenance thread may run at
-        # the same time. Serialize the complete fetch/ledger/key-sync cycle.
+        # 管理员触发的同步可能与维护线程同时运行，序列化完整的获取/账本/Key 同步周期。
         with self.lock:
             throttle_key = user_id or "*"
             stamp = now()
@@ -5786,9 +5870,7 @@ class PortalControlPlane:
             ]
             if len(sourced) == 1:
                 return sourced[0]
-        # Legacy rows may refer to a model that has since been disabled and has
-        # no active replacement. Keep that exact historical identity rather
-        # than inventing a public alias.
+        # 旧记录可能引用已停用且无替代的模型；保留精确历史身份，不虚构公开别名。
         for identity in identities:
             exact = connection.execute(
                 "SELECT * FROM published_models WHERE public_model_id=? LIMIT 1",
@@ -5833,8 +5915,7 @@ class PortalControlPlane:
                     or resolved["public_model_id"] != row["public_model_id"]
                 )
             ):
-                # Financial amounts and the immutable price snapshot are never
-                # repriced; this only repairs the public model attribution.
+                # 金额和不可变价格快照永不重新定价；此处只修复公开模型归属。
                 connection.execute(
                     "UPDATE usage_ledger SET model_id=?,public_model_id=? WHERE id=?",
                     (resolved["id"], resolved["public_model_id"], row["id"]),
@@ -5978,10 +6059,8 @@ class PortalControlPlane:
                         )
                 processed += 1
                 settled_users.add(str(user["id"]))
-                # Positive-balance settlement does not change effective
-                # permissions, so it must never toggle the externally visible
-                # key. If the debit exhausts the balance, sync_user publishes
-                # the reduced allowlist and active state in one OmniRoute PATCH.
+                # 正余额结算不改变有效权限，因此不能切换外部可见 Key。扣款耗尽余额时，
+                # sync_user 通过一次 OmniRoute PATCH 发布缩减后的 allowlist 和状态。
                 if amount > 0 and balance_after <= 0:
                     policy_users.add(str(user["id"]))
         sync_failed = 0
@@ -6537,8 +6616,8 @@ class PortalControlPlane:
                 target_connection_labels[connection] = label
                 route_map[connection] = label
 
-        # A provider identifier is safe to label only when it identifies one
-        # combo target.  Shared providers must be distinguished by connection.
+        # Provider 标识只在唯一指向一个 Combo 目标时才可安全标注；共享 Provider
+        # 必须通过 Connection 区分。
         for provider, labels in target_provider_labels.items():
             if len(labels) == 1:
                 route_map[provider] = next(iter(labels))
@@ -6758,8 +6837,8 @@ class PortalControlPlane:
                         ),
                     )
             except Exception:
-                # Popen succeeded but the durable run record did not.  Never leave an
-                # untracked benchmark consuming the gateway/GPU in the background.
+                # Popen 成功但持久运行记录失败时，不能让无人跟踪的压测继续在后台
+                # 消耗网关/GPU。
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(process.pid, signal.SIGTERM)
                 try:
@@ -6869,8 +6948,7 @@ class PortalControlPlane:
             gateway_models = self.omni.models()
             combos = self.omni.combos()
         except RuntimeError as error:
-            # The control plane remains useful for account, SMTP, ledger, and
-            # audit recovery while the data plane is temporarily unavailable.
+            # 数据面临时不可用时，控制面仍可用于账户、SMTP、账本和审计恢复。
             gateway_error = str(error)
         stress_runs = self.stress_runs()
         return {
@@ -7019,8 +7097,8 @@ class PortalControlPlane:
             ).fetchone():
                 raise ValueError("grant model does not exist")
         if user["api_key_id"]:
-            # Keep the old key fail-closed while status, groups, grants and
-            # balance are changed. A failed resync leaves it disabled.
+            # 修改状态、用户组、赠额和余额期间让旧 Key 保持故障关闭；重同步失败后
+            # 继续禁用。
             self.omni.activate_key(str(user["api_key_id"]), False)
         try:
             with self.db.connect() as connection:
@@ -7053,8 +7131,7 @@ class PortalControlPlane:
                         (stamp, user_id),
                     )
         except Exception:
-            # SQLite rolled back; restore the last committed policy rather than
-            # leaving a correctly configured user disabled.
+            # SQLite 已回滚，应恢复最后提交的策略，不能让配置正确的用户保持禁用。
             with contextlib.suppress(Exception):
                 self.sync_user(user_id)
             raise
@@ -7094,8 +7171,7 @@ class PortalControlPlane:
         return group_id
 
     def background_tick(self) -> None:
-        # This also migrates legacy OmniRoute token limits that incorrectly
-        # coupled promotional grants to the cash billing path.
+        # 同时迁移旧 OmniRoute Token 限制；该限制曾错误地把促销赠额与现金计费耦合。
         try:
             self.sync_all_users()
         except Exception as error:
@@ -7133,13 +7209,12 @@ class PortalServer:
         self.db.initialize()
         self.omni = OmniRouteClient(config)
         self.workflow = WorkflowClient()
+        self.models = ModelDeploymentClient()
         self.control = PortalControlPlane(config, self.db, self.omni)
         self.monitor = SystemMonitor()
-        # The process performing the first upgrade may still be the previous
-        # release's upgrader.  Let its health acceptance and file rollback
-        # window finish before mutating OmniRoute or either SQLite database.
-        # A failed control-plane upgrade therefore cannot leave a half-applied
-        # Responses API route migration behind.
+        # 首次升级进程可能仍是上一版本升级器；修改 OmniRoute 或任一 SQLite
+        # 数据库前，先等待其健康验收和文件回滚窗口结束，避免控制面升级失败后
+        # 留下只完成一半的 Responses API 路由迁移。
         self.route_migration_due = (
             time.monotonic() + PUBLIC_COMBO_MIGRATION_DELAY_SECONDS
         )
@@ -7176,15 +7251,13 @@ class PortalServer:
             if status["ready"]:
                 self.route_migration_due = current + PUBLIC_COMBO_AUDIT_SECONDS
                 return
-            # The source worker set or routing strategy changed after the last
-            # successful migration. Repair the public mirror without waiting
-            # for another control-plane upgrade.
+            # 来源 Worker 集合或路由策略在上次成功迁移后变化；无需等待再次升级，
+            # 立即修复公开镜像。
             self.route_migration_finished = False
         try:
             route_migration = self.control.reconcile_public_combo_routes()
         except Exception as error:
-            # Keep the legacy routes serving traffic and retry later.  The
-            # backup routine fails closed before any gateway route is changed.
+            # 保留旧路由继续服务并稍后重试；备份过程会在修改任何网关路由前故障关闭。
             self.route_migration_due = (
                 time.monotonic() + PUBLIC_COMBO_MIGRATION_RETRY_SECONDS
             )
@@ -7194,10 +7267,9 @@ class PortalServer:
                 flush=True,
             )
             return
-        # A per-model failure is not completion.  Marking the entire migration
-        # finished here used to leave /v1/responses permanently rewriting a
-        # missing bare combo to codex/<public-id>.  Chat traffic remains on the
-        # legacy route while the portal retries after a bounded delay.
+        # 单模型失败不代表迁移完成。若在此标记全部完成，/v1/responses 会永久把
+        # 缺失的裸 Combo 重写为 codex/<public-id>。门户在有限延迟后重试期间，
+        # Chat 流量继续走旧路由。
         self.route_migration_finished = route_migration["failed"] == 0
         self.route_migration_due = time.monotonic() + (
             PUBLIC_COMBO_AUDIT_SECONDS
@@ -7332,8 +7404,7 @@ def main() -> None:
         control = PortalControlPlane(config, database, OmniRouteClient(config))
         result: dict[str, Any] = {}
         if args.command == "reconcile-public-routes":
-            # Keep stdout machine-readable for llmctl while retaining the
-            # snapshot path and per-model diagnostics on stderr.
+            # stdout 保持供 llmctl 读取的机器格式，快照路径和逐模型诊断写入 stderr。
             with contextlib.redirect_stdout(sys.stderr):
                 result["reconciliation"] = control.reconcile_public_combo_routes()
                 if result["reconciliation"]["failed"] == 0:

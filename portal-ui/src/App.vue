@@ -39,6 +39,12 @@ const workflow = ref(null);
 const workflowLoading = ref(false);
 const workflowSaving = ref(false);
 const workflowPublishing = ref(false);
+const modelDeployments = ref(null);
+const modelDeploymentsLoading = ref(false);
+const modelDeploymentPlanning = ref(false);
+const modelDeploymentSubmitting = ref(false);
+const modelDeploymentPlan = ref(null);
+const modelDeploymentConfirmed = ref(false);
 const analyticsLoading = ref(false);
 const monitorLoading = ref(false);
 const monitorPaused = ref(false);
@@ -53,6 +59,7 @@ let usageRefreshTimer = null;
 let stressRefreshTimer = null;
 let analyticsRefreshTimer = null;
 let monitorRefreshTimer = null;
+let modelDeploymentRefreshTimer = null;
 let analyticsLoadVersion = 0;
 let monitorLoadVersion = 0;
 const authMode = ref(
@@ -164,6 +171,46 @@ const workflowNewAdapter = reactive({
   description: "",
   allowed_purposes: "",
 });
+const modelDeploymentMode = ref("local");
+const modelDeploymentForm = reactive({
+  deployment_id: "",
+  hub: "huggingface",
+  model_id: "",
+  revision: "main",
+  artifact_path: "/data/llm-cluster/models/current",
+  public_model_id: "",
+  served_model_name: "",
+  display_name: "",
+  additional_public_ids: "",
+  worker_start_id: 0,
+  worker_base_port: 8100,
+  selected_gpu_ids: [],
+  image: "vllm/vllm-openai:v0.22.1",
+  tensor_parallel_size: 1,
+  max_model_len: 32768,
+  gpu_memory_utilization: 0.9,
+  max_num_seqs: 4,
+  max_num_batched_tokens: 8192,
+  trust_remote_code: false,
+  supports_image_input: false,
+  supports_ocr: false,
+  supports_tool_calling: false,
+  supports_reasoning: false,
+  supports_thinking_toggle: false,
+  tool_call_parser: "",
+  reasoning_parser: "",
+  mm_limit: '{"image":4}',
+  publish_requested: true,
+  preserve_legacy_alias: false,
+});
+const modelRemoteTargets = ref([
+  {
+    id: "remote-0",
+    base_url: "",
+    api_key_env: "BACKEND_API_KEY",
+    enabled: true,
+  },
+]);
 const modelEdit = reactive({
   id: "",
   public_model_id: "",
@@ -546,11 +593,51 @@ const freeProviderOptions = computed(() =>
     .sort((a, b) => a.localeCompare(b))
     .map((value) => ({ value, label: value })),
 );
+const modelDeploymentRegistry = computed(
+  () => modelDeployments.value?.registry || { deployments: {}, artifacts: {} },
+);
+const modelDeploymentRows = computed(() =>
+  Object.values(modelDeploymentRegistry.value.deployments || {}).sort((left, right) =>
+    String(left.display_name || left.id).localeCompare(
+      String(right.display_name || right.id),
+    ),
+  ),
+);
+const modelDeploymentJobs = computed(() => modelDeployments.value?.jobs || []);
+const activeModelDeploymentJob = computed(() =>
+  modelDeploymentJobs.value.find(
+    (job) => !["succeeded", "failed", "cancelled", "rolled_back"].includes(job.state),
+  ),
+);
+const selectedDeploymentGpus = computed(() =>
+  new Set(modelDeploymentForm.selected_gpu_ids.map((value) => Number(value))),
+);
+const assignedDeploymentGpus = computed(() => {
+  const assigned = {};
+  for (const deployment of modelDeploymentRows.value) {
+    if (!deployment.enabled) continue;
+    for (const instance of deployment.instances || []) {
+      if (instance.kind !== "local" || !instance.enabled) continue;
+      for (const gpu of instance.gpu_devices || []) assigned[String(gpu)] = deployment.id;
+    }
+  }
+  return assigned;
+});
+
+watch(
+  [modelDeploymentMode, modelDeploymentForm, modelRemoteTargets],
+  () => {
+    modelDeploymentPlan.value = null;
+    modelDeploymentConfirmed.value = false;
+  },
+  { deep: true },
+);
 const nav = computed(() =>
   isAdmin.value
     ? [
         ["overview", "总览"],
         ["models", "模型与定价"],
+        ["deployments", "模型部署"],
         ["free", "免费资源"],
         ["users", "用户"],
         ["groups", "用户组"],
@@ -638,6 +725,9 @@ function clearAuthenticatedClientState() {
     monitorHistory[key].splice(0);
   for (const key of Object.keys(monitorHistory.gpus)) delete monitorHistory.gpus[key];
   workflow.value = null;
+  modelDeployments.value = null;
+  modelDeploymentPlan.value = null;
+  modelDeploymentConfirmed.value = false;
   selectedUserIds.value = [];
   section.value = "overview";
   usageFilters.user = "";
@@ -847,6 +937,8 @@ async function selectSection(nextSection) {
       await Promise.all([refreshWorkspace(), loadSystemMonitor()]);
     } else if (nextSection === "workflow" && isAdmin.value) {
       await Promise.all([refreshWorkspace(), loadWorkflow()]);
+    } else if (nextSection === "deployments" && isAdmin.value) {
+      await Promise.all([refreshWorkspace(), loadModelDeployments()]);
     } else if (nextSection === "billing") {
       await syncUsageAndRefresh({ preservePage: false });
     } else {
@@ -855,6 +947,302 @@ async function selectSection(nextSection) {
   } catch (error) {
     notify(`页面数据更新失败：${error.message}`, "bad");
   }
+}
+
+async function loadModelDeployments(options = {}) {
+  if (!isAdmin.value || !session.value?.authenticated || modelDeploymentsLoading.value)
+    return;
+  modelDeploymentsLoading.value = true;
+  try {
+    const result = await api("admin/model-deployments");
+    modelDeployments.value = result;
+    const gpuIds = (result.gpus || []).map((gpu) => Number(gpu.id));
+    if (!modelDeploymentForm.selected_gpu_ids.length && gpuIds.length) {
+      const midpoint = Math.max(1, Math.ceil(gpuIds.length / 2));
+      modelDeploymentForm.selected_gpu_ids = gpuIds.slice(midpoint);
+      modelDeploymentForm.worker_start_id =
+        modelDeploymentForm.selected_gpu_ids[0] ?? 0;
+    }
+    if (!result.gateway?.registry_publish)
+      modelDeploymentForm.publish_requested = false;
+  } catch (error) {
+    modelDeployments.value = { available: false, error: error.message };
+    if (!options.silent) notify(`模型部署状态读取失败：${error.message}`, "bad");
+  } finally {
+    modelDeploymentsLoading.value = false;
+  }
+}
+
+function prepareExistingDeployment(deployment) {
+  const artifact = modelDeploymentRegistry.value.artifacts?.[deployment.artifact_id] || {};
+  const instances = (deployment.instances || []).filter((item) => item.enabled !== false);
+  const localInstances = instances
+    .filter((item) => item.kind === "local")
+    .sort((left, right) => Number(left.worker_id) - Number(right.worker_id));
+  const remoteInstances = instances.filter((item) => item.kind === "remote");
+  const runtime = deployment.runtime || {};
+  const isLegacy = deployment.id === "legacy";
+  const publicIds = [...(deployment.public_model_ids || [])];
+
+  modelDeploymentMode.value = remoteInstances.length && !localInstances.length ? "remote" : "local";
+  Object.assign(modelDeploymentForm, {
+    deployment_id: deployment.id,
+    hub: artifact.hub || "local",
+    model_id: deployment.model_id || artifact.model_id || "",
+    revision: artifact.revision || "main",
+    artifact_path: artifact.path || "",
+    public_model_id: isLegacy ? "gdn-inside-ornith" : (publicIds[0] || deployment.id),
+    served_model_name: deployment.served_model_name || deployment.model_id || "",
+    display_name: isLegacy ? "Ornith 内部模型" : (deployment.display_name || deployment.id),
+    additional_public_ids: isLegacy ? "" : publicIds.slice(1).join(", "),
+    worker_start_id: localInstances[0]?.worker_id ?? 0,
+    worker_base_port: localInstances.length
+      ? Number(localInstances[0].port) - Number(localInstances[0].worker_id)
+      : 8100,
+    selected_gpu_ids: localInstances.flatMap((item) => item.gpu_devices || []).map(Number),
+    image: runtime.image || "vllm/vllm-openai:v0.22.1",
+    tensor_parallel_size: Number(runtime.tensor_parallel_size || 1),
+    max_model_len: Number(runtime.max_model_len || 32768),
+    gpu_memory_utilization: Number(runtime.gpu_memory_utilization || 0.9),
+    max_num_seqs: Number(runtime.max_num_seqs || 4),
+    max_num_batched_tokens: Number(runtime.max_num_batched_tokens || 8192),
+    trust_remote_code: Boolean(runtime.trust_remote_code),
+    supports_image_input: Boolean(runtime.supports_image_input),
+    supports_ocr: Boolean(runtime.supports_ocr),
+    supports_tool_calling: Boolean(runtime.supports_tool_calling),
+    supports_reasoning: Boolean(runtime.supports_reasoning),
+    supports_thinking_toggle: Boolean(runtime.supports_thinking_toggle),
+    tool_call_parser: runtime.tool_call_parser || "",
+    reasoning_parser: runtime.reasoning_parser || "",
+    mm_limit: runtime.mm_limit || '{"image":4}',
+    publish_requested: Boolean(
+      deployment.publish_requested && modelDeployments.value?.gateway?.registry_publish,
+    ),
+    preserve_legacy_alias: isLegacy,
+  });
+  modelRemoteTargets.value = remoteInstances.length
+    ? remoteInstances.map((item) => ({
+        id: item.id,
+        base_url: item.base_url,
+        api_key_env: item.api_key_env || "BACKEND_API_KEY",
+        enabled: item.enabled !== false,
+      }))
+    : [{ id: "remote-0", base_url: "", api_key_env: "BACKEND_API_KEY", enabled: true }];
+  modelDeploymentPlan.value = null;
+  modelDeploymentConfirmed.value = false;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  notify(
+    isLegacy
+      ? "已载入旧版 Ornith 部署；建议先完成 Qwen 对后半组 GPU 的接管，再把这里改为前半组"
+      : `已载入 ${deployment.display_name || deployment.id}，修改后请重新生成部署计划`,
+  );
+}
+
+function setDeploymentGpuSelection(mode) {
+  const ids = (modelDeployments.value?.gpus || []).map((gpu) => Number(gpu.id));
+  const midpoint = Math.max(1, Math.ceil(ids.length / 2));
+  if (mode === "first") modelDeploymentForm.selected_gpu_ids = ids.slice(0, midpoint);
+  else if (mode === "second") modelDeploymentForm.selected_gpu_ids = ids.slice(midpoint);
+  else modelDeploymentForm.selected_gpu_ids = ids;
+  modelDeploymentForm.worker_start_id =
+    modelDeploymentForm.selected_gpu_ids[0] ?? 0;
+}
+
+function toggleDeploymentGpu(gpuId) {
+  const id = Number(gpuId);
+  const selected = new Set(modelDeploymentForm.selected_gpu_ids.map(Number));
+  if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  modelDeploymentForm.selected_gpu_ids = [...selected].sort((left, right) => left - right);
+  if (modelDeploymentForm.selected_gpu_ids.length)
+    modelDeploymentForm.worker_start_id = modelDeploymentForm.selected_gpu_ids[0];
+}
+
+function addModelRemoteTarget() {
+  modelRemoteTargets.value.push({
+    id: `remote-${modelRemoteTargets.value.length}`,
+    base_url: "",
+    api_key_env: "BACKEND_API_KEY",
+    enabled: true,
+  });
+}
+
+function removeModelRemoteTarget(index) {
+  if (modelRemoteTargets.value.length === 1) {
+    notify("至少保留一个远程实例输入行", "bad");
+    return;
+  }
+  modelRemoteTargets.value.splice(index, 1);
+}
+
+function deploymentPublicIds(value) {
+  return [...new Set(String(value || "").split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean))];
+}
+
+function modelDeploymentPayload() {
+  const deploymentId = String(modelDeploymentForm.deployment_id || "").trim();
+  const publicModelId = String(modelDeploymentForm.public_model_id || "").trim();
+  const servedModelName = String(modelDeploymentForm.served_model_name || "").trim();
+  if (!deploymentId || !publicModelId || !servedModelName)
+    throw new Error("部署 ID、公开模型 ID 和 vLLM 服务模型名均为必填项");
+
+  const tensorParallelSize = Number(modelDeploymentForm.tensor_parallel_size);
+  let instances = [];
+  if (modelDeploymentMode.value === "local") {
+    const gpuIds = [...selectedDeploymentGpus.value].sort((left, right) => left - right);
+    if (!gpuIds.length) throw new Error("请至少选择一张 GPU");
+    if (!Number.isInteger(tensorParallelSize) || tensorParallelSize < 1)
+      throw new Error("张量并行数必须为正整数");
+    if (gpuIds.length % tensorParallelSize !== 0)
+      throw new Error("所选 GPU 数必须能被张量并行数整除");
+    const workerStart = Number(modelDeploymentForm.worker_start_id);
+    for (let offset = 0; offset < gpuIds.length; offset += tensorParallelSize) {
+      const workerId = workerStart + offset / tensorParallelSize;
+      instances.push({
+        id: `local-worker-${workerId}`,
+        kind: "local",
+        worker_id: workerId,
+        gpu_devices: gpuIds.slice(offset, offset + tensorParallelSize),
+        port: Number(modelDeploymentForm.worker_base_port) + workerId,
+        enabled: true,
+      });
+    }
+  } else {
+    instances = modelRemoteTargets.value
+      .filter((item) => item.enabled && String(item.base_url || "").trim())
+      .map((item, index) => ({
+        id: String(item.id || `remote-${index}`).trim(),
+        kind: "remote",
+        base_url: String(item.base_url).trim().replace(/\/$/, ""),
+        api_key_env: String(item.api_key_env || "BACKEND_API_KEY").trim(),
+        enabled: true,
+      }));
+    if (!instances.length) throw new Error("请至少配置一个已启用的远程实例");
+  }
+
+  const payload = {
+    deployment_id: deploymentId,
+    hub: modelDeploymentForm.hub,
+    model_id: String(modelDeploymentForm.model_id || "").trim(),
+    revision: String(modelDeploymentForm.revision || "main").trim(),
+    public_model_id: publicModelId,
+    served_model_name: servedModelName,
+    artifact_path: String(modelDeploymentForm.artifact_path || "").trim(),
+    instances,
+    image: String(modelDeploymentForm.image || "").trim(),
+    tensor_parallel_size: tensorParallelSize,
+    max_model_len: Number(modelDeploymentForm.max_model_len),
+    gpu_memory_utilization: Number(modelDeploymentForm.gpu_memory_utilization),
+    max_num_seqs: Number(modelDeploymentForm.max_num_seqs),
+    max_num_batched_tokens: Number(modelDeploymentForm.max_num_batched_tokens),
+    trust_remote_code: Boolean(modelDeploymentForm.trust_remote_code),
+    supports_image_input: Boolean(modelDeploymentForm.supports_image_input),
+    supports_ocr: Boolean(modelDeploymentForm.supports_ocr),
+    supports_tool_calling: Boolean(modelDeploymentForm.supports_tool_calling),
+    supports_reasoning: Boolean(modelDeploymentForm.supports_reasoning),
+    supports_thinking_toggle: Boolean(modelDeploymentForm.supports_thinking_toggle),
+    tool_call_parser: String(modelDeploymentForm.tool_call_parser || "").trim(),
+    reasoning_parser: String(modelDeploymentForm.reasoning_parser || "").trim(),
+    mm_limit: String(modelDeploymentForm.mm_limit || "").trim(),
+    display_name: String(modelDeploymentForm.display_name || publicModelId).trim(),
+    additional_public_ids: deploymentPublicIds(modelDeploymentForm.additional_public_ids),
+    publish_requested: Boolean(modelDeploymentForm.publish_requested),
+    preserve_legacy_alias: Boolean(modelDeploymentForm.preserve_legacy_alias),
+  };
+  if (!payload.model_id)
+    throw new Error("必须填写模型 ID；本机目录也需要填写其实际服务模型 ID");
+  return payload;
+}
+
+async function planModelDeployment() {
+  if (modelDeploymentPlanning.value || activeModelDeploymentJob.value) return;
+  modelDeploymentPlanning.value = true;
+  try {
+    const payload = modelDeploymentPayload();
+    const plan = await api("admin/model-deployments/plan", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    modelDeploymentPlan.value = {
+      ...plan,
+      request_fingerprint: JSON.stringify(payload),
+    };
+    modelDeploymentConfirmed.value = false;
+    notify("部署计划已生成，请核对受影响 Worker、GPU 和公开模型 ID");
+  } catch (error) {
+    notify(`部署计划生成失败：${error.message}`, "bad");
+  } finally {
+    modelDeploymentPlanning.value = false;
+  }
+}
+
+async function submitModelDeployment() {
+  if (modelDeploymentSubmitting.value || !modelDeploymentPlan.value) return;
+  if (!modelDeploymentConfirmed.value) {
+    notify("请先确认部署影响和自动回滚说明", "bad");
+    return;
+  }
+  modelDeploymentSubmitting.value = true;
+  try {
+    const payload = modelDeploymentPayload();
+    if (JSON.stringify(payload) !== modelDeploymentPlan.value.request_fingerprint)
+      throw new Error("配置已变化，请重新生成部署计划");
+    await api("admin/model-deployments/submit", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    notify("模型部署任务已进入后台执行", "working");
+    await loadModelDeployments({ silent: true });
+  } catch (error) {
+    notify(`模型部署提交失败：${error.message}`, "bad");
+  } finally {
+    modelDeploymentSubmitting.value = false;
+  }
+}
+
+async function cancelModelDeployment(job) {
+  if (!job?.id) return;
+  try {
+    await api("admin/model-deployments/cancel", {
+      method: "POST",
+      body: JSON.stringify({ id: job.id }),
+    });
+    notify("已请求取消；控制服务将在安全检查点停止或回滚", "working");
+    await loadModelDeployments({ silent: true });
+  } catch (error) {
+    notify(`取消部署失败：${error.message}`, "bad");
+  }
+}
+
+async function rollbackModelDeployment(job) {
+  if (!job?.id || !job?.backup || job.state !== "succeeded") return;
+  if (
+    !window.confirm(
+      "确认恢复到该任务执行前的运行配置？只会重启该任务涉及的 Worker；当前配置会先创建新的保护快照。",
+    )
+  )
+    return;
+  try {
+    await api("admin/model-deployments/rollback", {
+      method: "POST",
+      body: JSON.stringify({ id: job.id }),
+    });
+    notify("回滚任务已进入后台执行，可在本页持续查看进度", "working");
+    await loadModelDeployments({ silent: true });
+  } catch (error) {
+    notify(`回滚提交失败：${error.message}`, "bad");
+  }
+}
+
+function deploymentJobStateLabel(value) {
+  return {
+    waiting: "等待执行",
+    running: "执行中",
+    succeeded: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+    rolled_back: "已回滚",
+  }[value] || value || "未知";
 }
 
 async function loadWorkflow(options = {}) {
@@ -2234,6 +2622,16 @@ onMounted(async () => {
         return;
       loadSystemMonitor({ silent: true });
     }, 2_000);
+    modelDeploymentRefreshTimer = window.setInterval(() => {
+      if (
+        !isAdmin.value ||
+        document.hidden ||
+        modelDeploymentsLoading.value ||
+        (section.value !== "deployments" && !activeModelDeploymentJob.value)
+      )
+        return;
+      loadModelDeployments({ silent: true });
+    }, 2_000);
   } catch (error) {
     notify(error.message, "bad");
   }
@@ -2244,6 +2642,8 @@ onBeforeUnmount(() => {
   if (stressRefreshTimer) window.clearInterval(stressRefreshTimer);
   if (analyticsRefreshTimer) window.clearInterval(analyticsRefreshTimer);
   if (monitorRefreshTimer) window.clearInterval(monitorRefreshTimer);
+  if (modelDeploymentRefreshTimer)
+    window.clearInterval(modelDeploymentRefreshTimer);
   if (chatTimer) window.clearInterval(chatTimer);
   if (toastTimer) window.clearTimeout(toastTimer);
 });
@@ -3772,6 +4172,252 @@ onBeforeUnmount(() => {
                 )
               "
             />
+          </section>
+
+          <section v-if="section === 'deployments'" class="page model-deployment-page">
+            <div class="page-head">
+              <div>
+                <h1>模型部署</h1>
+                <p>下载模型、分配 GPU、生成 Worker 实例，并同步到当前 AI 接入层。</p>
+              </div>
+              <button
+                type="button"
+                class="ghost"
+                :disabled="modelDeploymentsLoading"
+                @click="loadModelDeployments()"
+              >
+                {{ modelDeploymentsLoading ? "读取中…" : "刷新状态" }}
+              </button>
+            </div>
+
+            <section v-if="modelDeployments?.available === false" class="panel deployment-unavailable">
+              <h2>模型部署控制服务不可用</h2>
+              <p>{{ modelDeployments.error }}</p>
+              <code>llmctl model status</code>
+              <code>systemctl status llm-model-control.service</code>
+            </section>
+
+            <template v-else>
+              <section class="panel deployment-safety-note">
+                <strong>变更边界</strong>
+                <p>
+                  部署前会生成计划并备份注册表与受影响 Worker 配置；任务只重启发生 GPU 或 Worker
+                  归属变化的实例，失败时自动恢复备份。现有 Router、门户和未受影响 Worker 不会重启。
+                </p>
+              </section>
+
+              <section v-if="modelDeploymentRows.some((item) => item.id === 'legacy')" class="panel deployment-migration-note">
+                <strong>8 卡单模型拆分建议</strong>
+                <ol>
+                  <li>先新建 Qwen 部署并选择 GPU 4–7，发布为 <code>gdn-inside-qwen</code>。</li>
+                  <li>待 Qwen 验收成功后，再编辑旧 Ornith 部署，保留 GPU 0–3，发布为 <code>gdn-inside-ornith</code>。</li>
+                  <li>勾选“保留兼容别名”后，旧客户端仍可使用 <code>gdn-inside</code>。</li>
+                </ol>
+              </section>
+
+              <section v-if="activeModelDeploymentJob" class="panel deployment-active-job">
+                <div class="deployment-job-head">
+                  <div>
+                    <span class="status warn">{{ deploymentJobStateLabel(activeModelDeploymentJob.state) }}</span>
+                    <strong>{{ activeModelDeploymentJob.message }}</strong>
+                  </div>
+                  <button type="button" class="danger ghost" @click="cancelModelDeployment(activeModelDeploymentJob)">
+                    安全取消
+                  </button>
+                </div>
+                <progress :value="activeModelDeploymentJob.progress || 0" max="100"></progress>
+                <small>
+                  阶段 {{ activeModelDeploymentJob.phase }} · {{ activeModelDeploymentJob.progress || 0 }}%
+                  · 任务 {{ activeModelDeploymentJob.id }}
+                </small>
+                <ol v-if="activeModelDeploymentJob.logs?.length" class="deployment-log">
+                  <li v-for="entry in activeModelDeploymentJob.logs.slice(-6)" :key="`${entry.time}-${entry.message}`">
+                    <time>{{ localTime(entry.time) }}</time><span>{{ entry.message }}</span>
+                  </li>
+                </ol>
+              </section>
+
+              <div class="deployment-workspace">
+                <div class="deployment-editor">
+                  <section class="panel deployment-form-section">
+                    <div class="section-title-row">
+                      <div><h2>1. 模型来源</h2><p>可以下载新权重、复用本机目录或接入远程推理实例。</p></div>
+                      <div class="segmented-control">
+                        <button type="button" :class="{ active: modelDeploymentMode === 'local' }" @click="modelDeploymentMode = 'local'">本机 GPU</button>
+                        <button type="button" :class="{ active: modelDeploymentMode === 'remote' }" @click="modelDeploymentMode = 'remote'">远程实例</button>
+                      </div>
+                    </div>
+                    <div class="form-grid deployment-source-grid">
+                      <label>部署 ID<input v-model.trim="modelDeploymentForm.deployment_id" placeholder="例如 qwen-35b" /></label>
+                      <label>来源
+                        <select v-model="modelDeploymentForm.hub">
+                          <option value="huggingface">Hugging Face</option>
+                          <option value="modelscope">ModelScope</option>
+                          <option value="local">本机已有目录</option>
+                        </select>
+                      </label>
+                      <label>模型 ID<input v-model.trim="modelDeploymentForm.model_id" :placeholder="modelDeploymentForm.hub === 'local' ? '模型实际 ID' : '组织名/模型名'" /></label>
+                      <label v-if="modelDeploymentForm.hub !== 'local'">Revision<input v-model.trim="modelDeploymentForm.revision" placeholder="main" /></label>
+                      <label v-else>模型目录<input v-model.trim="modelDeploymentForm.artifact_path" placeholder="/data/llm-cluster/models/..." /></label>
+                    </div>
+                  </section>
+
+                  <section class="panel deployment-form-section">
+                    <div class="section-title-row"><div><h2>2. 公开模型</h2><p>外部调用只看到公开 ID，vLLM 服务名用于内部路由。</p></div></div>
+                    <p class="deployment-gateway-note">
+                      {{ modelDeployments?.gateway?.message || '正在读取 AI 接入层能力…' }}
+                    </p>
+                    <div class="form-grid">
+                      <label>公开模型 ID<input v-model.trim="modelDeploymentForm.public_model_id" placeholder="gdn-inside-qwen" /></label>
+                      <label>vLLM 服务模型名<input v-model.trim="modelDeploymentForm.served_model_name" placeholder="qwen-..." /></label>
+                      <label>显示名称<input v-model.trim="modelDeploymentForm.display_name" placeholder="Qwen 内部模型" /></label>
+                      <label>附加公开 ID<input v-model.trim="modelDeploymentForm.additional_public_ids" placeholder="多个 ID 用逗号分隔" /></label>
+                    </div>
+                    <div class="check-row">
+                      <label><input v-model="modelDeploymentForm.publish_requested" type="checkbox" :disabled="!modelDeployments?.gateway?.registry_publish" />部署成功后同步到 AI 接入层</label>
+                      <label><input v-model="modelDeploymentForm.preserve_legacy_alias" type="checkbox" />保留兼容别名 gdn-inside</label>
+                    </div>
+                  </section>
+
+                  <section v-if="modelDeploymentMode === 'local'" class="panel deployment-form-section">
+                    <div class="section-title-row">
+                      <div><h2>3. GPU 与 Worker</h2><p>单卡实例使用 TP1；跨卡实例按张量并行数将 GPU 连续分组。</p></div>
+                      <div class="compact-actions">
+                        <button type="button" class="ghost" @click="setDeploymentGpuSelection('first')">前半组</button>
+                        <button type="button" class="ghost" @click="setDeploymentGpuSelection('second')">后半组</button>
+                        <button type="button" class="ghost" @click="setDeploymentGpuSelection('all')">全部</button>
+                      </div>
+                    </div>
+                    <div class="deployment-gpu-grid">
+                      <button
+                        v-for="gpu in modelDeployments?.gpus || []"
+                        :key="gpu.id"
+                        type="button"
+                        class="deployment-gpu-card"
+                        :class="{
+                          selected: selectedDeploymentGpus.has(Number(gpu.id)),
+                          assigned: assignedDeploymentGpus[String(gpu.id)],
+                        }"
+                        @click="toggleDeploymentGpu(gpu.id)"
+                      >
+                        <span>GPU {{ gpu.id }}</span><strong>{{ gpu.name }}</strong>
+                        <small>{{ Number(gpu.memory_mib).toLocaleString() }} MiB</small>
+                        <em v-if="assignedDeploymentGpus[String(gpu.id)]">当前：{{ assignedDeploymentGpus[String(gpu.id)] }}</em>
+                        <em v-else>当前：未登记</em>
+                      </button>
+                    </div>
+                    <div class="form-grid deployment-runtime-grid">
+                      <label>首个 Worker ID<input v-model.number="modelDeploymentForm.worker_start_id" type="number" min="0" max="255" /></label>
+                      <label>Worker 基础端口<input v-model.number="modelDeploymentForm.worker_base_port" type="number" min="1024" max="65000" /></label>
+                      <label>张量并行数
+                        <select v-model.number="modelDeploymentForm.tensor_parallel_size">
+                          <option :value="1">TP1</option><option :value="2">TP2</option><option :value="4">TP4</option><option :value="8">TP8</option>
+                        </select>
+                      </label>
+                      <label>vLLM 镜像<input v-model.trim="modelDeploymentForm.image" /></label>
+                    </div>
+                  </section>
+
+                  <section v-else class="panel deployment-form-section">
+                    <div class="section-title-row">
+                      <div><h2>3. 远程 Worker</h2><p>控制面只登记和健康检查远端，不在本机执行 Docker 或 systemd。</p></div>
+                      <button type="button" class="ghost" @click="addModelRemoteTarget">增加实例</button>
+                    </div>
+                    <div v-for="(target, index) in modelRemoteTargets" :key="index" class="remote-target-row">
+                      <input v-model.trim="target.id" aria-label="远程实例 ID" placeholder="remote-qwen-0" />
+                      <input v-model.trim="target.base_url" aria-label="远程实例地址" placeholder="http://10.0.0.20:8100/v1" />
+                      <input v-model.trim="target.api_key_env" aria-label="密钥环境变量" placeholder="BACKEND_API_KEY" />
+                      <label><input v-model="target.enabled" type="checkbox" />启用</label>
+                      <button type="button" class="danger ghost" @click="removeModelRemoteTarget(index)">移除</button>
+                    </div>
+                  </section>
+
+                  <details class="panel deployment-form-section deployment-advanced" open>
+                    <summary>4. vLLM 参数与模型能力</summary>
+                    <div class="form-grid deployment-runtime-grid">
+                      <label>最大上下文<input v-model.number="modelDeploymentForm.max_model_len" type="number" min="1024" /></label>
+                      <label>显存利用率<input v-model.number="modelDeploymentForm.gpu_memory_utilization" type="number" min="0.1" max="0.99" step="0.01" /></label>
+                      <label>最大并发序列<input v-model.number="modelDeploymentForm.max_num_seqs" type="number" min="1" /></label>
+                      <label>批处理 Token 上限<input v-model.number="modelDeploymentForm.max_num_batched_tokens" type="number" min="256" /></label>
+                      <label>工具解析器<input v-model.trim="modelDeploymentForm.tool_call_parser" placeholder="可留空" /></label>
+                      <label>思考解析器<input v-model.trim="modelDeploymentForm.reasoning_parser" placeholder="可留空" /></label>
+                      <label>多模态限制<input v-model.trim="modelDeploymentForm.mm_limit" placeholder='{"image":4}' /></label>
+                    </div>
+                    <div class="check-row deployment-capabilities">
+                      <label><input v-model="modelDeploymentForm.trust_remote_code" type="checkbox" />信任模型仓库代码</label>
+                      <label><input v-model="modelDeploymentForm.supports_image_input" type="checkbox" />图片输入</label>
+                      <label><input v-model="modelDeploymentForm.supports_ocr" type="checkbox" />OCR</label>
+                      <label><input v-model="modelDeploymentForm.supports_tool_calling" type="checkbox" />工具调用</label>
+                      <label><input v-model="modelDeploymentForm.supports_reasoning" type="checkbox" />思考</label>
+                      <label><input v-model="modelDeploymentForm.supports_thinking_toggle" type="checkbox" />可关闭思考</label>
+                    </div>
+                  </details>
+
+                  <section class="panel deployment-submit-panel">
+                    <button type="button" class="primary" :disabled="modelDeploymentPlanning || Boolean(activeModelDeploymentJob)" @click="planModelDeployment">
+                      {{ modelDeploymentPlanning ? "正在校验…" : "生成部署计划" }}
+                    </button>
+                    <p>生成计划不会停止服务、下载模型或修改配置。</p>
+                  </section>
+                </div>
+
+                <aside class="deployment-side">
+                  <section class="panel deployment-plan-card">
+                    <h2>部署计划</h2>
+                    <p v-if="!modelDeploymentPlan" class="empty-state">填写配置后先生成计划。执行按钮在计划确认前始终不可用。</p>
+                    <template v-else>
+                      <dl class="deployment-plan-facts">
+                        <div><dt>受影响 Worker</dt><dd>{{ modelDeploymentPlan.affected_worker_ids?.join(', ') || '无' }}</dd></div>
+                        <div><dt>目标 GPU</dt><dd>{{ modelDeploymentPlan.requested_gpu_ids?.join(', ') || '远程' }}</dd></div>
+                        <div><dt>公开 ID</dt><dd>{{ modelDeploymentPlan.public_model_ids?.join(', ') }}</dd></div>
+                        <div><dt>权重下载</dt><dd>{{ modelDeploymentPlan.download_required ? '需要' : '跳过，复用已有目录' }}</dd></div>
+                      </dl>
+                      <ul v-if="modelDeploymentPlan.warnings?.length" class="deployment-warnings">
+                        <li v-for="warning in modelDeploymentPlan.warnings" :key="warning">{{ warning }}</li>
+                      </ul>
+                      <label class="deployment-confirm">
+                        <input v-model="modelDeploymentConfirmed" type="checkbox" />
+                        我已核对 GPU、Worker、公开 ID；理解受影响实例将短暂停止，失败会自动回滚。
+                      </label>
+                      <button type="button" class="primary" :disabled="!modelDeploymentConfirmed || modelDeploymentSubmitting || Boolean(activeModelDeploymentJob)" @click="submitModelDeployment">
+                        {{ modelDeploymentSubmitting ? "正在提交…" : "确认并后台部署" }}
+                      </button>
+                    </template>
+                  </section>
+
+                  <section class="panel deployment-current-card">
+                    <h2>当前部署</h2>
+                    <article v-for="deployment in modelDeploymentRows" :key="deployment.id" class="deployment-current-row">
+                      <div><strong>{{ deployment.display_name || deployment.id }}</strong><code>{{ deployment.id }}</code></div>
+                      <span class="status" :class="deployment.enabled ? 'ok' : 'bad'">{{ deployment.enabled ? '已启用' : '已停用' }}</span>
+                      <small>公开 ID：{{ deployment.public_model_ids?.join(', ') || '未发布' }}</small>
+                      <small>实例：{{ (deployment.instances || []).filter((item) => item.enabled).length }} 个</small>
+                      <button type="button" class="ghost compact" :disabled="Boolean(activeModelDeploymentJob)" @click="prepareExistingDeployment(deployment)">
+                        {{ deployment.id === 'legacy' ? '拆分并改名' : '编辑部署' }}
+                      </button>
+                    </article>
+                    <p v-if="!modelDeploymentRows.length" class="empty-state">尚无注册部署；升级旧环境后会自动生成兼容记录。</p>
+                  </section>
+
+                  <section class="panel deployment-history-card">
+                    <h2>最近任务</h2>
+                    <article v-for="job in modelDeploymentJobs.slice(0, 8)" :key="job.id" class="deployment-history-row">
+                      <span class="status" :class="job.state === 'succeeded' ? 'ok' : ['failed', 'rolled_back'].includes(job.state) ? 'bad' : 'warn'">{{ deploymentJobStateLabel(job.state) }}</span>
+                      <strong>{{ job.kind === 'rollback' ? '配置回滚' : (job.request?.deployment?.display_name || job.request?.deployment?.id || job.id) }}</strong>
+                      <small>{{ job.message }}</small><time>{{ localTime(job.updated_at || job.created_at) }}</time>
+                      <button
+                        v-if="job.kind !== 'rollback' && job.state === 'succeeded' && job.backup"
+                        type="button"
+                        class="danger ghost compact"
+                        :disabled="Boolean(activeModelDeploymentJob)"
+                        @click="rollbackModelDeployment(job)"
+                      >回滚到部署前</button>
+                    </article>
+                    <p v-if="!modelDeploymentJobs.length" class="empty-state">暂无部署任务。</p>
+                  </section>
+                </aside>
+              </div>
+            </template>
           </section>
 
           <section v-if="section === 'free'" class="page">

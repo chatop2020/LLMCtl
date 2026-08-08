@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Upgrade the LLMCtl control plane without reinstalling or restarting the
-# deployed model workers. Downloads are pinned to one Git commit and every
-# installed control-plane file is backed up before replacement.
+# 在不重装、不重启现有模型 Worker 的前提下升级 LLMCtl 控制面。下载内容固定
+# 到单一 Git commit，替换前会备份每个已安装控制面文件。
 
 readonly PROGRAM_NAME="$(basename "$0")"
 readonly GITHUB_REPOSITORY="chatop2020/LLMCtl"
@@ -26,6 +25,12 @@ readonly WORKFLOW_UNIT_SOURCE="/usr/local/lib/llm-cluster/systemd/llm-workflow.s
 readonly WORKFLOW_SERVICE_UNIT="/etc/systemd/system/llm-workflow.service"
 readonly WORKFLOW_RUNTIME_DIR="/usr/local/lib/llm-cluster/workflowd"
 readonly WORKFLOW_RUNTIME="${WORKFLOW_RUNTIME_DIR}/llm-workflowd"
+readonly MODEL_CONTROL_UNIT_SOURCE="/usr/local/lib/llm-cluster/systemd/llm-model-control.service"
+readonly MODEL_CONTROL_SERVICE_UNIT="/etc/systemd/system/llm-model-control.service"
+readonly MODEL_CONTROL_SERVICE="llm-model-control.service"
+readonly MODEL_CONTROL_RUNTIME="/usr/local/lib/llm-cluster/model_deployment.py"
+readonly MODEL_CONTROL_SOCKET="/run/llm-cluster/model-control.sock"
+readonly DEPLOYMENT_REGISTRY="/etc/llm-cluster/deployments.json"
 
 LANG_CODE=""
 LOCAL_ZIP=""
@@ -45,6 +50,7 @@ SOURCE_COMMIT=""
 BACKUP_DIR=""
 ACCOUNT_WAS_ACTIVE=0
 WORKFLOW_WAS_ACTIVE=0
+MODEL_CONTROL_WAS_ACTIVE=0
 DEPLOYMENT_STARTED=0
 DEPLOYMENT_COMPLETE=0
 UPGRADE_CANCELLED=0
@@ -220,6 +226,7 @@ restore_control_plane() {
   set +e
   warn "$(l10n '升级未通过验收，正在自动恢复旧控制面。' 'Upgrade acceptance failed; restoring the previous control plane automatically.')"
   systemctl stop "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true
+  systemctl stop "${MODEL_CONTROL_SERVICE}" >/dev/null 2>&1 || true
   if (( WORKFLOW_WAS_ACTIVE )); then
     systemctl stop llm-workflow.service >/dev/null 2>&1 || true
   fi
@@ -228,12 +235,16 @@ restore_control_plane() {
   fi
   restore_runtime_data "${BACKUP_DIR}" || true
   restore_control_plane_files
+  restore_deployment_registry || true
   if runtime_data_has_role "${BACKUP_DIR}" omniroute; then
     systemctl start "${ROUTER_SERVICE}" >/dev/null 2>&1 || true
   fi
   if (( ACCOUNT_WAS_ACTIVE )); then systemctl start "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true; fi
   if (( WORKFLOW_WAS_ACTIVE )) && [[ -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
     systemctl start llm-workflow.service >/dev/null 2>&1 || true
+  fi
+  if (( MODEL_CONTROL_WAS_ACTIVE )) && [[ -e "${MODEL_CONTROL_SERVICE_UNIT}" ]]; then
+    systemctl start "${MODEL_CONTROL_SERVICE}" >/dev/null 2>&1 || true
   fi
   warn "$(l10n "已从 ${BACKUP_DIR} 恢复控制面及可用的运行数据快照；GPU Worker 和模型未修改。" "Restored the control plane and any available runtime-data snapshot from ${BACKUP_DIR}; GPU workers and models were not modified.")"
 }
@@ -500,9 +511,8 @@ for item in infos:
         target.parent.mkdir(parents=True, exist_ok=True)
         with handle.open(item) as source, target.open("wb") as output:
             shutil.copyfileobj(source, output)
-        # The hardened extractor deliberately avoids extractall(), but still has
-        # to preserve the executable bit carried by GitHub archives.  Ignore
-        # ownership/special bits and apply only rwx permission bits.
+        # 加固解包器刻意不使用 extractall()，但仍需保留 GitHub 归档中的可执行位；
+        # 忽略所有权和特殊位，只应用 rwx 权限位。
         permissions = (item.external_attr >> 16) & 0o777
         os.chmod(target, permissions or 0o644)
 handle.close()
@@ -545,10 +555,12 @@ validate_source() {
     "${SOURCE_ROOT}/lib/model_catalog.py" \
     "${SOURCE_ROOT}/lib/runtime_optimizer.py" \
     "${SOURCE_ROOT}/lib/gateway_config.py" \
+    "${SOURCE_ROOT}/lib/model_deployment.py" \
     "${SOURCE_ROOT}/lib/account_portal.py" \
     "${SOURCE_ROOT}/lib/llm_benchmark.py" \
     "${SOURCE_ROOT}/lib/workflow_config.py"
   grep -q '^ExecStart=/usr/local/lib/llm-cluster/workflowd/llm-workflowd ' "${SOURCE_ROOT}/systemd/llm-workflow.service" || die "$(l10n '工作流 service 单元无效' 'Invalid workflow service unit')"
+  grep -q '^ExecStart=/usr/local/lib/llm-cluster/model_deployment.py serve$' "${SOURCE_ROOT}/systemd/llm-model-control.service" || die "$(l10n '模型部署控制 service 单元无效' 'Invalid model deployment control service unit')"
   [[ -x "${SOURCE_ROOT}/lib/workflowd/llm-workflowd" && -x "${SOURCE_ROOT}/lib/workflowd/llm-workflowd-linux-amd64" && -x "${SOURCE_ROOT}/lib/workflowd/llm-workflowd-linux-arm64" ]] || die "$(l10n '工作流运行时不完整' 'The workflow runtime is incomplete')"
   python3 - "${SOURCE_ROOT}/lib/account_portal_ui" <<'PY'
 import re, sys
@@ -595,8 +607,8 @@ configure_keepwarm_timer() {
 
 restore_managed_systemd_units() {
   local unit
-  rm -f -- "${KEEPWARM_SERVICE_UNIT}" "${KEEPWARM_TIMER_UNIT}" "${WORKFLOW_SERVICE_UNIT}"
-  for unit in llm-keepwarm.service llm-keepwarm.timer llm-workflow.service; do
+  rm -f -- "${KEEPWARM_SERVICE_UNIT}" "${KEEPWARM_TIMER_UNIT}" "${WORKFLOW_SERVICE_UNIT}" "${MODEL_CONTROL_SERVICE_UNIT}"
+  for unit in llm-keepwarm.service llm-keepwarm.timer llm-workflow.service llm-model-control.service; do
     if [[ -e "${BACKUP_DIR}/systemd/${unit}" ]]; then
       cp -a "${BACKUP_DIR}/systemd/${unit}" "/etc/systemd/system/${unit}"
     fi
@@ -605,8 +617,17 @@ restore_managed_systemd_units() {
   apply_keepwarm_timer_state
 }
 
-# Keep the historical function name as a compatibility seam for deployments,
-# tests and operator tooling written before the optional workflow unit existed.
+restore_deployment_registry() {
+  local saved="${BACKUP_DIR}/runtime-config/deployments.json"
+  if [[ -e "${saved}" ]]; then
+    install -d -m 0750 "$(dirname "${DEPLOYMENT_REGISTRY}")"
+    cp -a "${saved}" "${DEPLOYMENT_REGISTRY}"
+  elif [[ -e "${BACKUP_DIR}/runtime-config/deployments.json.absent" ]]; then
+    rm -f -- "${DEPLOYMENT_REGISTRY}"
+  fi
+}
+
+# 保留历史函数名，兼容可选工作流单元出现前的部署、测试和运维工具。
 restore_keepwarm_systemd_units() {
   restore_managed_systemd_units
 }
@@ -631,6 +652,34 @@ validate_installed_workflow_runtime() {
     die "$(l10n '升级后的 Go 工作流运行时安装不完整；正在恢复旧控制面' 'The upgraded Go workflow runtime is incomplete; restoring the previous control plane')"
   "${WORKFLOW_RUNTIME}" --version >/dev/null || \
     die "$(l10n '升级后的 Go 工作流运行时无法在本机执行；正在恢复旧控制面' 'The upgraded Go workflow runtime cannot execute on this host; restoring the previous control plane')"
+}
+
+wait_for_model_control() {
+  local elapsed=0
+  while (( elapsed < 30 )); do
+    if systemctl is-active --quiet "${MODEL_CONTROL_SERVICE}" && \
+       [[ -S "${MODEL_CONTROL_SOCKET}" ]] && \
+       "${MODEL_CONTROL_RUNTIME}" snapshot >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+configure_model_control_service() {
+  [[ -x "${MODEL_CONTROL_RUNTIME}" ]] || die "$(l10n '模型部署控制运行时不可执行' 'The model deployment control runtime is not executable')"
+  [[ -r "${MODEL_CONTROL_UNIT_SOURCE}" ]] || die "$(l10n '模型部署控制 service 模板缺失' 'The model deployment control service template is missing')"
+  getent group llm-account >/dev/null 2>&1 || groupadd --system llm-account
+  install -m 0644 "${MODEL_CONTROL_UNIT_SOURCE}" "${MODEL_CONTROL_SERVICE_UNIT}"
+  install -d -o root -g llm-account -m 0750 /var/lib/llm-cluster/model-control
+  systemctl daemon-reload
+  systemctl enable --now "${MODEL_CONTROL_SERVICE}"
+  if ! wait_for_model_control; then
+    journalctl -u "${MODEL_CONTROL_SERVICE}" -n 80 --no-pager >&2 || true
+    die "$(l10n '模型部署控制服务未通过启动验收；正在恢复旧控制面' 'The model deployment control service failed startup acceptance; restoring the previous control plane')"
+  fi
 }
 
 wait_for_account_portal() {
@@ -676,9 +725,15 @@ backup_control_plane() {
     fi
   done <"${SOURCE_ROOT}/upgrade-manifest.tsv"
   install -d -m 0700 "${BACKUP_DIR}/systemd"
-  for unit in llm-keepwarm.service llm-keepwarm.timer llm-workflow.service; do
+  for unit in llm-keepwarm.service llm-keepwarm.timer llm-workflow.service llm-model-control.service; do
     [[ ! -e "/etc/systemd/system/${unit}" ]] || cp -a "/etc/systemd/system/${unit}" "${BACKUP_DIR}/systemd/${unit}"
   done
+  install -d -m 0700 "${BACKUP_DIR}/runtime-config"
+  if [[ -e "${DEPLOYMENT_REGISTRY}" ]]; then
+    cp -a "${DEPLOYMENT_REGISTRY}" "${BACKUP_DIR}/runtime-config/deployments.json"
+  else
+    : >"${BACKUP_DIR}/runtime-config/deployments.json.absent"
+  fi
   [[ ! -e "${RELEASE_ENV}" ]] || cp -a "${RELEASE_ENV}" "${BACKUP_DIR}/control-plane-version.env"
   printf 'created_at=%s\nsource_commit=%s\narchive_sha256=%s\n' \
     "${timestamp}" "${SOURCE_COMMIT}" "${ARCHIVE_SHA256}" >"${BACKUP_DIR}/upgrade.txt"
@@ -699,6 +754,8 @@ install_control_plane() {
   systemctl cat "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || ACCOUNT_WAS_ACTIVE=0
   systemctl is-active --quiet llm-workflow.service && WORKFLOW_WAS_ACTIVE=1 || WORKFLOW_WAS_ACTIVE=0
   systemctl cat llm-workflow.service >/dev/null 2>&1 || WORKFLOW_WAS_ACTIVE=0
+  systemctl is-active --quiet "${MODEL_CONTROL_SERVICE}" && MODEL_CONTROL_WAS_ACTIVE=1 || MODEL_CONTROL_WAS_ACTIVE=0
+  systemctl cat "${MODEL_CONTROL_SERVICE}" >/dev/null 2>&1 || MODEL_CONTROL_WAS_ACTIVE=0
 
   DEPLOYMENT_STARTED=1
   if (( ACCOUNT_WAS_ACTIVE )); then
@@ -718,6 +775,7 @@ install_control_plane() {
   /usr/local/sbin/llmctl version >/dev/null
   validate_installed_workflow_runtime
   configure_keepwarm_timer
+  configure_model_control_service
   refresh_workflow_unit_if_installed
   if (( ACCOUNT_WAS_ACTIVE && restart_account )); then
     systemctl start "${ACCOUNT_SERVICE}"
@@ -769,7 +827,9 @@ rollback_from_backup() {
   systemctl is-active --quiet "${ACCOUNT_SERVICE}" && ACCOUNT_WAS_ACTIVE=1 || ACCOUNT_WAS_ACTIVE=0
   systemctl is-active --quiet "${ROUTER_SERVICE}" && router_was_active=1 || router_was_active=0
   systemctl is-active --quiet llm-workflow.service && WORKFLOW_WAS_ACTIVE=1 || WORKFLOW_WAS_ACTIVE=0
+  systemctl is-active --quiet "${MODEL_CONTROL_SERVICE}" && MODEL_CONTROL_WAS_ACTIVE=1 || MODEL_CONTROL_WAS_ACTIVE=0
   systemctl stop "${ACCOUNT_SERVICE}" >/dev/null 2>&1 || true
+  systemctl stop "${MODEL_CONTROL_SERVICE}" >/dev/null 2>&1 || true
   if (( WORKFLOW_WAS_ACTIVE )); then
     systemctl stop llm-workflow.service >/dev/null 2>&1 || true
   fi
@@ -780,6 +840,7 @@ rollback_from_backup() {
   install -d -m 0700 "${safety_dir}"
   restore_runtime_data "${BACKUP_DIR}" "${safety_dir}"
   restore_control_plane_files
+  restore_deployment_registry
   if (( router_was_active )); then systemctl start "${ROUTER_SERVICE}"; fi
   if (( ACCOUNT_WAS_ACTIVE )); then
     systemctl start "${ACCOUNT_SERVICE}"
@@ -788,6 +849,9 @@ rollback_from_backup() {
   fi
   if (( WORKFLOW_WAS_ACTIVE )) && [[ -e "${WORKFLOW_SERVICE_UNIT}" ]]; then
     systemctl start llm-workflow.service
+  fi
+  if (( MODEL_CONTROL_WAS_ACTIVE )) && [[ -e "${MODEL_CONTROL_SERVICE_UNIT}" ]]; then
+    systemctl start "${MODEL_CONTROL_SERVICE}"
   fi
   log "$(l10n "回滚完成：${BACKUP_DIR}" "Rollback completed: ${BACKUP_DIR}")"
   log "$(l10n "回滚前运行数据安全副本：${safety_dir}" "Pre-rollback runtime safety copy: ${safety_dir}")"

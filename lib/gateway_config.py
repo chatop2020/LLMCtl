@@ -27,14 +27,12 @@ MANAGED_TAG = "llmctl-managed"
 MANAGED_TOKEN = "llmctl-default"
 OMNIROUTE_MANAGED_KEY = "llmctl-management"
 OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually."
-# Keep OmniRoute in the routing plane and leave request scheduling to vLLM.  The
-# upstream default queues behind a saturated Combo member for 30 seconds before
-# trying the next member.  That produces a deterministic 30-second stall for
-# multimodal requests even while another worker is idle.  OmniRoute currently
-# accepts at most 20 in-flight requests per target and a minimum queue timeout of
-# one second, so use those explicit bounds for every LLMCtl-owned connection and
-# Combo.  vLLM's MAX_NUM_SEQS remains the active-sequence limit; extra in-flight
-# requests wait in vLLM's scheduler instead of OmniRoute's opaque semaphore.
+# OmniRoute 只负责路由，具体请求调度交给 vLLM。上游默认会在已饱和的 Combo
+# 成员后排队 30 秒才尝试下一个成员，即使其他 Worker 空闲，多模态请求也会
+# 稳定卡住 30 秒。OmniRoute 当前每个目标最多接受 20 个在途请求，队列超时
+# 最低为 1 秒，因此对 LLMCtl 管理的 Connection 和 Combo 显式使用这两个边界。
+# vLLM 的 MAX_NUM_SEQS 仍是活跃序列上限；额外请求在 vLLM 调度器内等待，
+# 不进入 OmniRoute 不透明的 semaphore 队列。
 OMNIROUTE_INFLIGHT_PER_WORKER = 20
 OMNIROUTE_QUEUE_TIMEOUT_MS = 1000
 
@@ -194,7 +192,7 @@ def bifrost_config(worker_ids: Iterable[int]) -> str:
                 "admin_username": "env.UI_USERNAME",
                 "admin_password": "env.UI_PASSWORD",
                 "is_enabled": True,
-                # Authorization remains available for the OpenAI-style VK.
+                # OpenAI 风格的 VK 仍可携带 Authorization。
                 "disable_auth_on_inference": True,
             },
             "virtual_keys": [
@@ -251,29 +249,24 @@ def omniroute_plan(worker_ids: Iterable[int]) -> str:
     """Persist the desired OmniRoute graph without embedding credentials."""
     model = required_env("SERVED_MODEL_NAME")
     base_port = int(required_env("WORKER_BASE_PORT"))
-    # MAX_NUM_SEQS limits active vLLM sequences, not HTTP requests admitted by
-    # the gateway.  Capping OmniRoute at MAX_NUM_SEQS makes its own semaphore
-    # queue first and invokes the upstream 30-second failover timeout.
+    # MAX_NUM_SEQS 限制 vLLM 活跃序列，不限制网关接收的 HTTP 请求。若用它
+    # 限制 OmniRoute，会先触发网关自己的 semaphore 队列和 30 秒故障转移。
     concurrency_per_worker = OMNIROUTE_INFLIGHT_PER_WORKER
     data = {
         "gateway": "omniroute",
         "managed_tag": MANAGED_TAG,
         "model": model,
         "strategy": "round-robin",
-        # OmniRoute has a separate sticky round-robin batch setting whose
-        # global default is greater than one.  It must be explicitly disabled
-        # for independent vLLM replicas or a simultaneous burst will queue on
-        # the first target before rotation advances.
+        # OmniRoute 另有默认大于 1 的粘性轮询批次设置。独立 vLLM 副本必须
+        # 显式关闭该行为，否则突发并发会在轮询前集中排到第一个目标。
         "sticky_round_robin_limit": 1,
         "concurrency_per_worker": concurrency_per_worker,
         "queue_timeout_ms": OMNIROUTE_QUEUE_TIMEOUT_MS,
         "supports_vision": os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1",
-        # OmniRoute 3.8.x cannot resolve supportsVision from a custom Provider
-        # model while inspecting Combo members.  Its enabled-by-default Vision
-        # Bridge therefore waits 30 seconds for openai/gpt-4o-mini before it
-        # finally preserves the original image and calls the native-vision
-        # LLMCtl worker.  Disable that bridge for a cluster whose selected
-        # model was already verified as natively multimodal.
+        # OmniRoute 3.8.x 检查 Combo 成员时无法从自定义 Provider 模型解析
+        # supportsVision，默认启用的 Vision Bridge 会先等待
+        # openai/gpt-4o-mini 30 秒，才保留原图并调用原生视觉 LLMCtl Worker。
+        # 已验证为原生多模态的模型应关闭该桥接。
         "vision_bridge_enabled": False
         if os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
         else None,
@@ -484,15 +477,12 @@ def reconcile_omniroute(
     concurrency_per_worker = OMNIROUTE_INFLIGHT_PER_WORKER
 
     if supports_vision:
-        # The custom model rows below persist supportsVision=true, but
-        # OmniRoute's VisionBridgeGuardrail checks Combo targets through the
-        # static/synced registry and ignores that custom-provider metadata.  It
-        # consequently invokes the default openai/gpt-4o-mini bridge and waits
-        # its exact 30 s timeout on every image before forwarding the untouched
-        # image to vLLM.  The selected LLMCtl model has already passed native
-        # image capability validation, so the bridge is both redundant and
-        # harmful here.  PATCH is hot-reloaded by OmniRoute; workers and the
-        # router process do not need to restart.
+        # 下方自定义模型会持久化 supportsVision=true，但 OmniRoute 的
+        # VisionBridgeGuardrail 通过静态/同步注册表检查 Combo 目标，会忽略
+        # 自定义 Provider 元数据。因此每张图片都会调用默认
+        # openai/gpt-4o-mini 桥接并等待完整 30 秒，之后才把原图交给 vLLM。
+        # LLMCtl 已验证目标模型的原生图像能力，此桥接既多余又有害。OmniRoute
+        # 会热加载 PATCH，不需要重启 Worker 或 Router。
         bridge_settings = client.request(
             "PATCH", "/api/settings", {"visionBridgeEnabled": False}
         )
@@ -613,8 +603,7 @@ def reconcile_omniroute(
             "supportsVision": supports_vision,
         }
         if existing_model:
-            # Reconcile mutable capability/context metadata as the selected
-            # model plan changes; a stale manual row must not outlive it.
+            # 模型计划变化时同步可变的能力和上下文元数据，避免旧手工记录残留。
             client.request("PUT", "/api/provider-models", model_payload)
         else:
             client.request(
@@ -641,17 +630,13 @@ def reconcile_omniroute(
         "strategy": "round-robin",
         "config": {
             "disableSessionStickiness": True,
-            # This is distinct from conversation/session stickiness.  The
-            # OmniRoute global default batches several successful requests on
-            # one target.  Under a simultaneous benchmark burst that leaves
-            # the RR counter unchanged until responses finish, concentrating
-            # work on one or two GPUs.  One request per target restores true
-            # eager rotation across every healthy LLMCtl worker.
+            # 该设置不同于会话粘性。OmniRoute 全局默认会在同一目标批量处理
+            # 多个成功请求；并发压测时，响应完成前 RR 计数不变化，任务会集中
+            # 到一两张 GPU。每目标一个请求可恢复所有健康 Worker 的即时轮询。
             "stickyRoundRobinLimit": 1,
             "concurrencyPerModel": concurrency_per_worker,
-            # OmniRoute 3.8.x defaults to 30 seconds.  Its API strips the old
-            # queueDepth field on update, but queueTimeoutMs is supported and
-            # keeps a saturated target from hiding an idle fallback worker.
+            # OmniRoute 3.8.x 默认 30 秒。API 更新时会丢弃旧 queueDepth，
+            # 但支持 queueTimeoutMs，可避免饱和目标遮蔽空闲后备 Worker。
             "queueTimeoutMs": OMNIROUTE_QUEUE_TIMEOUT_MS,
             "healthCheckEnabled": True,
             "maxRetries": 1,
@@ -671,9 +656,8 @@ def reconcile_omniroute(
     else:
         client.request("POST", "/api/combos", combo_payload)
 
-    # Remove only LLMCtl-owned duplicates after the replacement combo is
-    # committed.  This ordering preserves the last known-good route if any
-    # earlier reconciliation step fails.
+    # 替代 Combo 提交后才删除 LLMCtl 所有的重复项；如果之前任何同步步骤失败，
+    # 该顺序仍能保留最后一条已知可用路由。
     for connection_id in sorted(stale_connection_ids):
         client.request(
             "DELETE", f"/api/providers/{urllib.parse.quote(connection_id, safe='')}"
@@ -688,6 +672,269 @@ def reconcile_omniroute(
             client.request(
                 "DELETE", f"/api/provider-nodes/{urllib.parse.quote(node_id, safe='')}"
             )
+
+
+def registry_omniroute_specs(registry_file: pathlib.Path) -> list[dict[str, Any]]:
+    """从部署注册表生成 OmniRoute 所需的多模型目标清单。"""
+
+    registry = json.loads(registry_file.read_text(encoding="utf-8"))
+    deployments = registry.get("deployments", {})
+    aliases = registry.get("legacy_aliases", {})
+    if not isinstance(deployments, dict) or not isinstance(aliases, dict):
+        raise RuntimeError("LLMCtl 部署注册表结构无效")
+    alias_targets: dict[str, list[str]] = {}
+    for alias, target in aliases.items():
+        alias_targets.setdefault(str(target), []).append(str(alias))
+    specs: list[dict[str, Any]] = []
+    for deployment_id, deployment in deployments.items():
+        if (
+            not isinstance(deployment, dict)
+            or not deployment.get("enabled", True)
+            or not deployment.get("publish_requested", True)
+        ):
+            continue
+        runtime = deployment.get("runtime", {})
+        served_model = str(deployment.get("served_model_name", ""))
+        public_ids = [str(item) for item in deployment.get("public_model_ids", [])]
+        public_ids.extend(alias_targets.get(served_model, []))
+        public_ids.extend(
+            alias
+            for target, aliases_for_target in alias_targets.items()
+            if target in public_ids
+            for alias in aliases_for_target
+        )
+        targets: list[dict[str, Any]] = []
+        for instance in deployment.get("instances", []):
+            if not isinstance(instance, dict) or not instance.get("enabled", True):
+                continue
+            if instance.get("kind") == "remote":
+                base_url = str(instance.get("base_url", "")).rstrip("/")
+                if not base_url.endswith("/v1"):
+                    base_url += "/v1"
+                targets.append(
+                    {
+                        "id": str(instance.get("id", "remote")),
+                        "base_url": base_url,
+                        "api_key_env": str(instance.get("api_key_env", "BACKEND_API_KEY")),
+                    }
+                )
+            elif instance.get("kind") == "local":
+                worker_id = int(instance["worker_id"])
+                host = (
+                    f"llm-worker-{worker_id}"
+                    if os.environ.get("DOCKER_NETWORK")
+                    else "127.0.0.1"
+                )
+                targets.append(
+                    {
+                        "id": f"worker-{worker_id}",
+                        "worker_id": worker_id,
+                        "base_url": f"http://{host}:{int(instance['port'])}/v1",
+                        "api_key_env": "BACKEND_API_KEY",
+                    }
+                )
+        if targets:
+            specs.append(
+                {
+                    "deployment_id": str(deployment_id),
+                    "served_model_name": served_model,
+                    "public_model_ids": list(dict.fromkeys(public_ids)),
+                    "max_model_len": int(runtime.get("max_model_len", 32768)),
+                    "supports_vision": bool(runtime.get("supports_image_input", False)),
+                    "targets": targets,
+                }
+            )
+    if not specs:
+        raise RuntimeError("部署注册表中没有可发布的模型实例")
+    return specs
+
+
+def reconcile_omniroute_registry(
+    client: OmniRouteClient, registry_file: pathlib.Path, secrets_file: pathlib.Path
+) -> None:
+    """把全部已启用部署一次性同步到 OmniRoute，避免模型间相互清理。"""
+
+    specs = registry_omniroute_specs(registry_file)
+    client.login()
+    ensure_omniroute_management_key(client, secrets_file)
+    if any(spec["supports_vision"] for spec in specs):
+        settings = client.request("PATCH", "/api/settings", {"visionBridgeEnabled": False})
+        if settings.get("visionBridgeEnabled") is not False:
+            raise RuntimeError("OmniRoute 未能关闭会造成多模态请求延迟的 Vision Bridge")
+
+    nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
+    connections = response_list(
+        client.request("GET", "/api/providers?limit=1000"), "connections"
+    )
+    combos = response_list(client.request("GET", "/api/combos?limit=1000"), "combos")
+    desired_node_ids: set[str] = set()
+    desired_combo_names: set[str] = set()
+    stale_connection_ids: set[str] = set()
+
+    for spec in specs:
+        combo_targets: list[dict[str, Any]] = []
+        for target_index, target in enumerate(spec["targets"]):
+            worker_suffix = target.get("worker_id", target["id"])
+            node_name = f"LLMCtl {spec['deployment_id']} worker {worker_suffix}"
+            node_prefix = f"llmctl-{spec['deployment_id']}-w{target_index}"
+            matching_nodes = [item for item in nodes if item.get("name") == node_name]
+            node_payload = {
+                "name": node_name,
+                "prefix": node_prefix,
+                "apiType": "chat",
+                "baseUrl": target["base_url"],
+                "chatPath": "/chat/completions",
+                "modelsPath": "/models",
+            }
+            if matching_nodes:
+                node_id = str(matching_nodes[0]["id"])
+                node = client.request(
+                    "PUT",
+                    f"/api/provider-nodes/{urllib.parse.quote(node_id, safe='')}",
+                    node_payload,
+                ).get("node", matching_nodes[0])
+            else:
+                node = client.request(
+                    "POST",
+                    "/api/provider-nodes",
+                    {**node_payload, "type": "openai-compatible"},
+                ).get("node", {})
+            node_id = str(node.get("id", ""))
+            if not node_id:
+                raise RuntimeError(f"OmniRoute 未返回节点：{node_name}")
+            desired_node_ids.add(node_id)
+
+            api_key_env = str(target.get("api_key_env", "BACKEND_API_KEY"))
+            backend_key = os.environ.get(api_key_env, "")
+            if not backend_key:
+                raise RuntimeError(f"远程实例密钥环境变量不存在：{api_key_env}")
+            matching_connections = [
+                item for item in connections if item.get("provider") == node_id
+            ]
+            connection_payload = {
+                "name": node_name,
+                "apiKey": backend_key,
+                "priority": 1,
+                "maxConcurrent": OMNIROUTE_INFLIGHT_PER_WORKER,
+                "defaultModel": spec["served_model_name"],
+                "isActive": True,
+                "testStatus": "success",
+            }
+            if matching_connections:
+                connection_id = str(matching_connections[0].get("id", ""))
+                connection = client.request(
+                    "PUT",
+                    f"/api/providers/{urllib.parse.quote(connection_id, safe='')}",
+                    connection_payload,
+                ).get("connection", matching_connections[0])
+                for duplicate in matching_connections[1:]:
+                    duplicate_id = str(duplicate.get("id", ""))
+                    if duplicate_id:
+                        stale_connection_ids.add(duplicate_id)
+            else:
+                connection = client.request(
+                    "POST",
+                    "/api/providers",
+                    {"provider": node_id, **connection_payload},
+                ).get("connection", {})
+            connection_id = str(connection.get("id", ""))
+            if not connection_id:
+                raise RuntimeError(f"OmniRoute 未返回连接：{node_name}")
+
+            models = response_list(
+                client.request(
+                    "GET",
+                    f"/api/provider-models?provider={urllib.parse.quote(node_id, safe='')}",
+                ),
+                "models",
+            )
+            model_payload = {
+                "provider": node_id,
+                "modelId": spec["served_model_name"],
+                "modelName": spec["served_model_name"],
+                "source": MANAGED_TAG,
+                "apiFormat": "chat-completions",
+                "supportedEndpoints": ["chat"],
+                "targetFormat": "openai",
+                "max_input_tokens": spec["max_model_len"],
+                "max_output_tokens": spec["max_model_len"],
+                "contextWindowOverride": spec["max_model_len"],
+                "supportsVision": spec["supports_vision"],
+            }
+            existing_model = next(
+                (
+                    item
+                    for item in models
+                    if item.get("id") == spec["served_model_name"]
+                    or item.get("modelId") == spec["served_model_name"]
+                ),
+                None,
+            )
+            client.request("PUT" if existing_model else "POST", "/api/provider-models", model_payload)
+            combo_targets.append(
+                {
+                    "kind": "model",
+                    "provider": node_id,
+                    "model": spec["served_model_name"],
+                    "connectionId": connection_id,
+                    "label": node_name,
+                }
+            )
+
+        for public_model_id in spec["public_model_ids"]:
+            desired_combo_names.add(public_model_id)
+            existing_combo = next(
+                (item for item in combos if item.get("name") == public_model_id), None
+            )
+            combo_payload = {
+                "name": public_model_id,
+                "description": OMNIROUTE_DESCRIPTION,
+                "models": combo_targets,
+                "strategy": "round-robin",
+                "config": {
+                    "disableSessionStickiness": True,
+                    "stickyRoundRobinLimit": 1,
+                    "concurrencyPerModel": OMNIROUTE_INFLIGHT_PER_WORKER,
+                    "queueTimeoutMs": OMNIROUTE_QUEUE_TIMEOUT_MS,
+                    "healthCheckEnabled": True,
+                    "maxRetries": 1,
+                    "failoverBeforeRetry": True,
+                },
+                "context_length": spec["max_model_len"],
+            }
+            if existing_combo:
+                if existing_combo.get("description") != OMNIROUTE_DESCRIPTION:
+                    raise RuntimeError(
+                        f"OmniRoute 模型组合 {public_model_id} 不是由 LLMCtl 管理"
+                    )
+                combo_id = str(existing_combo.get("id", ""))
+                client.request(
+                    "PUT",
+                    f"/api/combos/{urllib.parse.quote(combo_id, safe='')}",
+                    combo_payload,
+                )
+            else:
+                client.request("POST", "/api/combos", combo_payload)
+
+    # 先创建完整新路由，最后再清理旧资源，任何中途失败都保留上次可用链路。
+    for connection_id in sorted(stale_connection_ids):
+        client.request("DELETE", f"/api/providers/{urllib.parse.quote(connection_id, safe='')}")
+    for combo in combos:
+        combo_id = str(combo.get("id", ""))
+        if (
+            combo.get("description") == OMNIROUTE_DESCRIPTION
+            and str(combo.get("name", "")) not in desired_combo_names
+            and combo_id
+        ):
+            client.request("DELETE", f"/api/combos/{urllib.parse.quote(combo_id, safe='')}")
+    for node in nodes:
+        node_id = str(node.get("id", ""))
+        if (
+            str(node.get("name", "")).startswith("LLMCtl ")
+            and node_id
+            and node_id not in desired_node_ids
+        ):
+            client.request("DELETE", f"/api/provider-nodes/{urllib.parse.quote(node_id, safe='')}")
 
 
 def response_items(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -750,8 +997,8 @@ def ensure_newapi_token(client: NewAPIClient, secrets_file: pathlib.Path, rotate
     )
     if not managed_ids:
         raise RuntimeError("New API managed token is missing")
-    # New API token names are not unique. Selecting the newest ID lets an
-    # interrupted rotation recover without deleting the last working token.
+    # New API 的 Token 名称不唯一；选择最新 ID 可让中断的轮换恢复，同时保留
+    # 最后一枚可用 Token。
     token_id = managed_ids[-1]
     response = client.request("POST", f"/api/token/{token_id}/key")
     data = response.get("data") or {}
@@ -808,7 +1055,7 @@ def reconcile_newapi(client: NewAPIClient, worker_ids: list[int], secrets_file: 
                 },
             },
         )
-    # Preserve the last known-good routes until every replacement exists.
+    # 所有替代路由创建完成前保留最后一组已知可用路由。
     for channel_id in previous_managed_ids:
         client.request("DELETE", f"/api/channel/{channel_id}")
     ensure_newapi_token(client, secrets_file, rotate=False)
@@ -842,6 +1089,16 @@ def command_reconcile_omniroute(args: argparse.Namespace) -> None:
     reconcile_omniroute(
         OmniRouteClient(required_env("GATEWAY_LOCAL_URL")),
         parse_worker_ids(args.worker_ids),
+        pathlib.Path(args.secrets_file),
+    )
+
+
+def command_reconcile_omniroute_registry(args: argparse.Namespace) -> None:
+    """根据多模型部署注册表一次性同步全部 LLMCtl 路由。"""
+
+    reconcile_omniroute_registry(
+        OmniRouteClient(required_env("GATEWAY_LOCAL_URL")),
+        pathlib.Path(args.registry),
         pathlib.Path(args.secrets_file),
     )
 
@@ -924,6 +1181,11 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_omni.add_argument("--worker-ids", required=True)
     reconcile_omni.add_argument("--secrets-file", required=True)
     reconcile_omni.set_defaults(handler=command_reconcile_omniroute)
+
+    reconcile_omni_registry = subparsers.add_parser("reconcile-omniroute-registry")
+    reconcile_omni_registry.add_argument("--registry", required=True)
+    reconcile_omni_registry.add_argument("--secrets-file", required=True)
+    reconcile_omni_registry.set_defaults(handler=command_reconcile_omniroute_registry)
 
     rotate_omni = subparsers.add_parser("rotate-omniroute-key")
     rotate_omni.add_argument("--secrets-file", required=True)

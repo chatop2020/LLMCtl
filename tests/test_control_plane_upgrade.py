@@ -22,6 +22,7 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/model_catalog.py",
             "lib/runtime_optimizer.py",
             "lib/gateway_config.py",
+            "lib/model_deployment.py",
             "lib/account_portal.py",
             "lib/llm_benchmark.py",
             "lib/workflow_config.py",
@@ -32,6 +33,7 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "systemd/llm-keepwarm.service",
             "systemd/llm-keepwarm.timer",
             "systemd/llm-workflow.service",
+            "systemd/llm-model-control.service",
         ]
         files.extend(
             str(path.relative_to(ROOT))

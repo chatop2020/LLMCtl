@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Hardware-aware vLLM cluster deployment for Ubuntu 24.04 and NVIDIA GPUs.
-# Runtime is deliberately offline: temporary proxy settings are removed before
-# systemd starts any inference container. Images and model revisions are pinned.
+# 面向 Ubuntu 24.04 与 NVIDIA GPU 的硬件感知 vLLM 集群部署器。
+# 推理运行时默认离线：systemd 启动推理容器前会清除临时代理，镜像与模型
+# revision 均固定到明确版本。
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="3.4.1"
+readonly INSTALLER_VERSION="3.5.0"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -75,7 +75,7 @@ ACCOUNT_API_PUBLIC_URL=""
 ACCOUNT_REGISTRATION_ENABLED=0
 ACCOUNT_ALLOWED_EMAIL_DOMAINS=""
 ACCOUNT_DEFAULT_WELCOME_BALANCE="0"
-# Retained only so old cluster.env files can be migrated during an upgrade.
+# 仅用于升级时迁移旧版 cluster.env。
 ACCOUNT_DEFAULT_QUOTA_TOKENS=0
 ACCOUNT_QUOTA_RESET="monthly"
 ACCOUNT_QUOTA_RESET_TIME="00:00"
@@ -123,6 +123,7 @@ MANAGER_SOURCE="${SCRIPT_DIR}/llmctl.sh"
 CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
+MODEL_DEPLOYMENT_SOURCE="${SCRIPT_DIR}/lib/model_deployment.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
 BENCHMARK_SOURCE="${SCRIPT_DIR}/lib/llm_benchmark.py"
 WORKFLOW_CONFIG_SOURCE="${SCRIPT_DIR}/lib/workflow_config.py"
@@ -132,6 +133,7 @@ UPGRADER_SOURCE="${SCRIPT_DIR}/upgrade-llmctl.sh"
 KEEPWARM_SERVICE_SOURCE="${SCRIPT_DIR}/systemd/llm-keepwarm.service"
 KEEPWARM_TIMER_SOURCE="${SCRIPT_DIR}/systemd/llm-keepwarm.timer"
 WORKFLOW_SERVICE_SOURCE="${SCRIPT_DIR}/systemd/llm-workflow.service"
+MODEL_CONTROL_SERVICE_SOURCE="${SCRIPT_DIR}/systemd/llm-model-control.service"
 CATALOG_QUERY=""
 CATALOG_TASK="auto"
 CATALOG_LIMIT=10
@@ -376,7 +378,7 @@ parse_args() {
         shift 2 ;;
       --allowed-email-domains) need_value "$@"; ACCOUNT_ALLOWED_EMAIL_DOMAINS="$2"; shift 2 ;;
       --account-default-balance) need_value "$@"; ACCOUNT_DEFAULT_WELCOME_BALANCE="$2"; shift 2 ;;
-      # Backward-compatible upgrade input. New deployments use cash only.
+      # 兼容旧版升级输入；新部署只使用金额余额。
       --account-default-quota) need_value "$@"; ACCOUNT_DEFAULT_QUOTA_TOKENS="$2"; shift 2 ;;
       --account-quota-reset) need_value "$@"; ACCOUNT_QUOTA_RESET="$2"; shift 2 ;;
       --account-quota-reset-time) need_value "$@"; ACCOUNT_QUOTA_RESET_TIME="$2"; shift 2 ;;
@@ -774,8 +776,7 @@ search_catalog() {
 apply_catalog_assignments() {
   local assignments_file="${1:?}" saved_tp="${TP_SIZE}" saved_seqs="${MAX_NUM_SEQS}" saved_len="${MAX_MODEL_LEN}"
   local saved_startup="${STARTUP_PARALLELISM}"
-  # The assignments are emitted by our local, root-owned helper and every value
-  # is shell-quoted with shlex.quote before eval.
+  # 赋值来自本机 root 所有的辅助程序，每个值在 eval 前均由 shlex.quote 转义。
   # shellcheck disable=SC1090
   eval "$(<"${assignments_file}")"
   local planned_tp="${TP_SIZE}" planned_len="${MAX_MODEL_LEN}"
@@ -902,8 +903,8 @@ model_manifest_matches_selection() {
     grep -Fqx "MODEL_HUB=${MODEL_HUB}" "${manifest}"
     return
   fi
-  # Legacy Ornith manifests predate MODEL_HUB. They are known Hugging Face
-  # installs and are accepted only for the two pinned Ornith identities.
+  # 旧 Ornith manifest 早于 MODEL_HUB；仅对两个固定 Ornith 身份按已知
+  # Hugging Face 安装接受。
   [[ -f "${root%/}/.ornith-model-root" && "${MODEL_HUB}" == huggingface ]] || return 1
   [[ "${MODEL_ID}" == "${VALIDATED_MODEL_ID}" || "${MODEL_ID}" == "${OFFICIAL_MODEL_ID}" ]]
 }
@@ -1078,6 +1079,7 @@ check_discovery_host() {
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
+  [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -r "${WORKFLOW_CONFIG_SOURCE}" && -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd" ]] || die "$(l10n '缺少可插拔工作流控制面或运行时' 'The pluggable workflow control plane or runtime is missing')"
@@ -1086,6 +1088,7 @@ check_discovery_host() {
   [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
   [[ -r "${KEEPWARM_SERVICE_SOURCE}" && -r "${KEEPWARM_TIMER_SOURCE}" ]] || die "$(l10n '缺少 Worker 保活 systemd 单元' 'Worker keep-warm systemd units are missing')"
   [[ -r "${WORKFLOW_SERVICE_SOURCE}" ]] || die "$(l10n '缺少工作流 systemd 单元模板' 'The workflow systemd unit template is missing')"
+  [[ -r "${MODEL_CONTROL_SERVICE_SOURCE}" ]] || die "$(l10n '缺少模型部署控制 systemd 单元' 'The model deployment control systemd unit is missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
   nvidia-smi -L >/dev/null 2>&1 || die "$(l10n 'NVIDIA 驱动已安装，但 GPU 当前不可用' 'The NVIDIA driver is installed, but the GPUs are unavailable')"
@@ -1112,6 +1115,7 @@ check_host() {
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
+  [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -r "${WORKFLOW_CONFIG_SOURCE}" && -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd" ]] || die "$(l10n '缺少可插拔工作流控制面或运行时' 'The pluggable workflow control plane or runtime is missing')"
@@ -1120,6 +1124,7 @@ check_host() {
   [[ -r "${UPGRADER_SOURCE}" ]] || die "$(l10n '缺少 upgrade-llmctl.sh' 'upgrade-llmctl.sh is missing')"
   [[ -r "${KEEPWARM_SERVICE_SOURCE}" && -r "${KEEPWARM_TIMER_SOURCE}" ]] || die "$(l10n '缺少 Worker 保活 systemd 单元' 'Worker keep-warm systemd units are missing')"
   [[ -r "${WORKFLOW_SERVICE_SOURCE}" ]] || die "$(l10n '缺少工作流 systemd 单元模板' 'The workflow systemd unit template is missing')"
+  [[ -r "${MODEL_CONTROL_SERVICE_SOURCE}" ]] || die "$(l10n '缺少模型部署控制 systemd 单元' 'The model deployment control systemd unit is missing')"
   command -v python3 >/dev/null 2>&1 || die "$(l10n '未发现 python3' 'python3 was not found')"
   command -v nvidia-smi >/dev/null 2>&1 || die "$(l10n '未发现 nvidia-smi；请先正确安装 NVIDIA 驱动' 'nvidia-smi was not found; install the NVIDIA driver first')"
 
@@ -1210,8 +1215,7 @@ try:
     ) as response:
         raise SystemExit(0 if response.status < 500 else 1)
 except urllib.error.HTTPError as error:
-    # Authentication/rate-limit responses still prove that the international
-    # endpoint is reachable. Server errors do not.
+    # 认证或限流响应仍能证明国际端点可达，服务端错误则不能。
     raise SystemExit(0 if error.code < 500 else 1)
 except (OSError, urllib.error.URLError):
     raise SystemExit(1)
@@ -1528,7 +1532,7 @@ write_configuration() {
   ACCOUNT_ADMIN_USERNAME="${normalized_admin_username}"
   encoded_admin_username=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode(), end="")' "${ACCOUNT_ADMIN_USERNAME}")
   cat >"${CLUSTER_ENV}" <<EOF
-# Generated by install-llm-cluster.sh ${INSTALLER_VERSION}
+# 由 install-llm-cluster.sh ${INSTALLER_VERSION} 生成
 MODEL_SOURCE=${MODEL_SOURCE}
 MODEL_HUB=${MODEL_HUB}
 MODEL_ID=${MODEL_ID}
@@ -1711,6 +1715,7 @@ install_manager() {
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
+  install -m 755 "${MODEL_DEPLOYMENT_SOURCE}" /usr/local/lib/llm-cluster/model_deployment.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
   install -m 755 "${BENCHMARK_SOURCE}" /usr/local/lib/llm-cluster/llm_benchmark.py
   install -m 755 "${WORKFLOW_CONFIG_SOURCE}" /usr/local/lib/llm-cluster/workflow_config.py
@@ -1720,14 +1725,15 @@ install_manager() {
   install -m 644 "${KEEPWARM_SERVICE_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-keepwarm.service
   install -m 644 "${KEEPWARM_TIMER_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-keepwarm.timer
   install -m 644 "${WORKFLOW_SERVICE_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-workflow.service
+  install -m 644 "${MODEL_CONTROL_SERVICE_SOURCE}" /usr/local/lib/llm-cluster/systemd/llm-model-control.service
   rm -rf /usr/local/lib/llm-cluster/account_portal_ui
   cp -a "${ACCOUNT_UI_SOURCE}" /usr/local/lib/llm-cluster/account_portal_ui
   chown -R root:root /usr/local/lib/llm-cluster/account_portal_ui
+  getent group llm-account >/dev/null 2>&1 || groupadd --system llm-account
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-    getent group llm-account >/dev/null 2>&1 || groupadd --system llm-account
     id -u llm-account >/dev/null 2>&1 || useradd --system --gid llm-account --home-dir /nonexistent --shell /usr/sbin/nologin llm-account
-    # The portal user needs to traverse the shared parent, but it cannot read
-    # or enter the gateway sibling directory owned by container UID 1000.
+    # 门户用户需要穿越共享父目录，但不能读取或进入容器 UID 1000 所有的
+    # 网关同级目录。
     install -d -m 751 -o root -g llm-account "${STATE_DIR}/omniroute"
     install -d -m 770 -o 1000 -g 1000 "${STATE_DIR}/omniroute/gateway"
     install -d -m 750 -o llm-account -g llm-account "${STATE_DIR}/omniroute/portal"
@@ -1750,6 +1756,7 @@ validate_account_portal_configuration() {
 write_systemd_units() {
   install -m 0644 "${KEEPWARM_SERVICE_SOURCE}" /etc/systemd/system/llm-keepwarm.service
   install -m 0644 "${KEEPWARM_TIMER_SOURCE}" /etc/systemd/system/llm-keepwarm.timer
+  install -m 0644 "${MODEL_CONTROL_SERVICE_SOURCE}" /etc/systemd/system/llm-model-control.service
   cat >/etc/systemd/system/llm-worker@.service <<'EOF'
 [Unit]
 Description=vLLM model worker instance %i
@@ -1932,20 +1939,21 @@ EOF
   [[ ! -e /etc/systemd/system/llm-database.service ]] || chmod 644 /etc/systemd/system/llm-database.service
   [[ ! -e /etc/systemd/system/llm-account.service ]] || chmod 644 /etc/systemd/system/llm-account.service
   chmod 644 /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer
+  chmod 644 /etc/systemd/system/llm-model-control.service
   systemctl daemon-reload
 }
 
 prepare_worker_cache() {
   install -d -m 755 "${STATE_DIR}/cache/shared"
-  # llm-keepwarm.service uses ProtectSystem=strict and can write only here.
-  # Create the path before enabling its timer, including --no-start installs.
+  # llm-keepwarm.service 使用 ProtectSystem=strict，只能写入此处；启用 timer
+  # 前先创建路径，--no-start 安装也一样。
   install -d -m 700 "${STATE_DIR}/keepwarm"
 }
 
 start_cluster_with_progress() {
-  # `systemctl start` normally blocks while the oneshot controller waits for
-  # every large model load, but it does not stream the service journal to the
-  # caller. Start asynchronously and provide visible progress instead.
+  # `systemctl start` 会在 oneshot 控制器等待时阻塞，而且 systemd 启动
+  # 大模型时不会把 service journal 流式返回调用者，因此改为
+  # 异步启动并持续显示可见进度。
   systemctl start --no-block llm-cluster.service
   local timeout
   timeout=$((START_TIMEOUT * ((ACTIVE_INSTANCE_COUNT + STARTUP_PARALLELISM - 1) / STARTUP_PARALLELISM) + 300))
@@ -2093,8 +2101,7 @@ main() {
   preparse_language "$@"
   parse_args "$@"
   select_language_interactively
-  # Run this before gateway/model questions so an unreachable Hugging Face
-  # endpoint cannot silently shrink the later catalog result set.
+  # 在网关和模型提问前执行，避免 Hugging Face 不可达时静默缩小后续目录结果。
   prompt_proxy_if_needed
   export_proxy
   select_gateway_interactively
@@ -2155,8 +2162,7 @@ EOF
   verify_model_architecture_in_image
   download_model
 
-  # Runtime must not inherit an international proxy. A saved proxy is read only
-  # by explicit llmctl maintenance operations.
+  # 推理运行时不得继承国际代理；保存的代理仅供明确的 llmctl 维护操作读取。
   clear_install_proxy
   trap - EXIT
 
@@ -2166,6 +2172,20 @@ EOF
   prepare_worker_cache
   /usr/local/sbin/llmctl _nginx-install
   write_systemd_units
+
+  systemctl enable --now llm-model-control.service
+  local model_control_ready=0 model_control_wait
+  for model_control_wait in {1..30}; do
+    if /usr/local/lib/llm-cluster/model_deployment.py snapshot >/dev/null 2>&1; then
+      model_control_ready=1
+      break
+    fi
+    sleep 1
+  done
+  if (( model_control_ready == 0 )); then
+    journalctl -u llm-model-control.service -n 80 --no-pager >&2 || true
+    die "$(l10n '模型部署控制服务未通过启动验收' 'The model deployment control service failed startup acceptance')"
+  fi
 
   systemctl enable llm-cluster.service
   if (( KEEPWARM_ENABLED == 1 )); then

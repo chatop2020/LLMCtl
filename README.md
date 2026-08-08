@@ -32,6 +32,7 @@
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
 - 可选的 Go 工作流数据面支持把联网搜索、图片/音频/视频等 HTTP 适配器叠加到显式发布的模型；资源池使用可编辑的本机或远程 URL，普通模型请求继续走原有网关与 Worker 路径。详见 [WORKFLOW.md](WORKFLOW.md)。
+- 管理后台支持新增模型、复用本地权重、显式配置本机或远程 Worker、拆分 GPU、后台下载/验收、只重启受影响 Worker，以及失败后的任务级回滚。8 卡 Ornith/Qwen 拆分步骤见 [MULTI_MODEL.md](MULTI_MODEL.md)。
 - `llmctl info` 提供分门别类的完整灾备清单：公开/内部入口、硬件、镜像、服务、自启、Worker、数据库、管理员、全部密钥/密码、SMTP、代理、模型与文件路径；默认仅供可信 root 终端明文查看，分享时用 `--redact`。
 - `llmctl optimize` 可采集流式 TTFT/ITL/E2E、聚合吞吐、GPU/显存/温度、CPU/内存/Swap 和 vLLM KV Cache/排队/抢占/前缀缓存指标；先解释候选原因、代价和边界，经用户确认后才备份配置、逐项重启试验、自动择优、完整冒烟，并在失败或中断时回滚。
 
@@ -54,6 +55,7 @@
 | `lib/llm_benchmark.py` | 门户管理端的后台并发压测与流式性能指标执行器 |
 | `workflowd/` / `lib/workflowd/` | 可选 Go 工作流源码及 macOS 交叉编译的 Linux amd64/arm64 静态运行时 |
 | `lib/workflow_config.py` | 显式远程资源池、模型路由和适配器配置助手 |
+| `lib/model_deployment.py` | 多模型注册表、GPU/Worker 归属、后台部署与任务级回滚控制器 |
 | `portal-ui/` | Vue 3 企业门户源码与前端测试 |
 | `lib/account_portal_ui/` | 已构建、安装时直接复制的门户静态资源 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |
@@ -61,6 +63,7 @@
 | `README.md` / `README_EN.md` | 中英文项目说明 |
 | `USAGE.md` / `USAGE_EN.md` | 中英文日常使用、API 和故障排查手册 |
 | `WORKFLOW.md` / `WORKFLOW_EN.md` | 中英文可插拔工作流、远程 Worker 和升级兼容手册 |
+| `MULTI_MODEL.md` / `MULTI_MODEL_EN.md` | 中英文多模型安装、GPU 拆分、远程实例与回滚手册 |
 
 ## 默认值
 

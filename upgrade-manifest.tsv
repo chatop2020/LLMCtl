@@ -1,8 +1,9 @@
-# type  source                         destination                                             mode  restart
+# 类型    来源                           目标路径                                                权限    重启范围
 file    llmctl.sh                      /usr/local/sbin/llmctl                                  0755  none
 file    lib/model_catalog.py           /usr/local/lib/llm-cluster/model_catalog.py             0755  none
 file    lib/runtime_optimizer.py       /usr/local/lib/llm-cluster/runtime_optimizer.py         0755  none
 file    lib/gateway_config.py          /usr/local/lib/llm-cluster/gateway_config.py            0755  none
+file    lib/model_deployment.py        /usr/local/lib/llm-cluster/model_deployment.py           0755  none
 file    lib/account_portal.py          /usr/local/lib/llm-cluster/account_portal.py            0755  account
 file    lib/llm_benchmark.py           /usr/local/lib/llm-cluster/llm_benchmark.py              0755  account
 file    lib/workflow_config.py         /usr/local/lib/llm-cluster/workflow_config.py             0755  none
@@ -12,3 +13,4 @@ file    upgrade-llmctl.sh              /usr/local/lib/llm-cluster/upgrade-llmctl
 file    systemd/llm-keepwarm.service   /usr/local/lib/llm-cluster/systemd/llm-keepwarm.service  0644  none
 file    systemd/llm-keepwarm.timer     /usr/local/lib/llm-cluster/systemd/llm-keepwarm.timer    0644  none
 file    systemd/llm-workflow.service   /usr/local/lib/llm-cluster/systemd/llm-workflow.service  0644  none
+file    systemd/llm-model-control.service /usr/local/lib/llm-cluster/systemd/llm-model-control.service 0644 none

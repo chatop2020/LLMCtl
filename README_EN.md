@@ -32,6 +32,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
 - Optionally compose web search, image/audio/video HTTP adapters, and explicit local or remote URL pools behind a published model through the Go workflow data plane. Ordinary models retain the existing gateway-to-Worker path. See [WORKFLOW_EN.md](WORKFLOW_EN.md).
+- Add models from the administration portal, reuse local weights, explicitly configure local or remote Workers, partition GPUs, run background download and acceptance, restart only affected Workers, and roll back individual jobs. See [MULTI_MODEL_EN.md](MULTI_MODEL_EN.md) for the eight-GPU Ornith/Qwen split.
 - Use `llmctl info` as a categorized recovery inventory covering public/internal endpoints, hardware, images, services, autostart, workers, databases, administrators, every key/password, SMTP, proxy state, model details, and file paths. Plaintext is the root-terminal default; use `--redact` before sharing it.
 - Use `llmctl optimize` to collect streaming TTFT/ITL/E2E, aggregate throughput, GPU/VRAM/temperature, CPU/memory/swap, and vLLM KV-cache/queue/preemption/prefix-cache metrics. It explains every candidate's rationale, tradeoffs, and boundaries before consent, then backs up configuration, restarts and tests candidates, selects the objective-specific winner, runs full smoke acceptance, and rolls back on failure or interruption.
 
@@ -54,6 +55,7 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `lib/llm_benchmark.py` | Backend concurrent load generator and streaming performance metrics for the administration console |
 | `workflowd/` / `lib/workflowd/` | Optional Go workflow source plus macOS-cross-compiled Linux amd64/arm64 static runtimes |
 | `lib/workflow_config.py` | Explicit remote pools, model routes, and adapter configuration helper |
+| `lib/model_deployment.py` | Multi-model registry, GPU/Worker ownership, background deployment, and job-level rollback controller |
 | `portal-ui/` | Vue 3 company-portal source and frontend tests |
 | `lib/account_portal_ui/` | Built portal assets copied directly by the installer |
 | `tests/test_model_catalog.py` | Model catalog and hardware planning unit tests |
@@ -61,6 +63,7 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | `README.md` / `README_EN.md` | Chinese and English project overview |
 | `USAGE.md` / `USAGE_EN.md` | Chinese and English operations, API, and troubleshooting manual |
 | `WORKFLOW.md` / `WORKFLOW_EN.md` | Chinese and English workflow, remote-Worker, and upgrade-compatibility manuals |
+| `MULTI_MODEL.md` / `MULTI_MODEL_EN.md` | Chinese and English multi-model installation, GPU partitioning, remote-instance, and rollback manuals |
 
 ## Defaults
 

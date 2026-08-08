@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Hardware-aware vLLM cluster manager for Ubuntu 24.04.
-# Installed by install-llm-cluster.sh as /usr/local/sbin/llmctl.
+# 面向 Ubuntu 24.04 与 NVIDIA GPU 的硬件感知 vLLM 集群管理器。
+# 安装脚本会把本文件安装为 /usr/local/sbin/llmctl。
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.4.1"
+readonly CTL_VERSION="3.5.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -45,6 +45,12 @@ readonly WORKFLOW_HELPER="${LLM_WORKFLOW_HELPER:-/usr/local/lib/llm-cluster/work
 readonly WORKFLOW_RUNTIME="${LLM_WORKFLOW_RUNTIME:-/usr/local/lib/llm-cluster/workflowd/llm-workflowd}"
 readonly WORKFLOW_UNIT_SOURCE="${LLM_WORKFLOW_UNIT_SOURCE:-/usr/local/lib/llm-cluster/systemd/llm-workflow.service}"
 readonly WORKFLOW_SERVICE_UNIT="/etc/systemd/system/llm-workflow.service"
+readonly MODEL_CONTROL_RUNTIME="${LLM_MODEL_CONTROL_RUNTIME:-/usr/local/lib/llm-cluster/model_deployment.py}"
+readonly MODEL_CONTROL_SOCKET="${LLM_MODEL_CONTROL_SOCKET:-/run/llm-cluster/model-control.sock}"
+readonly MODEL_CONTROL_UNIT_SOURCE="${LLM_MODEL_CONTROL_UNIT_SOURCE:-/usr/local/lib/llm-cluster/systemd/llm-model-control.service}"
+readonly MODEL_CONTROL_SERVICE_UNIT="/etc/systemd/system/llm-model-control.service"
+readonly MODEL_CONTROL_STATE_DIR="${LLM_MODEL_CONTROL_STATE_DIR:-${STATE_DIR}/model-control}"
+readonly MODEL_CONTROL_BACKUP_DIR="${LLM_MODEL_BACKUPS_DIR:-/var/backups/llmctl/model-deployments}"
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
@@ -76,21 +82,20 @@ require_installed() {
 
 load_config() {
   require_installed
-  # These files are root-owned and generated/validated by the installer/manager.
+  # 这些文件由安装器或管理器生成并校验，且只允许 root 修改。
   # shellcheck disable=SC1090
   source "${CLUSTER_ENV}"
   # shellcheck disable=SC1090
   source "${SECRETS_ENV}"
 
-  # Backward compatibility for the previous Ornith-only release.
+  # 兼容此前只部署 Ornith 的版本。
   STARTUP_PARALLELISM="${STARTUP_PARALLELISM:-1}"
-  # Upgraded deployments opt in explicitly. Fresh 3.2+ installations write 1.
+  # 升级环境需要显式启用；3.2 及以后全新安装会写入 1。
   KEEPWARM_ENABLED="${KEEPWARM_ENABLED:-0}"
   KEEPWARM_INTERVAL_SECONDS="${KEEPWARM_INTERVAL_SECONDS:-300}"
   KEEPWARM_TIMEOUT_SECONDS="${KEEPWARM_TIMEOUT_SECONDS:-90}"
-  # Workflow routing is an optional, separately managed data plane. Existing
-  # 3.2.x deployments intentionally remain disabled after a control-plane
-  # upgrade until an administrator runs `llmctl workflow init/enable`.
+  # 工作流路由是独立管理的可选数据面。旧环境升级控制面后仍保持关闭，
+  # 直到管理员明确执行 `llmctl workflow init/enable`。
   WORKFLOW_ENABLED="${WORKFLOW_ENABLED:-0}"
   WORKFLOW_LISTEN="${WORKFLOW_LISTEN:-127.0.0.1:18100}"
   WORKFLOW_ROUTE_MODEL="${WORKFLOW_ROUTE_MODEL:-llmctl-workflow-${SERVED_MODEL_NAME:-gdn-inside}}"
@@ -262,12 +267,20 @@ cmd_worker_start() {
   require_root
   load_config
   local id="${1:?缺少 Worker ID}" worker_env="${CONFIG_DIR}/workers/${1}.env"
-  [[ "${id}" =~ ^[0-9]+$ ]] && (( id >= 0 && id < INSTANCE_COUNT )) || die "Worker ID 超出范围"
-  [[ -r "${worker_env}" ]] || die "缺少 ${worker_env}"
-  # shellcheck disable=SC1090
-  source "${worker_env}"
-  : "${GPU_DEVICES:?GPU_DEVICES missing}"
-  : "${WORKER_PORT:?WORKER_PORT missing}"
+  [[ "${id}" =~ ^[0-9]+$ ]] && (( id >= 0 && id <= 255 )) || die "Worker ID 超出范围"
+  if [[ -r "${worker_env}" ]]; then
+    # shellcheck disable=SC1090
+    source "${worker_env}"
+  else
+    # 旧版部署没有 Worker 私有配置，继续从全局参数推导，升级本身不改变运行方式。
+    GPU_DEVICES=$(worker_devices "${id}")
+    WORKER_PORT=$(worker_port "${id}")
+  fi
+  : "${GPU_DEVICES:?缺少 GPU_DEVICES}"
+  : "${WORKER_PORT:?缺少 WORKER_PORT}"
+  MODEL_LOCAL_DIR="${MODEL_LOCAL_DIR:-${MODEL_ROOT}/current}"
+  MODEL_LOCAL_DIR=$(readlink -f "${MODEL_LOCAL_DIR}" 2>/dev/null || true)
+  [[ -n "${MODEL_LOCAL_DIR}" && -d "${MODEL_LOCAL_DIR}" ]] || die "Worker ${id} 的模型目录不存在"
   ensure_docker_network
 
   local -a docker_args=(
@@ -277,9 +290,9 @@ cmd_worker_start() {
     -e "NVIDIA_VISIBLE_DEVICES=${GPU_DEVICES}"
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1
     -e VLLM_NO_USAGE_STATS=1 -e VLLM_MEDIA_URL_ALLOW_REDIRECTS=0
-    -v "${MODEL_ROOT}:/models:ro"
+    -v "${MODEL_LOCAL_DIR}:/model:ro"
     -v "${CACHE_DIR}/shared:/root/.cache"
-    "${VLLM_IMAGE}" /models/current
+    "${VLLM_IMAGE}" /model
     --served-model-name "${SERVED_MODEL_NAME}"
     --host 0.0.0.0 --port "${WORKER_PORT}"
     --api-key "${BACKEND_API_KEY}"
@@ -347,6 +360,13 @@ usage() {
   llmctl workflow secret set <环境变量> [值]   写入独立、root-only 的工作流密钥文件
   llmctl workflow <enable|disable|reload|check|status|show|health|logs>
                                                 独立管理 Go 数据面；默认不修改现有网关映射
+  llmctl model init                            初始化多模型注册表和本机控制服务；不重启 Worker
+  llmctl model status                          显示 GPU、部署、后台任务和控制服务状态
+  llmctl model plan <JSON文件|->               校验部署并显示受影响 Worker/GPU，不做修改
+  llmctl model deploy <JSON文件|->             提交已确认的后台部署任务
+  llmctl model job <任务ID>                    查询部署阶段、进度、日志与回滚结果
+  llmctl model cancel <任务ID>                 请求在安全检查点取消并回滚部署
+  llmctl model rollback <任务ID>               恢复到该成功部署执行前的快照
   llmctl responses status                      检查公开模型 ID 是否可被 Responses API 原生解析
   llmctl responses repair                      备份数据并修复 Responses API 原生 Combo 与用户权限
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
@@ -361,6 +381,7 @@ usage() {
   llmctl logs database [-f]                   PostgreSQL 日志
   llmctl logs account [-f]                    OmniRoute 账户门户日志
   llmctl logs workflow [-f]                   可插拔 Go 工作流日志
+  llmctl logs model [-f]                      多模型部署控制服务日志
   llmctl smoke [--worker ID] [--full]         文本/思考/工具；--full 另测 OCR/单请求6图
   llmctl ocr <图片文件> [提示词]               通过集群入口执行 OCR
   llmctl bench [--concurrency N] [--requests N] [--max-tokens N]
@@ -649,8 +670,7 @@ cmd_workflow_init() {
       *) die "未知 workflow init 参数：${arg}" ;;
     esac
   done
-  # Fail before creating workflow.json when an older installed upgrader did
-  # not yet copy the bundled Go runtime into the control-plane directory.
+  # 旧升级器尚未复制 Go 运行时到控制面目录时，在创建 workflow.json 前失败。
   workflow_require_runtime
   ensure_workflow_env
   if [[ -e "${WORKFLOW_CONFIG}" ]] && (( force == 0 )); then
@@ -883,15 +903,143 @@ cmd_workflow() {
   esac
 }
 
-worker_port() { printf '%s\n' "$((WORKER_BASE_PORT + $1))"; }
+model_control_require_runtime() {
+  [[ -x "${MODEL_CONTROL_RUNTIME}" ]] || \
+    die "多模型部署控制器不可执行：${MODEL_CONTROL_RUNTIME}。请运行 llmctl upgrade --force 补齐控制面文件。"
+}
+
+wait_model_control_ready() {
+  local elapsed=0
+  while (( elapsed < 30 )); do
+    if systemctl is-active --quiet llm-model-control.service && [[ -S "${MODEL_CONTROL_SOCKET}" ]]; then
+      if "${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  journalctl -u llm-model-control.service -n 80 --no-pager >&2 || true
+  return 1
+}
+
+model_control_request() {
+  local operation="${1:?}" input="${2:?}" temporary=""
+  model_control_require_runtime
+  [[ -S "${MODEL_CONTROL_SOCKET}" ]] || \
+    die "模型部署控制服务未就绪；请先运行 llmctl model init"
+  if [[ "${input}" == - ]]; then
+    temporary=$(mktemp "${STATE_DIR}/model-request.XXXXXX.json")
+    chmod 0600 "${temporary}"
+    dd status=none bs=1M count=2 of="${temporary}"
+    input="${temporary}"
+  fi
+  [[ -r "${input}" ]] || {
+    [[ -z "${temporary}" ]] || rm -f "${temporary}"
+    die "无法读取部署请求：${input}"
+  }
+  set +e
+  "${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" request "${operation}" "${input}"
+  local status=$?
+  set -e
+  [[ -z "${temporary}" ]] || rm -f "${temporary}"
+  return "${status}"
+}
+
+cmd_model() {
+  require_root; load_config
+  local action="${1:-status}" identifier="" payload="" enabled_state="" active_state=""
+  shift || true
+  case "${action}" in
+    init)
+      (( $# == 0 )) || die "用法：llmctl model init"
+      model_control_require_runtime
+      [[ -r "${MODEL_CONTROL_UNIT_SOURCE}" ]] || \
+        die "缺少模型部署 systemd 单元：${MODEL_CONTROL_UNIT_SOURCE}"
+      getent group llm-account >/dev/null 2>&1 || groupadd --system llm-account
+      install -d -o root -g llm-account -m 0750 "${STATE_DIR}/model-control"
+      install -m 0644 "${MODEL_CONTROL_UNIT_SOURCE}" "${MODEL_CONTROL_SERVICE_UNIT}"
+      systemctl daemon-reload
+      systemctl enable --now llm-model-control.service
+      wait_model_control_ready || die "模型部署控制服务未能在 30 秒内就绪"
+      "${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" migrate | jq .
+      log "多模型注册表已就绪；现有 Router 和 Worker 未重启。"
+      ;;
+    status)
+      (( $# == 0 )) || die "用法：llmctl model status"
+      enabled_state=$(systemctl is-enabled llm-model-control.service 2>/dev/null || true)
+      active_state=$(systemctl is-active llm-model-control.service 2>/dev/null || true)
+      printf 'LLMCtl model-control: configured=%s enabled=%s active=%s socket=%s\n' \
+        "$([[ -r "${CONFIG_DIR}/deployments.json" ]] && printf yes || printf legacy)" \
+        "${enabled_state:-not-installed}" "${active_state:-inactive}" \
+        "$([[ -S "${MODEL_CONTROL_SOCKET}" ]] && printf ready || printf unavailable)"
+      if [[ -S "${MODEL_CONTROL_SOCKET}" ]]; then
+        model_control_require_runtime
+        "${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot | jq .
+      fi
+      ;;
+    plan|deploy)
+      (( $# == 1 )) || die "用法：llmctl model ${action} <JSON文件|->"
+      payload="$1"
+      if [[ "${action}" == plan ]]; then
+        model_control_request plan "${payload}" | jq .
+      else
+        model_control_request submit "${payload}" | jq .
+      fi
+      ;;
+    job|cancel|rollback)
+      (( $# == 1 )) || die "用法：llmctl model ${action} <任务ID>"
+      identifier="$1"
+      [[ "${identifier}" =~ ^[a-f0-9-]{16,64}$ ]] || die "任务 ID 格式非法"
+      payload=$(mktemp "${STATE_DIR}/model-job.XXXXXX.json")
+      chmod 0600 "${payload}"
+      printf '{"id":"%s"}\n' "${identifier}" >"${payload}"
+      if [[ "${action}" == job ]]; then
+        model_control_request job "${payload}" | jq .
+      elif [[ "${action}" == rollback ]]; then
+        model_control_request rollback "${payload}" | jq .
+      else
+        model_control_request cancel "${payload}" | jq .
+      fi
+      rm -f "${payload}"
+      ;;
+    *) die "model 子命令必须是 init|status|plan|deploy|job|cancel|rollback" ;;
+  esac
+}
+
+worker_config_value() {
+  local id="${1:?}" name="${2:?}" fallback="${3-}" worker_env="${CONFIG_DIR}/workers/${1}.env"
+  (
+    [[ ! -r "${worker_env}" ]] || source "${worker_env}"
+    printf '%s\n' "${!name:-${fallback}}"
+  )
+}
+
+worker_port() {
+  local id="${1:?}"
+  worker_config_value "${id}" WORKER_PORT "$((WORKER_BASE_PORT + id))"
+}
 worker_unit() { printf 'llm-worker@%s.service\n' "$1"; }
 
 worker_devices() {
-  local instance start i out=""
+  local instance configured start i out=""
   instance="${1:?}"
+  configured=$(worker_config_value "${instance}" GPU_DEVICES "")
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+    return
+  fi
   start=$((instance * TP_SIZE))
   for ((i = 0; i < TP_SIZE; i++)); do out+="${out:+,}$((start + i))"; done
   printf '%s\n' "${out}"
+}
+
+worker_served_model() {
+  worker_config_value "${1:?}" SERVED_MODEL_NAME "${SERVED_MODEL_NAME}"
+}
+
+worker_supports_thinking_toggle() {
+  worker_config_value "${1:?}" SUPPORTS_THINKING_TOGGLE "${SUPPORTS_THINKING_TOGGLE}"
 }
 
 worker_is_active() {
@@ -915,15 +1063,17 @@ worker_health_fast() {
 }
 
 keepwarm_one_worker() {
-  local id="${1:?}" result_file="${2:?}" port payload response metrics="" curl_status=0
+  local id="${1:?}" result_file="${2:?}" port model thinking_toggle payload response metrics="" curl_status=0
   local http_code=000 ttft=0 total=0 status=failed error="" started_at finished_at
   port=$(worker_port "${id}")
+  model=$(worker_served_model "${id}")
+  thinking_toggle=$(worker_supports_thinking_toggle "${id}")
   response=$(mktemp "${KEEPWARM_STATE_DIR}/response-${id}.XXXXXX")
   started_at=$(date -u +%FT%TZ)
-  if (( SUPPORTS_THINKING_TOGGLE == 1 )); then
-    payload=$(jq -cn --arg model "${SERVED_MODEL_NAME}" '{model:$model,stream:false,max_tokens:1,temperature:0,chat_template_kwargs:{enable_thinking:false},messages:[{role:"user",content:"Reply OK."}]}')
+  if (( thinking_toggle == 1 )); then
+    payload=$(jq -cn --arg model "${model}" '{model:$model,stream:false,max_tokens:1,temperature:0,chat_template_kwargs:{enable_thinking:false},messages:[{role:"user",content:"Reply OK."}]}')
   else
-    payload=$(jq -cn --arg model "${SERVED_MODEL_NAME}" '{model:$model,stream:false,max_tokens:1,temperature:0,messages:[{role:"user",content:"Reply OK."}]}')
+    payload=$(jq -cn --arg model "${model}" '{model:$model,stream:false,max_tokens:1,temperature:0,messages:[{role:"user",content:"Reply OK."}]}')
   fi
   if metrics=$(curl --noproxy '*' -sS -o "${response}" \
       -w $'%{http_code}\t%{time_starttransfer}\t%{time_total}' \
@@ -977,9 +1127,8 @@ keepwarm_run_ids() {
   finished_at=$(date -u +%FT%TZ)
   finished_epoch=$(date +%s)
   total_count=${#keepwarm_id_list[@]}
-  # A killed shell, full filesystem, or unexpected helper failure must not
-  # make the aggregate disappear. Preserve one explicit result per requested
-  # Worker so status output can identify exactly which probe was lost.
+  # Shell 被终止、文件系统写满或辅助程序异常时，聚合结果不能消失；为每个请求的
+  # Worker 保留明确结果，让状态输出能定位具体丢失的探针。
   for id in "${keepwarm_id_list[@]}"; do
     result_file="${results_dir}/${id}.json"
     if [[ ! -s "${result_file}" ]] || ! jq -e 'type == "object" and has("status")' "${result_file}" >/dev/null 2>&1; then
@@ -1100,8 +1249,8 @@ gpu_memory_snapshot() {
     printf 'unavailable\n'
 }
 
-# Sets PROGRESS_* globals. Health probes run concurrently so an unavailable
-# batch costs about one second rather than one timeout per GPU.
+# 设置 PROGRESS_* 全局变量。健康探针并发运行，因此整批不可用时约耗时一秒，
+# 不会按每张 GPU 依次等待超时。
 collect_worker_progress() {
   local ids="${1:?}" inactive_is_pending="${2:-0}" id state healthy_csv="" label
   local -a id_list=()
@@ -1174,7 +1323,7 @@ wait_worker_batch() {
   while true; do
     now=$(date +%s)
     elapsed=$((now - started))
-    # Give a newly queued --no-block start a few seconds to leave inactive.
+    # 给刚进入队列的 --no-block 启动几秒时间离开 inactive 状态。
     collect_worker_progress "${ids}" "$((elapsed < 10 ? 1 : 0))"
     log_worker_progress "${elapsed}" "批次加载中"
     if (( PROGRESS_HEALTHY == PROGRESS_TOTAL )); then
@@ -1320,15 +1469,22 @@ reconcile_gateway() {
       gateway_helper reconcile-newapi --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
       ;;
     omniroute)
-      log "自动初始化 OmniRoute，并同步 ${worker_ids} 个健康 Worker、模型、Combo 和管理密钥..."
-      gateway_helper reconcile-omniroute --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
+      if [[ -s "${DEPLOYMENT_REGISTRY:-/etc/llm-cluster/deployments.json}" ]]; then
+        log "自动初始化 OmniRoute，并根据多模型注册表同步全部模型、实例、Combo 和管理密钥..."
+        gateway_helper reconcile-omniroute-registry \
+          --registry "${DEPLOYMENT_REGISTRY:-/etc/llm-cluster/deployments.json}" \
+          --secrets-file "${SECRETS_ENV}"
+      else
+        log "自动初始化 OmniRoute，并同步 ${worker_ids} 个健康 Worker、模型、Combo 和管理密钥..."
+        gateway_helper reconcile-omniroute --worker-ids "${worker_ids}" --secrets-file "${SECRETS_ENV}"
+      fi
       if (( SUPPORTS_IMAGE_INPUT == 1 )); then
         log "OmniRoute Vision Bridge 已关闭：当前模型原生支持图片，图片和 PDF 将直接转发给 vLLM。"
       fi
       ;;
     *) return 0 ;;
   esac
-  # Reconciliation can atomically replace the managed gateway key.
+  # 同步过程可能原子替换受管网关 Key。
   # shellcheck disable=SC1090
   source "${SECRETS_ENV}"
   log "$(gateway_display_name) 自动配置完成。"
@@ -1384,9 +1540,8 @@ reload_gateway_api_key() {
 
 router_health() {
   local base_url
-  # New API creates its managed token after the startup watcher has begun.
-  # Reload the atomically replaced root-only secrets file for every readiness
-  # probe so long-running observers and concurrent key rotations converge.
+  # New API 会在启动观察器运行后才创建受管 Token。每次就绪探测都重新加载
+  # 原子替换、仅 root 可读的 secrets 文件，使长时观察与并发 Key 轮换收敛。
   reload_gateway_api_key || return 1
   base_url=$(router_local_base_url)
   curl --noproxy '*' -fsS --max-time 3 \
@@ -1395,8 +1550,8 @@ router_health() {
 }
 
 router_local_base_url() {
-  # API_PORT fallback keeps source-only diagnostics for pre-2.4 configs usable;
-  # installed 2.4 configurations always define the isolated internal port.
+  # API_PORT 回退保证 2.4 之前配置仍可做源码诊断；已安装的 2.4 配置总会定义
+  # 隔离的内部端口。
   printf 'http://127.0.0.1:%s\n' "${GATEWAY_INTERNAL_PORT:-${API_PORT}}"
 }
 
@@ -1438,9 +1593,8 @@ render_nginx_config() {
     proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
     proxy_buffering off;
   }
-  # Public authentication endpoints receive a second, IP-wide throttle in
-  # addition to the portal's identity lockout. Exact locations override the
-  # generic portal-api proxy while keeping inference traffic unrestricted.
+  # 公开认证端点除门户身份锁定外，再增加一层按 IP 限流。精确 location 覆盖
+  # 通用 portal-api 代理，同时不限制推理流量。
   location = /portal-api/auth/login {
     limit_req zone=llmctl_auth burst=10 nodelay;
     proxy_pass http://127.0.0.1:${ACCOUNT_PORT};
@@ -1480,7 +1634,7 @@ render_nginx_config() {
       ;;
   esac
   cat <<EOF
-# Generated by LLMCtl ${CTL_VERSION}. Do not edit; use llmctl tune/info.
+# 由 LLMCtl ${CTL_VERSION} 生成；请勿手工编辑，使用 llmctl tune/info。
 map \$http_upgrade \$llmctl_connection_upgrade {
   default upgrade;
   '' close;
@@ -1490,8 +1644,7 @@ limit_req_zone \$binary_remote_addr zone=llmctl_auth:10m rate=30r/m;
 
 server {
   listen ${listen_address};
-  # Exact host/IP names allow this isolated server to coexist with an existing
-  # Nginx installation on the same listen socket without replacing its sites.
+  # 精确主机名/IP 让隔离 server 可与同一监听 socket 上的既有 Nginx 站点共存。
   server_name ${server_names};
   server_tokens off;
   client_max_body_size 128m;
@@ -1499,8 +1652,8 @@ server {
   proxy_http_version 1.1;
   proxy_set_header Host \$host;
   proxy_set_header X-Real-IP \$remote_addr;
-  # Never preserve a client-supplied X-Forwarded-For value. The portal trusts
-  # this header only from the local Nginx hop for audit and login throttling.
+  # 不保留客户端提供的 X-Forwarded-For；门户仅信任本机 Nginx 注入的该 Header，
+  # 用于审计和登录限流。
   proxy_set_header X-Forwarded-For \$remote_addr;
   proxy_set_header X-Forwarded-Proto \$scheme;
   proxy_set_header Upgrade \$http_upgrade;
@@ -1534,7 +1687,7 @@ ${ui_block}
     add_header Referrer-Policy "no-referrer" always;
   }
 
-  # Native gateway assets, management APIs, OAuth callbacks and deep links.
+  # 原生网关静态资源、管理 API、OAuth 回调与深层链接。
   location / {
     proxy_pass http://127.0.0.1:${GATEWAY_INTERNAL_PORT};
     proxy_buffering off;
@@ -1562,8 +1715,7 @@ cmd_nginx_install() {
       install -m 600 "${NGINX_CONFIG}" "${backup}"
       install_mode=replaced
     elif [[ -f "${backup}" ]]; then
-      # Upgrade from an earlier 2.4 development build that already captured an
-      # original same-name site before the install-mode marker existed.
+      # 兼容早期 2.4 开发版：该版本在 install-mode 标记出现前已捕获同名原站点。
       install_mode=replaced
     else
       rm -f "${backup}"
@@ -1783,7 +1935,7 @@ wait_worker_units_stopped() {
 
 restart_ids() {
   local ids="${1:?}" id failed=0
-  # Exclude restarting workers before taking them down.
+  # 停止前先排除处于重启过程的 Worker。
   stop_ids "${ids}" || return 1
   start_worker_ids_batched "${ids}" || failed=1
   refresh_router
@@ -2032,6 +2184,16 @@ cmd_info() {
       "$(jq -r '[.models|to_entries[]|select(.value.enabled)|.key]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)" \
       "$(jq -r '[.pools|to_entries[]|"\(.key)=\(.value.targets|length)"]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)"
   fi
+  printf '多模型控制器: registry=%s；service=%s/%s；socket=%s\n运行时: %s；任务目录: %s；回滚目录: %s\n' \
+    "$([[ -r "${CONFIG_DIR}/deployments.json" ]] && printf configured || printf legacy)" \
+    "$(systemctl is-active llm-model-control.service 2>/dev/null || printf inactive)" \
+    "$(systemctl is-enabled llm-model-control.service 2>/dev/null || printf disabled)" \
+    "$([[ -S "${MODEL_CONTROL_SOCKET}" ]] && printf ready || printf unavailable)" \
+    "${MODEL_CONTROL_RUNTIME}" "${STATE_DIR}/model-control/jobs" "${STATE_DIR}/model-control/backups"
+  if [[ -S "${MODEL_CONTROL_SOCKET}" && -x "${MODEL_CONTROL_RUNTIME}" ]]; then
+    printf '部署/GPU 分配: %s\n' \
+      "$("${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot 2>/dev/null | jq -c '{revision:.registry.revision,deployments:[.registry.deployments|to_entries[]|{id:.key,status:.value.status,public_ids:.value.public_model_ids,instances:[.value.instances[]|{id,kind,worker_id,gpu_devices,base_url,enabled}]}],active_jobs:[.jobs[]|select(.state|IN("waiting","running"))|{id,kind,state,phase,progress}]}' 2>/dev/null || printf unavailable)"
+  fi
   [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemctl is-active llm-account.service 2>/dev/null || printf unknown)"
   [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemctl is-active llm-database.service 2>/dev/null || printf unknown)"
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
@@ -2193,7 +2355,7 @@ cmd_stop() {
   require_root; load_config
   local spec="${1:-all}" ids
   # "stop all" means every possible instance, including one started manually
-  # without adding it to the persistent boot list.
+  # 启动但不加入持久开机列表。
   [[ "${spec}" == all ]] && ids=$(all_instance_ids) || ids=$(resolve_ids "${spec}")
   stop_ids "${ids}"
 }
@@ -2380,7 +2542,11 @@ cmd_logs() {
       [[ "${2:-}" == "-f" ]] && follow="-f"
       journalctl -u llm-workflow.service ${follow} -n 300 --no-pager
       ;;
-    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f] | logs account [-f] | logs workflow [-f]" ;;
+    model)
+      [[ "${2:-}" == "-f" ]] && follow="-f"
+      journalctl -u llm-model-control.service ${follow} -n 300 --no-pager
+      ;;
+    *) die "用法：llmctl logs [all] [-f] | logs worker <ID> [-f] | logs router [-f] | logs database [-f] | logs account [-f] | logs workflow [-f] | logs model [-f]" ;;
   esac
 }
 
@@ -3208,7 +3374,7 @@ cmd_tune() {
       elif (( restart_workers )); then
         warn "该参数需重启 Worker 才生效：llmctl restart all"
       elif (( apply_router )); then
-        # Reload values and apply router-only changes now.
+        # 重新加载数值并立即应用仅影响 Router 的变更。
         load_config
         refresh_router
       else
@@ -3249,7 +3415,7 @@ cmd_key() {
         export GATEWAY_LOCAL_URL
         GATEWAY_LOCAL_URL=$(router_local_base_url)
         gateway_helper rotate-omniroute-key --secrets-file "${SECRETS_ENV}"
-        # Reload the new management key before restarting the dependent portal.
+        # 重启依赖门户前重新加载新管理 Key。
         # shellcheck disable=SC1090
         source "${SECRETS_ENV}"
         systemctl restart llm-account.service
@@ -3426,7 +3592,7 @@ load_runtime_proxy() {
   RUNTIME_HTTPS_PROXY=""
   RUNTIME_NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
   if [[ -r "${RUNTIME_PROXY_ENV}" ]]; then
-    # This file is root-owned and generated by `llmctl runtime-proxy set`.
+    # 此文件由 root 所有，通过 `llmctl runtime-proxy set` 生成。
     # shellcheck disable=SC1090
     source "${RUNTIME_PROXY_ENV}"
   fi
@@ -3536,7 +3702,7 @@ prompt_proxy_if_needed() {
   load_saved_proxy
   log "$(ctl_l10n 'Hugging Face 搜索前网络测试：正在检查国际直连...' 'Pre-search network test: checking direct Hugging Face access...')"
   if hf_network_probe direct; then
-    # A saved proxy is only a fallback. Prefer direct access when available.
+    # 已保存代理仅作后备；直连可用时优先直连。
     MAINTENANCE_PROXY=""
     log "$(ctl_l10n '国际网络测试通过：Hugging Face 可直连。' 'International connectivity passed: Hugging Face is directly reachable.')"
     return 0
@@ -4045,19 +4211,19 @@ cmd_uninstall() {
     [[ "${answer}" =~ ^[Yy]$ ]] || { log "已取消。"; return 0; }
   fi
   log "卸载 1/4：禁用开机自启。"
-  # Only remove boot activation here. Stopping is deliberately delegated to
-  # the bounded, visible, concurrent lifecycle below so uninstall cannot
-  # become silent while systemd waits for a probe or container.
+  # 此处只移除开机启动；停止服务交给下方有超时、有进度的并发生命周期处理，
+  # 避免 systemd 等待探针或容器时让卸载过程长时间没有输出。
   systemctl disable llm-keepwarm.timer 2>/dev/null || true
   systemctl disable llm-cluster.service 2>/dev/null || true
   systemctl disable llm-workflow.service 2>/dev/null || true
+  systemctl disable llm-model-control.service 2>/dev/null || true
   log "卸载 2/4：并发停止 Router、数据库和 ${INSTANCE_COUNT} 个 Worker。"
   stop_managed_services_with_progress 180 || \
     die "LLM 服务未能在限定时间内安全停止；配置尚未删除，请根据上方单位/容器状态检查"
   log "卸载 3/4：删除 systemd 单元和可再生成数据；配置保留到最后一步。"
   remove_nginx_config
   remove_tree_with_progress "${NGINX_STATE_DIR}" "可再生成的 Nginx 回滚缓存" 2
-  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer /etc/systemd/system/llm-workflow.service
+  rm -f /etc/systemd/system/llm-cluster.service /etc/systemd/system/llm-router.service /etc/systemd/system/llm-database.service /etc/systemd/system/llm-account.service /etc/systemd/system/llm-worker@.service /etc/systemd/system/llm-keepwarm.service /etc/systemd/system/llm-keepwarm.timer /etc/systemd/system/llm-workflow.service /etc/systemd/system/llm-model-control.service
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
   clear_temporary_proxy
@@ -4078,6 +4244,10 @@ cmd_uninstall() {
   remove_tree_with_progress "${CACHE_DIR}" "可再生成编译缓存" 5
   [[ "${KEEPWARM_STATE_DIR}" == /var/lib/llm-cluster/keepwarm ]] || die "保活状态路径安全检查失败"
   remove_tree_with_progress "${KEEPWARM_STATE_DIR}" "可再生成保活状态" 2
+  [[ "${MODEL_CONTROL_STATE_DIR}" == /var/lib/llm-cluster/model-control ]] || die "模型部署状态路径安全检查失败"
+  remove_tree_with_progress "${MODEL_CONTROL_STATE_DIR}" "模型部署任务状态" 2
+  [[ "${MODEL_CONTROL_BACKUP_DIR}" == /var/backups/llmctl/model-deployments ]] || die "模型部署回滚路径安全检查失败"
+  remove_tree_with_progress "${MODEL_CONTROL_BACKUP_DIR}" "模型部署回滚快照" 2
   if (( purge_images )); then
     log "删除锁定的 LLM 容器镜像。"
     if [[ "${GATEWAY_KIND}" == omniroute ]]; then
@@ -4178,7 +4348,7 @@ running_managed_containers() {
 
 active_managed_units() {
   local unit state out=""
-  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer llm-workflow.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer llm-workflow.service llm-model-control.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
@@ -4208,7 +4378,7 @@ wait_managed_services_stopped() {
 
 force_stop_managed_services() {
   local names name
-  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-workflow.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-workflow.service llm-model-control.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   local id
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
@@ -4223,7 +4393,7 @@ force_stop_managed_services() {
 
 stop_managed_services_with_progress() {
   local timeout="${1:-180}" id
-  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer llm-workflow.service)
+  local -a units=(llm-cluster.service llm-router.service llm-keepwarm.service llm-keepwarm.timer llm-workflow.service llm-model-control.service)
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then units+=(llm-account.service); else units+=(llm-database.service); fi
   for ((id = 0; id < INSTANCE_COUNT; id++)); do units+=("$(worker_unit "${id}")"); done
   systemctl stop --no-block "${units[@]}" 2>/dev/null || true
@@ -4265,10 +4435,9 @@ cmd_boot_start() {
 
 cmd_boot_stop() {
   require_root; load_config
-  # Every child unit declares PartOf=llm-cluster.service. systemd already adds
-  # their stop jobs to the same transaction and runs them concurrently. Calling
-  # `systemctl stop` recursively from this ExecStop can wait on its own parent
-  # transaction and was the cause of the legacy uninstall appearing hung.
+  # 每个子单元都声明 PartOf=llm-cluster.service，systemd 会把停止任务加入同一
+  # 事务并并发执行。从此 ExecStop 递归调用 `systemctl stop` 可能等待自己的父事务，
+  # 这正是旧版卸载看似卡死的原因。
   log "systemd 已并发停止 Router、可选数据库/账户门户和 ${INSTANCE_COUNT} 个 Worker。"
 }
 
@@ -4301,6 +4470,7 @@ main() {
     autostart) cmd_autostart "$@" ;;
     keepwarm) cmd_keepwarm "$@" ;;
     workflow) cmd_workflow "$@" ;;
+    model) cmd_model "$@" ;;
     responses) cmd_responses "$@" ;;
     router) cmd_router "$@" ;;
     database) cmd_database "$@" ;;

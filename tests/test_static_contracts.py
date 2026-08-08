@@ -308,7 +308,7 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("/v1/models", ACCOUNT)
         self.assertIn("curl", ACCOUNT)
         self.assertIn("audit_events", ACCOUNT)
-        self.assertIn("API key plaintext is returned once", ACCOUNT)
+        self.assertIn("API Key 明文只返回一次", ACCOUNT)
 
 
 if __name__ == "__main__":
