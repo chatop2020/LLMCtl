@@ -3316,10 +3316,11 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                         {
                             "error": str(error),
                             "available": False,
-                            "setup_command": "llmctl model status",
+                            "setup_command": "llmctl model init",
                             "recovery_commands": [
+                                "llmctl model init",
                                 "llmctl model status",
-                                "systemctl status llm-model-control.service",
+                                "llmctl logs model",
                             ],
                         },
                     )
@@ -4492,7 +4493,7 @@ class ModelDeploymentClient:
                         raise RuntimeError("模型部署响应超过 2 MiB")
         except FileNotFoundError as error:
             raise RuntimeError(
-                "模型部署控制服务尚未安装或未启动；请运行 llmctl model status"
+                "模型部署控制服务尚未注册；请运行 llmctl model init。该操作不会重启 Router 或 Worker"
             ) from error
         except PermissionError as error:
             raise RuntimeError(
@@ -4500,7 +4501,7 @@ class ModelDeploymentClient:
             ) from error
         except (ConnectionRefusedError, TimeoutError, socket.timeout) as error:
             raise RuntimeError(
-                "模型部署控制服务不可用；请运行 llmctl model status"
+                "模型部署控制服务不可用；请先运行 llmctl model init，再用 llmctl logs model 查看日志"
             ) from error
         if not response:
             raise RuntimeError("模型部署控制服务未返回数据")

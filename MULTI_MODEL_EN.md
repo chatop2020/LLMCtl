@@ -6,7 +6,7 @@ Starting with LLMCtl 3.5, administrators can download, verify, and publish addit
 
 ## Prerequisites
 
-- Run `llmctl upgrade`, then confirm that `llm-model-control.service` is `active` with `llmctl model status`.
+- Run `llmctl upgrade`, then confirm that `llm-model-control.service` is `active` with `llmctl model status`. On the first upgrade from a release without the multi-model controller, run `llmctl model init` once if the status reports `enabled=not-installed`. This registers the service and migrates existing configuration; it installs no additional package and does not restart the Router or Workers.
 - Automatic publication of multiple public model IDs currently requires OmniRoute. New API, LiteLLM, and Bifrost may keep isolated resources that do not replace existing Workers, but LLMCtl will not claim that an unsupported gateway has been synchronized.
 - The default local model root is `/data/llm-cluster/models`. A selected local directory containing complete weights is verified and reused without downloading it again.
 - Every local instance must own unique Worker IDs, ports, and GPUs. A GPU cannot be assigned to two vLLM instances.
@@ -72,6 +72,7 @@ Remote instances do not write local systemd Worker configuration or consume loca
 ## Compatibility and Rollback
 
 - For legacy installations containing only `/etc/llm-cluster/cluster.env` and `llm-worker@N`, the controller synthesizes a registry without restarting the Router or Workers.
+- When the first cross-version upgrade is performed by a legacy updater, it can copy the new control-plane files but cannot register a systemd unit unknown to that old updater. Run `llmctl model init` once in this state. Later upgrades maintain the registered unit automatically.
 - `llmctl upgrade` updates the control plane and portal only. Existing models, Workers, and GPUs are not changed until an administrator submits a model deployment.
 - Every job snapshots the registry, per-Worker environment files, and gateway database/configuration. Rollback restarts only affected Workers.
 - Reusable model weights are not deleted by a control-plane rollback.

@@ -109,6 +109,21 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("workflow_require_runtime()", MANAGER)
         self.assertIn("llmctl upgrade --force", MANAGER)
 
+    def test_legacy_multimodel_upgrade_has_an_actionable_recovery_path(self):
+        """旧升级器只能复制新文件，状态命令必须明确给出无中断初始化路径。"""
+        model_command = MANAGER.split("cmd_model() {", 1)[1].split(
+            "worker_config_value() {", 1
+        )[0]
+        status = model_command.split("    status)\n", 1)[1].split("    plan|deploy)", 1)[0]
+        self.assertIn("enabled_state=not-installed", status)
+        self.assertIn("llmctl model init", status)
+        self.assertIn("不需要安装额外软件", status)
+        self.assertIn("不重启 Router 或 Worker", status)
+
+        account = (ROOT / "lib/account_portal.py").read_text(encoding="utf-8")
+        self.assertIn('"setup_command": "llmctl model init"', account)
+        self.assertIn("模型部署控制服务尚未注册；请运行 llmctl model init", account)
+
     def test_upgrader_preserves_runtime_and_only_refreshes_managed_nginx(self):
         source = UPGRADER.read_text(encoding="utf-8")
         normal_upgrade = source.split("install_control_plane() {", 1)[1].split(

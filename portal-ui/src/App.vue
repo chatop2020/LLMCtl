@@ -4193,8 +4193,15 @@ onBeforeUnmount(() => {
             <section v-if="modelDeployments?.available === false" class="panel deployment-unavailable">
               <h2>模型部署控制服务不可用</h2>
               <p>{{ modelDeployments.error }}</p>
+              <p>
+                从旧版 LLMCtl 首次升级时，运行时文件可能已经就绪，但 systemd 服务尚未注册。
+                这不需要安装额外软件，也不会影响当前 Router 或 Worker。
+              </p>
+              <strong>先执行</strong>
+              <code>llmctl model init</code>
+              <strong>然后确认</strong>
               <code>llmctl model status</code>
-              <code>systemctl status llm-model-control.service</code>
+              <code>llmctl logs model</code>
             </section>
 
             <template v-else>

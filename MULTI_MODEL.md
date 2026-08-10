@@ -6,7 +6,7 @@ LLMCtl 3.5 起可以在管理后台的“模型部署”页面下载、校验和
 
 ## 上线前提
 
-- 先执行 `llmctl upgrade`，再用 `llmctl model status` 确认 `llm-model-control.service` 为 `active`。
+- 先执行 `llmctl upgrade`，再用 `llmctl model status` 确认 `llm-model-control.service` 为 `active`。从不含多模型控制器的旧版首次升级时，如果状态显示 `enabled=not-installed`，执行一次 `llmctl model init` 即可注册服务并迁移现有配置；不需要安装额外软件，也不会重启 Router 或 Worker。
 - 自动发布多个公开模型 ID 目前要求 OmniRoute。New API、LiteLLM 和 Bifrost 可以维护不占用现有 Worker 的隔离资源，但 LLMCtl 不会假装已经把它们写入接入层。
 - 本机模型目录默认为 `/data/llm-cluster/models`。选择的本地目录已包含完整权重时会直接校验并复用，不重复下载。
 - 每个本地实例必须独占 Worker ID、监听端口和 GPU；一个 GPU 不能同时分配给两个 vLLM 实例。
@@ -72,6 +72,7 @@ sudo llmctl logs model
 ## 兼容与回滚
 
 - 旧版本只有 `/etc/llm-cluster/cluster.env` 和 `llm-worker@N` 时，首次启动模型控制器会合成一份注册表，不重启 Router 或 Worker。
+- 首次跨版本升级由旧升级器执行时，它只能复制新控制面文件，无法注册旧版尚不了解的 systemd 单元。此时运行一次 `llmctl model init` 完成注册；后续新版升级器会自动维护该单元。
 - `llmctl upgrade` 只更新控制面和门户；除非管理员提交模型部署任务，否则不会调整现有模型、Worker 或 GPU。
 - 每个任务会保存注册表、逐 Worker 环境文件和接入层数据库/配置快照。只恢复该任务影响的 Worker。
 - 模型权重属于可复用数据，不会因为控制面回滚而删除。

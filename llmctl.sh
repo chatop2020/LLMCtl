@@ -969,13 +969,29 @@ cmd_model() {
       (( $# == 0 )) || die "用法：llmctl model status"
       enabled_state=$(systemctl is-enabled llm-model-control.service 2>/dev/null || true)
       active_state=$(systemctl is-active llm-model-control.service 2>/dev/null || true)
+      [[ -n "${enabled_state}" && "${enabled_state}" != not-found ]] || enabled_state=not-installed
+      [[ -n "${active_state}" && "${active_state}" != unknown ]] || active_state=inactive
       printf 'LLMCtl model-control: configured=%s enabled=%s active=%s socket=%s\n' \
         "$([[ -r "${CONFIG_DIR}/deployments.json" ]] && printf yes || printf legacy)" \
-        "${enabled_state:-not-installed}" "${active_state:-inactive}" \
+        "${enabled_state}" "${active_state}" \
         "$([[ -S "${MODEL_CONTROL_SOCKET}" ]] && printf ready || printf unavailable)"
       if [[ -S "${MODEL_CONTROL_SOCKET}" ]]; then
         model_control_require_runtime
         "${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot | jq .
+      elif [[ "${enabled_state}" == not-installed ]]; then
+        if [[ -x "${MODEL_CONTROL_RUNTIME}" && -r "${MODEL_CONTROL_UNIT_SOURCE}" ]]; then
+          log "检测到旧版控制面升级后的首次初始化状态；不需要安装额外软件。"
+          log "请运行 llmctl model init。该命令只注册模型控制服务并迁移注册表，不重启 Router 或 Worker。"
+        else
+          warn "模型控制运行时或 systemd 单元模板不完整。"
+          log "请依次运行：llmctl upgrade --force；llmctl model init。"
+        fi
+      elif [[ "${active_state}" != active ]]; then
+        warn "模型控制服务已经注册但没有运行。"
+        log "请运行 llmctl model init；如仍失败，再运行 llmctl logs model。"
+      else
+        warn "模型控制服务正在运行，但 Unix Socket 尚不可用。"
+        log "请运行 llmctl logs model 检查启动日志。"
       fi
       ;;
     plan|deploy)
