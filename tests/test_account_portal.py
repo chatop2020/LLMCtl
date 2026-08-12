@@ -3,6 +3,7 @@ import dataclasses
 import datetime
 import http.cookiejar
 import importlib.util
+import io
 import json
 import pathlib
 import sqlite3
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unittest
+import zipfile
 from unittest import mock
 
 
@@ -1240,6 +1242,86 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(result["selected_user"]["summary"]["total_tokens"], 150)
         self.assertEqual(result["timeseries"][9]["total_tokens"], 150)
         self.assertEqual(result["timeseries"][10]["total_tokens"], 50)
+
+    def test_admin_usage_report_includes_zero_usage_staff_and_exports_all_pages(self):
+        self.insert_control_user_and_model()
+        zone = portal.ZoneInfo("Asia/Shanghai")
+        current = int(datetime.datetime(2026, 8, 3, 10, 30, tzinfo=zone).timestamp())
+        occurred = int(datetime.datetime(2026, 8, 3, 9, 15, tzinfo=zone).timestamp())
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id,email,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "idle-user", "idle@example.com", portal.hash_password("another password"),
+                    "user", "active", "idle-key", 0, "none", "00:00", current, current,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,?,0,?)",
+                ("idle-user", 2_000_000, current),
+            )
+            connection.execute(
+                """INSERT INTO usage_ledger(
+                     request_id,user_id,api_key_id,model_id,public_model_id,
+                     provider,resolved_model,input_tokens,output_tokens,cached_tokens,
+                     reasoning_tokens,granted_tokens,amount_micros,price_snapshot_json,
+                     occurred_at,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "report-request", "policy-user", "policy-key", "model-1", "gdn-inside",
+                    "local", "ornith", 120, 30, 8, 4, 0, 500_000, "{}", occurred, current,
+                ),
+            )
+        with mock.patch.dict(portal.os.environ, {"TZ": "Asia/Shanghai"}), mock.patch.object(
+            portal, "now", return_value=current
+        ):
+            first_page = self.server.control.admin_usage_report(
+                period="day", anchor="2026-08-03", page=1, page_size=1
+            )
+            content, filename, exported = self.server.control.admin_usage_report_export(
+                period="day", anchor="2026-08-03", page=1, page_size=1
+            )
+        self.assertEqual(first_page["summary"]["total_users"], 2)
+        self.assertEqual(first_page["summary"]["active_users"], 1)
+        self.assertEqual(first_page["summary"]["inactive_users"], 1)
+        self.assertEqual(first_page["summary"]["total_tokens"], 150)
+        self.assertEqual(first_page["pagination"], {"page": 1, "page_size": 1, "pages": 2, "total": 2})
+        self.assertEqual(len(first_page["users"]), 1)
+        self.assertEqual(len(exported["users"]), 2)
+        self.assertTrue(filename.endswith(".xlsx"))
+        self.assertTrue(content.startswith(b"PK"))
+        with zipfile.ZipFile(io.BytesIO(content)) as workbook:
+            self.assertEqual(workbook.testzip(), None)
+            self.assertIn("xl/worksheets/sheet2.xml", workbook.namelist())
+            staff_sheet = workbook.read("xl/worksheets/sheet2.xml").decode()
+        self.assertIn("policy@example.com", staff_sheet)
+        self.assertIn("idle@example.com", staff_sheet)
+
+    def test_admin_usage_report_http_routes_require_admin_and_export_xlsx(self):
+        self.insert_control_user_and_model()
+        anonymous, _ = self.opener()
+        status, _, _ = self.get(anonymous, "/portal-api/admin/usage-report?period=day")
+        self.assertEqual(status, 401)
+        client, _ = self.login_admin_api()
+        status, raw, _ = self.get(
+            client,
+            "/portal-api/admin/usage-report?period=day&page=1&page_size=20",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["source"], "usage_ledger")
+        with client.open(
+            self.base_url + "/portal-api/admin/usage-report/export?period=day&page=1&page_size=20",
+            timeout=5,
+        ) as response:
+            content = response.read()
+            content_type = response.headers.get_content_type()
+            disposition = response.headers.get("Content-Disposition", "")
+        self.assertEqual(
+            content_type,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertIn("attachment", disposition)
+        self.assertTrue(content.startswith(b"PK"))
 
     def test_bulk_user_policy_update_is_explicit_atomic_and_synced(self):
         self.insert_control_user_and_model()

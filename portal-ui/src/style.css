@@ -1037,6 +1037,99 @@ dialog::backdrop {
 }
 
 /* 运行分析与显式批量策略管理。 */
+.report-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.report-filter-panel {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+.report-period-tabs {
+  display: inline-flex;
+  justify-self: start;
+  gap: 4px;
+  padding: 4px;
+  background: #edf5f8;
+  border: 1px solid #d5e4ea;
+  border-radius: 10px;
+}
+.report-period-tabs button {
+  min-height: 34px;
+  padding: 6px 16px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  box-shadow: none;
+}
+.report-period-tabs button.active {
+  color: #fff;
+  background: #178dbd;
+}
+.usage-report-filters {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(130px, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+.usage-report-filters label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.usage-report-filters label > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+.usage-report-filters input,
+.usage-report-filters select {
+  min-width: 0;
+  min-height: 42px;
+}
+.report-query-button {
+  min-height: 42px;
+  padding-inline: 24px;
+}
+.report-filter-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.report-loading {
+  padding: 32px;
+  color: var(--muted);
+  text-align: center;
+}
+.usage-report-summary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.usage-report-summary article {
+  min-height: 116px;
+}
+.usage-report-summary strong {
+  font-size: clamp(18px, 1.7vw, 27px);
+  font-variant-numeric: tabular-nums;
+}
+.usage-report-table td:first-child {
+  min-width: 240px;
+}
+.usage-report-table td:first-child strong,
+.usage-report-table td:first-child small {
+  display: block;
+}
+.usage-report-table td:first-child small {
+  margin-top: 3px;
+  color: var(--muted);
+}
+.zero-usage-row td {
+  color: #70828d;
+  background: #f8fbfc;
+}
+
 .analytics-toolbar {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) minmax(150px, 190px) minmax(180px, 240px) auto;
@@ -1451,6 +1544,12 @@ dialog::backdrop {
 }
 
 @media (max-width: 1050px) {
+  .usage-report-filters {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .usage-report-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
   .analytics-toolbar {
     grid-template-columns: 1fr 1fr;
   }
@@ -1459,6 +1558,18 @@ dialog::backdrop {
   }
 }
 @media (max-width: 700px) {
+  .report-head-actions,
+  .report-period-tabs {
+    width: 100%;
+  }
+  .report-head-actions > *,
+  .report-period-tabs > * {
+    flex: 1 1 auto;
+  }
+  .usage-report-filters,
+  .usage-report-summary {
+    grid-template-columns: 1fr;
+  }
   .analytics-toolbar,
   .bulk-policy-fields,
   .bulk-scope {

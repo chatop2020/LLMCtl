@@ -20,6 +20,7 @@ import html
 import http.cookies
 import http.server
 import importlib
+import io
 import ipaddress
 import json
 import mimetypes
@@ -45,12 +46,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from email.message import EmailMessage
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -3889,6 +3892,26 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def binary_response(
+        self,
+        status: int,
+        content: bytes,
+        content_type: str,
+        filename: str,
+    ) -> None:
+        """返回受鉴权保护的二进制下载，并同时兼容中英文文件名。"""
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip("-")
+        safe_name = safe_name or "LLMCtl-export.xlsx"
+        encoded_name = urllib.parse.quote(filename, safe="")
+        self.send_headers(status, content_type)
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{encoded_name}",
+        )
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
     def json_body(self) -> dict[str, Any]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -4189,6 +4212,43 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 except ValueError as error:
                     self.json_response(400, {"error": str(error)})
             return
+        if path == "/portal-api/admin/usage-report/export":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    filters = self.usage_report_parameters(query)
+                    content, filename, report = self.app.control.admin_usage_report_export(
+                        **filters
+                    )
+                    self.app.db.audit(
+                        user_identity(user),
+                        "admin.usage-report.export",
+                        report["range"]["label"],
+                        "success",
+                        self.remote_addr(),
+                        detail=json.dumps(report["filters"], ensure_ascii=False),
+                    )
+                    self.binary_response(
+                        200,
+                        content,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        filename,
+                    )
+                except (TypeError, ValueError) as error:
+                    self.json_response(400, {"error": str(error)})
+            return
+        if path == "/portal-api/admin/usage-report":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    filters = self.usage_report_parameters(query)
+                    self.json_response(
+                        200,
+                        self.app.control.admin_usage_report(**filters),
+                    )
+                except (TypeError, ValueError) as error:
+                    self.json_response(400, {"error": str(error)})
+            return
         if path == "/portal-api/admin/analytics":
             user, _ = self.api_require(admin=True)
             if user:
@@ -4315,6 +4375,36 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             "model": values.get("model", [""])[-1].strip(),
         }
         if any(len(value) > 200 for value in result.values()):
+            raise ValueError("筛选条件过长")
+        return result
+
+    @classmethod
+    def usage_report_parameters(cls, query: str) -> dict[str, Any]:
+        values = urllib.parse.parse_qs(query, keep_blank_values=True)
+        page, page_size = cls.page_parameters(query)
+        result: dict[str, Any] = {
+            "period": values.get("period", ["day"])[-1].strip(),
+            "anchor": values.get("anchor", [""])[-1].strip(),
+            "start_date": values.get("start_date", [""])[-1].strip(),
+            "end_date": values.get("end_date", [""])[-1].strip(),
+            "model_id": values.get("model", [""])[-1].strip(),
+            "user_query": values.get("user_query", [""])[-1].strip(),
+            "status": values.get("status", [""])[-1].strip(),
+            "page": page,
+            "page_size": page_size,
+        }
+        if any(
+            len(str(result[key])) > 200
+            for key in (
+                "period",
+                "anchor",
+                "start_date",
+                "end_date",
+                "model_id",
+                "user_query",
+                "status",
+            )
+        ):
             raise ValueError("筛选条件过长")
         return result
 
@@ -7483,6 +7573,547 @@ class PortalControlPlane:
             },
             "selected_user": selected_user,
         }
+
+    @staticmethod
+    def usage_report_window(
+        period: str,
+        anchor: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        stamp: int | None = None,
+    ) -> dict[str, Any]:
+        """按门户时区建立完整、左闭右开的报表区间和展示桶。"""
+        if period not in {"day", "month", "year", "custom"}:
+            raise ValueError("统计周期无效")
+        timezone_name = os.environ.get("TZ", "Asia/Shanghai")
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            zone, timezone_name = ZoneInfo("UTC"), "UTC"
+        current = datetime.datetime.fromtimestamp(stamp if stamp is not None else now(), zone)
+
+        def local_midnight(value: datetime.date) -> datetime.datetime:
+            return datetime.datetime.combine(value, datetime.time.min, zone)
+
+        if period == "day":
+            raw = anchor or current.strftime("%Y-%m-%d")
+            try:
+                selected = datetime.date.fromisoformat(raw)
+            except ValueError as error:
+                raise ValueError("日期必须使用 YYYY-MM-DD") from error
+            start = local_midnight(selected)
+            end = local_midnight(selected + datetime.timedelta(days=1))
+            label, grain = selected.strftime("%Y年%m月%d日"), "hour"
+        elif period == "month":
+            raw = anchor or current.strftime("%Y-%m")
+            if not re.fullmatch(r"\d{4}-\d{2}", raw):
+                raise ValueError("月份必须使用 YYYY-MM")
+            try:
+                selected = datetime.date.fromisoformat(raw + "-01")
+            except ValueError as error:
+                raise ValueError("月份无效") from error
+            start = local_midnight(selected)
+            next_month = selected.replace(
+                year=selected.year + (1 if selected.month == 12 else 0),
+                month=1 if selected.month == 12 else selected.month + 1,
+            )
+            end = local_midnight(next_month)
+            label, grain = selected.strftime("%Y年%m月"), "day"
+        elif period == "year":
+            raw = anchor or str(current.year)
+            if not re.fullmatch(r"\d{4}", raw):
+                raise ValueError("年份必须使用四位数字")
+            year = int(raw)
+            if year < 1970 or year > 9998:
+                raise ValueError("年份超出允许范围")
+            start = local_midnight(datetime.date(year, 1, 1))
+            end = local_midnight(datetime.date(year + 1, 1, 1))
+            label, grain = f"{year}年", "month"
+        else:
+            try:
+                selected_start = datetime.date.fromisoformat(start_date)
+                selected_end = datetime.date.fromisoformat(end_date)
+            except ValueError as error:
+                raise ValueError("自定义日期必须使用 YYYY-MM-DD") from error
+            if selected_end < selected_start:
+                raise ValueError("结束日期不能早于开始日期")
+            span_days = (selected_end - selected_start).days + 1
+            if span_days > 1830:
+                raise ValueError("单次自定义统计范围不能超过 5 年")
+            start = local_midnight(selected_start)
+            end = local_midnight(selected_end + datetime.timedelta(days=1))
+            grain = "hour" if span_days <= 2 else ("day" if span_days <= 400 else "month")
+            label = f"{selected_start.isoformat()} 至 {selected_end.isoformat()}"
+
+        def advance(value: datetime.datetime) -> datetime.datetime:
+            if grain == "hour":
+                return value + datetime.timedelta(hours=1)
+            if grain == "day":
+                return value + datetime.timedelta(days=1)
+            month_index = value.year * 12 + value.month
+            return value.replace(year=month_index // 12, month=month_index % 12 + 1)
+
+        def bucket_label(value: datetime.datetime) -> str:
+            if grain == "hour":
+                return value.strftime("%m/%d %H:00") if period == "custom" else value.strftime("%H:00")
+            if grain == "day":
+                return value.strftime("%m/%d")
+            return value.strftime("%Y/%m")
+
+        buckets: list[dict[str, Any]] = []
+        cursor = start
+        while cursor < end:
+            next_cursor = min(advance(cursor), end)
+            buckets.append(
+                {
+                    "index": len(buckets),
+                    "label": bucket_label(cursor),
+                    "start_at": int(cursor.timestamp()),
+                    "end_at": int(next_cursor.timestamp()),
+                }
+            )
+            cursor = next_cursor
+        return {
+            "key": period,
+            "label": label,
+            "grain": grain,
+            "timezone": timezone_name,
+            "start_at": int(start.timestamp()),
+            "end_at": int(end.timestamp()),
+            "buckets": buckets,
+        }
+
+    @staticmethod
+    def _report_user_conditions(
+        user_query: str = "", status: str = ""
+    ) -> tuple[list[str], list[Any]]:
+        conditions = ["u.role='user'"]
+        parameters: list[Any] = []
+        if status:
+            if status not in {"pending", "active", "disabled"}:
+                raise ValueError("用户状态筛选无效")
+            conditions.append("u.status=?")
+            parameters.append(status)
+        if user_query:
+            keyword = f"%{user_query.lower()}%"
+            conditions.append(
+                "(LOWER(u.email) LIKE ? OR LOWER(COALESCE(u.login_name,'')) LIKE ?)"
+            )
+            parameters.extend((keyword, keyword))
+        return conditions, parameters
+
+    def _usage_report_series(
+        self,
+        connection: sqlite3.Connection,
+        window: dict[str, Any],
+        model_id: str,
+        user_query: str,
+        status: str,
+    ) -> list[dict[str, Any]]:
+        buckets = window["buckets"]
+        parameters: list[Any] = []
+        if self.db.is_mysql:
+            bucket_source = " UNION ALL ".join(
+                "SELECT ? AS bucket_index,? AS start_at,? AS end_at" for _ in buckets
+            )
+            bucket_definition = f"buckets AS ({bucket_source})"
+        else:
+            values = ",".join("(?,?,?)" for _ in buckets)
+            bucket_definition = f"buckets(bucket_index,start_at,end_at) AS (VALUES {values})"
+        for bucket in buckets:
+            parameters.extend((bucket["index"], bucket["start_at"], bucket["end_at"]))
+        user_conditions, user_parameters = self._report_user_conditions(user_query, status)
+        usage_conditions = [
+            "l.occurred_at>=?",
+            "l.occurred_at<?",
+            *user_conditions,
+        ]
+        usage_parameters: list[Any] = [window["start_at"], window["end_at"], *user_parameters]
+        if model_id:
+            usage_conditions.append("l.public_model_id=?")
+            usage_parameters.append(model_id)
+        rows = connection.execute(
+            f"""WITH {bucket_definition},
+                       filtered_usage AS (
+                         SELECT l.* FROM usage_ledger l
+                         JOIN users u ON u.id=l.user_id
+                         WHERE {' AND '.join(usage_conditions)}
+                       )
+                SELECT b.bucket_index,COUNT(l.id) requests,
+                       COUNT(DISTINCT l.user_id) active_users,
+                       COALESCE(SUM(l.input_tokens),0) input_tokens,
+                       COALESCE(SUM(l.output_tokens),0) output_tokens,
+                       COALESCE(SUM(l.input_tokens+l.output_tokens),0) total_tokens,
+                       COALESCE(SUM(l.cached_tokens),0) cached_tokens,
+                       COALESCE(SUM(l.reasoning_tokens),0) reasoning_tokens,
+                       COALESCE(SUM(l.amount_micros),0) amount_micros
+                FROM buckets b LEFT JOIN filtered_usage l
+                  ON l.occurred_at>=b.start_at AND l.occurred_at<b.end_at
+                GROUP BY b.bucket_index ORDER BY b.bucket_index""",
+            [*parameters, *usage_parameters],
+        ).fetchall()
+        by_index = {int(row["bucket_index"]): dict(row) for row in rows}
+        return [
+            {
+                **by_index.get(bucket["index"], {}),
+                "bucket_index": bucket["index"],
+                "label": bucket["label"],
+                "start_at": bucket["start_at"],
+                "end_at": bucket["end_at"],
+            }
+            for bucket in buckets
+        ]
+
+    def admin_usage_report(
+        self,
+        period: str = "day",
+        anchor: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        model_id: str = "",
+        user_query: str = "",
+        status: str = "",
+        page: int = 1,
+        page_size: int = 20,
+        export_all: bool = False,
+    ) -> dict[str, Any]:
+        """返回包含零用量用户的全员统计；筛选在数据库侧完成。"""
+        if any(len(value) > 200 for value in (anchor, start_date, end_date, model_id, user_query, status)):
+            raise ValueError("筛选条件过长")
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise ValueError("分页范围无效")
+        window = self.usage_report_window(period, anchor, start_date, end_date)
+        user_conditions, user_parameters = self._report_user_conditions(user_query, status)
+        ledger_conditions = [
+            "l.occurred_at>=?",
+            "l.occurred_at<?",
+            *user_conditions,
+        ]
+        ledger_parameters: list[Any] = [window["start_at"], window["end_at"], *user_parameters]
+        if model_id:
+            ledger_conditions.append("l.public_model_id=?")
+            ledger_parameters.append(model_id)
+        join_conditions = ["l.user_id=u.id", "l.occurred_at>=?", "l.occurred_at<?"]
+        join_parameters: list[Any] = [window["start_at"], window["end_at"]]
+        if model_id:
+            join_conditions.append("l.public_model_id=?")
+            join_parameters.append(model_id)
+
+        with self.db.connect() as connection:
+            summary_row = connection.execute(
+                f"""SELECT COUNT(l.id) requests,COUNT(DISTINCT l.user_id) active_users,
+                           COALESCE(SUM(l.input_tokens),0) input_tokens,
+                           COALESCE(SUM(l.output_tokens),0) output_tokens,
+                           COALESCE(SUM(l.input_tokens+l.output_tokens),0) total_tokens,
+                           COALESCE(SUM(l.cached_tokens),0) cached_tokens,
+                           COALESCE(SUM(l.reasoning_tokens),0) reasoning_tokens,
+                           COALESCE(SUM(l.amount_micros),0) amount_micros,
+                           MAX(l.occurred_at) last_activity_at
+                    FROM usage_ledger l JOIN users u ON u.id=l.user_id
+                    WHERE {' AND '.join(ledger_conditions)}""",
+                ledger_parameters,
+            ).fetchone()
+            summary = dict(summary_row)
+            total_users = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM users u WHERE {' AND '.join(user_conditions)}",
+                    user_parameters,
+                ).fetchone()[0]
+            )
+            summary["total_users"] = total_users
+            summary["inactive_users"] = max(0, total_users - int(summary["active_users"] or 0))
+            summary["average_tokens_per_request"] = (
+                round(int(summary["total_tokens"] or 0) / int(summary["requests"]), 2)
+                if int(summary["requests"] or 0)
+                else 0
+            )
+            pages = max(1, (total_users + page_size - 1) // page_size)
+            effective_page = min(page, pages)
+            limit_clause = "" if export_all else " LIMIT ? OFFSET ?"
+            staff_parameters = [*join_parameters, *user_parameters]
+            if not export_all:
+                staff_parameters.extend((page_size, (effective_page - 1) * page_size))
+            users = self.rows(
+                connection.execute(
+                    f"""SELECT u.id user_id,u.email,u.login_name,u.status,u.created_at,
+                               COALESCE(b.balance_micros,0) balance_micros,
+                               COUNT(l.id) requests,
+                               COALESCE(SUM(l.input_tokens),0) input_tokens,
+                               COALESCE(SUM(l.output_tokens),0) output_tokens,
+                               COALESCE(SUM(l.input_tokens+l.output_tokens),0) total_tokens,
+                               COALESCE(SUM(l.cached_tokens),0) cached_tokens,
+                               COALESCE(SUM(l.reasoning_tokens),0) reasoning_tokens,
+                               COALESCE(SUM(l.amount_micros),0) amount_micros,
+                               MAX(l.occurred_at) last_activity_at
+                        FROM users u
+                        LEFT JOIN billing_accounts b ON b.user_id=u.id
+                        LEFT JOIN usage_ledger l ON {' AND '.join(join_conditions)}
+                        WHERE {' AND '.join(user_conditions)}
+                        GROUP BY u.id,u.email,u.login_name,u.status,u.created_at,b.balance_micros
+                        ORDER BY total_tokens DESC,requests DESC,u.email{limit_clause}""",
+                    staff_parameters,
+                ).fetchall()
+            )
+            timeseries = self._usage_report_series(
+                connection, window, model_id, user_query, status
+            )
+            models = self.rows(
+                connection.execute(
+                    f"""SELECT l.public_model_id,COUNT(l.id) requests,
+                               COUNT(DISTINCT l.user_id) active_users,
+                               COALESCE(SUM(l.input_tokens),0) input_tokens,
+                               COALESCE(SUM(l.output_tokens),0) output_tokens,
+                               COALESCE(SUM(l.input_tokens+l.output_tokens),0) total_tokens,
+                               COALESCE(SUM(l.amount_micros),0) amount_micros
+                        FROM usage_ledger l JOIN users u ON u.id=l.user_id
+                        WHERE {' AND '.join(ledger_conditions)}
+                        GROUP BY l.public_model_id
+                        ORDER BY total_tokens DESC,l.public_model_id""",
+                    ledger_parameters,
+                ).fetchall()
+            )
+        return {
+            "generated_at": now(),
+            "timezone": window["timezone"],
+            "source": "usage_ledger",
+            "token_definition": "input_tokens + output_tokens",
+            "range": {key: value for key, value in window.items() if key != "buckets"},
+            "filters": {"model": model_id, "user_query": user_query, "status": status},
+            "summary": summary,
+            "timeseries": timeseries,
+            "models": models,
+            "users": users,
+            "pagination": {
+                "page": effective_page,
+                "page_size": page_size,
+                "pages": pages,
+                "total": total_users,
+            },
+        }
+
+    @staticmethod
+    def _xlsx_column_name(index: int) -> str:
+        result = ""
+        while index:
+            index, remainder = divmod(index - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    @staticmethod
+    def _xlsx_text(value: Any) -> str:
+        """过滤 OOXML 非法控制字符，并阻止表格公式注入。"""
+        text = "" if value is None else str(value)
+        text = "".join(
+            character
+            for character in text
+            if character in "\t\n\r" or ord(character) >= 32
+        )
+        if text.startswith(("=", "+", "-", "@")):
+            text = "'" + text
+        return text
+
+    @classmethod
+    def _xlsx_sheet(
+        cls,
+        rows: list[list[Any]],
+        widths: list[float],
+        header_rows: int = 1,
+        money_columns: set[int] | None = None,
+    ) -> str:
+        money_columns = money_columns or set()
+        row_xml: list[str] = []
+        for row_index, row in enumerate(rows, 1):
+            cells: list[str] = []
+            for column_index, value in enumerate(row, 1):
+                reference = f"{cls._xlsx_column_name(column_index)}{row_index}"
+                style = 1 if row_index <= header_rows else (2 if column_index in money_columns else 0)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cells.append(f'<c r="{reference}" s="{style}"><v>{value}</v></c>')
+                else:
+                    safe = xml_escape(cls._xlsx_text(value))
+                    cells.append(
+                        f'<c r="{reference}" s="{style}" t="inlineStr"><is><t xml:space="preserve">{safe}</t></is></c>'
+                    )
+            row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+        column_xml = "".join(
+            f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+            for index, width in enumerate(widths, 1)
+        )
+        last_column = cls._xlsx_column_name(max((len(row) for row in rows), default=1))
+        last_row = max(1, len(rows))
+        filter_xml = (
+            f'<autoFilter ref="A{header_rows}:{last_column}{last_row}"/>'
+            if header_rows and last_row > header_rows
+            else ""
+        )
+        pane_xml = (
+            f'<pane ySplit="{header_rows}" topLeftCell="A{header_rows + 1}" activePane="bottomLeft" state="frozen"/>'
+            if header_rows
+            else ""
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetViews><sheetView workbookViewId="0">{pane_xml}</sheetView></sheetViews>'
+            '<sheetFormatPr defaultRowHeight="18"/>'
+            f'<cols>{column_xml}</cols><sheetData>{"".join(row_xml)}</sheetData>{filter_xml}'
+            '</worksheet>'
+        )
+
+    @classmethod
+    def usage_report_workbook(cls, report: dict[str, Any]) -> bytes:
+        """仅使用标准库生成真实 XLSX，避免生产环境引入大型表格依赖。"""
+        summary = report["summary"]
+        range_info = report["range"]
+        generated = datetime.datetime.fromtimestamp(
+            report["generated_at"], datetime.timezone.utc
+        ).isoformat()
+        summary_rows = [
+            ["指标", "值"],
+            ["统计范围", range_info["label"]],
+            ["时区", report["timezone"]],
+            ["导出时间（UTC）", generated],
+            ["全员人数", int(summary["total_users"] or 0)],
+            ["活跃人数", int(summary["active_users"] or 0)],
+            ["零用量人数", int(summary["inactive_users"] or 0)],
+            ["请求数", int(summary["requests"] or 0)],
+            ["输入 Token", int(summary["input_tokens"] or 0)],
+            ["输出 Token", int(summary["output_tokens"] or 0)],
+            ["Token 总量", int(summary["total_tokens"] or 0)],
+            ["缓存命中 Token", int(summary["cached_tokens"] or 0)],
+            ["思考 Token", int(summary["reasoning_tokens"] or 0)],
+            ["余额扣款（USD）", int(summary["amount_micros"] or 0) / 1_000_000],
+        ]
+        user_rows: list[list[Any]] = [[
+            "用户", "登录名", "状态", "请求数", "输入 Token", "输出 Token",
+            "Token 总量", "缓存命中 Token", "思考 Token", "余额扣款（USD）",
+            "当前余额（USD）", "最后活跃时间", "注册时间",
+        ]]
+        for row in report["users"]:
+            user_rows.append([
+                row["email"], row.get("login_name") or "", row["status"],
+                int(row["requests"] or 0), int(row["input_tokens"] or 0),
+                int(row["output_tokens"] or 0), int(row["total_tokens"] or 0),
+                int(row["cached_tokens"] or 0), int(row["reasoning_tokens"] or 0),
+                int(row["amount_micros"] or 0) / 1_000_000,
+                int(row["balance_micros"] or 0) / 1_000_000,
+                (
+                    datetime.datetime.fromtimestamp(row["last_activity_at"], datetime.timezone.utc).isoformat()
+                    if row.get("last_activity_at") else ""
+                ),
+                datetime.datetime.fromtimestamp(row["created_at"], datetime.timezone.utc).isoformat(),
+            ])
+        trend_rows: list[list[Any]] = [[
+            "时间桶", "请求数", "活跃用户", "输入 Token", "输出 Token", "Token 总量",
+            "缓存命中 Token", "思考 Token", "余额扣款（USD）",
+        ]]
+        for row in report["timeseries"]:
+            trend_rows.append([
+                row["label"], int(row.get("requests") or 0), int(row.get("active_users") or 0),
+                int(row.get("input_tokens") or 0), int(row.get("output_tokens") or 0),
+                int(row.get("total_tokens") or 0), int(row.get("cached_tokens") or 0),
+                int(row.get("reasoning_tokens") or 0), int(row.get("amount_micros") or 0) / 1_000_000,
+            ])
+        model_rows: list[list[Any]] = [[
+            "模型 ID", "请求数", "活跃用户", "输入 Token", "输出 Token", "Token 总量", "余额扣款（USD）",
+        ]]
+        for row in report["models"]:
+            model_rows.append([
+                row["public_model_id"], int(row["requests"] or 0), int(row["active_users"] or 0),
+                int(row["input_tokens"] or 0), int(row["output_tokens"] or 0),
+                int(row["total_tokens"] or 0), int(row["amount_micros"] or 0) / 1_000_000,
+            ])
+        sheets = [
+            ("汇总", cls._xlsx_sheet(summary_rows, [24, 34])),
+            ("用户用量", cls._xlsx_sheet(user_rows, [34, 20, 12, 12, 16, 16, 18, 18, 16, 18, 18, 25, 25], money_columns={10, 11})),
+            ("时间趋势", cls._xlsx_sheet(trend_rows, [20, 12, 14, 16, 16, 18, 18, 16, 18], money_columns={9})),
+            ("模型用量", cls._xlsx_sheet(model_rows, [30, 12, 14, 16, 16, 18, 18], money_columns={7})),
+        ]
+        content_types = "".join(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for index in range(1, len(sheets) + 1)
+        )
+        workbook_sheets = "".join(
+            f'<sheet name="{xml_escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+            for index, (name, _content) in enumerate(sheets, 1)
+        )
+        workbook_relationships = "".join(
+            f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+            for index in range(1, len(sheets) + 1)
+        )
+        workbook_relationships += (
+            f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        )
+        files = {
+            "[Content_Types].xml": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+                '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+                f'{content_types}</Types>'
+            ),
+            "_rels/.rels": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+                '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+                '</Relationships>'
+            ),
+            "docProps/app.xml": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+                'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>LLMCtl</Application></Properties>'
+            ),
+            "docProps/core.xml": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+                'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:creator>LLMCtl</dc:creator>'
+                '<dc:title>全员用量报表</dc:title></cp:coreProperties>'
+            ),
+            "xl/workbook.xml": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                f'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{workbook_sheets}</sheets></workbook>'
+            ),
+            "xl/_rels/workbook.xml.rels": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f'{workbook_relationships}</Relationships>'
+            ),
+            "xl/styles.xml": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<fonts count="2"><font><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Aptos"/></font></fonts>'
+                '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF167EAF"/><bgColor indexed="64"/></patternFill></fill></fills>'
+                '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+                '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+                '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+                '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+                '<xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+                '</styleSheet>'
+            ),
+        }
+        for index, (_name, content) in enumerate(sheets, 1):
+            files[f"xl/worksheets/sheet{index}.xml"] = content
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path, content in files.items():
+                archive.writestr(path, content.encode("utf-8"))
+        return output.getvalue()
+
+    def admin_usage_report_export(self, **filters: Any) -> tuple[bytes, str, dict[str, Any]]:
+        export_filters = dict(filters)
+        export_filters.update(page=1, page_size=100, export_all=True)
+        report = self.admin_usage_report(**export_filters)
+        content = self.usage_report_workbook(report)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return content, f"LLMCtl-全员用量-{stamp}.xlsx", report
 
     def user_request_detail(self, user_id: str, request_id: str) -> dict[str, Any]:
         if not request_id or len(request_id) > 200:

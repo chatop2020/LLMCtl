@@ -34,6 +34,7 @@ const publicConfig = ref({
 const dashboard = ref(null);
 const admin = ref(null);
 const adminAnalytics = ref(null);
+const adminUsageReport = ref(null);
 const systemMonitor = ref(null);
 const workflow = ref(null);
 const workflowLoading = ref(false);
@@ -52,6 +53,8 @@ const databaseMigrationToken = ref("");
 const databaseMigrationConfirmation = ref("");
 const databaseRollbackConfirmation = ref("");
 const analyticsLoading = ref(false);
+const usageReportLoading = ref(false);
+const usageReportExporting = ref(false);
 const monitorLoading = ref(false);
 const monitorPaused = ref(false);
 const busy = ref(false);
@@ -68,6 +71,7 @@ let monitorRefreshTimer = null;
 let modelDeploymentRefreshTimer = null;
 let databaseMigrationRefreshTimer = null;
 let analyticsLoadVersion = 0;
+let usageReportLoadVersion = 0;
 let monitorLoadVersion = 0;
 const authMode = ref(
   location.hash.startsWith("#/register")
@@ -133,6 +137,26 @@ const analyticsFilters = reactive({
   model: "",
   user: "",
   active_page: 1,
+});
+function localDateValue(value = new Date()) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+const reportToday = new Date();
+const usageReportFilters = reactive({
+  period: "day",
+  anchor_day: localDateValue(reportToday),
+  anchor_month: localDateValue(reportToday).slice(0, 7),
+  anchor_year: String(reportToday.getFullYear()),
+  start_date: `${localDateValue(reportToday).slice(0, 7)}-01`,
+  end_date: localDateValue(reportToday),
+  model: "",
+  user_query: "",
+  status: "",
+  page: 1,
+  page_size: 20,
 });
 const monitorHistory = reactive({
   sampledAt: [],
@@ -440,6 +464,14 @@ const analyticsMaxTokens = computed(() =>
     ),
   ),
 );
+const usageReportMaxTokens = computed(() =>
+  Math.max(
+    1,
+    ...(adminUsageReport.value?.timeseries || []).map((row) =>
+      Number(row.total_tokens || 0),
+    ),
+  ),
+);
 const selectedUserAnalyticsMaxTokens = computed(() =>
   Math.max(
     1,
@@ -658,6 +690,7 @@ const nav = computed(() =>
         ["users", "用户"],
         ["groups", "用户组"],
         ["billing", "账单"],
+        ["reports", "用量报表"],
         ["database", "数据库"],
         ["monitoring", "系统监控"],
         ["workflow", "能力编排"],
@@ -737,6 +770,7 @@ function clearAuthenticatedClientState() {
   dashboard.value = null;
   admin.value = null;
   adminAnalytics.value = null;
+  adminUsageReport.value = null;
   systemMonitor.value = null;
   for (const key of ["sampledAt", "cpu", "memory", "receive", "transmit"])
     monitorHistory[key].splice(0);
@@ -785,6 +819,77 @@ async function loadAdminAnalytics(activePage = analyticsFilters.active_page, opt
 async function changeAnalyticsFilters() {
   analyticsFilters.active_page = 1;
   await loadAdminAnalytics(1);
+}
+
+function usageReportParams(page = usageReportFilters.page) {
+  let anchor = usageReportFilters.anchor_day;
+  if (usageReportFilters.period === "month") anchor = usageReportFilters.anchor_month;
+  if (usageReportFilters.period === "year") anchor = usageReportFilters.anchor_year;
+  return new URLSearchParams({
+    period: usageReportFilters.period,
+    anchor,
+    start_date: usageReportFilters.start_date,
+    end_date: usageReportFilters.end_date,
+    model: usageReportFilters.model,
+    user_query: usageReportFilters.user_query,
+    status: usageReportFilters.status,
+    page: String(page || 1),
+    page_size: String(usageReportFilters.page_size || 20),
+  });
+}
+
+async function loadAdminUsageReport(page = usageReportFilters.page, options = {}) {
+  if (!isAdmin.value || !session.value?.authenticated) return;
+  const version = ++usageReportLoadVersion;
+  usageReportLoading.value = true;
+  try {
+    const result = await api(`admin/usage-report?${usageReportParams(page)}`);
+    if (version !== usageReportLoadVersion) return;
+    adminUsageReport.value = result;
+    usageReportFilters.page = result.pagination?.page || 1;
+  } catch (error) {
+    if (!options.silent) notify(`全员用量报表读取失败：${error.message}`, "bad");
+  } finally {
+    if (version === usageReportLoadVersion) usageReportLoading.value = false;
+  }
+}
+
+async function changeUsageReportFilters() {
+  usageReportFilters.page = 1;
+  await loadAdminUsageReport(1);
+}
+
+async function exportAdminUsageReport() {
+  if (usageReportExporting.value) return;
+  usageReportExporting.value = true;
+  notify("正在生成 Excel 报表…", "working");
+  try {
+    const response = await fetch(
+      `/portal-api/admin/usage-report/export?${usageReportParams(1)}`,
+      { credentials: "same-origin" },
+    );
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const fallbackName = `LLMCtl-全员用量-${localDateValue()}.xlsx`;
+    const filename = encodedName ? decodeURIComponent(encodedName) : fallbackName;
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    notify("Excel 报表已导出");
+  } catch (error) {
+    notify(`Excel 导出失败：${error.message}`, "bad");
+  } finally {
+    usageReportExporting.value = false;
+  }
 }
 
 function appendMonitorHistory(snapshot) {
@@ -963,6 +1068,8 @@ async function selectSection(nextSection) {
       await Promise.all([refreshWorkspace(), loadModelDeployments()]);
     } else if (nextSection === "database" && isAdmin.value) {
       await loadDatabaseRuntime();
+    } else if (nextSection === "reports" && isAdmin.value) {
+      await Promise.all([refreshWorkspace(), loadAdminUsageReport(1)]);
     } else if (nextSection === "billing") {
       await syncUsageAndRefresh({ preservePage: false });
     } else {
@@ -5203,6 +5310,297 @@ onBeforeUnmount(() => {
                 "
               />
             </section>
+          </section>
+
+          <section v-if="section === 'reports'" class="page usage-report-page">
+            <div class="page-head">
+              <div>
+                <span class="eyebrow">USAGE REPORTS</span>
+                <h1>全员用量报表</h1>
+                <p>按日、月、年或自定义日期统计全部用户；零用量用户也会列入报表。</p>
+              </div>
+              <div class="report-head-actions">
+                <button
+                  class="ghost"
+                  type="button"
+                  :disabled="usageReportLoading"
+                  @click="loadAdminUsageReport(usageReportFilters.page)"
+                >
+                  {{ usageReportLoading ? "统计中…" : "刷新统计" }}
+                </button>
+                <button
+                  class="primary"
+                  type="button"
+                  :disabled="usageReportExporting || usageReportLoading"
+                  @click="exportAdminUsageReport"
+                >
+                  {{ usageReportExporting ? "生成 Excel…" : "导出 Excel" }}
+                </button>
+              </div>
+            </div>
+
+            <section class="panel report-filter-panel">
+              <div class="report-period-tabs" role="group" aria-label="统计周期">
+                <button
+                  v-for="option in [
+                    ['day', '按天'],
+                    ['month', '按月'],
+                    ['year', '按年'],
+                    ['custom', '自定义时间'],
+                  ]"
+                  :key="option[0]"
+                  type="button"
+                  :class="{ active: usageReportFilters.period === option[0] }"
+                  @click="
+                    usageReportFilters.period = option[0];
+                    changeUsageReportFilters();
+                  "
+                >
+                  {{ option[1] }}
+                </button>
+              </div>
+              <div class="usage-report-filters">
+                <label v-if="usageReportFilters.period === 'day'">
+                  <span>统计日期</span>
+                  <input v-model="usageReportFilters.anchor_day" type="date" />
+                </label>
+                <label v-else-if="usageReportFilters.period === 'month'">
+                  <span>统计月份</span>
+                  <input v-model="usageReportFilters.anchor_month" type="month" />
+                </label>
+                <label v-else-if="usageReportFilters.period === 'year'">
+                  <span>统计年份</span>
+                  <input
+                    v-model="usageReportFilters.anchor_year"
+                    type="number"
+                    min="1970"
+                    max="9998"
+                    inputmode="numeric"
+                  />
+                </label>
+                <template v-else>
+                  <label>
+                    <span>开始日期</span>
+                    <input v-model="usageReportFilters.start_date" type="date" />
+                  </label>
+                  <label>
+                    <span>结束日期</span>
+                    <input v-model="usageReportFilters.end_date" type="date" />
+                  </label>
+                </template>
+                <label>
+                  <span>模型</span>
+                  <select v-model="usageReportFilters.model">
+                    <option value="">全部模型</option>
+                    <option
+                      v-for="model in admin.models"
+                      :key="model.id"
+                      :value="model.public_model_id"
+                    >
+                      {{ model.public_model_id }}
+                    </option>
+                  </select>
+                </label>
+                <label>
+                  <span>用户</span>
+                  <input
+                    v-model.trim="usageReportFilters.user_query"
+                    type="search"
+                    placeholder="邮箱或登录名"
+                    @keyup.enter="changeUsageReportFilters"
+                  />
+                </label>
+                <label>
+                  <span>账户状态</span>
+                  <select v-model="usageReportFilters.status">
+                    <option value="">全部状态</option>
+                    <option value="active">正常</option>
+                    <option value="pending">待验证</option>
+                    <option value="disabled">已禁用</option>
+                  </select>
+                </label>
+                <label>
+                  <span>每页行数</span>
+                  <select v-model.number="usageReportFilters.page_size">
+                    <option :value="20">20</option>
+                    <option :value="50">50</option>
+                    <option :value="100">100</option>
+                  </select>
+                </label>
+                <button
+                  class="primary report-query-button"
+                  type="button"
+                  :disabled="usageReportLoading"
+                  @click="changeUsageReportFilters"
+                >
+                  查询
+                </button>
+              </div>
+              <p class="report-filter-note">
+                页面分页与 Excel 导出使用同一组筛选条件；导出文件包含筛选范围内的全部用户，而不是仅导出当前页。
+              </p>
+            </section>
+
+            <section v-if="usageReportLoading && !adminUsageReport" class="panel report-loading">
+              正在汇总全员用量…
+            </section>
+
+            <template v-if="adminUsageReport">
+              <div class="metrics usage-report-summary">
+                <article class="panel">
+                  <span>统计范围</span>
+                  <strong>{{ adminUsageReport.range.label }}</strong>
+                  <small>{{ adminUsageReport.timezone }}</small>
+                </article>
+                <article class="panel">
+                  <span>全员 / 活跃</span>
+                  <strong>
+                    {{ formatTokens(adminUsageReport.summary.total_users) }} /
+                    {{ formatTokens(adminUsageReport.summary.active_users) }}
+                  </strong>
+                  <small>{{ formatTokens(adminUsageReport.summary.inactive_users) }} 人零用量</small>
+                </article>
+                <article class="panel">
+                  <span>请求数</span>
+                  <strong>{{ formatTokens(adminUsageReport.summary.requests) }}</strong>
+                  <small>平均 {{ formatTokens(adminUsageReport.summary.average_tokens_per_request) }} Token / 请求</small>
+                </article>
+                <article class="panel">
+                  <span>Token 总量</span>
+                  <strong>{{ formatTokens(adminUsageReport.summary.total_tokens) }}</strong>
+                  <small>
+                    输入 {{ formatTokens(adminUsageReport.summary.input_tokens) }} ·
+                    输出 {{ formatTokens(adminUsageReport.summary.output_tokens) }}
+                  </small>
+                </article>
+                <article class="panel">
+                  <span>余额扣款</span>
+                  <strong>{{ money(adminUsageReport.summary.amount_micros) }}</strong>
+                  <small>按请求结算记录汇总</small>
+                </article>
+              </div>
+
+              <section class="panel usage-trend-panel">
+                <div class="panel-head analytics-panel-head">
+                  <div>
+                    <h2>用量趋势</h2>
+                    <p>蓝色为输入 Token，绿色为输出 Token。</p>
+                  </div>
+                  <div class="chart-legend" aria-hidden="true">
+                    <span><i class="input"></i>输入</span>
+                    <span><i class="output"></i>输出</span>
+                  </div>
+                </div>
+                <div class="usage-composition">
+                  <span><b>{{ formatTokens(adminUsageReport.summary.input_tokens) }}</b>输入 Token</span>
+                  <span><b>{{ formatTokens(adminUsageReport.summary.output_tokens) }}</b>输出 Token</span>
+                  <span><b>{{ formatTokens(adminUsageReport.summary.cached_tokens) }}</b>缓存命中 Token</span>
+                  <span><b>{{ formatTokens(adminUsageReport.summary.reasoning_tokens) }}</b>思考 Token</span>
+                </div>
+                <div class="usage-chart" role="img" :aria-label="`${adminUsageReport.range.label} Token 用量趋势`">
+                  <div
+                    v-for="(point, index) in adminUsageReport.timeseries"
+                    :key="point.start_at"
+                    class="chart-slot"
+                    :title="`${point.label}：输入 ${formatTokens(point.input_tokens)}，输出 ${formatTokens(point.output_tokens)}，请求 ${formatTokens(point.requests)}`"
+                  >
+                    <span class="chart-value">{{ formatTokens(point.total_tokens) }}</span>
+                    <span class="chart-column">
+                      <i
+                        class="chart-segment output"
+                        :style="{ height: analyticsSegmentHeight(point.output_tokens, usageReportMaxTokens) }"
+                      ></i>
+                      <i
+                        class="chart-segment input"
+                        :style="{ height: analyticsSegmentHeight(point.input_tokens, usageReportMaxTokens) }"
+                      ></i>
+                    </span>
+                    <small v-if="analyticsLabelVisible(index, adminUsageReport.timeseries.length)">{{ point.label }}</small>
+                  </div>
+                </div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>模型用量</h2>
+                    <p>仅显示当前时间和模型筛选范围内产生过请求的模型。</p>
+                  </div>
+                  <span class="filter-count">{{ adminUsageReport.models.length }} 个模型</span>
+                </div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>模型 ID</th><th>请求</th><th>活跃用户</th><th>输入 Token</th>
+                        <th>输出 Token</th><th>Token 总量</th><th>余额扣款</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="row in adminUsageReport.models" :key="row.public_model_id">
+                        <td><code>{{ row.public_model_id }}</code></td>
+                        <td>{{ formatTokens(row.requests) }}</td>
+                        <td>{{ formatTokens(row.active_users) }}</td>
+                        <td>{{ formatTokens(row.input_tokens) }}</td>
+                        <td>{{ formatTokens(row.output_tokens) }}</td>
+                        <td><strong>{{ formatTokens(row.total_tokens) }}</strong></td>
+                        <td>{{ money(row.amount_micros) }}</td>
+                      </tr>
+                      <tr v-if="!adminUsageReport.models.length">
+                        <td colspan="7" class="empty">当前范围没有模型调用记录。</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>全员使用情况</h2>
+                    <p>按 Token 总量降序排列；未产生调用的用户仍会显示为零用量。</p>
+                  </div>
+                  <span class="filter-count">{{ adminUsageReport.pagination.total }} 位用户</span>
+                </div>
+                <div class="table-wrap usage-report-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>用户</th><th>状态</th><th>请求</th><th>输入 Token</th><th>输出 Token</th>
+                        <th>Token 总量</th><th>余额扣款</th><th>当前余额</th><th>最后活跃</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="row in adminUsageReport.users"
+                        :key="row.user_id"
+                        :class="{ 'zero-usage-row': !Number(row.requests || 0) }"
+                      >
+                        <td><strong>{{ row.email }}</strong><small v-if="row.login_name">{{ row.login_name }}</small></td>
+                        <td><span class="status" :class="row.status === 'active' ? 'ok' : row.status === 'disabled' ? 'bad' : 'warn'">{{ statusLabel(row.status) }}</span></td>
+                        <td>{{ formatTokens(row.requests) }}</td>
+                        <td>{{ formatTokens(row.input_tokens) }}</td>
+                        <td>{{ formatTokens(row.output_tokens) }}</td>
+                        <td><strong>{{ formatTokens(row.total_tokens) }}</strong></td>
+                        <td>{{ money(row.amount_micros) }}</td>
+                        <td>{{ money(row.balance_micros) }}</td>
+                        <td>{{ date(row.last_activity_at) }}</td>
+                      </tr>
+                      <tr v-if="!adminUsageReport.users.length">
+                        <td colspan="9" class="empty">当前筛选条件下没有用户。</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  :page="adminUsageReport.pagination.page"
+                  :pages="adminUsageReport.pagination.pages"
+                  :total="adminUsageReport.pagination.total"
+                  @previous="loadAdminUsageReport(Math.max(1, adminUsageReport.pagination.page - 1))"
+                  @next="loadAdminUsageReport(Math.min(adminUsageReport.pagination.pages, adminUsageReport.pagination.page + 1))"
+                />
+              </section>
+            </template>
           </section>
 
           <section v-if="section === 'database'" class="page database-page">
