@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""LLMCtl OmniRoute 模式使用的轻量、无第三方依赖账户门户。
+"""LLMCtl OmniRoute 模式使用的轻量账户门户。
 
-门户使用独立的 SQLite 数据库，不读取或修改 OmniRoute 的 SQLite schema；
+门户默认使用独立 SQLite，也可由管理员迁移到独立 MySQL 数据库；
+不读取或修改 OmniRoute 的 SQLite schema；
 所有网关操作均通过公开 HTTP API 完成。API Key 明文只返回一次，门户不持久化。
 """
 
@@ -18,6 +19,7 @@ import hmac
 import html
 import http.cookies
 import http.server
+import importlib
 import ipaddress
 import json
 import mimetypes
@@ -48,7 +50,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -95,6 +97,265 @@ SYSTEM_MONITOR_SECRET_ARGUMENT = re.compile(
 SYSTEM_MONITOR_CREDENTIAL_URL = re.compile(
     r"(?i)([a-z][a-z0-9+.-]*://[^/@:\s]+:)[^/@\s]+(@)"
 )
+MYSQL_CAPABILITY_VERSION = 1
+MYSQL_SCHEMA_VERSION = 1
+MYSQL_CONFIG_DIRECTORY = "Config"
+MYSQL_CAPABILITY_FILE = "mysql-capability.json"
+DATABASE_CONFIG_FILE = "database.json"
+DATABASE_MIGRATION_FILE = "database-migration.json"
+MYSQL_DATABASE_RE = re.compile(r"^[A-Za-z0-9_$-]{1,64}$")
+MYSQL_HOST_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
+
+
+class DatabaseCapabilityError(RuntimeError):
+    """数据库能力尚未激活或配置不完整。"""
+
+
+class DatabaseMigrationError(RuntimeError):
+    """数据库迁移在切换前失败。"""
+
+
+class CompatRow(dict[str, Any]):
+    """同时兼容 sqlite3.Row 的列名和数字下标读取方式。"""
+
+    def __init__(self, values: dict[str, Any]):
+        super().__init__(values)
+        self._column_values = tuple(values.values())
+
+    def __getitem__(self, key: str | int) -> Any:
+        if isinstance(key, int):
+            return self._column_values[key]
+        return super().__getitem__(key)
+
+
+class MySQLResult:
+    """将 PyMySQL 游标适配为门户现有的 SQLite 结果接口。"""
+
+    def __init__(self, cursor: Any):
+        self._cursor = cursor
+        self.rowcount = int(cursor.rowcount)
+        self.lastrowid = cursor.lastrowid
+
+    @staticmethod
+    def _row(value: Any) -> CompatRow | None:
+        return CompatRow(value) if isinstance(value, dict) else value
+
+    def fetchone(self) -> CompatRow | None:
+        return self._row(self._cursor.fetchone())
+
+    def fetchall(self) -> list[CompatRow]:
+        return [self._row(value) for value in self._cursor.fetchall()]
+
+
+def _replace_sqlite_placeholders(statement: str) -> str:
+    """只替换 SQL 字符串字面量之外的问号占位符。"""
+    output: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(statement):
+        character = statement[index]
+        if quote:
+            output.append(character)
+            if character == quote:
+                if index + 1 < len(statement) and statement[index + 1] == quote:
+                    output.append(statement[index + 1])
+                    index += 1
+                else:
+                    quote = ""
+        elif character in {"'", '"'}:
+            quote = character
+            output.append(character)
+        elif character == "?":
+            output.append("%s")
+        else:
+            output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def mysql_compatible_sql(statement: str) -> str:
+    """把门户使用的有限 SQLite DML 语法转换成 MySQL 语法。"""
+    translated = statement.strip()
+    insert_ignored = bool(re.match(r"(?is)^INSERT\s+OR\s+IGNORE\b", translated))
+    translated = re.sub(
+        r"(?is)^INSERT\s+OR\s+IGNORE\b", "INSERT IGNORE", translated
+    )
+    if re.search(r"(?is)\bON\s+CONFLICT\s*\([^)]*\)\s+DO\s+NOTHING\s*$", translated):
+        translated = re.sub(
+            r"(?is)\s+ON\s+CONFLICT\s*\([^)]*\)\s+DO\s+NOTHING\s*$",
+            "",
+            translated,
+        )
+        if not re.match(r"(?is)^INSERT\s+IGNORE\b", translated):
+            translated = re.sub(r"(?is)^INSERT\b", "INSERT IGNORE", translated)
+    conflict = re.search(
+        r"(?is)\s+ON\s+CONFLICT\s*\([^)]*\)\s+DO\s+UPDATE\s+SET\s+(.+)$",
+        translated,
+    )
+    if conflict:
+        assignments = re.sub(
+            r"(?i)\bexcluded\.([A-Za-z_][A-Za-z0-9_]*)",
+            r"VALUES(\1)",
+            conflict.group(1),
+        )
+        translated = translated[: conflict.start()] + " ON DUPLICATE KEY UPDATE " + assignments
+    if insert_ignored and " ON DUPLICATE KEY UPDATE " in translated:
+        translated = re.sub(r"(?is)^INSERT\s+IGNORE\b", "INSERT", translated)
+    translated = re.sub(r"(?i)\s+COLLATE\s+NOCASE\b", "", translated)
+    return _replace_sqlite_placeholders(translated)
+
+
+class MySQLConnection:
+    """为门户查询提供与 sqlite3.Connection 一致的最小接口。"""
+
+    def __init__(self, connection: Any):
+        self._connection = connection
+
+    def execute(self, statement: str, parameters: tuple[Any, ...] | list[Any] = ()) -> MySQLResult:
+        cursor = self._connection.cursor()
+        cursor.execute(mysql_compatible_sql(statement), tuple(parameters))
+        return MySQLResult(cursor)
+
+    def executemany(self, statement: str, rows: list[tuple[Any, ...]]) -> MySQLResult:
+        cursor = self._connection.cursor()
+        cursor.executemany(mysql_compatible_sql(statement), rows)
+        return MySQLResult(cursor)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def _atomic_json_write(path: pathlib.Path, payload: dict[str, Any], mode: int = 0o600) -> None:
+    """原子写入包含数据库状态或凭据的 JSON 文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class DatabaseRuntime:
+    """管理 MySQL 能力标记、连接配置和迁移状态。"""
+
+    def __init__(self, db_path: pathlib.Path):
+        self.directory = db_path.parent / MYSQL_CONFIG_DIRECTORY
+        self.capability_path = self.directory / MYSQL_CAPABILITY_FILE
+        self.config_path = self.directory / DATABASE_CONFIG_FILE
+        self.migration_path = self.directory / DATABASE_MIGRATION_FILE
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _read(path: pathlib.Path) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def capability(self) -> dict[str, Any]:
+        value = self._read(self.capability_path)
+        return {
+            "enabled": bool(value.get("enabled")),
+            "version": int(value.get("version") or 0),
+            "runtime_python": str(value.get("runtime_python") or ""),
+            "driver": str(value.get("driver") or ""),
+            "activated_at": int(value.get("activated_at") or 0),
+        }
+
+    def config(self, include_password: bool = True) -> dict[str, Any]:
+        value = self._read(self.config_path)
+        result = {
+            "active_backend": "mysql" if value.get("active_backend") == "mysql" else "sqlite",
+            "host": str(value.get("host") or ""),
+            "port": int(value.get("port") or 3306),
+            "database": str(value.get("database") or ""),
+            "username": str(value.get("username") or ""),
+            "password": str(value.get("password") or ""),
+            "tls_mode": str(value.get("tls_mode") or "preferred"),
+            "ca_file": str(value.get("ca_file") or ""),
+            "updated_at": int(value.get("updated_at") or 0),
+        }
+        if not include_password:
+            result["password_configured"] = bool(result["password"])
+            result.pop("password", None)
+        return result
+
+    def save_config(self, payload: dict[str, Any], keep_password: bool = True) -> dict[str, Any]:
+        with self._lock:
+            current = self.config(include_password=True)
+            host = str(payload.get("host", current["host"])).strip()
+            database = str(payload.get("database", current["database"])).strip()
+            username = str(payload.get("username", current["username"])).strip()
+            if not MYSQL_HOST_RE.fullmatch(host):
+                raise ValueError("MySQL 主机名或 IP 地址无效")
+            if not MYSQL_DATABASE_RE.fullmatch(database):
+                raise ValueError("MySQL database 名称必须为 1-64 个安全字符")
+            if not username or len(username) > 128 or any(ord(value) < 32 for value in username):
+                raise ValueError("MySQL 用户名无效")
+            try:
+                port = int(payload.get("port", current["port"]))
+            except (TypeError, ValueError) as error:
+                raise ValueError("MySQL 端口必须是整数") from error
+            if not 1 <= port <= 65535:
+                raise ValueError("MySQL 端口必须在 1-65535 之间")
+            tls_mode = str(payload.get("tls_mode", current["tls_mode"])).strip().lower()
+            if tls_mode not in {"disabled", "preferred", "required", "verify_ca"}:
+                raise ValueError("MySQL TLS 模式无效")
+            ca_file = str(payload.get("ca_file", current["ca_file"])).strip()
+            if tls_mode == "verify_ca" and (not ca_file or not pathlib.Path(ca_file).is_file()):
+                raise ValueError("verify_ca 模式必须填写服务器上可读取的 CA 文件")
+            password = str(payload.get("password") or "")
+            if not password and keep_password:
+                password = str(current.get("password") or "")
+            if not password:
+                raise ValueError("MySQL 密码不能为空")
+            saved = {
+                "active_backend": current["active_backend"],
+                "host": host,
+                "port": port,
+                "database": database,
+                "username": username,
+                "password": password,
+                "tls_mode": tls_mode,
+                "ca_file": ca_file,
+                "updated_at": now(),
+            }
+            _atomic_json_write(self.config_path, saved)
+            return self.config(include_password=False)
+
+    def set_active_backend(self, backend: str) -> None:
+        with self._lock:
+            if backend not in {"sqlite", "mysql"}:
+                raise ValueError("数据库后端无效")
+            value = self.config(include_password=True)
+            value["active_backend"] = backend
+            value["updated_at"] = now()
+            _atomic_json_write(self.config_path, value)
+
+    def migration(self) -> dict[str, Any]:
+        value = self._read(self.migration_path)
+        return value if value else {"status": "idle", "progress": 0, "stage": "未开始"}
+
+    def save_migration(self, **values: Any) -> dict[str, Any]:
+        with self._lock:
+            current = self.migration()
+            current.update(values)
+            current["updated_at"] = now()
+            _atomic_json_write(self.migration_path, current)
+            return current
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -536,12 +797,11 @@ def micros_to_money(value: int) -> str:
 
 
 def tokens_to_money_micros(tokens: int, price_micros_per_million: int) -> int:
-    """Convert a raw token entitlement to cash at one conservative unit price.
+    """按保守单价把原始 Token 权益换算成现金。
 
-    Existing LLMCtl grants were consumed against the most expensive token class
-    first.  Using the highest current model price therefore preserves at least
-    the purchasing power of every remaining grant during the one-time cash
-    migration.  As with request billing, fractional micro-dollars round up.
+    LLMCtl 旧赠额会优先抵扣价格最高的 Token 类型，因此一次性现金迁移采用
+    当前最高模型单价，至少保留每笔剩余赠额的购买力。与请求计费一致，
+    不足一微美元的部分向上取整。
     """
     tokens = max(0, int(tokens))
     price = max(0, int(price_micros_per_million))
@@ -554,7 +814,7 @@ def apply_welcome_credit(
     settings: dict[str, str],
     stamp: int,
 ) -> tuple[int, str]:
-    """Credit the configured one-time welcome balance idempotently."""
+    """以幂等方式写入配置的一次性欢迎余额。"""
     amount = money_to_micros(settings.get("default_welcome_balance", "0") or "0")
     if amount < 0:
         raise ValueError("default welcome balance cannot be negative")
@@ -589,7 +849,7 @@ def apply_welcome_credit(
 def rollback_source_credit(
     connection: sqlite3.Connection, user_id: str, source_ref: str, stamp: int
 ) -> None:
-    """Undo a provisioning credit when the external API-key transaction fails."""
+    """外部 API Key 事务失败时撤销开户赠款。"""
     transaction = connection.execute(
         "SELECT amount_micros FROM balance_transactions WHERE user_id=? AND source_ref=?",
         (user_id, source_ref),
@@ -1204,9 +1464,62 @@ CREATE INDEX IF NOT EXISTS idx_stress_runs_status ON stress_runs(status,updated_
 class Database:
     def __init__(self, config: Config):
         self.config = config
+        self.runtime = DatabaseRuntime(config.db_path)
+        self._connection_condition = threading.Condition()
+        self._active_connections = 0
+        self._migration_exclusive = False
+
+    @staticmethod
+    def _pymysql() -> Any:
+        try:
+            return importlib.import_module("pymysql")
+        except ImportError as error:
+            raise DatabaseCapabilityError(
+                "MySQL 运行时未激活；请先在服务器执行 llmctl database enable-mysql"
+            ) from error
+
+    def _mysql_raw_connection(self, config: dict[str, Any] | None = None) -> Any:
+        capability = self.runtime.capability()
+        if not capability["enabled"]:
+            raise DatabaseCapabilityError(
+                "MySQL 能力尚未激活；请先执行 llmctl database enable-mysql"
+            )
+        mysql = self._pymysql()
+        config = config or self.runtime.config(include_password=True)
+        if not all(config.get(name) for name in ("host", "database", "username", "password")):
+            raise DatabaseCapabilityError("MySQL 连接信息尚未配置完整")
+        ssl_config: dict[str, Any] | None = None
+        tls_mode = str(config.get("tls_mode") or "preferred")
+        if tls_mode in {"preferred", "required"}:
+            ssl_config = {"check_hostname": False}
+        elif tls_mode == "verify_ca":
+            ssl_config = {"ca": str(config.get("ca_file") or ""), "check_hostname": True}
+        connect_options = {
+            "host": str(config["host"]),
+            "port": int(config["port"]),
+            "user": str(config["username"]),
+            "password": str(config["password"]),
+            "database": str(config["database"]),
+            "charset": "utf8mb4",
+            "autocommit": False,
+            "connect_timeout": 5,
+            "read_timeout": 30,
+            "write_timeout": 30,
+            "ssl": ssl_config,
+            "cursorclass": mysql.cursors.DictCursor,
+        }
+        try:
+            return mysql.connect(**connect_options)
+        except mysql.err.OperationalError as error:
+            # preferred 模式只在服务器明确不支持 TLS（2026）时回退明文；
+            # 认证、网络和证书错误不能被回退掩盖。
+            if tls_mode != "preferred" or not error.args or error.args[0] != 2026:
+                raise
+            connect_options["ssl"] = None
+            return mysql.connect(**connect_options)
 
     @contextlib.contextmanager
-    def connect(self):
+    def _sqlite_connect(self):
         connection = sqlite3.connect(self.config.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -1220,9 +1533,81 @@ class Database:
         finally:
             connection.close()
 
+    @contextlib.contextmanager
+    def connect(self):
+        with self._connection_condition:
+            if self._migration_exclusive:
+                raise DatabaseMigrationError("数据库正在迁移，请稍后重试")
+            self._active_connections += 1
+        try:
+            if self.runtime.config(include_password=False)["active_backend"] != "mysql":
+                with self._sqlite_connect() as connection:
+                    yield connection
+                return
+            raw_connection = self._mysql_raw_connection()
+            connection = MySQLConnection(raw_connection)
+            try:
+                yield connection
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        finally:
+            with self._connection_condition:
+                self._active_connections -= 1
+                self._connection_condition.notify_all()
+
+    @contextlib.contextmanager
+    def migration_exclusive(self):
+        """暂停新数据库请求，并等待已开始的事务结束。"""
+        with self._connection_condition:
+            if self._migration_exclusive:
+                raise DatabaseMigrationError("已有数据库迁移正在执行")
+            self._migration_exclusive = True
+            while self._active_connections:
+                self._connection_condition.wait(timeout=1)
+        try:
+            yield
+        finally:
+            with self._connection_condition:
+                self._migration_exclusive = False
+                self._connection_condition.notify_all()
+
+    @property
+    def is_mysql(self) -> bool:
+        return self.runtime.config(include_password=False)["active_backend"] == "mysql"
+
+    def is_integrity_error(self, error: BaseException) -> bool:
+        if isinstance(error, sqlite3.IntegrityError):
+            return True
+        with contextlib.suppress(DatabaseCapabilityError):
+            mysql = self._pymysql()
+            return isinstance(error, mysql.err.IntegrityError)
+        return False
+
     def initialize(self) -> None:
-        self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.runtime.config(include_password=False)["active_backend"] == "mysql":
+            self._initialize_mysql()
+            return
+        self._initialize_sqlite()
+
+    def _initialize_mysql(self) -> None:
         with self.connect() as connection:
+            marker = connection.execute(
+                "SELECT schema_version FROM llmctl_database_meta WHERE id=1"
+            ).fetchone()
+            if not marker or int(marker["schema_version"] or 0) != MYSQL_SCHEMA_VERSION:
+                raise SystemExit(
+                    "MySQL schema 未通过 LLMCtl 迁移校验；已停止，避免使用不完整数据"
+                )
+            for table in ("users", "settings", "usage_ledger", "billing_accounts"):
+                connection.execute(f"SELECT 1 FROM `{table}` LIMIT 1").fetchone()
+
+    def _initialize_sqlite(self) -> None:
+        self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._sqlite_connect() as connection:
             connection.executescript(SCHEMA)
             had_welcome_balance = connection.execute(
                 "SELECT 1 FROM settings WHERE key='default_welcome_balance'"
@@ -1451,21 +1836,28 @@ class Database:
     def _migrate_token_grants_to_cash(
         connection: sqlite3.Connection, had_welcome_balance: bool
     ) -> dict[str, int | str]:
-        """Convert all remaining promotional tokens to cash exactly once.
+        """把全部剩余赠送 Token 一次性折算为现金。
 
-        The migration is deliberately transactional and fail-closed.  If any
-        active grant cannot be valued, no grant is consumed.  A unique source
-        reference protects balances if initialization is retried.
+        迁移全程使用事务并采用失败关闭策略：任一有效赠额无法定价时，
+        所有赠额均保持不变；唯一来源标识可防止初始化重试时重复入账。
         """
         stamp = now()
         grants = connection.execute(
             "SELECT * FROM token_grants WHERE status='active' AND tokens_remaining>0 "
             "ORDER BY created_at,id"
         ).fetchall()
+        price_case = (
+            "CASE WHEN input_price_micros>=output_price_micros "
+            "AND input_price_micros>=cached_price_micros "
+            "AND input_price_micros>=reasoning_price_micros THEN input_price_micros "
+            "WHEN output_price_micros>=cached_price_micros "
+            "AND output_price_micros>=reasoning_price_micros THEN output_price_micros "
+            "WHEN cached_price_micros>=reasoning_price_micros THEN cached_price_micros "
+            "ELSE reasoning_price_micros END"
+        )
         public_rate_row = connection.execute(
-            "SELECT MAX(MAX(input_price_micros,output_price_micros,"
-            "cached_price_micros,reasoning_price_micros)) rate "
-            "FROM published_models WHERE status='published'"
+            f"SELECT MAX({price_case}) rate FROM published_models "
+            "WHERE status='published'"
         ).fetchone()
         public_rate = int(public_rate_row["rate"] or 0) if public_rate_row else 0
         legacy_default = connection.execute(
@@ -1478,9 +1870,7 @@ class Database:
             rate = public_rate
             if grant["model_id"]:
                 model = connection.execute(
-                    "SELECT MAX(input_price_micros,output_price_micros,"
-                    "cached_price_micros,reasoning_price_micros) rate "
-                    "FROM published_models WHERE id=?",
+                    f"SELECT {price_case} rate FROM published_models WHERE id=?",
                     (grant["model_id"],),
                 ).fetchone()
                 rate = int(model["rate"] or 0) if model else 0
@@ -1611,13 +2001,9 @@ class Database:
                 )
 
     def recovery_inventory(self, show_secrets: bool = False) -> dict[str, Any]:
-        """Return the current persisted portal state for `llmctl info`.
-
-        This intentionally reads the portal-owned SQLite database instead of
-        repeating installation-time environment defaults: administrators can
-        change SMTP and registration settings from the Vue portal later.
-        """
-        if not self.config.db_path.is_file():
+        """返回 ``llmctl info`` 所需的门户持久化状态。"""
+        backend = "mysql" if self.is_mysql else "sqlite"
+        if backend == "sqlite" and not self.config.db_path.is_file():
             raise RuntimeError(f"portal database does not exist: {self.config.db_path}")
         tables = (
             "users",
@@ -1637,18 +2023,29 @@ class Database:
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in tables
             }
-            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            integrity = "connected"
+            if backend == "sqlite":
+                integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
         if not show_secrets and settings.get("smtp_password"):
             settings["smtp_password"] = "<redacted>"
-        stat = self.config.db_path.stat()
+        database: dict[str, Any] = {
+            "backend": backend,
+            "quick_check": integrity,
+        }
+        if backend == "sqlite":
+            stat = self.config.db_path.stat()
+            database.update(
+                {
+                    "path": str(self.config.db_path),
+                    "bytes": stat.st_size,
+                    "mode": oct(stat.st_mode & 0o777),
+                }
+            )
+        else:
+            database.update(self.runtime.config(include_password=show_secrets))
         return {
             "version": APP_VERSION,
-            "database": {
-                "path": str(self.config.db_path),
-                "bytes": stat.st_size,
-                "mode": oct(stat.st_mode & 0o777),
-                "quick_check": integrity,
-            },
+            "database": database,
             "settings": settings,
             "counts": counts,
         }
@@ -1663,6 +2060,554 @@ class Database:
                 "INSERT INTO audit_events(created_at,actor,action,target,status,remote_addr,detail) VALUES(?,?,?,?,?,?,?)",
                 (now(), actor, action, target, status, remote, detail[:2000]),
             )
+
+
+class DatabaseMigrationManager:
+    """在后台执行 SQLite 到 MySQL 的可验证单向迁移。"""
+
+    def __init__(self, database: Database):
+        self.database = database
+        self.runtime = database.runtime
+        self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+        self._progress_token = ""
+
+    def snapshot(self) -> dict[str, Any]:
+        capability = self.runtime.capability()
+        config = self.runtime.config(include_password=False)
+        migration = self.runtime.migration()
+        thread_running = bool(self._thread and self._thread.is_alive())
+        sqlite = {
+            "path": str(self.database.config.db_path),
+            "exists": self.database.config.db_path.is_file(),
+            "bytes": (
+                self.database.config.db_path.stat().st_size
+                if self.database.config.db_path.is_file()
+                else 0
+            ),
+        }
+        return {
+            "capability": capability,
+            "config": config,
+            "migration": migration,
+            "sqlite": sqlite,
+            "busy": thread_running or migration.get("status") == "running",
+            "requirements": {
+                "server": "MySQL 8.0+",
+                "empty_database": True,
+                "scope": "LLMCtl account portal only",
+            },
+        }
+
+    def save_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.runtime.capability()["enabled"]:
+            raise DatabaseCapabilityError(
+                "MySQL 能力尚未激活；请先在服务器执行 llmctl database enable-mysql"
+            )
+        if self.database.is_mysql:
+            raise DatabaseMigrationError(
+                "当前已使用 MySQL；为避免运行中换库，请先回滚到 SQLite"
+            )
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                raise DatabaseMigrationError("数据库迁移执行期间不能修改连接配置")
+            return self.runtime.save_config(payload)
+
+    def test(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if payload:
+            self.save_config(payload)
+        config = self.runtime.config(include_password=True)
+        started = time.monotonic()
+        connection = self.database._mysql_raw_connection(config)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT VERSION() AS version, DATABASE() AS database_name")
+                row = cursor.fetchone()
+                cursor.execute("SHOW TABLES")
+                tables = cursor.fetchall()
+            version = str(row.get("version") or "")
+            match = re.match(r"^(\d+)\.(\d+)", version)
+            if not match or int(match.group(1)) < 8:
+                raise DatabaseMigrationError(
+                    f"需要 MySQL 8.0 或更高版本，当前为 {version or 'unknown'}"
+                )
+            return {
+                "ok": True,
+                "version": version,
+                "database": str(row.get("database_name") or ""),
+                "tables": len(tables),
+                "empty": not tables,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+        finally:
+            connection.close()
+
+    def start(self, actor: str) -> dict[str, Any]:
+        if self.database.is_mysql:
+            raise DatabaseMigrationError("门户当前已经使用 MySQL")
+        if not self.database.config.db_path.is_file():
+            raise DatabaseMigrationError("SQLite 源数据库不存在")
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                raise DatabaseMigrationError("已有数据库迁移正在执行")
+            test_result = self.test()
+            if not test_result["empty"]:
+                raise DatabaseMigrationError(
+                    "目标 MySQL database 必须为空；不会覆盖已有表"
+                )
+            migration_id = str(uuid.uuid4())
+            self._progress_token = secrets.token_urlsafe(32)
+            self.runtime.save_migration(
+                id=migration_id,
+                status="running",
+                stage="准备冻结 SQLite 写入",
+                progress=1,
+                actor=actor,
+                started_at=now(),
+                finished_at=0,
+                error="",
+                backup_path="",
+                source_backend="sqlite",
+                target_backend="mysql",
+                table_counts={},
+            )
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(migration_id,),
+                name="llmctl-database-migration",
+                daemon=True,
+            )
+            self._thread.start()
+        result = self.snapshot()
+        result["progress_token"] = self._progress_token
+        return result
+
+    def progress(self, supplied_token: str) -> dict[str, Any]:
+        """迁移期间不访问业务数据库，使用一次性随机令牌返回进度。"""
+        if not self._progress_token or not hmac.compare_digest(
+            self._progress_token, supplied_token
+        ):
+            raise PermissionError("迁移进度令牌无效")
+        return {
+            "migration": self.runtime.migration(),
+            "busy": bool(self._thread and self._thread.is_alive()),
+        }
+
+    def rollback_to_sqlite(self, confirmation: str, actor: str) -> dict[str, Any]:
+        if confirmation != "ROLLBACK_TO_SQLITE":
+            raise ValueError("请输入 ROLLBACK_TO_SQLITE 确认回滚")
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                raise DatabaseMigrationError("数据库迁移执行期间不能回滚")
+            if not self.database.is_mysql:
+                raise DatabaseMigrationError("当前没有使用 MySQL")
+            if not self.database.config.db_path.is_file():
+                raise DatabaseMigrationError("原 SQLite 数据库不存在，不能回滚")
+            with self.database._sqlite_connect() as source:
+                quick_check = str(source.execute("PRAGMA quick_check").fetchone()[0])
+            if quick_check != "ok":
+                raise DatabaseMigrationError(
+                    f"SQLite 完整性检查失败：{quick_check}"
+                )
+            self.runtime.set_active_backend("sqlite")
+            self.runtime.save_migration(
+                status="rolled_back",
+                stage="已回滚到迁移时保留的 SQLite",
+                progress=100,
+                rolled_back_at=now(),
+                rolled_back_by=actor,
+                error="",
+            )
+        return self.snapshot()
+
+    @staticmethod
+    def _identifier(value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise DatabaseMigrationError(f"发现不安全的数据库标识符：{value}")
+        return f"`{value}`"
+
+    @staticmethod
+    def _sqlite_default(value: Any, mysql_type: str) -> str:
+        if value is None:
+            return ""
+        raw = str(value).strip()
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", raw):
+            return f" DEFAULT {raw}"
+        if raw.upper() == "NULL":
+            return " DEFAULT NULL"
+        if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+            literal = raw[1:-1].replace(raw[0] * 2, raw[0])
+            escaped = literal.replace("'", "''")
+            if mysql_type in {"LONGTEXT", "LONGBLOB"}:
+                return f" DEFAULT ('{escaped}')"
+            return f" DEFAULT '{escaped}'"
+        return ""
+
+    def _mysql_table_definition(
+        self, source: sqlite3.Connection, table: str
+    ) -> tuple[str, list[dict[str, Any]]]:
+        columns = [dict(row) for row in source.execute(f"PRAGMA table_info({self._identifier(table)})")]
+        indexes = [dict(row) for row in source.execute(f"PRAGMA index_list({self._identifier(table)})")]
+        foreign_keys = [
+            dict(row)
+            for row in source.execute(f"PRAGMA foreign_key_list({self._identifier(table)})")
+        ]
+        keyed: set[str] = {str(row["name"]) for row in columns if int(row["pk"] or 0)}
+        for index in indexes:
+            keyed.update(
+                str(row["name"])
+                for row in source.execute(
+                    f"PRAGMA index_info({self._identifier(str(index['name']))})"
+                )
+            )
+        keyed.update(str(row["from"]) for row in foreign_keys)
+        keyed.update(str(row["to"]) for row in foreign_keys)
+        primary = sorted(
+            (row for row in columns if int(row["pk"] or 0)),
+            key=lambda row: int(row["pk"]),
+        )
+        primary_names = {str(row["name"]) for row in primary}
+        auto_primary = (
+            len(primary) == 1
+            and "INT" in str(primary[0]["type"] or "").upper()
+        )
+        definitions: list[str] = []
+        for column in columns:
+            declared = str(column["type"] or "TEXT").upper()
+            name = str(column["name"])
+            if "INT" in declared:
+                mysql_type = "BIGINT"
+            elif any(value in declared for value in ("REAL", "FLOA", "DOUB")):
+                mysql_type = "DOUBLE"
+            elif "BLOB" in declared:
+                mysql_type = "LONGBLOB"
+            elif name in keyed:
+                mysql_type = "VARCHAR(191)"
+            else:
+                mysql_type = "LONGTEXT"
+            item = f"{self._identifier(name)} {mysql_type}"
+            if auto_primary and name == str(primary[0]["name"]):
+                item += " NOT NULL AUTO_INCREMENT PRIMARY KEY"
+            else:
+                # SQLite 的复合主键列可能在 PRAGMA table_info 中仍显示
+                # notnull=0；MySQL 要求主键的每一列都显式声明 NOT NULL。
+                item += (
+                    " NOT NULL"
+                    if name in primary_names or int(column["notnull"] or 0)
+                    else " NULL"
+                )
+                item += self._sqlite_default(column["dflt_value"], mysql_type)
+            definitions.append(item)
+        if primary and not auto_primary:
+            definitions.append(
+                "PRIMARY KEY ("
+                + ",".join(self._identifier(str(row["name"])) for row in primary)
+                + ")"
+            )
+        for foreign in foreign_keys:
+            definitions.append(
+                "FOREIGN KEY ("
+                + self._identifier(str(foreign["from"]))
+                + ") REFERENCES "
+                + self._identifier(str(foreign["table"]))
+                + " ("
+                + self._identifier(str(foreign["to"]))
+                + ") ON UPDATE "
+                + str(foreign["on_update"] or "NO ACTION")
+                + " ON DELETE "
+                + str(foreign["on_delete"] or "NO ACTION")
+            )
+        statement = (
+            f"CREATE TABLE {self._identifier(table)} ("
+            + ",".join(definitions)
+            + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        )
+        return statement, indexes
+
+    def _create_indexes(
+        self,
+        source: sqlite3.Connection,
+        cursor: Any,
+        table: str,
+        indexes: list[dict[str, Any]],
+    ) -> None:
+        for index in indexes:
+            if str(index.get("origin")) == "pk":
+                continue
+            name = str(index["name"])
+            columns = [
+                str(row["name"])
+                for row in source.execute(
+                    f"PRAGMA index_info({self._identifier(name)})"
+                )
+            ]
+            if not columns:
+                continue
+            prefix = "CREATE UNIQUE INDEX" if int(index.get("unique") or 0) else "CREATE INDEX"
+            cursor.execute(
+                f"{prefix} {self._identifier(name[:64])} ON {self._identifier(table)} ("
+                + ",".join(self._identifier(value) for value in columns)
+                + ")"
+            )
+
+    @staticmethod
+    def _digest_value(value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"base64": base64.b64encode(value).decode("ascii")}
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _table_digest(
+        self, connection: Any, table: str, columns: list[str], primary: list[str]
+    ) -> tuple[int, str]:
+        order = primary or columns
+        statement = (
+            "SELECT "
+            + ",".join(self._identifier(value) for value in columns)
+            + f" FROM {self._identifier(table)} ORDER BY "
+            + ",".join(self._identifier(value) for value in order)
+        )
+        digest = hashlib.sha256()
+        count = 0
+        cursor = connection.execute(statement) if isinstance(connection, sqlite3.Connection) else connection.cursor()
+        if not isinstance(connection, sqlite3.Connection):
+            cursor.execute(statement)
+        while True:
+            rows = cursor.fetchmany(500)
+            if not rows:
+                break
+            for row in rows:
+                values = [
+                    self._digest_value(row[name] if hasattr(row, "keys") else row[index])
+                    for index, name in enumerate(columns)
+                ]
+                digest.update(
+                    json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                    + b"\n"
+                )
+                count += 1
+        return count, digest.hexdigest()
+
+    def _run(self, migration_id: str) -> None:
+        source: sqlite3.Connection | None = None
+        target: Any = None
+        backup_path = ""
+        created_tables: list[str] = []
+        target_cleaned = False
+        exclusive = self.database.migration_exclusive()
+        exclusive_entered = False
+        try:
+            # 全程暂停门户数据库请求，防止校验完成后仍有请求写入旧 SQLite。
+            # 管理页面通过独立的无数据库状态接口轮询进度。
+            exclusive.__enter__()
+            exclusive_entered = True
+            self.runtime.save_migration(
+                stage="已暂停门户数据库请求，正在创建 SQLite 备份", progress=5
+            )
+            source = sqlite3.connect(self.database.config.db_path, timeout=30)
+            source.row_factory = sqlite3.Row
+            source.execute("PRAGMA foreign_keys=ON")
+            backup_directory = self.database.config.db_path.parent / "backups"
+            backup_directory.mkdir(parents=True, exist_ok=True)
+            backup = backup_directory / (
+                "before-mysql-"
+                + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                + ".db"
+            )
+            backup_connection = sqlite3.connect(backup)
+            try:
+                source.backup(backup_connection)
+                check = str(backup_connection.execute("PRAGMA quick_check").fetchone()[0])
+                if check != "ok":
+                    raise DatabaseMigrationError(f"SQLite 备份完整性检查失败：{check}")
+            finally:
+                backup_connection.close()
+            os.chmod(backup, 0o600)
+            backup_path = str(backup)
+            source.execute("BEGIN IMMEDIATE")
+            self.runtime.save_migration(
+                backup_path=backup_path,
+                stage="SQLite 备份完成，正在创建 MySQL schema",
+                progress=12,
+            )
+
+            target = self.database._mysql_raw_connection()
+            target.autocommit(False)
+            with target.cursor() as cursor:
+                cursor.execute("SHOW TABLES")
+                if cursor.fetchall():
+                    raise DatabaseMigrationError(
+                        "目标 MySQL database 在迁移开始后出现了表，已拒绝覆盖"
+                    )
+                cursor.execute("SET FOREIGN_KEY_CHECKS=0")
+                tables = [
+                    str(row["name"])
+                    for row in source.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%' ORDER BY rootpage"
+                    )
+                ]
+                definitions: dict[str, list[dict[str, Any]]] = {}
+                for table in tables:
+                    ddl, indexes = self._mysql_table_definition(source, table)
+                    cursor.execute(ddl)
+                    created_tables.append(table)
+                    definitions[table] = indexes
+                table_counts: dict[str, int] = {}
+                for table_index, table in enumerate(tables):
+                    columns = [
+                        str(row["name"])
+                        for row in source.execute(
+                            f"PRAGMA table_info({self._identifier(table)})"
+                        )
+                    ]
+                    select_cursor = source.execute(
+                        "SELECT "
+                        + ",".join(self._identifier(value) for value in columns)
+                        + f" FROM {self._identifier(table)}"
+                    )
+                    insert = (
+                        f"INSERT INTO {self._identifier(table)} ("
+                        + ",".join(self._identifier(value) for value in columns)
+                        + ") VALUES ("
+                        + ",".join("%s" for _ in columns)
+                        + ")"
+                    )
+                    copied = 0
+                    while True:
+                        batch = select_cursor.fetchmany(500)
+                        if not batch:
+                            break
+                        cursor.executemany(
+                            insert,
+                            [tuple(row[value] for value in columns) for row in batch],
+                        )
+                        copied += len(batch)
+                    table_counts[table] = copied
+                    self.runtime.save_migration(
+                        stage=f"正在复制 {table}",
+                        progress=15 + int((table_index + 1) * 55 / max(1, len(tables))),
+                        table_counts=table_counts,
+                    )
+                for table in tables:
+                    self._create_indexes(source, cursor, table, definitions[table])
+                cursor.execute("SET FOREIGN_KEY_CHECKS=1")
+            target.commit()
+            self.runtime.save_migration(stage="正在逐表校验数量与 SHA-256", progress=75)
+            validation: dict[str, Any] = {}
+            for table_index, table in enumerate(tables):
+                info = [
+                    dict(row)
+                    for row in source.execute(
+                        f"PRAGMA table_info({self._identifier(table)})"
+                    )
+                ]
+                columns = [str(row["name"]) for row in info]
+                primary = [
+                    str(row["name"])
+                    for row in sorted(
+                        (row for row in info if int(row["pk"] or 0)),
+                        key=lambda value: int(value["pk"]),
+                    )
+                ]
+                source_count, source_digest = self._table_digest(
+                    source, table, columns, primary
+                )
+                target_count, target_digest = self._table_digest(
+                    target, table, columns, primary
+                )
+                if source_count != target_count or source_digest != target_digest:
+                    raise DatabaseMigrationError(
+                        f"{table} 校验失败：SQLite={source_count}/{source_digest[:12]}，"
+                        f"MySQL={target_count}/{target_digest[:12]}"
+                    )
+                validation[table] = {
+                    "rows": source_count,
+                    "sha256": source_digest,
+                }
+                self.runtime.save_migration(
+                    stage=f"已校验 {table}",
+                    progress=75 + int((table_index + 1) * 18 / max(1, len(tables))),
+                )
+
+            with target.cursor() as cursor:
+                cursor.execute(
+                    "CREATE TABLE llmctl_database_meta ("
+                    "id BIGINT NOT NULL PRIMARY KEY,schema_version BIGINT NOT NULL,"
+                    "source_backend VARCHAR(32) NOT NULL,migration_id VARCHAR(64) NOT NULL,"
+                    "migrated_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+                )
+                created_tables.append("llmctl_database_meta")
+                cursor.execute(
+                    "INSERT INTO llmctl_database_meta VALUES (1,%s,'sqlite',%s,%s)",
+                    (MYSQL_SCHEMA_VERSION, migration_id, now()),
+                )
+            target.commit()
+            self.runtime.set_active_backend("mysql")
+            source.commit()
+            self.runtime.save_migration(
+                status="completed",
+                stage="迁移校验通过，门户已切换到 MySQL",
+                progress=100,
+                finished_at=now(),
+                validation=validation,
+                error="",
+            )
+        except Exception as error:
+            with contextlib.suppress(Exception):
+                if source:
+                    source.rollback()
+            with contextlib.suppress(Exception):
+                if target:
+                    target.rollback()
+            # MySQL 的 CREATE TABLE 会隐式提交。目标库在开始时已经验证为空，
+            # 因此失败时只删除本次迁移明确创建的表，使管理员修正问题后可重试；
+            # 绝不扫描或删除迁移期间由其他系统新增的未知表。
+            if target and created_tables:
+                try:
+                    with target.cursor() as cursor:
+                        cursor.execute("SET FOREIGN_KEY_CHECKS=0")
+                        for table in reversed(created_tables):
+                            cursor.execute(
+                                f"DROP TABLE IF EXISTS {self._identifier(table)}"
+                            )
+                        cursor.execute("SET FOREIGN_KEY_CHECKS=1")
+                    target.commit()
+                    target_cleaned = True
+                except Exception as cleanup_error:
+                    print(
+                        f"[account-portal] MySQL migration cleanup failed: {cleanup_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            self.runtime.set_active_backend("sqlite")
+            self.runtime.save_migration(
+                status="failed",
+                stage=(
+                    "迁移失败，已清理本次创建的 MySQL 表，门户继续使用 SQLite"
+                    if target_cleaned
+                    else "迁移失败，门户继续使用 SQLite"
+                ),
+                finished_at=now(),
+                error=str(error)[:2000],
+                backup_path=backup_path,
+                target_cleaned=target_cleaned,
+            )
+            print(
+                f"[account-portal] MySQL migration failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            if source:
+                source.close()
+            if target:
+                target.close()
+            if exclusive_entered:
+                exclusive.__exit__(None, None, None)
 
 
 class OmniRouteClient:
@@ -3051,7 +3996,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 with self.app.db.connect() as connection:
                     connection.execute("SELECT 1").fetchone()
                 self.json_response(200, {"status": "ok", "version": APP_VERSION})
-            except sqlite3.Error as error:
+            except Exception as error:
                 self.json_response(503, {"status": "error", "error": str(error)})
             return
         if parsed.path == "/ready":
@@ -3124,6 +4069,16 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.response(404, page("Not found", '<div class="card"><h1>404</h1></div>'))
 
     def handle_api_get(self, path: str, query: str = "") -> None:
+        if path == "/portal-api/database-migration-progress":
+            try:
+                result = self.app.database_migration.progress(
+                    str(self.headers.get("X-LLMCtl-Migration-Token") or "")
+                )
+            except PermissionError as error:
+                self.json_response(403, {"error": str(error)})
+                return
+            self.json_response(200, result)
+            return
         if path == "/portal-api/public":
             settings = self.app.db.settings()
             portal_url, api_url = effective_public_urls(self.app.config, settings)
@@ -3325,6 +4280,11 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                         },
                     )
             return
+        if path == "/portal-api/admin/database":
+            user, _ = self.api_require(admin=True)
+            if user:
+                self.json_response(200, self.app.database_migration.snapshot())
+            return
         if path == "/portal-api/admin":
             user, _ = self.api_require(admin=True)
             if user:
@@ -3452,6 +4412,18 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.models.request(
                     "rollback", {"id": str(payload.get("id", ""))}
                 )
+            elif path == "/portal-api/admin/database/config":
+                result = self.app.database_migration.save_config(payload)
+            elif path == "/portal-api/admin/database/test":
+                result = self.app.database_migration.test(payload)
+            elif path == "/portal-api/admin/database/migrate":
+                if str(payload.get("confirmation") or "") != "MIGRATE_TO_MYSQL":
+                    raise ValueError("请输入 MIGRATE_TO_MYSQL 确认迁移")
+                result = self.app.database_migration.start(user_identity(user))
+            elif path == "/portal-api/admin/database/rollback":
+                result = self.app.database_migration.rollback_to_sqlite(
+                    str(payload.get("confirmation") or ""), user_identity(user)
+                )
             elif path == "/portal-api/admin/settings":
                 result = self.api_update_settings(payload)
             elif path == "/portal-api/admin/smtp/test":
@@ -3462,8 +4434,10 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 self.json_response(404, {"error": "not found"})
                 return
         except Exception as error:
-            self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
-            self.json_response(400 if isinstance(error, ValueError) else 502, {"error": str(error)})
+            with contextlib.suppress(Exception):
+                self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
+            status = 409 if isinstance(error, (DatabaseMigrationError, DatabaseCapabilityError)) else 400 if isinstance(error, ValueError) else 502
+            self.json_response(status, {"error": str(error)})
             return
         # 审计账本不持久化凭据明文；事件只证明发生展示/轮换，不复制秘密。
         audit_result = (
@@ -3479,14 +4453,15 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             and result.get("failed")
             else "success"
         )
-        self.app.db.audit(
-            user_identity(user),
-            path.removeprefix("/portal-api/"),
-            str(payload.get("id", "")),
-            audit_status,
-            self.remote_addr(),
-            audit_result,
-        )
+        if path != "/portal-api/admin/database/migrate":
+            self.app.db.audit(
+                user_identity(user),
+                path.removeprefix("/portal-api/"),
+                str(payload.get("id", "")),
+                audit_status,
+                self.remote_addr(),
+                audit_result,
+            )
         self.json_response(200, result)
 
     def api_login(self, payload: dict[str, Any]) -> None:
@@ -6345,8 +7320,18 @@ class PortalControlPlane:
         if user_id:
             join_conditions.append("l.user_id=?")
             parameters.append(user_id)
+        if self.db.is_mysql:
+            bucket_source = " UNION ALL ".join(
+                "SELECT ? AS bucket_index,? AS start_at,? AS end_at"
+                for _ in buckets
+            )
+            bucket_cte = f"WITH buckets AS ({bucket_source})"
+        else:
+            bucket_cte = (
+                f"WITH buckets(bucket_index,start_at,end_at) AS (VALUES {values})"
+            )
         rows = connection.execute(
-            f"""WITH buckets(bucket_index,start_at,end_at) AS (VALUES {values})
+            f"""{bucket_cte}
                 SELECT b.bucket_index,
                        COUNT(l.id) requests,
                        COUNT(DISTINCT l.user_id) active_users,
@@ -7158,15 +8143,15 @@ class PortalControlPlane:
                     "INSERT INTO user_groups(id,name,description,status,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,status=excluded.status,updated_at=excluded.updated_at",
                     (group_id, name, str(payload.get("description", "")), status, stamp, stamp),
                 )
-        except sqlite3.IntegrityError as error:
+        except Exception as error:
+            if not self.db.is_integrity_error(error):
+                with contextlib.suppress(Exception):
+                    self.sync_all_users()
+                raise
             with contextlib.suppress(Exception):
                 self.sync_all_users()
-            if "user_groups.name" in str(error):
+            if "user_groups.name" in str(error) or "name" in str(error).lower():
                 raise ValueError("用户组名称已存在") from error
-            raise
-        except Exception:
-            with contextlib.suppress(Exception):
-                self.sync_all_users()
             raise
         self.sync_all_users()
         return group_id
@@ -7208,6 +8193,7 @@ class PortalServer:
         self.config = config
         self.db = Database(config)
         self.db.initialize()
+        self.database_migration = DatabaseMigrationManager(self.db)
         self.omni = OmniRouteClient(config)
         self.workflow = WorkflowClient()
         self.models = ModelDeploymentClient()

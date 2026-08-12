@@ -872,6 +872,170 @@ dialog::backdrop {
   }
 }
 
+/* 门户数据库：连接配置、迁移进度和回滚入口保持在同一工作区内。 */
+.database-page {
+  max-width: 1320px;
+}
+.database-loading {
+  min-height: 160px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+.database-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.database-summary .panel {
+  margin: 0;
+  min-width: 0;
+}
+.database-summary span,
+.database-summary small {
+  color: var(--muted);
+}
+.database-summary strong {
+  display: block;
+  margin: 8px 0 4px;
+  font-size: 24px;
+  overflow-wrap: anywhere;
+}
+.database-capability-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border-color: #e6c879;
+  background: #fffaf0;
+}
+.database-capability-note h2,
+.database-capability-note p {
+  margin: 0;
+}
+.database-capability-note p {
+  margin-top: 7px;
+  color: var(--muted);
+}
+.database-capability-note code {
+  flex: 0 0 auto;
+  padding: 10px 13px;
+  color: #805315;
+  border: 1px solid #ead39a;
+  border-radius: 9px;
+  background: #fff;
+  user-select: all;
+}
+.database-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
+  align-items: start;
+  gap: 18px;
+}
+.database-workspace > .panel {
+  margin: 0;
+}
+.database-workspace .panel-head {
+  align-items: flex-start;
+  margin-bottom: 18px;
+}
+.database-workspace .panel-head h2,
+.database-workspace .panel-head p {
+  margin: 0;
+}
+.database-workspace .panel-head p {
+  margin-top: 6px;
+  color: var(--muted);
+}
+.database-form label,
+.database-migration-card > label {
+  color: var(--text);
+  font-weight: 620;
+}
+.database-form input,
+.database-form select,
+.database-migration-card input {
+  margin-top: 2px;
+}
+.database-actions {
+  margin-top: 16px;
+}
+.database-test-result {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-top: 16px;
+  padding: 12px 14px;
+  color: #246c55;
+  border: 1px solid #a8ddc9;
+  border-radius: 10px;
+  background: #effaf5;
+}
+.database-migration-state {
+  display: grid;
+  gap: 9px;
+  margin-bottom: 15px;
+  padding: 13px;
+  border: 1px solid #bbd5e1;
+  border-radius: 10px;
+  background: #f7fbfd;
+}
+.database-migration-state > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.database-migration-state progress {
+  width: 100%;
+  height: 9px;
+  accent-color: var(--brand);
+}
+.database-migration-state p,
+.database-migration-state small {
+  margin: 0;
+}
+.database-safety-list {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 18px;
+  padding: 14px 14px 14px 34px;
+  color: #5f7180;
+  border: 1px solid #d8e5eb;
+  border-radius: 10px;
+  background: #f8fbfc;
+}
+.database-migration-card .warning {
+  margin-bottom: 16px;
+}
+
+@media (max-width: 1040px) {
+  .database-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .database-workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 700px) {
+  .database-summary,
+  .database-form {
+    grid-template-columns: 1fr;
+  }
+  .database-capability-note {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .database-capability-note code {
+    width: 100%;
+    overflow: auto;
+  }
+  .database-form .span-2 {
+    grid-column: auto;
+  }
+}
+
 /* 运行分析与显式批量策略管理。 */
 .analytics-toolbar {
   display: grid;

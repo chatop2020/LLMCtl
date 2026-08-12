@@ -290,11 +290,27 @@ sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
 
 Add `--check` to download and validate without replacing files. Upgrade metadata is stored in `/var/lib/llm-cluster/control-plane-version.env`, backups are kept under `/var/backups/llmctl/`, and `llmctl info` reports the installed control-plane commit.
 
+## Optional MySQL Portal Database
+
+The LLMCtl account portal continues to use SQLite by default; small and medium deployments do not need to migrate merely because MySQL support is available. MySQL replaces only the portal users, permissions, billing, usage, and audit data stored in `/var/lib/llm-cluster/omniroute/portal/account-portal.db`. It does not replace OmniRoute's own `storage.sqlite` and is never inserted into the `/v1` inference data path.
+
+First run `sudo llmctl upgrade` as described above. The only command-line step for MySQL is then to activate the portal driver:
+
+```bash
+sudo llmctl database enable-mysql
+```
+
+This command installs and enables the pinned PyMySQL driver and the runtime required by MySQL 8's default authentication only for `llm-account.service`, then briefly restarts the account portal. It does not install MySQL Server, create a database, migrate data, or restart OmniRoute, Nginx, Docker, or GPU workers. The administrator supplies MySQL 8.0 or later, an empty database, a dedicated user, and its privileges.
+
+After activation, sign in to the `/ui/` administration console and open **Database**. Enter the host, port, database, username, password, and TLS options, save them, and run the connection test. The connection test validates the MySQL version, connectivity, and an empty target database. Table-creation, write, index, and foreign-key privileges are exercised by the real migration transaction; any failure keeps SQLite active and removes tables created by that migration attempt. After the test passes, enter the confirmation phrase shown by the page to start SQLite-to-MySQL migration. Backup, schema creation, batched copying, per-table row-count/digest validation, final cutover, and progress reporting are all performed through the Web UI. Portal administration enters maintenance mode during migration, while `/v1`, OmniRoute, and GPU workers remain online.
+
+The original SQLite file and a pre-migration backup remain after a successful cutover. The Web UI provides an explicit emergency rollback to SQLite. It does not merge writes made to MySQL after cutover back into the old SQLite file, so use rollback only when immediate post-migration acceptance fails. Database passwords are never returned to the browser; leaving the password field blank preserves the stored value.
+
 ## Operations Metrics and Bulk Call Policies
 
-In OmniRoute mode, the administrator home page aggregates LLMCtl's separate SQLite usage ledger into Today (hourly), 7-day, 30-day, and 12-month views. It reports requests, active users, input/output/cached/reasoning tokens, cash charges, the top ten users by token usage, a server-paginated recent-active-user list, and per-user trends. Total tokens always means input plus output; cached tokens are a subset of input and reasoning tokens are a subset of output, so neither is counted twice. Every view supports model filtering and states its ledger source, timezone, and typical two-second settlement lag. Internal stress traffic or calls that cannot be mapped to a portal user are not presented as user usage.
+In OmniRoute mode, the administrator home page aggregates the usage ledger from LLMCtl's separate portal database (SQLite by default, optionally MySQL) into Today (hourly), 7-day, 30-day, and 12-month views. It reports requests, active users, input/output/cached/reasoning tokens, cash charges, the top ten users by token usage, a server-paginated recent-active-user list, and per-user trends. Total tokens always means input plus output; cached tokens are a subset of input and reasoning tokens are a subset of output, so neither is counted twice. Every view supports model filtering and states its ledger source, timezone, and typical two-second settlement lag. Internal stress traffic or calls that cannot be mapped to a portal user are not presented as user usage.
 
-User management can bulk-update the API-key active-session limit, requests per minute (RPM), and requests per day for either the current filtered result or explicitly selected users. The browser submits an explicit list of user IDs. The backend validates the entire scope, briefly disables the target keys, commits the SQLite changes atomically, and then synchronizes each key to the selected AI gateway. A failed synchronization remains fail-closed. Bulk policy updates do not change cash balances, account status, groups, or model permissions, and every operation is written to the audit log.
+User management can bulk-update the API-key active-session limit, requests per minute (RPM), and requests per day for either the current filtered result or explicitly selected users. The browser submits an explicit list of user IDs. The backend validates the entire scope, briefly disables the target keys, commits the changes atomically to the active portal database, and then synchronizes each key to the selected AI gateway. A failed synchronization remains fail-closed. Bulk policy updates do not change cash balances, account status, groups, or model permissions, and every operation is written to the audit log.
 
 The **System Monitor** administrator page reads Linux `/proc`, mount statistics, and fixed-argument `nvidia-smi` queries directly. It never executes a browser-supplied command and does not send monitoring traffic through OmniRoute or GPU workers. It shows up to 60 in-page CPU/memory/GPU samples, GPU driver and PCI details, per-interface network rates, filesystem capacity, and a searchable, sortable, paginated view of the top 200 processes. Samples are intentionally not persisted to LLMCtl's database; this is an immediate operational view, not a replacement for long-retention monitoring such as Prometheus.
 
@@ -329,7 +345,7 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `/etc/nginx/conf.d/llm-cluster.conf` | Isolated LLMCtl Nginx front-door configuration |
 | `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute's SQLite database |
-| `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | Separate account-portal SQLite database |
+| `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | Default portal SQLite database; retained as the pre-migration rollback copy after MySQL cutover |
 | `/data/llm-cluster/models` | Default model root |
 | `llm-cluster.service` | Top-level oneshot service |
 | `llm-worker@N.service` | vLLM worker |

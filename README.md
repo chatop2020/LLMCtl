@@ -290,11 +290,27 @@ sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
 
 仅下载/校验而不替换文件可加 `--check`。升级记录保存在 `/var/lib/llm-cluster/control-plane-version.env`，备份保存在 `/var/backups/llmctl/`，并由 `llmctl info` 显示当前控制面提交。
 
+## 可选 MySQL 门户数据库
+
+LLMCtl 账户门户默认继续使用 SQLite；小型和中型部署无需因为新增 MySQL 能力而迁移。MySQL 只替代 `/var/lib/llm-cluster/omniroute/portal/account-portal.db` 承载的门户用户、授权、计费、用量与审计数据，不替代 OmniRoute 自身的 `storage.sqlite`，也不参与 `/v1` 推理数据路径。
+
+先按上一节执行 `sudo llmctl upgrade`，再用下面唯一的命令行步骤激活门户 MySQL 驱动：
+
+```bash
+sudo llmctl database enable-mysql
+```
+
+该命令只为 `llm-account.service` 安装并启用固定版本的 PyMySQL 驱动及 MySQL 8 默认认证所需运行库，然后短暂重启账户门户；它不安装 MySQL Server、不创建数据库、不迁移数据，也不重启 OmniRoute、Nginx、Docker 或 GPU Worker。MySQL 8.0 及以上版本、空数据库、专用用户和权限由管理员自行准备。
+
+驱动激活后，登录 `/ui/` 管理端并进入“数据库”：填写主机、端口、数据库、用户名、密码和 TLS 选项，保存后执行连接测试。连接测试会校验 MySQL 版本、连通性和目标库是否为空；建表、写入、索引与外键权限会在正式迁移事务中实际验证，任何一步失败都会保持 SQLite 为活动数据库并清理本次新建的目标表。测试通过后输入页面要求的确认短语即可启动 SQLite → MySQL 迁移；备份、表结构创建、分批复制、逐表行数/摘要校验、最终切换和进度显示都在 WebUI 内完成。迁移期间门户管理功能会进入维护状态，但 `/v1`、OmniRoute 和 GPU Worker 持续服务。
+
+切换成功后，原 SQLite 文件和迁移前备份都会保留。WebUI 提供显式回退到 SQLite 的应急入口；回退不会把切换后写入 MySQL 的新数据反向合并到旧 SQLite，因此应只在刚迁移后验收失败时使用。数据库密码不会返回给浏览器；编辑配置时留空表示保持现有密码。
+
 ## 运行度量与批量调用策略
 
-OmniRoute 模式的门户管理员首页直接聚合 LLMCtl 独立 SQLite 用量账本，提供今日（按小时）、近 7 天、近 30 天和近 12 个月视图。指标包括请求数、活跃用户、输入/输出/缓存/思考 Token、现金扣款、Token 用量 Top 10、最近活跃用户分页列表，以及单用户趋势。总 Token 始终定义为“输入 Token + 输出 Token”；缓存是输入的子集、思考是输出的子集，不会重复相加。所有图表均支持模型筛选，并显示账本来源、统计时区和通常约 2 秒的结算延迟。内部压测或无法映射到门户用户的流量不会伪装成用户用量。
+OmniRoute 模式的门户管理员首页直接聚合 LLMCtl 独立门户数据库（默认 SQLite，可选 MySQL）中的用量账本，提供今日（按小时）、近 7 天、近 30 天和近 12 个月视图。指标包括请求数、活跃用户、输入/输出/缓存/思考 Token、现金扣款、Token 用量 Top 10、最近活跃用户分页列表，以及单用户趋势。总 Token 始终定义为“输入 Token + 输出 Token”；缓存是输入的子集、思考是输出的子集，不会重复相加。所有图表均支持模型筛选，并显示账本来源、统计时区和通常约 2 秒的结算延迟。内部压测或无法映射到门户用户的流量不会伪装成用户用量。
 
-用户管理支持对“当前筛选结果”或“明确勾选的用户”批量修改 API Key 活跃会话上限、每分钟请求数（RPM）和每日请求数。浏览器会把目标用户 ID 明确提交给后端，后端在修改前校验完整范围、短暂停用目标 Key、原子写入 SQLite，再逐一同步到当前 AI 接入层；同步失败的 Key 保持停用，避免旧策略继续生效。批量操作不会修改现金余额、账户状态、用户组或模型权限，并会写入审计日志。
+用户管理支持对“当前筛选结果”或“明确勾选的用户”批量修改 API Key 活跃会话上限、每分钟请求数（RPM）和每日请求数。浏览器会把目标用户 ID 明确提交给后端，后端在修改前校验完整范围、短暂停用目标 Key、原子写入当前门户数据库，再逐一同步到当前 AI 接入层；同步失败的 Key 保持停用，避免旧策略继续生效。批量操作不会修改现金余额、账户状态、用户组或模型权限，并会写入审计日志。
 
 管理员菜单中的“系统监控”直接读取 Linux `/proc`、挂载点统计和固定参数的 `nvidia-smi` 查询，不执行浏览器传入的命令，也不让监控流量经过 OmniRoute 或 GPU Worker。页面展示最近最多 60 次的短时 CPU/内存/GPU 趋势、各 GPU 驱动与 PCI 信息、逐接口网络速率、逐文件系统容量，以及 CPU/内存可排序、可搜索、分页的前 200 个进程。历史只保存在当前浏览器页面内；LLMCtl 不把系统监控样本写入数据库，因此它用于即时运维观察，不替代 Prometheus 等长期监控系统。
 
@@ -329,7 +345,7 @@ sudo llmctl models current
 | `/etc/nginx/conf.d/llm-cluster.conf` | LLMCtl 独立 Nginx 统一入口配置 |
 | `/var/lib/llm-cluster/cache` | 可再生成的 vLLM 缓存 |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute 自身 SQLite 数据库 |
-| `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | 账户门户独立 SQLite 数据库 |
+| `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | 账户门户默认 SQLite 数据库；切换 MySQL 后作为迁移前回退副本保留 |
 | `/data/llm-cluster/models` | 默认模型根目录 |
 | `llm-cluster.service` | 总控 oneshot 服务 |
 | `llm-worker@N.service` | vLLM Worker |

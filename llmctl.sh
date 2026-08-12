@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.5.0"
+readonly CTL_VERSION="3.6.0"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -22,6 +22,13 @@ readonly OMNIROUTE_PLAN="${CONFIG_DIR}/omniroute-plan.json"
 readonly OMNIROUTE_SQLITE="${STATE_DIR}/omniroute/gateway/storage.sqlite"
 readonly ACCOUNT_SQLITE="${STATE_DIR}/omniroute/portal/account-portal.db"
 readonly ACCOUNT_HELPER="${LLM_ACCOUNT_HELPER:-/usr/local/lib/llm-cluster/account_portal.py}"
+readonly ACCOUNT_MYSQL_VENV="${STATE_DIR}/omniroute/portal/mysql-venv"
+readonly ACCOUNT_MYSQL_CONFIG_DIR="${STATE_DIR}/omniroute/portal/Config"
+readonly ACCOUNT_MYSQL_CAPABILITY="${ACCOUNT_MYSQL_CONFIG_DIR}/mysql-capability.json"
+readonly ACCOUNT_DATABASE_CONFIG="${ACCOUNT_MYSQL_CONFIG_DIR}/database.json"
+readonly ACCOUNT_DATABASE_MIGRATION="${ACCOUNT_MYSQL_CONFIG_DIR}/database-migration.json"
+readonly ACCOUNT_MYSQL_DROPIN_DIR="/etc/systemd/system/llm-account.service.d"
+readonly ACCOUNT_MYSQL_DROPIN="${ACCOUNT_MYSQL_DROPIN_DIR}/50-llmctl-mysql.conf"
 readonly CONTROL_PLANE_UPDATER="${LLM_CONTROL_PLANE_UPDATER:-/usr/local/lib/llm-cluster/upgrade-llmctl.sh}"
 readonly CONTROL_PLANE_RELEASE="${LLM_CONTROL_PLANE_RELEASE:-/var/lib/llm-cluster/control-plane-version.env}"
 readonly DOCKER_PROXY_DROPIN="/etc/systemd/system/docker.service.d/90-llm-cluster-temporary-proxy.conf"
@@ -371,6 +378,7 @@ usage() {
   llmctl responses repair                      备份数据并修复 Responses API 原生 Combo 与用户权限
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
+  llmctl database enable-mysql                激活门户 MySQL 驱动；连接配置与迁移在 WebUI 完成
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
   llmctl nginx <apply|test|status>              应用、校验或查看 LLMCtl Nginx 公开入口
   llmctl timezone show|set [时区]              查看或设置系统时区（默认 Asia/Shanghai）
@@ -1411,7 +1419,15 @@ account_helper() {
   export ACCOUNT_DEFAULT_WELCOME_BALANCE ACCOUNT_DEFAULT_QUOTA_TOKENS ACCOUNT_QUOTA_RESET ACCOUNT_QUOTA_RESET_TIME
   export SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USERNAME SMTP_PASSWORD SMTP_FROM
   export GATEWAY_API_KEY API_PORT GATEWAY_INTERNAL_PORT SUPPORTS_OCR
-  "${ACCOUNT_HELPER}" "$@"
+  # MySQL 能力激活后，CLI 与 systemd 门户必须使用同一套固定驱动环境；否则门户
+  # 已能连接 MySQL，而 llmctl info 等维护命令仍会因系统 Python 缺少驱动失败。
+  if [[ -r "${ACCOUNT_MYSQL_CAPABILITY}" ]] \
+    && jq -e '.enabled == true' "${ACCOUNT_MYSQL_CAPABILITY}" >/dev/null 2>&1 \
+    && [[ -x "${ACCOUNT_MYSQL_VENV}/bin/python" ]]; then
+    "${ACCOUNT_MYSQL_VENV}/bin/python" "${ACCOUNT_HELPER}" "$@"
+  else
+    "${ACCOUNT_HELPER}" "$@"
+  fi
 }
 
 persisted_published_origin() {
@@ -2021,6 +2037,10 @@ cmd_info() {
   local redact=0 value public_host public_origin effective_public_origin id state portal_inventory="" portal_inventory_status=unavailable
   local portal_users="n/a" portal_groups="n/a" portal_models="n/a" portal_free="n/a"
   local portal_usage="n/a" portal_transactions="n/a" portal_audits="n/a" portal_integrity="n/a"
+  local portal_db_backend="sqlite" mysql_capability="disabled" mysql_driver="<未激活>"
+  local mysql_host="<未配置>" mysql_port="3306" mysql_database="<未配置>" mysql_username="<未配置>"
+  local mysql_password="" mysql_tls="preferred" mysql_ca="<empty>"
+  local migration_status="idle" migration_stage="未开始" migration_progress="0" migration_backup="<none>" migration_error="<none>"
   case "${1:-}" in
     "") ;;
     --redact) redact=1 ;;
@@ -2067,7 +2087,37 @@ cmd_info() {
       portal_transactions=$(printf '%s' "${portal_inventory}" | jq -r '.counts.balance_transactions')
       portal_audits=$(printf '%s' "${portal_inventory}" | jq -r '.counts.audit_events')
       portal_integrity=$(printf '%s' "${portal_inventory}" | jq -r '.database.quick_check')
+      portal_db_backend=$(printf '%s' "${portal_inventory}" | jq -r '.database.backend // "sqlite"')
+      mysql_host=$(printf '%s' "${portal_inventory}" | jq -r '.database.host // "<未配置>"')
+      mysql_port=$(printf '%s' "${portal_inventory}" | jq -r '.database.port // 3306')
+      mysql_database=$(printf '%s' "${portal_inventory}" | jq -r '.database.database // "<未配置>"')
+      mysql_username=$(printf '%s' "${portal_inventory}" | jq -r '.database.username // "<未配置>"')
+      mysql_password=$(printf '%s' "${portal_inventory}" | jq -r '.database.password // ""')
+      mysql_tls=$(printf '%s' "${portal_inventory}" | jq -r '.database.tls_mode // "preferred"')
+      mysql_ca=$(printf '%s' "${portal_inventory}" | jq -r '.database.ca_file // "<empty>"')
     fi
+  fi
+  if [[ -r "${ACCOUNT_MYSQL_CAPABILITY}" ]]; then
+    mysql_capability=$(jq -r 'if .enabled == true then "enabled" else "disabled" end' "${ACCOUNT_MYSQL_CAPABILITY}" 2>/dev/null || printf invalid)
+    mysql_driver=$(jq -r '.driver // "unknown"' "${ACCOUNT_MYSQL_CAPABILITY}" 2>/dev/null || printf invalid)
+  fi
+  # 即使当前仍使用 SQLite，也要从受保护配置中展示已经保存的 MySQL 目标，便于长期维护与灾难恢复。
+  if [[ -r "${ACCOUNT_DATABASE_CONFIG}" ]]; then
+    portal_db_backend=$(jq -r '.active_backend // "sqlite"' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_host=$(jq -r '.host // "<未配置>"' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_port=$(jq -r '.port // 3306' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_database=$(jq -r '.database // "<未配置>"' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_username=$(jq -r '.username // "<未配置>"' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_password=$(jq -r '.password // ""' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_tls=$(jq -r '.tls_mode // "preferred"' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+    mysql_ca=$(jq -r '.ca_file // "<empty>"' "${ACCOUNT_DATABASE_CONFIG}" 2>/dev/null || printf invalid)
+  fi
+  if [[ -r "${ACCOUNT_DATABASE_MIGRATION}" ]]; then
+    migration_status=$(jq -r '.status // "idle"' "${ACCOUNT_DATABASE_MIGRATION}" 2>/dev/null || printf invalid)
+    migration_stage=$(jq -r '.stage // "unknown"' "${ACCOUNT_DATABASE_MIGRATION}" 2>/dev/null || printf invalid)
+    migration_progress=$(jq -r '.progress // 0' "${ACCOUNT_DATABASE_MIGRATION}" 2>/dev/null || printf 0)
+    migration_backup=$(jq -r '.backup_path // .backup // "<none>"' "${ACCOUNT_DATABASE_MIGRATION}" 2>/dev/null || printf invalid)
+    migration_error=$(jq -r '.error // "<none>"' "${ACCOUNT_DATABASE_MIGRATION}" 2>/dev/null || printf invalid)
   fi
   effective_public_origin="${ACCOUNT_PUBLISHED_ORIGIN:-${public_origin}}"
 
@@ -2139,10 +2189,15 @@ cmd_info() {
 
   printf '\n[数据库 / Databases]\n'
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-    printf 'OmniRoute SQLite: %s (mode=%s, size=%s)\n门户 SQLite: %s (mode=%s, size=%s)\n两者隔离: yes\n' \
+    printf 'OmniRoute SQLite: %s (mode=%s, size=%s)\n门户活动后端: %s\n门户 SQLite/回滚副本: %s (mode=%s, size=%s)\nOmniRoute 与门户数据库隔离: yes\n' \
       "${OMNIROUTE_SQLITE}" "$(stat -c %a "${OMNIROUTE_SQLITE}" 2>/dev/null || printf missing)" "$(du -h "${OMNIROUTE_SQLITE}" 2>/dev/null | awk '{print $1}' || printf missing)" \
-      "${ACCOUNT_DB_PATH}" "$(stat -c %a "${ACCOUNT_DB_PATH}" 2>/dev/null || printf missing)" "$(du -h "${ACCOUNT_DB_PATH}" 2>/dev/null | awk '{print $1}' || printf missing)"
-    printf '门户持久配置读取: %s；SQLite quick_check: %s\n门户对象: users=%s groups=%s models=%s free-resources=%s usage=%s transactions=%s audits=%s\n' \
+      "${portal_db_backend}" "${ACCOUNT_DB_PATH}" "$(stat -c %a "${ACCOUNT_DB_PATH}" 2>/dev/null || printf missing)" "$(du -h "${ACCOUNT_DB_PATH}" 2>/dev/null | awk '{print $1}' || printf missing)"
+    printf 'MySQL 能力: %s；驱动: %s\nMySQL: %s:%s/%s；用户名=%s；密码=%s；TLS=%s；CA=%s\n' \
+      "${mysql_capability}" "${mysql_driver}" "${mysql_host}" "${mysql_port}" "${mysql_database}" "${mysql_username}" \
+      "$(secret_value "${mysql_password}")" "${mysql_tls}" "${mysql_ca}"
+    printf '迁移: status=%s progress=%s%% stage=%s\n迁移备份: %s\n迁移错误: %s\n' \
+      "${migration_status}" "${migration_progress}" "${migration_stage}" "${migration_backup}" "${migration_error}"
+    printf '门户持久配置读取: %s；活动后端检查: %s\n门户对象: users=%s groups=%s models=%s free-resources=%s usage=%s transactions=%s audits=%s\n' \
       "${portal_inventory_status}" "${portal_integrity}" "${portal_users}" "${portal_groups}" "${portal_models}" "${portal_free}" "${portal_usage}" "${portal_transactions}" "${portal_audits}"
   else
     printf 'PostgreSQL 数据库: %s\nPostgreSQL 用户名: %s\nPostgreSQL 密码: %s\nDATABASE_URL: %s\n数据卷: llm-cluster-gateway-postgres\n' \
@@ -2477,8 +2532,97 @@ cmd_router() {
   esac
 }
 
+cmd_database_enable_mysql() {
+  [[ "${GATEWAY_KIND}" == omniroute ]] || \
+    die "MySQL 可选能力只用于 OmniRoute 模式下的 LLMCtl 账户门户。"
+  [[ -f /etc/systemd/system/llm-account.service ]] || \
+    die "未找到 llm-account.service；请先运行 llmctl upgrade，再重试。"
+  command -v python3 >/dev/null 2>&1 || die "缺少 python3，无法创建独立 MySQL 驱动环境。"
+  id llm-account >/dev/null 2>&1 || die "缺少 llm-account 系统用户；账户门户安装不完整。"
+
+  local venv_python="${ACCOUNT_MYSQL_VENV}/bin/python"
+  local site_packages driver_version crypto_version capability_tmp dropin_tmp was_active=0
+  install -d -m 750 -o llm-account -g llm-account "$(dirname "${ACCOUNT_MYSQL_VENV}")"
+  if [[ ! -x "${venv_python}" ]]; then
+    log "正在创建账户门户专用的 MySQL 驱动环境；不会安装或修改 MySQL Server。"
+    python3 -m venv "${ACCOUNT_MYSQL_VENV}" || \
+      die "无法创建 Python venv；请确认系统已安装 python3-venv。"
+  fi
+
+  load_saved_proxy
+  export_proxy_env
+  log "正在安装并锁定 MySQL 驱动及 caching_sha2_password 支持；现有 Router 与 GPU Worker 不受影响。"
+  if ! "${venv_python}" -m pip install --disable-pip-version-check --timeout 30 --retries 2 \
+      "PyMySQL==1.1.2" "cryptography==46.0.7"; then
+    warn "MySQL 驱动下载失败，将检查国际网络并按需询问维护代理。"
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy || true
+    MAINTENANCE_PROXY=""
+    prompt_proxy_if_needed
+    export_proxy_env
+    "${venv_python}" -m pip install --disable-pip-version-check --timeout 30 --retries 2 \
+      "PyMySQL==1.1.2" "cryptography==46.0.7" || \
+      die "MySQL 驱动安装失败；可先运行 llmctl proxy set <IP> <端口> 后重试。"
+  fi
+
+  site_packages=$("${venv_python}" -c 'import site; print(site.getsitepackages()[0])')
+  driver_version=$("${venv_python}" -c 'from importlib.metadata import version; print(version("PyMySQL"))')
+  crypto_version=$("${venv_python}" -c 'from importlib.metadata import version; print(version("cryptography"))')
+  PYTHONPATH="${site_packages}" /usr/bin/python3 -c 'import pymysql, cryptography' || \
+    die "MySQL 驱动已安装但账户门户 Python 无法加载；未修改 systemd。"
+
+  install -d -m 700 -o llm-account -g llm-account "${ACCOUNT_MYSQL_CONFIG_DIR}"
+  capability_tmp=$(mktemp "${ACCOUNT_MYSQL_CONFIG_DIR}/.mysql-capability.XXXXXX")
+  "${venv_python}" - "${capability_tmp}" "${venv_python}" "${driver_version}" "${crypto_version}" <<'PY'
+import json
+import os
+import sys
+import time
+
+target, runtime_python, driver_version, crypto_version = sys.argv[1:]
+payload = {
+    "enabled": True,
+    "version": 1,
+    "runtime_python": runtime_python,
+    "driver": f"PyMySQL {driver_version}; cryptography {crypto_version}",
+    "activated_at": int(time.time()),
+}
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+  chown llm-account:llm-account "${capability_tmp}"
+  chmod 600 "${capability_tmp}"
+  mv -f "${capability_tmp}" "${ACCOUNT_MYSQL_CAPABILITY}"
+
+  install -d -m 755 "${ACCOUNT_MYSQL_DROPIN_DIR}"
+  dropin_tmp=$(mktemp "${ACCOUNT_MYSQL_DROPIN_DIR}/.50-llmctl-mysql.XXXXXX")
+  printf '[Service]\nEnvironment="PYTHONPATH=%s"\n' "${site_packages}" >"${dropin_tmp}"
+  chmod 644 "${dropin_tmp}"
+  mv -f "${dropin_tmp}" "${ACCOUNT_MYSQL_DROPIN}"
+  systemctl daemon-reload
+
+  systemctl is-active --quiet llm-account.service && was_active=1 || true
+  if (( was_active == 1 )); then
+    log "仅重启账户门户以加载 MySQL 驱动；Router 与 GPU Worker 保持运行。"
+    systemctl restart llm-account.service
+    wait_account_portal
+  else
+    log "账户门户当前未运行；MySQL 驱动会在下次启动时加载。"
+  fi
+
+  log "MySQL 能力已激活：PyMySQL ${driver_version}，cryptography ${crypto_version}。"
+  log "下一步请登录 /ui/ 管理端，进入“数据库”，在 WebUI 中填写连接、测试并迁移。"
+  log "本命令没有安装 MySQL Server、没有迁移数据，也没有改变 OmniRoute 自身的 SQLite。"
+}
+
 cmd_database() {
   require_root; load_config
+  if [[ "${1:-}" == enable-mysql ]]; then
+    cmd_database_enable_mysql
+    return 0
+  fi
   [[ "${GATEWAY_KIND}" != omniroute ]] || die "OmniRoute 模式使用两个隔离的 SQLite 文件，没有 PostgreSQL 服务；请使用 llmctl account。"
   case "${1:-status}" in
     start)
@@ -2496,7 +2640,7 @@ cmd_database() {
       warn "数据库停止时 $(gateway_display_name) 的 Web UI、密钥和入口路由均不可用。"
       ;;
     status) systemctl status llm-database.service --no-pager || true ;;
-    *) die "database 子命令必须是 start|stop|restart|status" ;;
+    *) die "database 子命令必须是 enable-mysql|start|stop|restart|status" ;;
   esac
 }
 

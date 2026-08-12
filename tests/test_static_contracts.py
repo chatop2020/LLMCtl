@@ -116,6 +116,33 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("Router 和 Worker 均未重启", router)
         self.assertNotIn("refresh_router", router.split("reconcile)", 1)[1].split(";;", 1)[0])
 
+    def test_mysql_command_only_activates_the_portal_driver(self):
+        command = MANAGER.split("cmd_database_enable_mysql() {", 1)[1].split(
+            "cmd_database() {", 1
+        )[0]
+        self.assertIn("PyMySQL==1.1.2", command)
+        self.assertIn("cryptography==46.0.7", command)
+        self.assertIn("mysql-capability.json", MANAGER)
+        self.assertIn("systemctl restart llm-account.service", command)
+        self.assertIn("Router 与 GPU Worker 保持运行", command)
+        self.assertIn("在 WebUI 中填写连接、测试并迁移", command)
+        self.assertIn("没有安装 MySQL Server、没有迁移数据", command)
+        self.assertNotIn("mysql -", command)
+        self.assertNotIn("mysqld", command)
+        self.assertNotIn("CREATE DATABASE", command)
+
+    def test_mysql_cli_helpers_and_recovery_inventory_use_the_activated_runtime(self):
+        helper = MANAGER.split("account_helper() {", 1)[1].split(
+            "persisted_published_origin() {", 1
+        )[0]
+        info = MANAGER.split("cmd_info() {", 1)[1].split("cmd_health() {", 1)[0]
+        self.assertIn('ACCOUNT_MYSQL_VENV}/bin/python', helper)
+        self.assertIn(".enabled == true", helper)
+        self.assertIn("门户活动后端", info)
+        self.assertIn("MySQL 能力", info)
+        self.assertIn("ACCOUNT_DATABASE_MIGRATION", info)
+        self.assertIn("迁移备份", info)
+
     def test_gateway_versions_are_pinned_and_only_selected_image_is_pulled(self):
         self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)
         self.assertIn("ghcr.io/berriai/litellm:v1.94.0", INSTALLER)

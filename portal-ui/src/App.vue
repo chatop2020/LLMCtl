@@ -45,6 +45,12 @@ const modelDeploymentPlanning = ref(false);
 const modelDeploymentSubmitting = ref(false);
 const modelDeploymentPlan = ref(null);
 const modelDeploymentConfirmed = ref(false);
+const databaseRuntime = ref(null);
+const databaseLoading = ref(false);
+const databaseConnectionTest = ref(null);
+const databaseMigrationToken = ref("");
+const databaseMigrationConfirmation = ref("");
+const databaseRollbackConfirmation = ref("");
 const analyticsLoading = ref(false);
 const monitorLoading = ref(false);
 const monitorPaused = ref(false);
@@ -60,6 +66,7 @@ let stressRefreshTimer = null;
 let analyticsRefreshTimer = null;
 let monitorRefreshTimer = null;
 let modelDeploymentRefreshTimer = null;
+let databaseMigrationRefreshTimer = null;
 let analyticsLoadVersion = 0;
 let monitorLoadVersion = 0;
 const authMode = ref(
@@ -237,6 +244,15 @@ const modelEdit = reactive({
   access: [{ type: "all", id: "" }],
 });
 const settings = reactive({});
+const databaseConfig = reactive({
+  host: "",
+  port: 3306,
+  database: "",
+  username: "",
+  password: "",
+  tls_mode: "preferred",
+  ca_file: "",
+});
 const portalTitle = computed(
   () => settings.portal_title || publicConfig.value.portal_title || "LLMCtl",
 );
@@ -642,6 +658,7 @@ const nav = computed(() =>
         ["users", "用户"],
         ["groups", "用户组"],
         ["billing", "账单"],
+        ["database", "数据库"],
         ["monitoring", "系统监控"],
         ["workflow", "能力编排"],
         ["stress", "性能压测"],
@@ -728,6 +745,11 @@ function clearAuthenticatedClientState() {
   modelDeployments.value = null;
   modelDeploymentPlan.value = null;
   modelDeploymentConfirmed.value = false;
+  databaseRuntime.value = null;
+  databaseConnectionTest.value = null;
+  databaseMigrationToken.value = "";
+  databaseMigrationConfirmation.value = "";
+  databaseRollbackConfirmation.value = "";
   selectedUserIds.value = [];
   section.value = "overview";
   usageFilters.user = "";
@@ -939,6 +961,8 @@ async function selectSection(nextSection) {
       await Promise.all([refreshWorkspace(), loadWorkflow()]);
     } else if (nextSection === "deployments" && isAdmin.value) {
       await Promise.all([refreshWorkspace(), loadModelDeployments()]);
+    } else if (nextSection === "database" && isAdmin.value) {
+      await loadDatabaseRuntime();
     } else if (nextSection === "billing") {
       await syncUsageAndRefresh({ preservePage: false });
     } else {
@@ -946,6 +970,150 @@ async function selectSection(nextSection) {
     }
   } catch (error) {
     notify(`页面数据更新失败：${error.message}`, "bad");
+  }
+}
+
+function applyDatabaseRuntime(snapshot) {
+  databaseRuntime.value = snapshot;
+  const config = snapshot?.config || {};
+  databaseConfig.host = config.host || "";
+  databaseConfig.port = Number(config.port || 3306);
+  databaseConfig.database = config.database || "";
+  databaseConfig.username = config.username || "";
+  databaseConfig.password = "";
+  databaseConfig.tls_mode = config.tls_mode || "preferred";
+  databaseConfig.ca_file = config.ca_file || "";
+}
+
+function databasePayload() {
+  return {
+    host: databaseConfig.host,
+    port: Number(databaseConfig.port || 3306),
+    database: databaseConfig.database,
+    username: databaseConfig.username,
+    password: databaseConfig.password,
+    tls_mode: databaseConfig.tls_mode,
+    ca_file: databaseConfig.ca_file,
+  };
+}
+
+async function loadDatabaseRuntime(options = {}) {
+  if (!isAdmin.value || !session.value?.authenticated || databaseLoading.value)
+    return;
+  databaseLoading.value = true;
+  try {
+    applyDatabaseRuntime(await api("admin/database"));
+  } catch (error) {
+    if (!options.silent) notify(`数据库状态读取失败：${error.message}`, "bad");
+  } finally {
+    databaseLoading.value = false;
+  }
+}
+
+async function saveDatabaseConfig() {
+  const result = await action(
+    () =>
+      api("admin/database/config", {
+        method: "POST",
+        body: JSON.stringify(databasePayload()),
+      }),
+    "MySQL 连接配置已保存",
+    { key: "database-save", pending: "正在保存 MySQL 连接配置…", refresh: false },
+  );
+  if (result) await loadDatabaseRuntime();
+}
+
+async function testDatabaseConnection() {
+  const result = await action(
+    () =>
+      api("admin/database/test", {
+        method: "POST",
+        body: JSON.stringify(databasePayload()),
+      }),
+    "MySQL 连接与版本检查通过",
+    { key: "database-test", pending: "正在连接并检查 MySQL…", refresh: false },
+  );
+  if (result) {
+    databaseConnectionTest.value = result;
+    databaseConfig.password = "";
+    await loadDatabaseRuntime();
+  }
+}
+
+async function pollDatabaseMigration() {
+  if (!databaseMigrationToken.value) return;
+  try {
+    const result = await api("database-migration-progress", {
+      headers: {
+        "X-LLMCtl-Migration-Token": databaseMigrationToken.value,
+      },
+    });
+    databaseRuntime.value = {
+      ...(databaseRuntime.value || {}),
+      migration: result.migration,
+      busy: result.busy,
+    };
+    if (result.migration?.status === "running" || result.busy) return;
+    databaseMigrationToken.value = "";
+    busy.value = false;
+    operation.value = "";
+    if (result.migration?.status === "completed") {
+      notify("数据校验通过，门户已切换到 MySQL");
+      await Promise.all([loadDatabaseRuntime(), refreshWorkspace()]);
+    } else {
+      notify(`迁移失败，门户仍使用 SQLite：${result.migration?.error || "未知错误"}`, "bad");
+      await loadDatabaseRuntime();
+    }
+  } catch (error) {
+    databaseMigrationToken.value = "";
+    busy.value = false;
+    operation.value = "";
+    notify(`迁移进度读取失败：${error.message}。请重新打开数据库页面确认实际状态。`, "bad");
+  }
+}
+
+async function startDatabaseMigration() {
+  if (busy.value) return;
+  if (databaseMigrationConfirmation.value !== "MIGRATE_TO_MYSQL") {
+    notify("请输入 MIGRATE_TO_MYSQL 确认迁移", "bad");
+    return;
+  }
+  busy.value = true;
+  operation.value = "database-migrate";
+  notify("正在备份 SQLite 并启动迁移…", "working");
+  try {
+    const result = await api("admin/database/migrate", {
+      method: "POST",
+      body: JSON.stringify({ confirmation: databaseMigrationConfirmation.value }),
+    });
+    applyDatabaseRuntime(result);
+    databaseMigrationToken.value = result.progress_token || "";
+    databaseMigrationConfirmation.value = "";
+    if (!databaseMigrationToken.value)
+      throw new Error("服务未返回迁移进度令牌");
+    await pollDatabaseMigration();
+  } catch (error) {
+    busy.value = false;
+    operation.value = "";
+    notify(`迁移未启动：${error.message}`, "bad");
+    await loadDatabaseRuntime({ silent: true });
+  }
+}
+
+async function rollbackDatabaseToSqlite() {
+  const result = await action(
+    () =>
+      api("admin/database/rollback", {
+        method: "POST",
+        body: JSON.stringify({ confirmation: databaseRollbackConfirmation.value }),
+      }),
+    "门户已回滚到迁移时保留的 SQLite",
+    { key: "database-rollback", pending: "正在检查 SQLite 并切换…", refresh: false },
+  );
+  if (result) {
+    databaseRollbackConfirmation.value = "";
+    applyDatabaseRuntime(result);
+    await refreshWorkspace();
   }
 }
 
@@ -2632,6 +2800,10 @@ onMounted(async () => {
         return;
       loadModelDeployments({ silent: true });
     }, 2_000);
+    databaseMigrationRefreshTimer = window.setInterval(() => {
+      if (!databaseMigrationToken.value || document.hidden) return;
+      pollDatabaseMigration();
+    }, 1_000);
   } catch (error) {
     notify(error.message, "bad");
   }
@@ -2644,6 +2816,8 @@ onBeforeUnmount(() => {
   if (monitorRefreshTimer) window.clearInterval(monitorRefreshTimer);
   if (modelDeploymentRefreshTimer)
     window.clearInterval(modelDeploymentRefreshTimer);
+  if (databaseMigrationRefreshTimer)
+    window.clearInterval(databaseMigrationRefreshTimer);
   if (chatTimer) window.clearInterval(chatTimer);
   if (toastTimer) window.clearTimeout(toastTimer);
 });
@@ -5029,6 +5203,145 @@ onBeforeUnmount(() => {
                 "
               />
             </section>
+          </section>
+
+          <section v-if="section === 'database'" class="page database-page">
+            <div class="page-head">
+              <div>
+                <span class="eyebrow">PORTAL DATABASE</span>
+                <h1>门户数据库</h1>
+                <p>配置并迁移 LLMCtl 账户门户数据；AI 接入层、推理 Router 和 GPU Worker 不受影响。</p>
+              </div>
+              <button class="ghost" type="button" :disabled="databaseLoading" @click="loadDatabaseRuntime()">
+                {{ databaseLoading ? "读取中…" : "刷新状态" }}
+              </button>
+            </div>
+
+            <section v-if="!databaseRuntime" class="panel database-loading">
+              {{ databaseLoading ? "正在读取数据库状态…" : "暂无数据库状态。" }}
+            </section>
+
+            <template v-else>
+              <section class="database-summary">
+                <article class="panel">
+                  <span>当前后端</span>
+                  <strong>{{ databaseRuntime.config.active_backend === "mysql" ? "MySQL" : "SQLite" }}</strong>
+                  <small>{{ databaseRuntime.config.active_backend === "mysql" ? "门户业务读写已切换" : "默认本地数据库" }}</small>
+                </article>
+                <article class="panel">
+                  <span>MySQL 能力</span>
+                  <strong>{{ databaseRuntime.capability.enabled ? "已激活" : "未激活" }}</strong>
+                  <small>{{ databaseRuntime.capability.driver || "尚未安装 PyMySQL 驱动" }}</small>
+                </article>
+                <article class="panel">
+                  <span>SQLite 源库</span>
+                  <strong>{{ formatBytes(databaseRuntime.sqlite.bytes || 0) }}</strong>
+                  <small>{{ databaseRuntime.sqlite.exists ? "迁移后保留，可回滚" : "文件不存在" }}</small>
+                </article>
+                <article class="panel">
+                  <span>迁移状态</span>
+                  <strong>{{ databaseRuntime.migration.status === "idle" ? "未迁移" : databaseRuntime.migration.status }}</strong>
+                  <small>{{ databaseRuntime.migration.stage || "未开始" }}</small>
+                </article>
+              </section>
+
+              <section v-if="!databaseRuntime.capability.enabled" class="panel database-capability-note">
+                <div>
+                  <h2>先激活 MySQL 能力</h2>
+                  <p>服务器只需执行一次下列命令。它仅安装门户所需的 Python 驱动并短暂重启账户门户，不安装 MySQL Server，也不重启 AI 接入层、Router 或任何 Worker。</p>
+                </div>
+                <code>llmctl database enable-mysql</code>
+              </section>
+
+              <template v-else>
+                <div class="database-workspace">
+                  <section class="panel database-config-card">
+                    <div class="panel-head">
+                      <div>
+                        <h2>MySQL 连接</h2>
+                        <p>请先自行创建 MySQL 8.0+ database 和专用用户，再在此保存和测试。</p>
+                      </div>
+                      <span class="status" :class="databaseRuntime.config.active_backend === 'mysql' ? 'ok' : 'warn'">
+                        {{ databaseRuntime.config.active_backend === "mysql" ? "使用中" : "待迁移" }}
+                      </span>
+                    </div>
+                    <div class="form-grid database-form">
+                      <label>主机
+                        <input v-model.trim="databaseConfig.host" autocomplete="off" placeholder="127.0.0.1" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'" />
+                      </label>
+                      <label>端口
+                        <input v-model.number="databaseConfig.port" type="number" min="1" max="65535" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'" />
+                      </label>
+                      <label>Database
+                        <input v-model.trim="databaseConfig.database" autocomplete="off" placeholder="llmctl_portal" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'" />
+                      </label>
+                      <label>用户名
+                        <input v-model.trim="databaseConfig.username" autocomplete="username" placeholder="llmctl" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'" />
+                      </label>
+                      <label class="span-2">密码
+                        <input v-model="databaseConfig.password" type="password" autocomplete="new-password" :placeholder="databaseRuntime.config.password_configured ? '已保存；留空保持不变' : '输入 MySQL 用户密码'" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'" />
+                      </label>
+                      <label>TLS 模式
+                        <select v-model="databaseConfig.tls_mode" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'">
+                          <option value="disabled">关闭（仅可信内网）</option>
+                          <option value="preferred">优先 TLS</option>
+                          <option value="required">必须 TLS</option>
+                          <option value="verify_ca">TLS 并验证 CA</option>
+                        </select>
+                      </label>
+                      <label>CA 文件（服务器路径）
+                        <input v-model.trim="databaseConfig.ca_file" autocomplete="off" placeholder="/etc/ssl/certs/mysql-ca.pem" :disabled="databaseRuntime.busy || databaseRuntime.config.active_backend === 'mysql'" />
+                      </label>
+                    </div>
+                    <div class="button-row database-actions">
+                      <button class="primary" type="button" :disabled="busy || databaseRuntime.config.active_backend === 'mysql'" @click="saveDatabaseConfig">保存配置</button>
+                      <button class="ghost" type="button" :disabled="busy || databaseRuntime.config.active_backend === 'mysql'" @click="testDatabaseConnection">测试连接</button>
+                    </div>
+                    <div v-if="databaseConnectionTest" class="database-test-result">
+                      <strong>连接通过</strong>
+                      <span>MySQL {{ databaseConnectionTest.version }}</span>
+                      <span>{{ databaseConnectionTest.latency_ms }} ms</span>
+                      <span>{{ databaseConnectionTest.empty ? "目标库为空，可迁移" : `目标库已有 ${databaseConnectionTest.tables} 张表` }}</span>
+                    </div>
+                  </section>
+
+                  <section class="panel database-migration-card">
+                    <div class="panel-head">
+                      <div>
+                        <h2>数据迁移与切换</h2>
+                        <p>迁移期间账户门户暂停业务数据库请求；普通 <code>/v1</code> 推理仍直达 AI 接入层。</p>
+                      </div>
+                    </div>
+                    <div v-if="databaseRuntime.migration.status !== 'idle'" class="database-migration-state">
+                      <div><strong>{{ databaseRuntime.migration.stage }}</strong><span>{{ Number(databaseRuntime.migration.progress || 0) }}%</span></div>
+                      <progress :value="Number(databaseRuntime.migration.progress || 0)" max="100"></progress>
+                      <p v-if="databaseRuntime.migration.error" class="error-text">{{ databaseRuntime.migration.error }}</p>
+                      <small v-if="databaseRuntime.migration.backup_path">SQLite 备份：<code>{{ databaseRuntime.migration.backup_path }}</code></small>
+                    </div>
+                    <ol class="database-safety-list">
+                      <li>目标 MySQL database 必须为空，LLMCtl 不会覆盖已有表。</li>
+                      <li>切换前会创建 SQLite 备份，并逐表核对行数和 SHA-256。</li>
+                      <li>只有全部校验通过才写入切换标记；失败时继续使用 SQLite。</li>
+                    </ol>
+                    <template v-if="databaseRuntime.config.active_backend === 'sqlite'">
+                      <label>输入 <code>MIGRATE_TO_MYSQL</code> 确认
+                        <input v-model.trim="databaseMigrationConfirmation" autocomplete="off" placeholder="MIGRATE_TO_MYSQL" :disabled="databaseRuntime.busy || busy" />
+                      </label>
+                      <button class="primary wide-button" type="button" :disabled="databaseRuntime.busy || busy || databaseMigrationConfirmation !== 'MIGRATE_TO_MYSQL'" @click="startDatabaseMigration">
+                        {{ databaseRuntime.busy || operation === "database-migrate" ? "迁移中…" : "备份、迁移、校验并切换" }}
+                      </button>
+                    </template>
+                    <template v-else>
+                      <div class="warning">回滚会切回迁移时保留的 SQLite；切换 MySQL 后产生的新用户、用量和设置不会自动写回旧 SQLite。</div>
+                      <label>输入 <code>ROLLBACK_TO_SQLITE</code> 确认
+                        <input v-model.trim="databaseRollbackConfirmation" autocomplete="off" placeholder="ROLLBACK_TO_SQLITE" :disabled="busy" />
+                      </label>
+                      <button class="danger wide-button" type="button" :disabled="busy || databaseRollbackConfirmation !== 'ROLLBACK_TO_SQLITE'" @click="rollbackDatabaseToSqlite">回滚到保留的 SQLite</button>
+                    </template>
+                  </section>
+                </div>
+              </template>
+            </template>
           </section>
 
           <section v-if="section === 'monitoring'" class="page monitor-page">

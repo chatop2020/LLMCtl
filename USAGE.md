@@ -172,6 +172,25 @@ OmniRoute 自身没有完整的企业注册和易用计费流程。LLMCtl 因此
 
 第一项完全归 OmniRoute 管理；第二项保存门户用户/用户组、验证状态、会话、公开模型、授权、价格版本、金额流水、历史 Token 折现记录、使用账本和门户审计。门户数据库不保存明文 API Key。用户验证邮箱时创建一把长期固定 Key；以后登录只通过受保护的 OmniRoute 管理接口读取同一把 Key，并暂存在当前浏览器会话，curl 示例也自动使用它。读取动作会审计但不会记录明文；只有用户主动点击“轮换”才会创建新 Key 并撤销旧 Key。门户定期读取 OmniRoute 调用日志，以请求 ID 幂等结算；进行结算和权限变更时先停用用户 Key，提交账本后再同步新权限，失败时保持关闭。
 
+门户数据库默认使用上述独立 SQLite 文件。需要更高写入并发或长期增长空间时，可在升级到支持版本后只用命令行激活 MySQL 驱动：
+
+```bash
+sudo llmctl upgrade
+sudo llmctl database enable-mysql
+```
+
+`database enable-mysql` 只创建门户专用 Python 驱动环境与 systemd 配置，并短暂重启 `llm-account.service`；它不会安装 MySQL Server、创建数据库或执行迁移，也不停止 OmniRoute、Nginx、Docker 或 GPU Worker。管理员自行准备 MySQL 8.0+、一个空的 `utf8mb4` 数据库及专用用户。该用户至少需要对目标库拥有 `CREATE`、`ALTER`、`INDEX`、`REFERENCES`、`SELECT`、`INSERT`、`UPDATE` 和 `DELETE` 权限。
+
+其余操作全部在 `/ui/` 管理端的“数据库”页面完成：
+
+1. 填写 MySQL 主机、端口、数据库、用户名、密码与 TLS 模式；密码字段留空表示保持已保存密码。
+2. 保存配置并执行连接测试；目标库必须为空，避免覆盖其他系统数据。
+3. 阅读迁移范围与停写说明，输入 `MIGRATE_TO_MYSQL` 后启动迁移。
+4. 页面持续显示 SQLite 备份、建表、分批复制、逐表行数/摘要校验和最终切换进度。只有全部校验通过后才把活动后端切换为 MySQL。
+5. 切换后执行门户登录、用户列表、账单和审计验收。`/v1` 推理链路始终直达 OmniRoute，因此迁移不影响正在推理的请求。
+
+迁移前 SQLite 和带时间戳的备份都会保留。WebUI 的应急回退要求输入 `ROLLBACK_TO_SQLITE`；它只把门户重新指向迁移前 SQLite，不会把切换后新增的 MySQL 写入合并回去。OmniRoute 自身的 `storage.sqlite` 始终保持独立，不参与这次迁移。
+
 默认关闭公开注册。启用时必须配置精确邮箱域名白名单、公开门户地址和外部 SMTP。例如：
 
 ```bash
@@ -220,7 +239,7 @@ sudo llmctl logs account -f
 
 OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显示降级告警，并允许查看用户、SMTP、账本和审计；依赖网关的模型、Key、权限和实时对账操作会明确失败，不会伪装成功。`llmctl startup status` 会把这种状态标为 `degraded`，而完整启动验收仍要求门户 `/ready` 与 OmniRoute 一起恢复。
 
-生产环境只需保护公开 `8000`，并在现有 Nginx/TLS 站点或上游负载均衡器终止 HTTPS；不要公开回环 `8001/18000/810x`。`--account-public-url` 可使用公开 origin 或其 `/ui` 路径，`--account-api-public-url` 使用无路径 origin。SMTP 密码和管理 key 位于 root-only 配置；当前门户 SQLite 也会保存运行期 SMTP 设置，因此应按敏感文件备份和保护，不要把凭据写入命令历史。
+生产环境只需保护公开 `8000`，并在现有 Nginx/TLS 站点或上游负载均衡器终止 HTTPS；不要公开回环 `8001/18000/810x`。`--account-public-url` 可使用公开 origin 或其 `/ui` 路径，`--account-api-public-url` 使用无路径 origin。SMTP 密码、管理 key 和门户数据库连接配置位于 root-only 配置；SQLite 文件或 MySQL 备份同样应按敏感数据保护，不要把凭据写入命令历史。
 
 公网发布前执行以下安全清单：
 
@@ -228,8 +247,8 @@ OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显�
 2. 使用受信任证书并强制用户从 HTTPS 域名访问；在门户管理端保存相同的“公开访问源”。LLMCtl 不自动申请证书，也不修改你的边缘端口映射。
 3. 升级控制面后运行 `sudo llmctl nginx apply && sudo llmctl nginx test`。生成器先备份旧 LLMCtl 配置并执行 `nginx -t`，失败自动回滚；该配置覆盖客户端伪造的 `X-Forwarded-For`、限制登录/注册/验证请求，并增加 `nosniff`、Referrer 和 Permissions Policy 响应头。
 4. `/base_ui/` 及其原生网关管理 API 仅供排障。公网域名应在最外层反向代理对该路径使用 VPN、IP ACL 或独立管理认证；普通用户只需要 `/ui/`、`/portal-api/` 和 `/v1/`。
-5. 不要公开或复制 `/etc/llm-cluster/secrets.env`、两个 SQLite 文件和未脱敏的 `llmctl info`。工单中只使用 `sudo llmctl info --redact`。
-6. 开启企业注册时保留精确邮箱后缀白名单和 SMTP 验证；定期检查门户审计、失败登录和 Nginx 429 日志，并备份两个 SQLite 文件。
+5. 不要公开或复制 `/etc/llm-cluster/secrets.env`、OmniRoute SQLite、门户数据库/备份和未脱敏的 `llmctl info`。工单中只使用 `sudo llmctl info --redact`。
+6. 开启企业注册时保留精确邮箱后缀白名单和 SMTP 验证；定期检查门户审计、失败登录和 Nginx 429 日志，并分别备份 OmniRoute SQLite 与当前门户数据库。
 
 ## OpenAI 兼容 API
 
@@ -457,7 +476,7 @@ journalctl -u llm-cluster.service -n 300 --no-pager
 sudo llmctl upgrade
 ```
 
-确认后，LLMCtl 从 GitHub 获取最新项目内容；API 预检或实际 ZIP 下载任一步失败都会引导配置临时或持久代理并重试。升级会更新 `llmctl`、安装维护脚本、账户门户后端和 Vue 静态资源，并对门户 SQLite 执行向后兼容的原地迁移。现有 vLLM Worker、模型目录、路由组合、用户和账本不会被重装。
+确认后，LLMCtl 从 GitHub 获取最新项目内容；API 预检或实际 ZIP 下载任一步失败都会引导配置临时或持久代理并重试。升级会更新 `llmctl`、安装维护脚本、账户门户后端和 Vue 静态资源，并对当前门户数据库执行向后兼容的原地迁移。现有 vLLM Worker、模型目录、路由组合、用户和账本不会被重装。升级本身不会把 SQLite 自动切换为 MySQL；如需 MySQL，应在升级成功后执行一次 `sudo llmctl database enable-mysql`，再在 WebUI 中配置、测试和迁移。
 
 升级完成后建议执行：
 

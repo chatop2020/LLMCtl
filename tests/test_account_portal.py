@@ -2283,6 +2283,86 @@ class PortalIntegrationTests(unittest.TestCase):
 
 
 class PortalUnitTests(unittest.TestCase):
+    def test_mysql_schema_marks_every_composite_primary_key_column_not_null(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE model_access("
+            "model_id TEXT,subject_type TEXT,subject_id TEXT,"
+            "PRIMARY KEY(model_id,subject_type,subject_id))"
+        )
+        manager = object.__new__(portal.DatabaseMigrationManager)
+        statement, _indexes = manager._mysql_table_definition(
+            connection, "model_access"
+        )
+        self.assertIn("`model_id` VARCHAR(191) NOT NULL", statement)
+        self.assertIn("`subject_type` VARCHAR(191) NOT NULL", statement)
+        self.assertIn("`subject_id` VARCHAR(191) NOT NULL", statement)
+
+    def test_mysql_sql_adapter_converts_portal_dml_without_touching_literals(self):
+        statement = (
+            "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=excluded.value,updated_at=excluded.updated_at"
+        )
+        self.assertEqual(
+            portal.mysql_compatible_sql(statement),
+            "INSERT INTO settings(key,value,updated_at) VALUES(%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE value=VALUES(value),updated_at=VALUES(updated_at)",
+        )
+        self.assertEqual(
+            portal.mysql_compatible_sql("SELECT '?' AS literal, ? AS value"),
+            "SELECT '?' AS literal, %s AS value",
+        )
+        self.assertEqual(
+            portal.mysql_compatible_sql(
+                "INSERT OR IGNORE INTO model_access(model_id,subject_type,subject_id) "
+                "VALUES(?,?,?)"
+            ),
+            "INSERT IGNORE INTO model_access(model_id,subject_type,subject_id) "
+            "VALUES(%s,%s,%s)",
+        )
+
+    def test_database_runtime_redacts_and_preserves_mysql_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = portal.DatabaseRuntime(pathlib.Path(directory) / "account.db")
+            saved = runtime.save_config(
+                {
+                    "host": "mysql.internal",
+                    "port": 3306,
+                    "database": "llmctl_portal",
+                    "username": "llmctl",
+                    "password": "database-secret",
+                    "tls_mode": "required",
+                    "ca_file": "",
+                }
+            )
+            self.assertNotIn("password", saved)
+            self.assertTrue(saved["password_configured"])
+            self.assertEqual(
+                runtime.config(include_password=True)["password"], "database-secret"
+            )
+
+            # WebUI 留空密码表示继续使用已经保存的密码。
+            runtime.save_config(
+                {
+                    "host": "mysql.internal",
+                    "port": 3307,
+                    "database": "llmctl_portal",
+                    "username": "llmctl",
+                    "password": "",
+                    "tls_mode": "preferred",
+                    "ca_file": "",
+                }
+            )
+            self.assertEqual(runtime.config(include_password=True)["port"], 3307)
+            self.assertEqual(
+                runtime.config(include_password=True)["password"], "database-secret"
+            )
+            runtime.set_active_backend("mysql")
+            self.assertEqual(runtime.config(include_password=False)["active_backend"], "mysql")
+            self.assertEqual(runtime.config_path.stat().st_mode & 0o777, 0o600)
+
     def test_token_credit_conversion_uses_ceil_and_preserves_value(self):
         self.assertEqual(
             portal.tokens_to_money_micros(100_000_000, 12_000_000),

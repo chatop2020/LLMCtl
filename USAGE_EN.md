@@ -172,6 +172,25 @@ OmniRoute does not provide a complete company-registration and administrator-fri
 
 The first file is owned entirely by OmniRoute. The second stores portal users/groups, verification state, sessions, published models, access rules, price versions, balances, legacy token-conversion records, the usage ledger, and portal audit events. The portal database never stores a plaintext user API key. Email verification creates one long-lived key; later sign-ins retrieve that same key through OmniRoute's protected management API and keep it only in the current browser session, including in generated curl examples. Reveal events are audited without the plaintext. Only an explicit user rotation creates a new key and revokes the old one. The portal periodically reconciles OmniRoute call logs by unique request ID. Entitlement-changing reconciliation disables the user key first, commits the ledger, then publishes the new permission set; a failed sync remains closed.
 
+The portal uses that separate SQLite file by default. For higher write concurrency or long-term growth, first upgrade to a supporting release and use the command line only to activate the MySQL driver:
+
+```bash
+sudo llmctl upgrade
+sudo llmctl database enable-mysql
+```
+
+`database enable-mysql` creates the portal-only Python driver environment and systemd configuration, then briefly restarts `llm-account.service`. It does not install MySQL Server, create a database, or migrate data, and it does not stop OmniRoute, Nginx, Docker, or GPU workers. The administrator supplies MySQL 8.0 or later, an empty `utf8mb4` database, and a dedicated user. That user needs at least `CREATE`, `ALTER`, `INDEX`, `REFERENCES`, `SELECT`, `INSERT`, `UPDATE`, and `DELETE` privileges on the target database.
+
+Every remaining action is performed in the `/ui/` administration console under **Database**:
+
+1. Enter the MySQL host, port, database, username, password, and TLS mode. A blank password field preserves the saved password.
+2. Save the configuration and run the connection test. The target database must be empty so LLMCtl cannot overwrite another application's data.
+3. Read the migration scope and write-freeze notice, then enter `MIGRATE_TO_MYSQL` to start.
+4. The page continuously reports SQLite backup, schema creation, batched copying, per-table row-count/digest validation, and final cutover. MySQL becomes active only after all checks pass.
+5. After cutover, validate portal sign-in, users, billing, and audit. `/v1` always goes directly to OmniRoute, so active inference requests are unaffected.
+
+The pre-migration SQLite file and timestamped backup remain available. Emergency rollback in the Web UI requires `ROLLBACK_TO_SQLITE`; it points the portal back to the pre-migration SQLite data and does not merge subsequent MySQL writes into it. OmniRoute's own `storage.sqlite` remains separate throughout.
+
 Public registration is disabled by default. Enabling it requires an exact email-domain allowlist, the public portal origin, and external SMTP:
 
 ```bash
@@ -220,7 +239,7 @@ The administration console's **Performance benchmark** is executed by server-sid
 
 If OmniRoute is temporarily unavailable, the portal's local administration pages remain accessible with a degradation warning so users, SMTP settings, ledgers, and audits can still be inspected. Operations that depend on the gateway—models, keys, permissions, and live reconciliation—fail explicitly rather than reporting false success. `llmctl startup status` reports this state as `degraded`, while full startup acceptance still requires the portal `/ready` endpoint and OmniRoute to recover together.
 
-In production, protect only public port `8000` and terminate HTTPS in an existing Nginx/TLS site or upstream load balancer; never expose loopback ports `8001`, `18000`, or `810x`. `--account-public-url` may be the public origin or its `/ui` path, while `--account-api-public-url` is a path-free origin. SMTP and management credentials are in root-only configuration; the portal SQLite file also stores runtime SMTP settings and must be backed up and protected as a sensitive file.
+In production, protect only public port `8000` and terminate HTTPS in an existing Nginx/TLS site or upstream load balancer; never expose loopback ports `8001`, `18000`, or `810x`. `--account-public-url` may be the public origin or its `/ui` path, while `--account-api-public-url` is a path-free origin. SMTP, management, and portal database connection credentials are in root-only configuration. Protect the SQLite file or MySQL backups as sensitive data and never place credentials in shell history.
 
 Complete this security checklist before Internet publication:
 
@@ -228,8 +247,8 @@ Complete this security checklist before Internet publication:
 2. Use a trusted certificate, force users through the HTTPS domain, and save the same **Published origin** in the portal. LLMCtl does not obtain certificates or alter edge port mappings.
 3. After a control-plane upgrade, run `sudo llmctl nginx apply && sudo llmctl nginx test`. The generator backs up the LLMCtl site and runs `nginx -t` before reload, rolling back on failure. The generated site overwrites spoofable client `X-Forwarded-For`, throttles login/registration/verification, and adds `nosniff`, Referrer, and Permissions Policy headers.
 4. `/base_ui/` and the native gateway management API are troubleshooting surfaces. Restrict them at the outer reverse proxy with a VPN, IP ACL, or separate administration authentication. Ordinary users need only `/ui/`, `/portal-api/`, and `/v1/`.
-5. Never publish or paste `/etc/llm-cluster/secrets.env`, either SQLite file, or an unredacted `llmctl info`. Use `sudo llmctl info --redact` in tickets.
-6. Keep the exact email-domain allowlist and SMTP verification enabled for company registration. Review portal audit events, failed sign-ins, and Nginx 429 logs, and back up both SQLite files regularly.
+5. Never publish or paste `/etc/llm-cluster/secrets.env`, OmniRoute's SQLite file, the portal database/backups, or an unredacted `llmctl info`. Use `sudo llmctl info --redact` in tickets.
+6. Keep the exact email-domain allowlist and SMTP verification enabled for company registration. Review portal audit events, failed sign-ins, and Nginx 429 logs, and back up OmniRoute SQLite and the active portal database separately.
 
 ## OpenAI-Compatible API
 
@@ -457,7 +476,7 @@ Common interpretations:
 sudo llmctl upgrade
 ```
 
-After confirmation, LLMCtl downloads the latest project content from GitHub. A failure in either API preflight or the real ZIP transfer offers temporary or persistent proxy configuration and retries safely. The command updates `llmctl`, installer-maintenance scripts, the account-portal backend, and Vue assets, then applies backward-compatible SQLite migrations. Existing vLLM workers, model directories, routing combos, users, and ledgers are not reinstalled.
+After confirmation, LLMCtl downloads the latest project content from GitHub. A failure in either API preflight or the real ZIP transfer offers temporary or persistent proxy configuration and retries safely. The command updates `llmctl`, installer-maintenance scripts, the account-portal backend, and Vue assets, then applies backward-compatible migrations to the active portal database. Existing vLLM workers, model directories, routing combos, users, and ledgers are not reinstalled. Upgrade never switches SQLite to MySQL automatically. To use MySQL, run `sudo llmctl database enable-mysql` once after a successful upgrade, then configure, test, and migrate exclusively in the Web UI.
 
 After the upgrade, run:
 
