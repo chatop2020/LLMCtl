@@ -294,8 +294,8 @@ export default {
             <div>
               <strong>模型原生参数</strong
               ><small
-                >从当前 AI
-                接入层读取；路由组合采用所有底层目标中的保守值。</small
+                >LLMCtl 受管模型优先读取当前 Worker 有效配置；其他模型读取 AI
+                接入层，路由组合采用所有底层目标中的保守值。</small
               >
             </div>
             <button
@@ -350,6 +350,13 @@ export default {
                   : "部分目标无法原生同步"
               }}</span
             >
+            <span
+              v-if="modelEdit.metadata.managed_runtime_corrected_count"
+              class="warn-text"
+            >
+              已按运行配置修正
+              {{ modelEdit.metadata.managed_runtime_corrected_count }} 个接入层旧值；保存时同步
+            </span>
             <details>
               <summary>查看底层目标</summary>
               <ul>
@@ -363,6 +370,17 @@ export default {
                       target.context_window_tokens?.toLocaleString() ||
                       "上下文未知"
                     }}
+                    <template
+                      v-if="
+                        target.managed_runtime_context &&
+                        target.gateway_context_window_tokens &&
+                        target.gateway_context_window_tokens !==
+                          target.context_window_tokens
+                      "
+                    >
+                      （接入层旧值
+                      {{ target.gateway_context_window_tokens.toLocaleString() }}）
+                    </template>
                     /
                     {{
                       target.max_output_tokens?.toLocaleString() || "输出未知"

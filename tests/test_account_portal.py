@@ -1583,10 +1583,88 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(route["mapping_kind"], "native-combo")
         self.assertTrue(route["mapping_id"].startswith("public-combo-"))
         snapshot = self.server.control.admin_snapshot()
-        model = next(item for item in snapshot["models"] if item["public_model_id"] == "gdn-inside")
+        model = next(
+            item
+            for item in snapshot["models"]
+            if item["public_model_id"] == "gdn-inside"
+        )
         self.assertEqual(model["description"], "公司内部模型")
         self.assertEqual(model["context_window_tokens"], 200000)
         self.assertEqual(model["metadata_sync_status"], "synced")
+
+    def test_managed_runtime_context_overrides_stale_gateway_metadata(self):
+        """本机 Worker 的有效上下文必须覆盖 OmniRoute 中残留的旧数值。"""
+
+        self.fake_omni.combo_items = [
+            {
+                "id": "combo-runtime",
+                "name": "ornith-runtime-combo",
+                "models": [
+                    {
+                        "kind": "model",
+                        "providerId": provider,
+                        "modelId": "ornith-1.0-35b-fp8",
+                    }
+                    for provider in ("local-a", "local-b")
+                ],
+            }
+        ]
+        gateway_options = {
+            "providers": [
+                {
+                    "providerId": provider,
+                    "models": [
+                        {
+                            "id": "ornith-1.0-35b-fp8",
+                            "qualifiedModel": f"{provider}/ornith-1.0-35b-fp8",
+                            "contextLength": 256144,
+                            "outputTokenLimit": 64144,
+                        }
+                    ],
+                }
+                for provider in ("local-a", "local-b")
+            ]
+        }
+
+        class ManagedModels:
+            @staticmethod
+            def snapshot():
+                return {
+                    "registry": {
+                        "deployments": {
+                            "ornith": {
+                                "enabled": True,
+                                "served_model_name": "ornith-1.0-35b-fp8",
+                                "runtime": {"max_model_len": 262144},
+                            }
+                        }
+                    }
+                }
+
+        self.server.control.models = ManagedModels()
+        with mock.patch.object(
+            self.fake_omni, "combo_builder_options", return_value=gateway_options
+        ):
+            inspected = self.server.control.inspect_model(
+                {
+                    "source_kind": "combo",
+                    "source_ref": "combo-runtime",
+                    "source_model": "ornith-runtime-combo",
+                }
+            )
+
+        self.assertEqual(inspected["context_window_tokens"], 262144)
+        self.assertEqual(inspected["max_output_tokens"], 64144)
+        self.assertEqual(inspected["managed_runtime_count"], 2)
+        self.assertEqual(inspected["managed_runtime_corrected_count"], 2)
+        self.assertEqual(
+            [item["context_window_tokens"] for item in inspected["targets"]],
+            [262144, 262144],
+        )
+        self.assertEqual(
+            [item["gateway_context_window_tokens"] for item in inspected["targets"]],
+            [256144, 256144],
+        )
 
     def test_permission_sync_exposes_only_public_model_id(self):
         self.insert_control_user_and_model()

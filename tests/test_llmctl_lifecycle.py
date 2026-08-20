@@ -42,6 +42,18 @@ def run_bash(body: str) -> str:
 
 
 class LlmctlLifecycleTests(unittest.TestCase):
+    def test_model_init_reloads_an_already_running_control_service(self):
+        """恢复命令必须重启旧进程，而不只是对活动单元重复 enable --now。"""
+
+        manager = manager_implementation()
+        command = manager.split("cmd_model() {", 1)[1].split(
+            "worker_config_value() {", 1
+        )[0]
+        init = command.split("    init)\n", 1)[1].split("    status)", 1)[0]
+        self.assertIn("systemctl enable llm-model-control.service", init)
+        self.assertIn("systemctl restart llm-model-control.service", init)
+        self.assertNotIn("enable --now llm-model-control.service", init)
+
     def test_model_upgrade_cli_reuses_plan_revision_and_submits_stale_guard(self):
         """CLI apply 必须把计划版本带回控制服务，且不要求管理员手写 JSON。"""
 

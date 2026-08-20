@@ -83,6 +83,12 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   const modelUpgradeProfiles = computed(
     () => modelDeployments.value?.upgrade_profiles || [],
   );
+  const modelUpgradeUnavailableReason = computed(() => {
+    if (!modelDeployments.value || modelDeployments.value.available === false)
+      return "";
+    if (modelUpgradeProfiles.value.length) return "";
+    return "模型部署控制服务仍在运行旧版本。请执行 sudo llmctl model init 重新加载控制服务，然后刷新状态。";
+  });
   const ornithUpgradeSources = computed(() =>
     modelDeploymentRows.value.filter(
       (deployment) =>
@@ -130,6 +136,33 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     { deep: true },
   );
 
+  let upgradeSourceDefaultsId = "";
+
+  /**
+   * 从来源部署读取升级前真实生效的上下文。
+   * 管理员切换来源时更新一次，后续自动刷新不覆盖其手工调整。
+   */
+  function applyUpgradeSourceRuntime(deploymentId) {
+    const source = modelDeploymentRows.value.find(
+      (deployment) => deployment.id === deploymentId,
+    );
+    if (!source) return;
+    const maxModelLen = Number(source.runtime?.max_model_len);
+    modelUpgradeForm.max_model_len =
+      Number.isInteger(maxModelLen) && maxModelLen >= 8192 && maxModelLen <= 262144
+        ? maxModelLen
+        : 32768;
+    upgradeSourceDefaultsId = deploymentId;
+  }
+
+  watch(
+    () => modelUpgradeForm.source_deployment_id,
+    (deploymentId) => {
+      if (deploymentId && deploymentId !== upgradeSourceDefaultsId)
+        applyUpgradeSourceRuntime(deploymentId);
+    },
+  );
+
   async function loadModelDeployments(options = {}) {
     if (!isAdmin.value || !session.value?.authenticated || modelDeploymentsLoading.value)
       return;
@@ -150,17 +183,21 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       if (!modelUpgradeForm.target_model_id && profile) {
         modelUpgradeForm.target_model_id = profile.model_id || "";
         modelUpgradeForm.target_revision = profile.revision || "";
-        modelUpgradeForm.max_model_len = Number(
-          profile.recommended_max_model_len || 32768,
-        );
       }
       const sources = Object.values(result.registry?.deployments || {}).filter(
         (deployment) =>
           deployment.enabled !== false &&
           String(deployment.model_id || "").toLowerCase().includes("ornith"),
       );
-      if (!modelUpgradeForm.source_deployment_id && sources.length === 1)
+      if (!modelUpgradeForm.source_deployment_id && sources.length === 1) {
         modelUpgradeForm.source_deployment_id = sources[0].id;
+        applyUpgradeSourceRuntime(sources[0].id);
+      } else if (
+        modelUpgradeForm.source_deployment_id &&
+        !upgradeSourceDefaultsId
+      ) {
+        applyUpgradeSourceRuntime(modelUpgradeForm.source_deployment_id);
+      }
     } catch (error) {
       modelDeployments.value = { available: false, error: error.message };
       if (!options.silent) notify(`模型部署状态读取失败：${error.message}`, "bad");
@@ -529,6 +566,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     modelDeploymentRows,
     modelDeploymentJobs,
     modelUpgradeProfiles,
+    modelUpgradeUnavailableReason,
     ornithUpgradeSources,
     activeModelDeploymentJob,
     selectedDeploymentGpus,

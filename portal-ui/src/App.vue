@@ -513,6 +513,7 @@ const {
   modelDeploymentRows,
   modelDeploymentJobs,
   modelUpgradeProfiles,
+  modelUpgradeUnavailableReason,
   ornithUpgradeSources,
   activeModelDeploymentJob,
   selectedDeploymentGpus,
@@ -2177,7 +2178,8 @@ async function inspectModel(overwrite = true) {
       body: JSON.stringify(modelEdit),
     });
     modelEdit.metadata = metadata;
-    if (overwrite || !modelEdit.context_window_tokens)
+    const managedRuntime = Number(metadata.managed_runtime_count || 0) > 0;
+    if (managedRuntime || overwrite || !modelEdit.context_window_tokens)
       modelEdit.context_window_tokens = metadata.context_window_tokens || "";
     if (overwrite || !modelEdit.max_output_tokens)
       modelEdit.max_output_tokens = metadata.max_output_tokens || "";
@@ -2187,6 +2189,8 @@ async function inspectModel(overwrite = true) {
       metadata.capabilities?.length
     )
       modelEdit.capabilities = [...metadata.capabilities];
+    if (Number(metadata.managed_runtime_corrected_count || 0) > 0)
+      modelEdit.sync_context_window = true;
   } catch (error) {
     notify(error.message, "bad");
   } finally {
@@ -2657,6 +2661,7 @@ provide(PORTAL_WORKSPACE_KEY, {
   modelDeploymentRows,
   modelDeploymentJobs,
   modelUpgradeProfiles,
+  modelUpgradeUnavailableReason,
   ornithUpgradeSources,
   activeModelDeploymentJob,
   selectedDeploymentGpus,

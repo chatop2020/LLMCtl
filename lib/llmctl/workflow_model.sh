@@ -509,7 +509,8 @@ cmd_model() {
       install -d -o root -g llm-account -m 0750 "${STATE_DIR}/model-control"
       install -m 0644 "${MODEL_CONTROL_UNIT_SOURCE}" "${MODEL_CONTROL_SERVICE_UNIT}"
       systemctl daemon-reload
-      systemctl enable --now llm-model-control.service
+      systemctl enable llm-model-control.service
+      systemctl restart llm-model-control.service
       wait_model_control_ready || die "模型部署控制服务未能在 30 秒内就绪"
       "${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" migrate | jq .
       log "多模型注册表已就绪；现有 Router 和 Worker 未重启。"

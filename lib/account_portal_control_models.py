@@ -224,8 +224,37 @@ class PortalModelControlMixin:
         visit(selected)
         return targets
 
+    def _managed_runtime_contexts(self) -> dict[str, int]:
+        """按 vLLM 服务模型名返回当前受管部署的有效上下文。
+
+        模型部署注册表直接生成 Worker 启动参数，因此它比接入层中可能残留的
+       手工覆盖值更接近实际运行状态。控制服务不可用时返回空映射，让第三方
+        模型继续使用网关原生元数据。
+        """
+
+        if self.models is None:
+            return {}
+        try:
+            snapshot = self.models.snapshot()
+        except Exception:
+            return {}
+        deployments = snapshot.get("registry", {}).get("deployments", {})
+        result: dict[str, int] = {}
+        for deployment in deployments.values():
+            if not isinstance(deployment, dict) or not deployment.get("enabled", True):
+                continue
+            served_model = str(deployment.get("served_model_name", "")).strip()
+            runtime = deployment.get("runtime", {})
+            try:
+                max_model_len = int(runtime.get("max_model_len"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if served_model and max_model_len > 0:
+                result[served_model] = max_model_len
+        return result
+
     def inspect_model(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """读取公开模型背后每个实际目标的网关原生元数据。"""
+        """读取实际目标元数据，并优先采用受管 Worker 的有效上下文。"""
         if payload.get("id") and not payload.get("source_model"):
             with self.db.connect() as connection:
                 row = connection.execute(
@@ -256,8 +285,10 @@ class PortalModelControlMixin:
                     q_provider, q_model = self._qualified_target(qualified, provider_id)
                     lookup[(q_provider or provider_id, q_model or model_id)] = model_entry
 
+        managed_contexts = self._managed_runtime_contexts()
         enriched: list[dict[str, Any]] = []
         capabilities: set[str] = set()
+        corrected_contexts = 0
         for target in targets:
             provider, model_id = target["provider"], target["model"]
             option = lookup.get((provider, model_id), {})
@@ -287,6 +318,12 @@ class PortalModelControlMixin:
                 "contextLength", limits.get("contextWindow", limits.get("maxInputTokens"))
             )
             max_output = option.get("outputTokenLimit", limits.get("maxOutputTokens"))
+            gateway_context = int(context_window) if context_window else None
+            managed_context = managed_contexts.get(model_id)
+            if managed_context is not None:
+                context_window = managed_context
+                if gateway_context != managed_context:
+                    corrected_contexts += 1
             for key, portal_cap in {
                 "vision": "vision",
                 "toolCalling": "tools",
@@ -303,6 +340,8 @@ class PortalModelControlMixin:
                     "model": model_id,
                     "qualified_id": qualified,
                     "context_window_tokens": int(context_window) if context_window else None,
+                    "gateway_context_window_tokens": gateway_context,
+                    "managed_runtime_context": managed_context is not None,
                     "max_output_tokens": int(max_output) if max_output else None,
                     "family": str(
                         (native.get("metadata") or {}).get("family", "")
@@ -324,6 +363,10 @@ class PortalModelControlMixin:
             "max_output_tokens": min(outputs) if outputs else None,
             "capabilities": sorted(capabilities),
             "native_sync_supported": all(item["provider"] for item in enriched),
+            "managed_runtime_count": sum(
+                1 for item in enriched if item["managed_runtime_context"]
+            ),
+            "managed_runtime_corrected_count": corrected_contexts,
             "read_at": now(),
         }
 

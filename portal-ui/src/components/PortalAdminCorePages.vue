@@ -569,6 +569,9 @@ export default {
                 <p v-if="!modelDeployments?.gateway?.registry_publish" class="warning">
                   当前接入层不能原子同步版本切换。升级入口保持关闭，避免 Worker 已变化但公开路由仍指向旧配置。
                 </p>
+                <p v-else-if="modelUpgradeUnavailableReason" class="warning">
+                  {{ modelUpgradeUnavailableReason }}
+                </p>
                 <p v-else-if="!ornithUpgradeSources.length" class="empty-state">
                   当前没有已启用且包含本机 Worker 的 Ornith 部署。
                 </p>

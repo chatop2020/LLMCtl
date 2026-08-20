@@ -267,6 +267,10 @@ describe("LLMCtl portal contracts", () => {
       "公开切换前执行真实生成",
       "确认升级并保留回退点",
       "回退到升级前",
+      "模型部署控制服务仍在运行旧版本",
+      "source.runtime?.max_model_len",
+      "managed_runtime_corrected_count",
+      "接入层旧值",
     ])
       expect(source).toContain(marker);
   });
