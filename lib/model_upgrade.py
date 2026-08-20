@@ -282,6 +282,17 @@ def build_upgrade_request(
     served_name = re.sub(
         r"[^A-Za-z0-9._-]+", "-", target["model_id"].split("/")[-1]
     ).lower()
+    source_served_name = str(source.get("served_model_name") or "").strip()
+    served_aliases = list(
+        dict.fromkeys(
+            alias
+            for alias in [
+                source_served_name,
+                *source.get("served_model_aliases", []),
+            ]
+            if alias and alias != served_name
+        )
+    )
     aliases = registry.get("legacy_aliases", {})
     preserve_legacy_alias = str(aliases.get("gdn-inside", "")) in public_ids
     profile = next(
@@ -301,6 +312,7 @@ def build_upgrade_request(
         "public_model_id": public_ids[0],
         "additional_public_ids": public_ids[1:],
         "served_model_name": served_name,
+        "served_model_aliases": served_aliases,
         "display_name": str(profile["label"] if profile else served_name),
         "publish_requested": bool(source.get("publish_requested", True)),
         "preserve_legacy_alias": preserve_legacy_alias,
@@ -332,6 +344,8 @@ def build_upgrade_request(
         "current_artifact_path": str(source_artifact.get("path", "")),
         "target_hub": target["hub"],
         "target_model_id": target["model_id"],
+        "target_served_model_name": served_name,
+        "compatible_served_model_aliases": served_aliases,
         "target_revision": revision,
         "target_weight_bytes": int(catalog.get("weight_bytes") or 0),
         "target_architectures": list(catalog.get("supported_architectures") or []),

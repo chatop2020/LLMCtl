@@ -727,6 +727,12 @@ export default {
                         </dd>
                       </div>
                       <div>
+                        <dt>兼容内部名</dt>
+                        <dd>
+                          {{ modelUpgradePlan.upgrade.compatible_served_model_aliases?.join(", ") || "无" }}
+                        </dd>
+                      </div>
+                      <div>
                         <dt>固定 SHA</dt>
                         <dd><code>{{ modelUpgradePlan.upgrade.target_revision }}</code></dd>
                       </div>

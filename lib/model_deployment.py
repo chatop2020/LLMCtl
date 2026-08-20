@@ -397,8 +397,9 @@ class RegistryStore:
             "id": "legacy",
             "display_name": served,
             "artifact_id": "legacy-current",
-            "model_id": model_id,
-            "served_model_name": served,
+                "model_id": model_id,
+                "served_model_name": served,
+                "served_model_aliases": [],
             "public_model_ids": [served],
             "status": "running",
             "enabled": True,
@@ -557,6 +558,18 @@ def validate_registry(payload: dict[str, Any], paths: Paths) -> None:
             raise ValueError(f"部署模型 ID 非法：{deployment_id}")
         if not PUBLIC_ID_RE.fullmatch(str(deployment.get("served_model_name", ""))):
             raise ValueError(f"服务模型 ID 非法：{deployment_id}")
+        served_aliases = deployment.get("served_model_aliases", [])
+        if (
+            not isinstance(served_aliases, list)
+            or len(served_aliases) > 16
+            or any(
+                not PUBLIC_ID_RE.fullmatch(str(item))
+                for item in served_aliases
+            )
+            or len(set(str(item) for item in served_aliases)) != len(served_aliases)
+            or str(deployment.get("served_model_name")) in served_aliases
+        ):
+            raise ValueError(f"服务模型兼容别名非法：{deployment_id}")
         public_ids = deployment.get("public_model_ids", [])
         if not isinstance(public_ids, list) or not public_ids or any(
             not PUBLIC_ID_RE.fullmatch(str(item)) for item in public_ids
@@ -1199,10 +1212,13 @@ class DeploymentManager:
                     job,
                     "testing",
                     84,
-                    "公开切换前逐实例执行真实文本生成",
+                    "公开切换前逐实例执行真实文本生成；每个实例最多等待 60 秒",
                 )
                 self._verify_instances(
-                    candidate, request["deployment"]["id"], inference=True
+                    candidate,
+                    request["deployment"]["id"],
+                    inference=True,
+                    job=job,
                 )
             gateway = gateway_capabilities(self.paths)
             if gateway["registry_publish"]:
@@ -1581,7 +1597,11 @@ class DeploymentManager:
         )
 
     def _verify_instances(
-        self, candidate: dict[str, Any], deployment_id: str, inference: bool = False
+        self,
+        candidate: dict[str, Any],
+        deployment_id: str,
+        inference: bool = False,
+        job: dict[str, Any] | None = None,
     ) -> None:
         """验证目标部署的健康端点，并按需执行真实文本生成。
 
@@ -1589,27 +1609,73 @@ class DeploymentManager:
             candidate: 已写入 Worker 配置的候选注册表。
             deployment_id: 本次需要验收的目标部署 ID。
             inference: 为真时要求每个实例完成一次 Chat Completions 生成。
+            job: 可选的后台任务；提供时逐实例保存阶段进度和验收日志。
         """
 
         deployment = candidate["deployments"][deployment_id]
         failures: list[str] = []
-        for instance in deployment["instances"]:
-            if not instance.get("enabled", True):
-                continue
+        instances = [
+            instance
+            for instance in deployment["instances"]
+            if instance.get("enabled", True)
+        ]
+        total = len(instances)
+        inference_timeout = bounded_int(
+            os.environ.get("LLM_MODEL_INFERENCE_PROBE_TIMEOUT", "60"),
+            "真实生成探测超时",
+            10,
+            300,
+        )
+        for index, instance in enumerate(instances, start=1):
+            instance_id = str(instance["id"])
+            if inference and job:
+                progress = 84 + ((index - 1) * 7 // max(total, 1))
+                self._update_job(
+                    job,
+                    "testing",
+                    progress,
+                    f"真实生成验收 {index}/{total}：{instance_id}（最多等待 {inference_timeout} 秒）",
+                )
             origin = (
                 str(instance["base_url"]).removesuffix("/v1").rstrip("/")
                 if instance["kind"] == "remote"
                 else f"http://127.0.0.1:{instance['port']}"
             )
             if not endpoint_healthy(origin, self.paths.secrets_env):
-                failures.append(str(instance["id"]))
+                failures.append(instance_id)
+                if inference and job:
+                    self._update_job(
+                        job,
+                        "testing",
+                        84 + (index * 7 // max(total, 1)),
+                        f"真实生成验收 {index}/{total}：{instance_id} 健康检查失败",
+                        log=f"实例 {instance_id} 健康检查失败",
+                    )
                 continue
             if inference and not endpoint_inference_ready(
                 origin,
                 self.paths.secrets_env,
                 str(deployment["served_model_name"]),
+                timeout=inference_timeout,
             ):
-                failures.append(f"{instance['id']}:inference")
+                failures.append(f"{instance_id}:inference")
+                if job:
+                    self._update_job(
+                        job,
+                        "testing",
+                        84 + (index * 7 // max(total, 1)),
+                        f"真实生成验收 {index}/{total}：{instance_id} 失败",
+                        log=f"实例 {instance_id} 真实生成失败或超时",
+                    )
+                continue
+            if inference and job:
+                self._update_job(
+                    job,
+                    "testing",
+                    84 + (index * 7 // max(total, 1)),
+                    f"真实生成验收 {index}/{total}：{instance_id} 已通过",
+                    log=f"实例 {instance_id} 真实生成通过",
+                )
         if failures:
             raise RuntimeError(f"实例验收失败：{failures}")
 
@@ -1706,6 +1772,18 @@ def normalize_request(request: dict[str, Any], paths: Paths) -> dict[str, Any]:
     served = str(request.get("served_model_name", public_id)).strip()
     if not PUBLIC_ID_RE.fullmatch(served):
         raise ValueError("服务模型 ID 非法")
+    raw_served_aliases = request.get("served_model_aliases", [])
+    if not isinstance(raw_served_aliases, list):
+        raise ValueError("服务模型兼容别名必须是列表")
+    served_aliases = list(
+        dict.fromkeys(str(item).strip() for item in raw_served_aliases)
+    )
+    if (
+        len(served_aliases) > 16
+        or any(not PUBLIC_ID_RE.fullmatch(item) for item in served_aliases)
+        or served in served_aliases
+    ):
+        raise ValueError("服务模型兼容别名非法")
     artifact_hash = hashlib.sha256(f"{hub}\0{model_id}\0{revision}".encode()).hexdigest()[:12]
     artifact_id = f"artifact-{artifact_hash}"
     if hub == "local":
@@ -1751,6 +1829,7 @@ def normalize_request(request: dict[str, Any], paths: Paths) -> dict[str, Any]:
             "artifact_id": artifact_id,
             "model_id": model_id,
             "served_model_name": served,
+            "served_model_aliases": served_aliases,
             "public_model_ids": list(dict.fromkeys([public_id, *request.get("additional_public_ids", [])])),
             "status": "planned",
             "enabled": True,
@@ -1926,6 +2005,9 @@ def worker_environment(
         "MODEL_LOCAL_DIR": artifact["path"],
         "MODEL_ID": deployment["model_id"],
         "SERVED_MODEL_NAME": deployment["served_model_name"],
+        "SERVED_MODEL_ALIASES": ",".join(
+            str(item) for item in deployment.get("served_model_aliases", [])
+        ),
         "VLLM_IMAGE": runtime["image"],
         "TP_SIZE": runtime["tensor_parallel_size"],
         "MAX_MODEL_LEN": runtime["max_model_len"],
@@ -2000,7 +2082,10 @@ def endpoint_healthy(origin: str, secrets_file: pathlib.Path) -> bool:
 
 
 def endpoint_inference_ready(
-    origin: str, secrets_file: pathlib.Path, served_model_name: str
+    origin: str,
+    secrets_file: pathlib.Path,
+    served_model_name: str,
+    timeout: int = 60,
 ) -> bool:
     """向单个 Worker 发送有界文本生成，验证真实模型执行路径。
 
@@ -2008,6 +2093,7 @@ def endpoint_inference_ready(
         origin: 不含 `/v1` 的 Worker 来源地址。
         secrets_file: 保存内部 Worker API Key 的受保护环境文件。
         served_model_name: 候选部署写入 vLLM 的服务模型名。
+        timeout: 单个真实生成请求的最大等待秒数。
 
     返回：
         HTTP 成功且响应包含至少一个有效 assistant 消息时返回真。
@@ -2034,7 +2120,7 @@ def endpoint_inference_ready(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 return False
             payload = json.loads(response.read(2 << 20))

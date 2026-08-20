@@ -54,6 +54,101 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn("systemctl restart llm-model-control.service", init)
         self.assertNotIn("enable --now llm-model-control.service", init)
 
+    def test_worker_start_passes_new_and_legacy_served_model_names_to_vllm(self):
+        """升级后的 Worker 必须同时接受新内部名和旧客户端仍在使用的名称。"""
+
+        manager = manager_implementation()
+        worker_start = manager.split("cmd_worker_start() {", 1)[1].split(
+            "set_env_value() {", 1
+        )[0]
+        self.assertIn('SERVED_MODEL_ALIASES:-', worker_start)
+        self.assertIn('served_model_names+=("${alias}")', worker_start)
+        self.assertIn(
+            '--served-model-name "${served_model_names[@]}"', worker_start
+        )
+
+    def test_status_prefers_registry_and_worker_model_over_legacy_cluster_name(self):
+        """多模型环境的状态页必须显示实际 1.5 部署，不能继续报告全局 1.0。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "config"
+            config.mkdir()
+            registry = {
+                "schema_version": 1,
+                "revision": 3,
+                "artifacts": {
+                    "artifact-new": {
+                        "hub": "modelscope",
+                        "model_id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+                        "revision": "b" * 40,
+                        "path": "/data/models/ornith-1.5",
+                    }
+                },
+                "deployments": {
+                    "legacy": {
+                        "enabled": True,
+                        "artifact_id": "artifact-new",
+                        "model_id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+                        "served_model_name": "ornith-1.5-35b-a3b-fp8",
+                        "served_model_aliases": ["ornith-1.0-35b-fp8"],
+                        "runtime": {
+                            "tensor_parallel_size": 2,
+                            "max_num_seqs": 7,
+                        },
+                        "instances": [
+                            {
+                                "kind": "local",
+                                "enabled": True,
+                                "worker_id": index,
+                            }
+                            for index in range(4)
+                        ],
+                    }
+                },
+            }
+            (config / "deployments.json").write_text(
+                json.dumps(registry), encoding="utf-8"
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                export LLM_CLUSTER_CONFIG_DIR={config!s}
+                source {MANAGER!s}
+                load_config() {{
+                  MODEL_HUB=modelscope; MODEL_ID=protoLabsAI/Ornith-1.0-35B-FP8; MODEL_REVISION=master
+                  MODEL_ARCHITECTURE=Qwen3_5MoeForConditionalGeneration; MODEL_PRECISION=fp8; MODEL_TASK=vision
+                  MODEL_ROOT=/data/models; ACTIVE_WORKERS=0,1,2,3,4,5,6,7; TP_SIZE=1; PHYSICAL_GPU_COUNT=8
+                  INSTANCE_COUNT=8; MAX_NUM_SEQS=7; ESTIMATED_MAX_NUM_SEQS=11; STARTUP_PARALLELISM=8
+                  SUPPORTS_IMAGE_INPUT=1; MM_LIMIT='{{"image":8}}'; SUPPORTS_TOOL_CALLING=1; TOOL_CALL_PARSER=qwen3_xml
+                  SUPPORTS_REASONING=1; REASONING_PARSER=qwen3; SUPPORTS_THINKING_TOGGLE=1
+                  API_BIND=0.0.0.0; API_PORT=8000; SERVED_MODEL_NAME=ornith-1.0-35b-fp8
+                  GATEWAY_KIND=omniroute; ACCOUNT_DB_PATH=/tmp/portal.db
+                  ACCOUNT_BIND=127.0.0.1; ACCOUNT_PORT=8001
+                }}
+                gateway_display_name() {{ printf OmniRoute; }}
+                router_health() {{ return 0; }}
+                account_portal_health() {{ return 0; }}
+                worker_health() {{ return 0; }}
+                worker_port() {{ printf '%s\n' "$((8100 + $1))"; }}
+                worker_devices() {{ printf '%s\n' "$((2 * $1)),$((2 * $1 + 1))"; }}
+                worker_served_model() {{ printf 'ornith-1.5-35b-a3b-fp8\n'; }}
+                systemctl() {{ [[ "$1" == is-active ]] && printf 'active\n' || return 0; }}
+                cmd_status
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script], check=False, text=True, capture_output=True
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            "模型: modelscope:ornith-ai/Ornith-1.5-35B-A3B-FP8",
+            completed.stdout,
+        )
+        self.assertIn("拓扑: TP=2", completed.stdout)
+        self.assertIn("兼容别名: ornith-1.0-35b-fp8", completed.stdout)
+        self.assertIn("ornith-1.5-35b-a3b-fp8", completed.stdout)
+
     def test_model_upgrade_cli_reuses_plan_revision_and_submits_stale_guard(self):
         """CLI apply 必须把计划版本带回控制服务，且不要求管理员手写 JSON。"""
 

@@ -290,6 +290,18 @@ cmd_worker_start() {
   [[ -n "${MODEL_LOCAL_DIR}" && -d "${MODEL_LOCAL_DIR}" ]] || die "Worker ${id} 的模型目录不存在"
   ensure_docker_network
 
+  # vLLM 原生支持多个服务模型名。升级部署把新版本名放在首位，同时保留
+  # 旧内部名，避免尚未更新的 OpenAI 兼容客户端在切换后立即收到 404。
+  local alias
+  local -a configured_served_aliases=() served_model_names=("${SERVED_MODEL_NAME}")
+  IFS=',' read -r -a configured_served_aliases <<<"${SERVED_MODEL_ALIASES:-}"
+  for alias in "${configured_served_aliases[@]}"; do
+    [[ -z "${alias}" || "${alias}" == "${SERVED_MODEL_NAME}" ]] && continue
+    [[ "${alias}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$ ]] || \
+      die "Worker ${id} 的服务模型兼容别名非法：${alias}"
+    served_model_names+=("${alias}")
+  done
+
   local -a docker_args=(
     /usr/bin/docker run --rm --name "llm-worker-${id}"
     --network "${DOCKER_NETWORK}" --ipc host --runtime=nvidia
@@ -300,7 +312,7 @@ cmd_worker_start() {
     -v "${MODEL_LOCAL_DIR}:/model:ro"
     -v "${CACHE_DIR}/shared:/root/.cache"
     "${VLLM_IMAGE}" /model
-    --served-model-name "${SERVED_MODEL_NAME}"
+    --served-model-name "${served_model_names[@]}"
     --host 0.0.0.0 --port "${WORKER_PORT}"
     --api-key "${BACKEND_API_KEY}"
     --tensor-parallel-size "${TP_SIZE}"
@@ -1476,16 +1488,48 @@ restart_ids() {
 cmd_status() {
   load_config
   local spec="${1:-all}" ids id port unit_state health_state router_state database_state devices max_images active_worker_count
+  local registry="${CONFIG_DIR}/deployments.json" registry_line="" registry_active_workers=""
+  local status_hub="" status_model_id="" status_revision="" status_path="" status_served="" status_aliases=""
+  local status_tp="" status_instances="" status_max_seqs="" status_slot_limit="" worker_model=""
   local -a active_id_list=()
-  if [[ "${spec}" == "all" ]]; then ids=$(all_instance_ids); else ids=$(resolve_ids "${spec}"); fi
+  if [[ -r "${registry}" ]] && jq -e '.schema_version == 1 and (.deployments|type == "object")' "${registry}" >/dev/null 2>&1; then
+    registry_line=$(jq -r '
+      first(.deployments|to_entries[]|select(.value.enabled != false)) as $entry
+      | $entry.value as $d | .artifacts[$d.artifact_id] as $a
+      | [($a.hub // "unknown"), ($d.model_id // "unknown"), ($a.revision // "unknown"),
+         ($a.path // "unknown"), ($d.served_model_name // "unknown"),
+         (($d.served_model_aliases // [])|join(",")),
+         (($d.runtime.tensor_parallel_size // 0)|tostring),
+         ([ $d.instances[]? | select(.kind == "local" and .enabled != false) ]|length|tostring),
+         (($d.runtime.max_num_seqs // 0)|tostring)] | join("\u001f")
+    ' "${registry}" 2>/dev/null || true)
+    if [[ -n "${registry_line}" ]]; then
+      IFS=$'\x1f' read -r status_hub status_model_id status_revision status_path status_served status_aliases status_tp status_instances status_max_seqs <<<"${registry_line}"
+      registry_active_workers=$(jq -r '[.deployments[].instances[]? | select(.kind == "local" and .enabled != false) | .worker_id] | unique | sort | join(",")' "${registry}")
+      status_slot_limit=$(jq -r '[.deployments[] | select(.enabled != false) as $d | ([ $d.instances[]? | select(.kind == "local" and .enabled != false) ]|length) * ($d.runtime.max_num_seqs // 0)] | add // 0' "${registry}")
+    fi
+  fi
+  if [[ "${spec}" == "all" ]]; then ids="${registry_active_workers:-$(all_instance_ids)}"; else ids=$(resolve_ids "${spec}"); fi
   printf 'LLM 集群管理器: %s\n' "${CTL_VERSION}"
-  printf '模型: %s:%s @ %s\n' "${MODEL_HUB}" "${MODEL_ID}" "${MODEL_REVISION}"
+  if [[ -n "${registry_line}" ]]; then
+    printf '模型: %s:%s @ %s（部署注册表）\n' "${status_hub}" "${status_model_id}" "${status_revision}"
+  else
+    printf '模型: %s:%s @ %s（旧版全局配置）\n' "${MODEL_HUB}" "${MODEL_ID}" "${MODEL_REVISION}"
+  fi
   printf '架构/精度/任务: %s / %s / %s\n' "${MODEL_ARCHITECTURE}" "${MODEL_PRECISION}" "${MODEL_TASK}"
-  printf '本地模型: %s/current\n' "${MODEL_ROOT}"
-  IFS=',' read -r -a active_id_list <<<"${ACTIVE_WORKERS}"
+  printf '本地模型: %s\n' "${status_path:-${MODEL_ROOT}/current}"
+  IFS=',' read -r -a active_id_list <<<"${registry_active_workers:-${ACTIVE_WORKERS}}"
   active_worker_count=${#active_id_list[@]}
-  printf '拓扑: TP=%s，物理 GPU=%s，实例数=%s，每实例 max-num-seqs=%s（已激活调度槽上限=%s）\n' \
-    "${TP_SIZE}" "${PHYSICAL_GPU_COUNT}" "${INSTANCE_COUNT}" "${MAX_NUM_SEQS}" "$((active_worker_count * MAX_NUM_SEQS))"
+  if [[ -n "${registry_line}" ]]; then
+    printf '拓扑: TP=%s，物理 GPU=%s，活动实例数=%s，每实例 max-num-seqs=%s（调度槽上限=%s）\n' \
+      "${status_tp}" "${PHYSICAL_GPU_COUNT}" "${status_instances}" "${status_max_seqs}" "${status_slot_limit}"
+    printf '内部模型名: %s；兼容别名: %s\n' "${status_served}" "${status_aliases:-无}"
+    printf '活动部署:\n'
+    jq -r '.artifacts as $artifacts | .deployments | to_entries[] | select(.value.enabled != false) | .value as $d | $artifacts[$d.artifact_id] as $a | "  - \(.key): \($a.hub):\($d.model_id) @ \($a.revision)；served=\($d.served_model_name)；aliases=\(($d.served_model_aliases // [])|join(","))；TP=\($d.runtime.tensor_parallel_size)；instances=\([$d.instances[]? | select(.kind == "local" and .enabled != false)]|length)"' "${registry}"
+  else
+    printf '拓扑: TP=%s，物理 GPU=%s，实例数=%s，每实例 max-num-seqs=%s（已激活调度槽上限=%s）\n' \
+      "${TP_SIZE}" "${PHYSICAL_GPU_COUNT}" "${INSTANCE_COUNT}" "${MAX_NUM_SEQS}" "$((active_worker_count * MAX_NUM_SEQS))"
+  fi
   printf '规划参考: 当前模型/显存估算每实例 32K 级请求最多约 %s 个；长请求会降低实际并发\n' "${ESTIMATED_MAX_NUM_SEQS}"
   printf '启动并行度: 每批最多 %s 个 Worker\n' "${STARTUP_PARALLELISM}"
   if (( SUPPORTS_IMAGE_INPUT == 1 )); then
@@ -1497,8 +1541,8 @@ cmd_status() {
   printf '工具/思考: %s(parser=%s) / %s(parser=%s，可按请求关闭=%s)\n' \
     "${SUPPORTS_TOOL_CALLING}" "${TOOL_CALL_PARSER:-none}" "${SUPPORTS_REASONING}" \
     "${REASONING_PARSER:-none}" "${SUPPORTS_THINKING_TOGGLE}"
-  printf '入口: http://%s:%s/v1  模型名: %s\n' "${API_BIND}" "${API_PORT}" "${SERVED_MODEL_NAME}"
-  printf '开机激活 Worker: %s\n' "${ACTIVE_WORKERS}"
+  printf '入口: http://%s:%s/v1  模型名: %s\n' "${API_BIND}" "${API_PORT}" "${status_served:-${SERVED_MODEL_NAME}}"
+  printf '开机激活 Worker: %s\n' "${registry_active_workers:-${ACTIVE_WORKERS}}"
   router_state=$(systemctl is-active llm-router.service 2>/dev/null || true)
   printf '%s: %s (%s)\n' "$(gateway_display_name)" "${router_state:-unknown}" "$([[ -n "${router_state}" ]] && router_health && printf healthy || printf unhealthy)"
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
@@ -1508,16 +1552,17 @@ cmd_status() {
     database_state=$(systemctl is-active llm-database.service 2>/dev/null || true)
     printf 'PostgreSQL: %s (%s，仅监听 127.0.0.1:%s)\n' "${database_state:-unknown}" "$([[ -n "${database_state}" ]] && database_health && printf healthy || printf unhealthy)" "${GATEWAY_DB_PORT}"
   fi
-  printf '\n%-8s %-10s %-7s %-9s %-9s %-12s %-18s\n' INSTANCE GPUS PORT BOOT SYSTEMD HEALTH VRAM
+  printf '\n%-8s %-10s %-7s %-9s %-9s %-12s %-18s %s\n' INSTANCE GPUS PORT BOOT SYSTEMD HEALTH VRAM MODEL
   IFS=',' read -r -a id_list <<<"${ids}"
   for id in "${id_list[@]}"; do
     port=$(worker_port "${id}")
     devices=$(worker_devices "${id}")
     unit_state=$(systemctl is-active "$(worker_unit "${id}")" 2>/dev/null || true)
+    worker_model=$(worker_served_model "${id}")
     health_state=down
     worker_health "${id}" && health_state=healthy
     local boot=no vram='n/a' gpu_id gpu_vram
-    csv_has "${ACTIVE_WORKERS}" "${id}" && boot=yes
+    csv_has "${registry_active_workers:-${ACTIVE_WORKERS}}" "${id}" && boot=yes
     if command -v nvidia-smi >/dev/null 2>&1; then
       vram=""
       IFS=',' read -r -a gpu_list <<<"${devices}"
@@ -1526,7 +1571,7 @@ cmd_status() {
         vram+="${vram:+ }${gpu_id}:${gpu_vram}"
       done
     fi
-    printf '%-8s %-10s %-7s %-9s %-9s %-12s %-18s\n' "${id}" "${devices}" "${port}" "${boot}" "${unit_state:-unknown}" "${health_state}" "${vram}"
+    printf '%-8s %-10s %-7s %-9s %-9s %-12s %-18s %s\n' "${id}" "${devices}" "${port}" "${boot}" "${unit_state:-unknown}" "${health_state}" "${vram}" "${worker_model}"
   done
 }
 
