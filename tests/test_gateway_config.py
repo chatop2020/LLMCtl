@@ -153,6 +153,23 @@ class FakeOmniRouteClient:
 
 
 class GatewayConfigTests(unittest.TestCase):
+    def test_model_registry_accepts_account_portal_managed_combo(self):
+        """两个 LLMCtl 控制面必须互认 Combo 所有权，避免发布阶段冲突。"""
+
+        self.assertTrue(
+            gateway.is_llmctl_managed_combo(
+                {"description": gateway.OMNIROUTE_DESCRIPTION}
+            )
+        )
+        self.assertTrue(
+            gateway.is_llmctl_managed_combo(
+                {"description": gateway.PORTAL_PUBLIC_COMBO_DESCRIPTION}
+            )
+        )
+        self.assertFalse(
+            gateway.is_llmctl_managed_combo({"description": "user managed"})
+        )
+
     def test_render_litellm_has_one_backend_per_worker_and_no_plaintext_secret(self):
         with mock.patch.dict(os.environ, BASE_ENV, clear=True):
             content = gateway.litellm_config([0, 1, 7])
