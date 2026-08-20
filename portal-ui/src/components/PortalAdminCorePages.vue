@@ -721,7 +721,7 @@ export default {
                 </small>
                 <ol v-if="activeModelDeploymentJob.logs?.length" class="deployment-log">
                   <li v-for="entry in activeModelDeploymentJob.logs.slice(-6)" :key="`${entry.time}-${entry.message}`">
-                    <time>{{ localTime(entry.time) }}</time><span>{{ entry.message }}</span>
+                    <time>{{ date(entry.time) }}</time><span>{{ entry.message }}</span>
                   </li>
                 </ol>
               </section>
@@ -893,7 +893,7 @@ export default {
                     <article v-for="job in modelDeploymentJobs.slice(0, 8)" :key="job.id" class="deployment-history-row">
                       <span class="status" :class="job.state === 'succeeded' ? 'ok' : ['failed', 'rolled_back'].includes(job.state) ? 'bad' : 'warn'">{{ deploymentJobStateLabel(job.state) }}</span>
                       <strong>{{ job.kind === 'rollback' ? '配置回滚' : job.kind === 'upgrade' ? 'Ornith 版本升级' : (job.request?.deployment?.display_name || job.request?.deployment?.id || job.id) }}</strong>
-                      <small>{{ job.message }}</small><time>{{ localTime(job.updated_at || job.created_at) }}</time>
+                      <small>{{ job.message }}</small><time>{{ date(job.updated_at || job.created_at) }}</time>
                       <button
                         v-if="job.kind !== 'rollback' && job.state === 'succeeded' && job.backup"
                         type="button"

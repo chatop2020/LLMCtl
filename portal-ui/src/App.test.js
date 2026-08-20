@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
+import { compileTemplate, parse } from "@vue/compiler-sfc";
 import { describe, expect, it } from "vitest";
 
 // 门户已经按页面和组合逻辑拆分；契约检查必须覆盖真实生产源码，同时排除
@@ -6,8 +7,13 @@ import { describe, expect, it } from "vitest";
 const componentSources = readdirSync(new URL("./components/", import.meta.url))
   .filter((name) => name.endsWith(".vue"))
   .map((name) => readFileSync(new URL(`./components/${name}`, import.meta.url), "utf8"));
+const appSource = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
+const adminCoreSource = readFileSync(
+  new URL("./components/PortalAdminCorePages.vue", import.meta.url),
+  "utf8",
+);
 const source = [
-  readFileSync(new URL("./App.vue", import.meta.url), "utf8"),
+  appSource,
   readFileSync(new URL("./useModelDeployments.js", import.meta.url), "utf8"),
   readFileSync(new URL("./portalWorkspaceContext.js", import.meta.url), "utf8"),
   ...componentSources,
@@ -15,6 +21,31 @@ const source = [
 const style = readFileSync(new URL("./style.css", import.meta.url), "utf8");
 
 describe("LLMCtl portal contracts", () => {
+  it("provides every root field referenced by the split admin page", () => {
+    // 编译后的 `_ctx` 访问就是拆分页面向组合根索取的真实字段。把它与
+    // provide 对象逐项核对，可在构建前阻止只在任务、空态等稀有分支触发的白屏。
+    const descriptor = parse(adminCoreSource).descriptor;
+    const compiled = compileTemplate({
+      source: descriptor.template.content,
+      filename: "PortalAdminCorePages.vue",
+      id: "portal-admin-context-contract",
+    }).code;
+    const referenced = new Set(
+      [...compiled.matchAll(/_ctx\.([A-Za-z_$][\w$]*)/g)].map((match) => match[1]),
+    );
+    const providerBody = appSource.match(
+      /provide\(PORTAL_WORKSPACE_KEY,\s*\{([\s\S]*?)\n\}\);/,
+    )?.[1];
+    expect(providerBody).toBeTruthy();
+    const provided = new Set(
+      [...providerBody.matchAll(/^\s*([A-Za-z_$][\w$]*),\s*$/gm)].map(
+        (match) => match[1],
+      ),
+    );
+
+    expect([...referenced].filter((name) => !provided.has(name)).sort()).toEqual([]);
+  });
+
   it("sends inference directly to the public v1 endpoint", () => {
     expect(source).toContain("`${dashboard.value.api_base}/chat/completions`");
     expect(source).not.toContain('api("chat');
