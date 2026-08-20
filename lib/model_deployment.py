@@ -1657,15 +1657,17 @@ class DeploymentManager:
                 self.paths.secrets_env,
                 str(deployment["served_model_name"]),
                 timeout=inference_timeout,
+                detail=(probe_detail := []),
             ):
-                failures.append(f"{instance_id}:inference")
+                reason = probe_detail[0] if probe_detail else "未知响应"
+                failures.append(f"{instance_id}:inference:{reason}")
                 if job:
                     self._update_job(
                         job,
                         "testing",
                         84 + (index * 7 // max(total, 1)),
-                        f"真实生成验收 {index}/{total}：{instance_id} 失败",
-                        log=f"实例 {instance_id} 真实生成失败或超时",
+                        f"真实生成验收 {index}/{total}：{instance_id} 失败（{reason}）",
+                        log=f"实例 {instance_id} 真实生成失败：{reason}",
                     )
                 continue
             if inference and job:
@@ -2086,6 +2088,7 @@ def endpoint_inference_ready(
     secrets_file: pathlib.Path,
     served_model_name: str,
     timeout: int = 60,
+    detail: list[str] | None = None,
 ) -> bool:
     """向单个 Worker 发送有界文本生成，验证真实模型执行路径。
 
@@ -2094,6 +2097,7 @@ def endpoint_inference_ready(
         secrets_file: 保存内部 Worker API Key 的受保护环境文件。
         served_model_name: 候选部署写入 vLLM 的服务模型名。
         timeout: 单个真实生成请求的最大等待秒数。
+        detail: 可选的诊断输出列表；失败时追加一条脱敏、截断的原因。
 
     返回：
         HTTP 成功且响应包含至少一个有效 assistant 消息时返回真。
@@ -2119,23 +2123,47 @@ def endpoint_inference_ready(
         headers=headers,
         method="POST",
     )
+    def fail(reason: str) -> bool:
+        """记录不含密钥的单条失败摘要并返回假。"""
+
+        if detail is not None:
+            detail.append(" ".join(str(reason).split())[:800])
+        return False
+
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
-                return False
+                return fail(f"HTTP {response.status}")
             payload = json.loads(response.read(2 << 20))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
-        return False
+    except urllib.error.HTTPError as error:
+        with contextlib.suppress(OSError):
+            body = error.read(4096).decode("utf-8", errors="replace")
+            return fail(f"HTTP {error.code}: {body}")
+        return fail(f"HTTP {error.code}")
+    except json.JSONDecodeError as error:
+        return fail(f"响应不是有效 JSON：{error.msg}")
+    except (OSError, urllib.error.URLError) as error:
+        return fail(f"请求失败或超时：{error}")
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list) or not choices:
-        return False
+        return fail("响应缺少 choices")
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
     if not isinstance(message, dict):
-        return False
-    return any(
+        return fail("响应缺少 assistant message")
+    has_text = any(
         isinstance(message.get(field), str) and bool(message.get(field).strip())
-        for field in ("content", "reasoning_content")
+        for field in (
+            "content",
+            "reasoning_content",
+            "reasoning_text",
+            "reasoning",
+        )
     )
+    if has_text or (
+        isinstance(message.get("tool_calls"), list) and bool(message["tool_calls"])
+    ):
+        return True
+    return fail("assistant message 没有文本、思考内容或工具调用")
 
 
 def gpu_inventory(runner: CommandRunner) -> list[dict[str, Any]]:
