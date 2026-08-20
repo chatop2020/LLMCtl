@@ -66,6 +66,8 @@ sudo llmctl model upgrade rollback <升级任务ID>
 
 `apply` 会再次检查注册表版本；计划生成后如果其他管理员修改了部署，提交会拒绝并要求重新计划。`--yes` 只跳过命令行确认，不会跳过固定 revision、目录、GPU、真实生成或回滚门禁。
 
+如果模型和全部实例已经验收通过，但任务只在 `publishing` 阶段失败，可执行 `sudo llmctl model publish`，或点击页面任务卡中的“仅重试 OmniRoute 发布”。该操作只同步当前注册表，不下载权重、不停止 Worker，也不会执行模型回滚。
+
 ## 命令行兜底
 
 ```bash

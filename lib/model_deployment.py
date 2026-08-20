@@ -1130,6 +1130,44 @@ class DeploymentManager:
             thread.start()
         return job
 
+    def publish(self) -> dict[str, Any]:
+        """创建仅同步当前注册表到 AI 接入层的后台恢复任务。
+
+        返回：
+            已持久化的 waiting 任务。该任务不下载权重、不修改注册表，也不
+            停止 Worker；失败后可安全重试。
+
+        异常：
+            RuntimeError: 已有非终态模型任务。
+            ValueError: 当前注册表没有可发布部署或接入层不支持注册表同步。
+        """
+
+        with self._submission_lock:
+            if any(
+                item.get("state") not in TERMINAL_JOB_STATES
+                for item in self.jobs.list(limit=200)
+            ):
+                raise RuntimeError("已有模型部署、升级或发布任务正在运行")
+            registry = self.registry.read()
+            if not any(
+                deployment.get("enabled", True)
+                and deployment.get("publish_requested", True)
+                for deployment in registry.get("deployments", {}).values()
+            ):
+                raise ValueError("当前注册表没有可发布部署")
+            if not gateway_capabilities(self.paths)["registry_publish"]:
+                raise ValueError("当前 AI 接入层不支持注册表发布")
+            job = self.jobs.create(
+                {"registry_revision": int(registry.get("revision", 0))},
+                kind="publish",
+            )
+            thread = threading.Thread(
+                target=self._run_publish_job, args=(job["id"],), daemon=True
+            )
+            self._threads[job["id"]] = thread
+            thread.start()
+        return job
+
     def cancel(self, job_id: str) -> dict[str, Any]:
         """请求取消任务；已进入配置提交阶段时会先完成安全回滚。"""
 
@@ -1337,6 +1375,43 @@ class DeploymentManager:
                     "state": "failed" if not safety_backup else "rolled_back",
                     "phase": "failed",
                     "message": f"回滚失败：{error}{recovery_error}",
+                    "error": str(error)[:4000],
+                }
+            )
+            self.jobs.save(job)
+        finally:
+            if acquired:
+                self._mutation_lock.release()
+            self._threads.pop(job_id, None)
+
+    def _run_publish_job(self, job_id: str) -> None:
+        """幂等重试当前注册表发布，不触碰模型和 Worker 生命周期。"""
+
+        job = self.jobs.get(job_id)
+        acquired = False
+        try:
+            acquired = self._mutation_lock.acquire(blocking=False)
+            if not acquired:
+                raise RuntimeError("另一个模型任务持有变更锁")
+            self._update_job(
+                job, "publishing", 50, "根据当前部署注册表重新同步 OmniRoute"
+            )
+            self._reconcile_gateway()
+            job.update(
+                {
+                    "state": "succeeded",
+                    "phase": "succeeded",
+                    "progress": 100,
+                    "message": "OmniRoute 已与当前部署注册表同步；Worker 未重启",
+                }
+            )
+            self.jobs.save(job)
+        except Exception as error:
+            job.update(
+                {
+                    "state": "failed",
+                    "phase": "failed",
+                    "message": f"OmniRoute 发布重试失败：{error}",
                     "error": str(error)[:4000],
                 }
             )
@@ -1589,6 +1664,18 @@ class DeploymentManager:
         gateway = cluster.get("GATEWAY_KIND", "litellm")
         if gateway != "omniroute":
             raise RuntimeError("当前多模型在线发布首先支持 OmniRoute；其他网关不会被静默改写")
+        environment = os.environ.copy()
+        if not str(environment.get("GATEWAY_LOCAL_URL") or "").strip():
+            # 交互式 llmctl 会临时导出此变量，但 systemd 模型控制服务只读取
+            # cluster.env。根据同一配置中的内部端口构造回环地址，保证后台任务
+            # 与命令行使用完全相同的 OmniRoute 管理入口。
+            port = bounded_int(
+                cluster.get("GATEWAY_INTERNAL_PORT", cluster.get("API_PORT", "8000")),
+                "OmniRoute 内部端口",
+                1,
+                65535,
+            )
+            environment["GATEWAY_LOCAL_URL"] = f"http://127.0.0.1:{port}"
         self.runner.run(
             [
                 str(self.paths.gateway_helper),
@@ -1599,6 +1686,7 @@ class DeploymentManager:
                 str(self.paths.secrets_env),
             ],
             timeout=180,
+            env=environment,
         )
 
     def _verify_instances(
@@ -2281,6 +2369,8 @@ class ControlServer(socketserver.ThreadingUnixStreamServer):
             return self.manager.plan_upgrade(payload)
         if operation == "upgrade-submit":
             return self.manager.submit_upgrade(payload)
+        if operation == "publish":
+            return self.manager.publish()
         if operation == "download-proxy-test":
             return self.manager.test_download_proxy(payload)
         if operation == "download-proxy-save":
@@ -2354,6 +2444,7 @@ def main() -> int:
             "submit",
             "upgrade-plan",
             "upgrade-submit",
+            "publish",
             "download-proxy-test",
             "download-proxy-save",
             "download-proxy-clear",

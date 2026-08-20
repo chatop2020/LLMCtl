@@ -383,6 +383,7 @@ usage() {
   llmctl model status                          显示 GPU、部署、后台任务和控制服务状态
   llmctl model plan <JSON文件|->               校验部署并显示受影响 Worker/GPU，不做修改
   llmctl model deploy <JSON文件|->             提交已确认的后台部署任务
+  llmctl model publish                         仅重试当前注册表到 AI 接入层，不重启 Worker
   llmctl model upgrade plan <部署ID> [选项]   解析固定 SHA 并显示 Ornith 升级/回退计划
   llmctl model upgrade apply <部署ID> [选项]  确认后提交升级；支持 --yes
   llmctl model upgrade rollback <任务ID>      恢复到该升级任务执行前的模型版本

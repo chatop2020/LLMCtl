@@ -133,7 +133,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   const displayedModelUpgradeJob = computed(
     () =>
       activeModelDeploymentJob.value ||
-      modelDeploymentJobs.value.find((job) => job.kind === "upgrade") ||
+      modelDeploymentJobs.value.find((job) => ["upgrade", "publish"].includes(job.kind)) ||
       null,
   );
   const selectedDeploymentGpus = computed(() =>
@@ -538,6 +538,28 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     }
   }
 
+  /**
+   * 仅把当前部署注册表重新发布到 AI 接入层。
+   * 该恢复动作不下载权重、不停止 Worker，适用于模型已验收但 publishing 失败。
+   */
+  async function retryModelDeploymentPublish() {
+    if (activeModelDeploymentJob.value) return;
+    try {
+      const job = await api("admin/model-deployments/publish", {
+        method: "POST",
+        body: "{}",
+      });
+      await loadModelDeployments({ silent: true });
+      if (!(modelDeployments.value?.jobs || []).some((item) => item?.id === job?.id)) {
+        recordModelDeploymentJob(job);
+      }
+      notify("已创建仅路由发布任务；模型和 Worker 保持运行", "working");
+      await focusActiveModelDeploymentJob();
+    } catch (error) {
+      notify(`路由发布重试失败：${error.message}`, "bad");
+    }
+  }
+
   function deploymentJobStateLabel(value) {
     return {
       waiting: "等待执行",
@@ -777,6 +799,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     submitModelDeployment,
     cancelModelDeployment,
     rollbackModelDeployment,
+    retryModelDeploymentPublish,
     deploymentJobStateLabel,
     modelDownloadProxyPayload,
     testModelDownloadProxy,

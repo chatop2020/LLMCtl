@@ -196,6 +196,38 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["expected_registry_revision"], 7)
         self.assertIn("ornith-ai/Ornith-1.5-35B-A3B-FP8", completed.stdout)
 
+    def test_model_publish_cli_retries_routes_without_deployment_payload(self):
+        """部分完成恢复命令必须只提交 publish 操作和空对象。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "state"
+            state.mkdir()
+            capture = pathlib.Path(directory) / "publish.txt"
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                export LLM_CLUSTER_STATE_DIR={state!s}
+                source {MANAGER!s}
+                require_root() {{ :; }}
+                load_config() {{ :; }}
+                model_control_request() {{
+                  printf 'operation=%s payload=%s\n' "$1" "$(cat "$2")" >{capture!s}
+                  printf '{{"id":"publish-job","kind":"publish","state":"waiting"}}\n'
+                }}
+                cmd_model publish
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            submitted = capture.read_text(encoding="utf-8")
+        self.assertIn("operation=publish payload={}", submitted)
+        self.assertIn('"kind": "publish"', completed.stdout)
+
     def test_workflow_init_preserves_existing_config_and_prints_recovery_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = pathlib.Path(directory) / "state"

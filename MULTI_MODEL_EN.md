@@ -66,6 +66,8 @@ sudo llmctl model upgrade rollback <upgrade-job-id>
 
 `apply` checks the registry revision again. If another administrator changed deployments after planning, submission is rejected and must be re-planned. `--yes` skips only the terminal prompt; it never bypasses immutable-revision, catalog, GPU, real-generation, or rollback gates.
 
+If the model and every instance passed acceptance but the job failed only during `publishing`, run `sudo llmctl model publish` or select **Retry OmniRoute publication only** on the task card. This operation only synchronizes the current registry; it does not download weights, stop Workers, or run a model rollback.
+
 ## Command-Line Recovery Path
 
 ```bash

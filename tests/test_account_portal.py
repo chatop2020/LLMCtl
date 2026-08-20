@@ -1495,6 +1495,13 @@ class PortalIntegrationTests(unittest.TestCase):
                 },
             )
             self.assertEqual(status, 200)
+        status, _publish, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/model-deployments/publish",
+            {},
+        )
+        self.assertEqual(status, 200)
         self.assertEqual(
             [operation for operation, _payload in models.calls],
             [
@@ -1503,6 +1510,7 @@ class PortalIntegrationTests(unittest.TestCase):
                 "download-proxy-test",
                 "download-proxy-save",
                 "download-proxy-clear",
+                "publish",
             ],
         )
         self.assertEqual(models.calls[1][1]["expected_registry_revision"], 7)

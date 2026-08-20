@@ -790,6 +790,7 @@ class ModelDeploymentClient:
             "submit",
             "upgrade-plan",
             "upgrade-submit",
+            "publish",
             "download-proxy-test",
             "download-proxy-save",
             "download-proxy-clear",

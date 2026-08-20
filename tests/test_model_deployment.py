@@ -72,6 +72,7 @@ class ModelDeploymentTests(unittest.TestCase):
                     "GPU_MEMORY_UTILIZATION=0.9",
                     "MAX_NUM_SEQS=7",
                     "MAX_NUM_BATCHED_TOKENS=8192",
+                    "GATEWAY_INTERNAL_PORT=18000",
                     f"GATEWAY_KIND={gateway}",
                 ]
             )
@@ -519,6 +520,33 @@ class ModelDeploymentTests(unittest.TestCase):
                 RuntimeError, "gdn-inside ownership conflict"
             ):
                 MODEL.CommandRunner().run(["gateway-helper"])
+
+    def test_gateway_reconcile_derives_local_url_for_systemd_controller(self):
+        """后台服务没有临时 Shell 变量时必须从 cluster.env 构造 OmniRoute 地址。"""
+
+        runner = mock.Mock()
+        runner.run.return_value = subprocess.CompletedProcess(
+            args=["gateway-helper"], returncode=0, stdout=""
+        )
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        with mock.patch.dict(MODEL.os.environ, {}, clear=True):
+            manager._reconcile_gateway()
+        environment = runner.run.call_args.kwargs["env"]
+        self.assertEqual(environment["GATEWAY_LOCAL_URL"], "http://127.0.0.1:18000")
+
+    def test_publish_retry_only_reconciles_gateway_and_keeps_workers_untouched(self):
+        """部分完成状态应能仅重试路由发布，不重新加载已经验收的模型。"""
+
+        manager = MODEL.DeploymentManager(self.paths)
+        manager.registry.write(manager.registry.read())
+        job = manager.jobs.create({"registry_revision": 0}, kind="publish")
+        manager._reconcile_gateway = mock.Mock()
+        manager._run_publish_job(job["id"])
+        saved = manager.jobs.get(job["id"])
+        self.assertEqual(saved["state"], "succeeded")
+        self.assertEqual(saved["progress"], 100)
+        self.assertIn("Worker 未重启", saved["message"])
+        manager._reconcile_gateway.assert_called_once_with()
 
     def test_upgrade_inference_probe_requires_an_assistant_message(self):
         """升级发布前的真实探测不能把空 choices 或纯健康响应当成成功。"""
