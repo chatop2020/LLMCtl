@@ -571,7 +571,7 @@ export default {
                     <strong>{{ displayedModelUpgradeJob.message }}</strong>
                   </div>
                   <button
-                    v-if="activeModelDeploymentJob"
+                    v-if="activeModelDeploymentJob && activeModelDeploymentJob.kind !== 'publish'"
                     type="button"
                     class="danger ghost"
                     @click="cancelModelDeployment(activeModelDeploymentJob)"
@@ -587,6 +587,13 @@ export default {
                     <time>{{ date(entry.time) }}</time><span>{{ entry.message }}</span>
                   </li>
                 </ol>
+                <button
+                  v-if="displayedModelUpgradeJob.kind === 'upgrade' && ['failed', 'rolled_back'].includes(displayedModelUpgradeJob.state) && Number(displayedModelUpgradeJob.progress || 0) >= 92"
+                  type="button"
+                  class="primary"
+                  :disabled="Boolean(activeModelDeploymentJob)"
+                  @click="retryModelDeploymentPublish"
+                >仅重试 AI 接入层发布（不重启 Worker）</button>
               </section>
 
               <section class="panel deployment-form-section">
@@ -951,7 +958,7 @@ export default {
                     <h2>最近任务</h2>
                     <article v-for="job in modelDeploymentJobs.slice(0, 8)" :key="job.id" class="deployment-history-row">
                       <span class="status" :class="job.state === 'succeeded' ? 'ok' : ['failed', 'rolled_back'].includes(job.state) ? 'bad' : 'warn'">{{ deploymentJobStateLabel(job.state) }}</span>
-                      <strong>{{ job.kind === 'rollback' ? '配置回滚' : job.kind === 'upgrade' ? 'Ornith 版本升级' : (job.request?.deployment?.display_name || job.request?.deployment?.id || job.id) }}</strong>
+                      <strong>{{ job.kind === 'rollback' ? '配置回滚' : job.kind === 'upgrade' ? 'Ornith 版本升级' : job.kind === 'publish' ? 'AI 接入层路由发布' : (job.request?.deployment?.display_name || job.request?.deployment?.id || job.id) }}</strong>
                       <small>{{ job.message }}</small><time>{{ date(job.updated_at || job.created_at) }}</time>
                       <button
                         v-if="job.kind !== 'rollback' && job.state === 'succeeded' && job.backup"

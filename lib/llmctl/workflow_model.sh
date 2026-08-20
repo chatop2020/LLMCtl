@@ -557,6 +557,14 @@ cmd_model() {
         model_control_request submit "${payload}" | jq .
       fi
       ;;
+    publish)
+      (( $# == 0 )) || die "用法：llmctl model publish"
+      payload=$(mktemp "${STATE_DIR}/model-publish.XXXXXX.json")
+      chmod 0600 "${payload}"
+      printf '{}\n' >"${payload}"
+      model_control_request publish "${payload}" | jq .
+      rm -f "${payload}"
+      ;;
     upgrade)
       cmd_model_upgrade "$@"
       ;;
@@ -576,6 +584,6 @@ cmd_model() {
       fi
       rm -f "${payload}"
       ;;
-    *) die "model 子命令必须是 init|status|plan|deploy|upgrade|job|cancel|rollback" ;;
+    *) die "model 子命令必须是 init|status|plan|deploy|publish|upgrade|job|cancel|rollback" ;;
   esac
 }

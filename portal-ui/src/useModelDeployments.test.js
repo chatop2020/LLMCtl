@@ -216,4 +216,53 @@ describe("模型版本升级组合逻辑", () => {
     );
     expect(state.modelUpgradeForm.max_model_len).toBe(262144);
   });
+
+  it("发布阶段失败后只重试路由并立即显示新任务", async () => {
+    const failed = {
+      id: "failed-upgrade",
+      kind: "upgrade",
+      state: "rolled_back",
+      phase: "failed",
+      progress: 92,
+      message: "OmniRoute 发布失败",
+    };
+    const snapshot = {
+      available: true,
+      gateway: { registry_publish: true },
+      gpus: [],
+      jobs: [failed],
+      registry: { deployments: {}, artifacts: {} },
+      upgrade_profiles: [],
+    };
+    const api = vi.fn(async (path) => {
+      if (path === "admin/model-deployments") return snapshot;
+      if (path === "admin/model-deployments/publish") {
+        return {
+          id: "publish-retry",
+          kind: "publish",
+          state: "waiting",
+          phase: "waiting",
+          progress: 0,
+          message: "等待执行",
+        };
+      }
+      throw new Error(`未处理的测试路径：${path}`);
+    });
+    const notify = vi.fn();
+    const state = useModelDeployments({
+      api,
+      isAdmin: ref(true),
+      session: ref({ authenticated: true }),
+      notify,
+    });
+    await state.loadModelDeployments();
+    await state.retryModelDeploymentPublish();
+
+    expect(state.activeModelDeploymentJob.value?.id).toBe("publish-retry");
+    expect(state.displayedModelUpgradeJob.value?.kind).toBe("publish");
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("模型和 Worker 保持运行"),
+      "working",
+    );
+  });
 });
