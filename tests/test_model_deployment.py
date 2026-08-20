@@ -510,10 +510,9 @@ class ModelDeploymentTests(unittest.TestCase):
         """升级发布前的真实探测不能把空 choices 或纯健康响应当成成功。"""
 
         class Response:
-            status = 200
-
-            def __init__(self, payload: dict):
+            def __init__(self, payload: dict, status: int = 200):
                 self.payload = payload
+                self.status = status
 
             def __enter__(self):
                 return self
@@ -541,6 +540,35 @@ class ModelDeploymentTests(unittest.TestCase):
                     "ornith-1.5-35b-a3b-fp8",
                 )
             )
+        with mock.patch.object(
+            MODEL.urllib.request,
+            "urlopen",
+            return_value=Response(
+                {"choices": [{"message": {"content": None, "reasoning": "OK"}}]}
+            ),
+        ):
+            self.assertTrue(
+                MODEL.endpoint_inference_ready(
+                    "http://127.0.0.1:8100",
+                    self.paths.secrets_env,
+                    "ornith-1.5-35b-a3b-fp8",
+                )
+            )
+        detail = []
+        with mock.patch.object(
+            MODEL.urllib.request,
+            "urlopen",
+            return_value=Response({"error": "model not found"}, status=404),
+        ):
+            self.assertFalse(
+                MODEL.endpoint_inference_ready(
+                    "http://127.0.0.1:8100",
+                    self.paths.secrets_env,
+                    "ornith-1.5-35b-a3b-fp8",
+                    detail=detail,
+                )
+            )
+        self.assertEqual(detail, ["HTTP 404"])
         with mock.patch.object(
             MODEL.urllib.request,
             "urlopen",
