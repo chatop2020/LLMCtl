@@ -1484,9 +1484,26 @@ class PortalIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(job["kind"], "upgrade")
+        for suffix in ("test", "save", "clear"):
+            status, _result, _ = self.json_post(
+                client,
+                jar,
+                f"/portal-api/admin/model-download/proxy/{suffix}",
+                {
+                    "proxy_url": "http://proxy.internal:7890",
+                    "hub": "huggingface",
+                },
+            )
+            self.assertEqual(status, 200)
         self.assertEqual(
             [operation for operation, _payload in models.calls],
-            ["upgrade-plan", "upgrade-submit"],
+            [
+                "upgrade-plan",
+                "upgrade-submit",
+                "download-proxy-test",
+                "download-proxy-save",
+                "download-proxy-clear",
+            ],
         )
         self.assertEqual(models.calls[1][1]["expected_registry_revision"], 7)
 

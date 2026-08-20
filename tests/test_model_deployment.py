@@ -366,6 +366,81 @@ class ModelDeploymentTests(unittest.TestCase):
         )
         self.assertFalse(self.paths.registry.exists())
 
+    def test_maintenance_proxy_is_translated_to_standard_download_variables(self):
+        """保存字段必须真正变成 Hub 客户端识别的标准代理环境变量。"""
+
+        self.paths.proxy_env.write_text(
+            "MAINTENANCE_PROXY=http://127.0.0.1:7890\n"
+            "MAINTENANCE_NO_PROXY=127.0.0.1,localhost,::1\n",
+            encoding="utf-8",
+        )
+        environment = MODEL.maintenance_environment(self.paths.proxy_env)
+        self.assertEqual(environment["HTTPS_PROXY"], "http://127.0.0.1:7890")
+        self.assertEqual(environment["https_proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(environment["NO_PROXY"], "127.0.0.1,localhost,::1")
+
+    def test_web_proxy_is_only_saved_after_real_hub_probe(self):
+        """页面代理必须通过真实 curl 探测后才原子写入维护配置。"""
+
+        runner = mock.Mock()
+        runner.run.return_value = subprocess.CompletedProcess(
+            args=["curl"], returncode=0, stdout=""
+        )
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        result = manager.save_download_proxy(
+            {
+                "proxy_url": "http://proxy.internal:7890",
+                "no_proxy": "127.0.0.1,localhost,::1",
+                "hub": "huggingface",
+            }
+        )
+        self.assertTrue(result["maintenance_proxy"]["configured"])
+        self.assertEqual(
+            MODEL.parse_env_file(self.paths.proxy_env)["MAINTENANCE_PROXY"],
+            "http://proxy.internal:7890",
+        )
+        command = runner.run.call_args.args[0]
+        self.assertIn("--proxy", command)
+        self.assertIn("https://huggingface.co/api/models?limit=1", command)
+        self.assertEqual(self.paths.proxy_env.stat().st_mode & 0o777, 0o600)
+
+    def test_modelscope_downloader_is_automatically_prepared_when_missing(self):
+        """旧环境缺少 Hub venv 时应安装固定依赖，而不是让升级立即失败。"""
+
+        downloader = self.root / "opt/llm-cluster/hub-venv/bin/ms"
+        paths = MODEL.dataclasses.replace(
+            self.paths, modelscope_downloader=downloader
+        )
+        runner = mock.Mock()
+        runner.run.return_value = subprocess.CompletedProcess(
+            args=["command"], returncode=0, stdout=""
+        )
+        manager = MODEL.DeploymentManager(paths)
+        resolved = manager._ensure_modelscope_downloader(runner, {})
+        self.assertEqual(resolved, downloader)
+        commands = [call.args[0] for call in runner.run.call_args_list]
+        self.assertTrue(
+            any(command[1:3] == ["-m", "venv"] for command in commands)
+        )
+        self.assertTrue(
+            any("modelscope-hub==0.1.8" in command for command in commands)
+        )
+        self.assertTrue(
+            any(command[-2:] == ["download", "--help"] for command in commands)
+        )
+
+    def test_proxy_rejects_credentials_and_does_not_probe_or_save(self):
+        """Web UI 不得把代理凭据写入可展示的维护配置。"""
+
+        runner = mock.Mock()
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        with self.assertRaisesRegex(ValueError, "无凭据"):
+            manager.save_download_proxy(
+                {"proxy_url": "http://user:secret@proxy.internal:7890"}
+            )
+        runner.run.assert_not_called()
+        self.assertFalse(self.paths.proxy_env.exists())
+
     def test_upgrade_catalog_failure_surfaces_hub_error_instead_of_exit_code(self):
         """Hub 失败原因必须穿透到页面，不能只剩无法排障的退出码 2。"""
 

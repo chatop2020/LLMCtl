@@ -557,6 +557,38 @@ export default {
                 </p>
               </section>
 
+              <section
+                v-if="displayedModelUpgradeJob"
+                id="model-deployment-active-job"
+                class="panel deployment-active-job"
+              >
+                <div class="deployment-job-head">
+                  <div>
+                    <span
+                      class="status"
+                      :class="['failed', 'rolled_back'].includes(displayedModelUpgradeJob.state) ? 'bad' : displayedModelUpgradeJob.state === 'succeeded' ? 'ok' : 'warn'"
+                    >{{ deploymentJobStateLabel(displayedModelUpgradeJob.state) }}</span>
+                    <strong>{{ displayedModelUpgradeJob.message }}</strong>
+                  </div>
+                  <button
+                    v-if="activeModelDeploymentJob"
+                    type="button"
+                    class="danger ghost"
+                    @click="cancelModelDeployment(activeModelDeploymentJob)"
+                  >安全取消</button>
+                </div>
+                <progress :value="displayedModelUpgradeJob.progress || 0" max="100"></progress>
+                <small>
+                  阶段 {{ displayedModelUpgradeJob.phase }} · {{ displayedModelUpgradeJob.progress || 0 }}%
+                  · 任务 {{ displayedModelUpgradeJob.id }}
+                </small>
+                <ol v-if="displayedModelUpgradeJob.logs?.length" class="deployment-log">
+                  <li v-for="entry in displayedModelUpgradeJob.logs.slice(-6)" :key="`${entry.time}-${entry.message}`">
+                    <time>{{ date(entry.time) }}</time><span>{{ entry.message }}</span>
+                  </li>
+                </ol>
+              </section>
+
               <section class="panel deployment-form-section">
                 <div class="section-title-row">
                   <div>
@@ -566,6 +598,46 @@ export default {
                     </p>
                   </div>
                 </div>
+                <details class="panel deployment-advanced">
+                  <summary>下载环境与维护代理</summary>
+                  <p class="deployment-gateway-note">
+                    ModelScope 下载器：
+                    {{ modelDeployments?.download_environment?.modelscope?.downloader_ready ? "已就绪" : "缺失时将在任务中自动准备" }}；
+                    维护代理只用于模型目录、依赖和权重下载，不会注入 Router 或 Worker。
+                  </p>
+                  <div class="form-grid deployment-source-grid">
+                    <label>
+                      代理地址
+                      <input
+                        v-model.trim="modelDownloadProxyForm.proxy_url"
+                        placeholder="例如 http://127.0.0.1:7890"
+                      />
+                    </label>
+                    <label>
+                      测试目标
+                      <select v-model="modelDownloadProxyForm.hub">
+                        <option value="huggingface">Hugging Face</option>
+                        <option value="modelscope">ModelScope</option>
+                      </select>
+                    </label>
+                    <label>
+                      NO_PROXY
+                      <input v-model.trim="modelDownloadProxyForm.no_proxy" />
+                    </label>
+                  </div>
+                  <div class="button-row">
+                    <button type="button" class="ghost" :disabled="modelDownloadProxyBusy" @click="testModelDownloadProxy">
+                      {{ modelDownloadProxyBusy ? "正在测试…" : "仅测试" }}
+                    </button>
+                    <button type="button" class="primary" :disabled="modelDownloadProxyBusy" @click="saveModelDownloadProxy">
+                      测试并保存
+                    </button>
+                    <button type="button" class="danger ghost" :disabled="modelDownloadProxyBusy" @click="clearModelDownloadProxy">
+                      清除代理
+                    </button>
+                    <small>{{ modelDownloadProxyMessage || (modelDeployments?.download_environment?.maintenance_proxy?.configured ? "已保存维护代理" : "当前未保存维护代理") }}</small>
+                  </div>
+                </details>
                 <p v-if="!modelDeployments?.gateway?.registry_publish" class="warning">
                   当前接入层不能原子同步版本切换。升级入口保持关闭，避免 Worker 已变化但公开路由仍指向旧配置。
                 </p>
@@ -691,6 +763,9 @@ export default {
                     >
                       {{ modelUpgradeSubmitting ? "正在提交…" : "确认升级并保留回退点" }}
                     </button>
+                    <p v-if="modelUpgradeSubmitError" class="error-text" role="alert">
+                      {{ modelUpgradeSubmitError }}
+                    </p>
                   </section>
                 </template>
               </section>
@@ -701,28 +776,6 @@ export default {
                   <li>先新建 Qwen 部署并选择 GPU 4–7，发布为 <code>gdn-inside-qwen</code>。</li>
                   <li>待 Qwen 验收成功后，再编辑旧 Ornith 部署，保留 GPU 0–3，发布为 <code>gdn-inside-ornith</code>。</li>
                   <li>勾选“保留兼容别名”后，旧客户端仍可使用 <code>gdn-inside</code>。</li>
-                </ol>
-              </section>
-
-              <section v-if="activeModelDeploymentJob" class="panel deployment-active-job">
-                <div class="deployment-job-head">
-                  <div>
-                    <span class="status warn">{{ deploymentJobStateLabel(activeModelDeploymentJob.state) }}</span>
-                    <strong>{{ activeModelDeploymentJob.message }}</strong>
-                  </div>
-                  <button type="button" class="danger ghost" @click="cancelModelDeployment(activeModelDeploymentJob)">
-                    安全取消
-                  </button>
-                </div>
-                <progress :value="activeModelDeploymentJob.progress || 0" max="100"></progress>
-                <small>
-                  阶段 {{ activeModelDeploymentJob.phase }} · {{ activeModelDeploymentJob.progress || 0 }}%
-                  · 任务 {{ activeModelDeploymentJob.id }}
-                </small>
-                <ol v-if="activeModelDeploymentJob.logs?.length" class="deployment-log">
-                  <li v-for="entry in activeModelDeploymentJob.logs.slice(-6)" :key="`${entry.time}-${entry.message}`">
-                    <time>{{ date(entry.time) }}</time><span>{{ entry.message }}</span>
-                  </li>
                 </ol>
               </section>
 

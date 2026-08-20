@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Callable, Iterable
@@ -56,6 +57,8 @@ DEPLOYMENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,299}$")
 SAFE_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "rolled_back"}
+DEFAULT_MAINTENANCE_NO_PROXY = "127.0.0.1,localhost,::1"
+MODELSCOPE_DOWNLOADER_VERSION = "0.1.8"
 
 
 def utc_now() -> str:
@@ -118,6 +121,83 @@ def parse_env_file(path: pathlib.Path) -> dict[str, str]:
     return result
 
 
+def validate_maintenance_proxy(
+    proxy_url: str, no_proxy: str = DEFAULT_MAINTENANCE_NO_PROXY
+) -> tuple[str, str]:
+    """校验只用于模型目录和权重下载的维护代理配置。
+
+    参数：
+        proxy_url: 完整的 HTTP(S) 代理地址，不允许凭据、路径或查询参数。
+        no_proxy: 不经过代理的逗号分隔主机、IP 或 CIDR 清单。
+
+    返回：
+        规范化后的代理地址与直连清单。
+
+    异常：
+        ValueError: 地址、端口或直连清单不满足安全边界。
+    """
+
+    value = str(proxy_url or "").strip()
+    bypass = str(no_proxy or DEFAULT_MAINTENANCE_NO_PROXY).strip()
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("维护代理地址或端口无效") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("维护代理必须是无凭据、无路径的 http(s)://主机:端口")
+    if (
+        not bypass
+        or len(bypass) > 2048
+        or any(character.isspace() or ord(character) < 32 for character in bypass)
+        or not re.fullmatch(r"[A-Za-z0-9._:/,\[\]-]+", bypass)
+    ):
+        raise ValueError("NO_PROXY 必须是无空格的逗号分隔主机、IP 或 CIDR")
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{host}:{port}", bypass
+
+
+def maintenance_environment(proxy_env: pathlib.Path) -> dict[str, str]:
+    """构造显式维护操作环境，并把保存字段转换成标准代理变量。
+
+    参数：
+        proxy_env: root 管理的维护代理环境文件。
+
+    返回：
+        当前进程环境副本；配置有效时同时包含大小写两组代理变量。
+    """
+
+    environment = os.environ.copy()
+    saved = parse_env_file(proxy_env)
+    proxy_url = str(saved.get("MAINTENANCE_PROXY") or "").strip()
+    no_proxy = str(
+        saved.get("MAINTENANCE_NO_PROXY") or DEFAULT_MAINTENANCE_NO_PROXY
+    ).strip()
+    if proxy_url:
+        proxy_url, no_proxy = validate_maintenance_proxy(proxy_url, no_proxy)
+        environment.update(
+            {
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "NO_PROXY": no_proxy,
+                "no_proxy": no_proxy,
+            }
+        )
+    return environment
+
+
 def render_env(values: dict[str, Any]) -> str:
     """把受校验的 Worker 配置渲染为不可执行注入的 Shell 环境文件。"""
 
@@ -150,6 +230,9 @@ class Paths:
     gateway_helper: pathlib.Path
     catalog_helper: pathlib.Path = pathlib.Path(
         "/usr/local/lib/llm-cluster/model_catalog.py"
+    )
+    modelscope_downloader: pathlib.Path = pathlib.Path(
+        "/opt/llm-cluster/hub-venv/bin/ms"
     )
 
     @classmethod
@@ -190,6 +273,12 @@ class Paths:
                 os.environ.get(
                     "LLM_CATALOG_HELPER",
                     "/usr/local/lib/llm-cluster/model_catalog.py",
+                )
+            ),
+            modelscope_downloader=pathlib.Path(
+                os.environ.get(
+                    "LLM_MODELSCOPE_DOWNLOADER",
+                    "/opt/llm-cluster/hub-venv/bin/ms",
                 )
             ),
         )
@@ -673,8 +762,128 @@ class DeploymentManager:
             "gpus": gpu_inventory(self.runner),
             "gateway": gateway_capabilities(self.paths),
             "upgrade_profiles": upgrade_profiles(),
+            "download_environment": self.download_environment(),
             "socket": str(self.paths.socket),
         }
+
+    def download_environment(self) -> dict[str, Any]:
+        """返回维护代理和 ModelScope 下载器的只读准备状态。
+
+        返回：
+            页面可安全展示的下载环境；代理地址不支持内嵌凭据。
+        """
+
+        saved = parse_env_file(self.paths.proxy_env)
+        proxy_url = str(saved.get("MAINTENANCE_PROXY") or "").strip()
+        no_proxy = str(
+            saved.get("MAINTENANCE_NO_PROXY")
+            or DEFAULT_MAINTENANCE_NO_PROXY
+        ).strip()
+        error = ""
+        if proxy_url:
+            try:
+                proxy_url, no_proxy = validate_maintenance_proxy(
+                    proxy_url, no_proxy
+                )
+            except ValueError as invalid:
+                error = str(invalid)
+                proxy_url = ""
+        return {
+            "maintenance_proxy": {
+                "configured": bool(proxy_url),
+                "proxy_url": proxy_url,
+                "no_proxy": no_proxy,
+                "error": error,
+                "scope": "仅模型目录、依赖和权重下载；不注入 Router 或 Worker",
+            },
+            "modelscope": {
+                "downloader_ready": self.paths.modelscope_downloader.is_file()
+                and os.access(self.paths.modelscope_downloader, os.X_OK),
+                "downloader_path": str(self.paths.modelscope_downloader),
+                "auto_prepare": True,
+                "version": MODELSCOPE_DOWNLOADER_VERSION,
+            },
+        }
+
+    def _probe_download_proxy(self, proxy_url: str, hub: str) -> dict[str, Any]:
+        """通过候选代理访问指定 Hub 的轻量元数据端点。
+
+        参数：
+            proxy_url: 已通过结构校验但尚未持久化的代理地址。
+            hub: `huggingface` 或 `modelscope`，决定实际探测目标。
+
+        返回：
+            包含 Hub、代理地址和成功状态的页面结果。
+
+        异常：
+            ValueError: Hub 不受支持。
+            RuntimeError: curl 不存在、超时或代理无法访问目标 Hub。
+        """
+
+        targets = {
+            "huggingface": "https://huggingface.co/api/models?limit=1",
+            "modelscope": "https://modelscope.cn/openapi/v1/models?page_size=1",
+        }
+        if hub not in targets:
+            raise ValueError("代理测试目标只能是 Hugging Face 或 ModelScope")
+        command = [
+            "curl",
+            "--proxy",
+            proxy_url,
+            "--noproxy",
+            "",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "8",
+            "--max-time",
+            "20",
+            "--output",
+            "/dev/null",
+            targets[hub],
+        ]
+        try:
+            result = self.runner.run(command, check=False, timeout=25)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(f"代理测试无法执行：{error}") from error
+        if result.returncode:
+            detail = "；".join((result.stdout or "").strip().splitlines()[-3:])
+            raise RuntimeError(
+                f"代理无法访问 {hub}：{detail or f'curl 退出码 {result.returncode}'}"
+            )
+        return {"ok": True, "hub": hub, "proxy_url": proxy_url}
+
+    def test_download_proxy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验但不保存页面提交的维护代理，并执行真实 Hub 请求。"""
+
+        proxy_url, no_proxy = validate_maintenance_proxy(
+            str(payload.get("proxy_url") or ""),
+            str(payload.get("no_proxy") or DEFAULT_MAINTENANCE_NO_PROXY),
+        )
+        result = self._probe_download_proxy(
+            proxy_url, str(payload.get("hub") or "huggingface").lower()
+        )
+        return {**result, "no_proxy": no_proxy}
+
+    def save_download_proxy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """真实测试成功后原子保存维护代理，供后续目录和下载操作使用。"""
+
+        tested = self.test_download_proxy(payload)
+        atomic_write(
+            self.paths.proxy_env,
+            "MAINTENANCE_PROXY="
+            f"{tested['proxy_url']}\nMAINTENANCE_NO_PROXY={tested['no_proxy']}\n",
+            mode=0o600,
+        )
+        return self.download_environment()
+
+    def clear_download_proxy(self) -> dict[str, Any]:
+        """清除维护代理；推理服务和正在运行的 Worker 不会被修改。"""
+
+        with contextlib.suppress(FileNotFoundError):
+            self.paths.proxy_env.unlink()
+        return self.download_environment()
 
     def _inspect_upgrade_target(
         self,
@@ -719,8 +928,7 @@ class DeploymentManager:
                 str(max_model_len),
             ]
         )
-        environment = os.environ.copy()
-        environment.update(parse_env_file(self.paths.proxy_env))
+        environment = maintenance_environment(self.paths.proxy_env)
         try:
             result = self.runner.run(
                 command, check=False, timeout=90, env=environment
@@ -1117,6 +1325,81 @@ class DeploymentManager:
                 self._mutation_lock.release()
             self._threads.pop(job_id, None)
 
+    def _ensure_modelscope_downloader(
+        self, runner: CommandRunner, environment: dict[str, str]
+    ) -> pathlib.Path:
+        """核验并按需准备固定版本的 ModelScope 独立下载器。
+
+        参数：
+            runner: 把安装输出写入当前后台任务的受控命令执行器。
+            environment: 包含可选维护代理的显式下载环境。
+
+        返回：
+            已核验且支持 `download` 子命令的固定 CLI 路径。
+
+        异常：
+            RuntimeError: Python venv、固定依赖安装或 CLI 验证失败。
+        """
+
+        downloader = self.paths.modelscope_downloader
+        venv = downloader.parent.parent
+        python = venv / "bin/python"
+        pip = venv / "bin/pip"
+        version_check = [
+            str(python),
+            "-c",
+            "import importlib.metadata;"
+            "raise SystemExit(0 if importlib.metadata.version('modelscope-hub')"
+            f" == '{MODELSCOPE_DOWNLOADER_VERSION}' else 1)",
+        ]
+        if (
+            python.is_file()
+            and os.access(python, os.X_OK)
+            and downloader.is_file()
+            and os.access(downloader, os.X_OK)
+        ):
+            version = runner.run(
+                version_check, check=False, timeout=30, env=environment
+            )
+            help_result = runner.run(
+                [str(downloader), "download", "--help"],
+                check=False,
+                timeout=30,
+                env=environment,
+            )
+            if version.returncode == 0 and help_result.returncode == 0:
+                return downloader
+        try:
+            runner.run(
+                [sys.executable, "-m", "venv", str(venv)],
+                timeout=120,
+                env=environment,
+            )
+            runner.run(
+                [
+                    str(pip),
+                    "install",
+                    "--disable-pip-version-check",
+                    "--upgrade",
+                    "--force-reinstall",
+                    f"modelscope-hub=={MODELSCOPE_DOWNLOADER_VERSION}",
+                ],
+                timeout=600,
+                env=environment,
+            )
+            runner.run(version_check, timeout=30, env=environment)
+            runner.run(
+                [str(downloader), "download", "--help"],
+                timeout=30,
+                env=environment,
+            )
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(
+                "ModelScope 下载器自动准备失败："
+                f"{error}；请确认已安装 python3-venv，并检查维护代理"
+            ) from error
+        return downloader
+
     def _download_artifact(
         self, artifact: dict[str, Any], runtime: dict[str, Any], job: dict[str, Any]
     ) -> None:
@@ -1125,22 +1408,21 @@ class DeploymentManager:
         destination = pathlib.Path(artifact["path"])
         partial = destination.with_name(destination.name + ".partial")
         partial.mkdir(parents=True, exist_ok=True)
-        environment = os.environ.copy()
-        environment.update(parse_env_file(self.paths.proxy_env))
+        environment = maintenance_environment(self.paths.proxy_env)
         hub = artifact["hub"]
         model_id = artifact["model_id"]
         revision = artifact["revision"]
         logger = lambda line: self._append_job_log(job, line)
         runner = CommandRunner(logger)
         if hub == "modelscope":
+            downloader = self._ensure_modelscope_downloader(runner, environment)
             command = [
-                "/opt/llm-cluster/hub-venv/bin/ms",
+                str(downloader),
                 "download",
-                "--model",
                 model_id,
                 "--revision",
                 revision,
-                "--local_dir",
+                "--local-dir",
                 str(partial),
                 "--max-workers",
                 "8",
@@ -1880,6 +2162,12 @@ class ControlServer(socketserver.ThreadingUnixStreamServer):
             return self.manager.plan_upgrade(payload)
         if operation == "upgrade-submit":
             return self.manager.submit_upgrade(payload)
+        if operation == "download-proxy-test":
+            return self.manager.test_download_proxy(payload)
+        if operation == "download-proxy-save":
+            return self.manager.save_download_proxy(payload)
+        if operation == "download-proxy-clear":
+            return self.manager.clear_download_proxy()
         if operation == "job":
             return self.manager.jobs.get(str(payload.get("id", "")))
         if operation == "cancel":
@@ -1947,6 +2235,9 @@ def main() -> int:
             "submit",
             "upgrade-plan",
             "upgrade-submit",
+            "download-proxy-test",
+            "download-proxy-save",
+            "download-proxy-clear",
             "job",
             "cancel",
             "rollback",
