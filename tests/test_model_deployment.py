@@ -258,6 +258,10 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertEqual(request["artifact"]["revision"], "0" * 40)
         self.assertEqual(request["artifact"]["hub"], "modelscope")
         self.assertEqual(deployment["public_model_ids"], ["ornith-1.0-35b-fp8"])
+        self.assertEqual(deployment["served_model_name"], "ornith-1.5-35b-a3b-fp8")
+        self.assertEqual(
+            deployment["served_model_aliases"], ["ornith-1.0-35b-fp8"]
+        )
         self.assertEqual(deployment["runtime"]["tensor_parallel_size"], 2)
         self.assertEqual(len(deployment["instances"]), 4)
         self.assertEqual(
@@ -268,6 +272,45 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertTrue(plan["upgrade"]["retains_current_artifact"])
         self.assertTrue(plan["upgrade"]["rollback_requires_worker_reload"])
         self.assertEqual(plan["source_registry_revision"], 0)
+
+    def test_upgrade_inference_reports_each_instance_progress_and_result(self):
+        """真实生成验收必须逐实例推进，不能长时间停在无法解释的 84%。"""
+
+        manager = MODEL.DeploymentManager(self.paths)
+        job = manager.jobs.create({"deployment": {}}, kind="upgrade")
+        candidate = {
+            "deployments": {
+                "legacy": {
+                    "served_model_name": "ornith-1.5-35b-a3b-fp8",
+                    "instances": [
+                        {
+                            "id": f"worker-{index}",
+                            "kind": "local",
+                            "port": 8100 + index,
+                            "enabled": True,
+                        }
+                        for index in range(2)
+                    ],
+                }
+            }
+        }
+        with mock.patch.object(MODEL, "endpoint_healthy", return_value=True), mock.patch.object(
+            MODEL, "endpoint_inference_ready", return_value=True
+        ) as inference:
+            manager._verify_instances(
+                candidate, "legacy", inference=True, job=job
+            )
+        saved = manager.jobs.get(job["id"])
+        self.assertEqual(saved["progress"], 91)
+        self.assertIn("2/2", saved["message"])
+        self.assertEqual(
+            [entry["message"] for entry in saved["logs"]],
+            ["实例 worker-0 真实生成通过", "实例 worker-1 真实生成通过"],
+        )
+        self.assertEqual(inference.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["timeout"] == 60 for call in inference.call_args_list)
+        )
 
     def test_ornith_upgrade_submit_rejects_stale_registry_before_starting_job(self):
         """页面或 CLI 的旧确认不得覆盖已经变化的部署注册表。"""

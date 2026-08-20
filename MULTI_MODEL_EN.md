@@ -52,7 +52,7 @@ Do not overwrite the 1.0 weight directory or execute a mutable Hub `main` revisi
 3. Select a target from the official native-GPU Ornith weights grouped by ModelScope and Hugging Face. The page follows the current deployment Hub by default and prefers the size-compatible `ornith-ai/Ornith-1.5-35B-A3B-FP8`. The revision may be blank during planning; LLMCtl resolves and displays the full immutable SHA.
 4. Start conservatively with a `32768` context. The controller re-plans TP and replica count from the real GPUs, memory, and target weights instead of copying the 1.0 topology.
 5. Review the pinned SHA, affected Workers, target TP, retained old-weight path, and rollback behavior. Planning does not download weights or stop services.
-6. Confirm during a maintenance window. The page immediately replaces the confirmation plan with task phase, progress, message, and logs. After the new Workers become healthy, the controller runs one real text generation against every instance and only then switches the public route.
+6. Confirm during a maintenance window. The page immediately replaces the confirmation plan with task phase, progress, message, and logs. After the new Workers become healthy, the controller displays instance N/total and runs one real generation with a 60-second per-instance limit before switching the public route. vLLM accepts both the new 1.5 internal name and the pre-upgrade 1.0 name so clients do not have to change in lockstep.
 7. Download, load, generation, or route-publication failures restore the pre-upgrade snapshot automatically. After success, **Roll back before upgrade** reloads the retained 1.0 weights.
 
 The CLI uses the same backend contract and does not require hand-written deployment JSON:
