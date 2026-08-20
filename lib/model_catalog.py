@@ -679,6 +679,39 @@ def ms_raw_file(model_id: str, revision: str, filename: str, token: str | None) 
     return request_optional_json(url, token=token)
 
 
+def ms_resolve_revision(
+    model_id: str, revision: str | None, token: str | None
+) -> str:
+    """把 ModelScope 分支或标签解析为仓库当前不可变提交 SHA。"""
+
+    requested = str(revision or "master").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40,64}", requested):
+        return requested.lower()
+    params = urllib.parse.urlencode(
+        {"Revision": requested, "Recursive": "true"}
+    )
+    payload = request_json(
+        f"{MS_ENDPOINT}/api/v1/models/"
+        f"{urllib.parse.quote(model_id, safe='/')}/repo/files?{params}",
+        token=token,
+    )
+    files = (payload.get("Data") or {}).get("Files") or []
+    commits = [
+        (int(item.get("CommittedDate") or 0), str(item.get("Revision") or ""))
+        for item in files
+        if isinstance(item, dict)
+        and re.fullmatch(r"[0-9a-fA-F]{40,64}", str(item.get("Revision") or ""))
+    ]
+    if not commits:
+        raise CatalogError(
+            tr(
+                "ModelScope 没有返回可固定的仓库提交 SHA",
+                "ModelScope did not return an immutable repository commit SHA",
+            )
+        )
+    return max(commits)[1].lower()
+
+
 def ms_search(query: str, task: str, limit: int, token: str | None) -> list[dict[str, Any]]:
     tasks = ["text-generation", "image-text-to-text"] if task == "auto" else [
         "image-text-to-text" if task == "vision" else "text-generation"
@@ -761,7 +794,7 @@ def inspect_ms(model_id: str, revision: str | None, token: str | None) -> dict[s
         token=token,
     )
     detail = payload.get("data") or {}
-    rev = revision or "master"
+    rev = ms_resolve_revision(model_id, revision, token)
     config = ms_raw_file(model_id, rev, "config.json", token)
     tokenizer = ms_raw_file(model_id, rev, "tokenizer_config.json", token)
     return {

@@ -85,7 +85,7 @@ class LlmctlLifecycleTests(unittest.TestCase):
                     *) return 1 ;;
                   esac
                 }}
-                cmd_model_upgrade apply legacy --yes
+                cmd_model_upgrade apply legacy --hub modelscope --yes
                 """
             )
             completed = subprocess.run(
@@ -96,6 +96,7 @@ class LlmctlLifecycleTests(unittest.TestCase):
             )
             payload = json.loads(submitted.read_text(encoding="utf-8"))
         self.assertEqual(payload["source_deployment_id"], "legacy")
+        self.assertEqual(payload["target_hub"], "modelscope")
         self.assertEqual(payload["target_revision"], revision)
         self.assertEqual(payload["expected_registry_revision"], 7)
         self.assertIn("ornith-ai/Ornith-1.5-35B-A3B-FP8", completed.stdout)

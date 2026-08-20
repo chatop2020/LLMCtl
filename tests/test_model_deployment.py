@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,7 +124,7 @@ class ModelDeploymentTests(unittest.TestCase):
         """返回无需网络且覆盖升级拓扑与能力映射的目录结果。"""
 
         return {
-            "source": "huggingface",
+            "source": "modelscope",
             "id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
             "revision": "0" * 40,
             "weight_bytes": 39_365_175_520,
@@ -255,6 +256,7 @@ class ModelDeploymentTests(unittest.TestCase):
             deployment["model_id"], "ornith-ai/Ornith-1.5-35B-A3B-FP8"
         )
         self.assertEqual(request["artifact"]["revision"], "0" * 40)
+        self.assertEqual(request["artifact"]["hub"], "modelscope")
         self.assertEqual(deployment["public_model_ids"], ["ornith-1.0-35b-fp8"])
         self.assertEqual(deployment["runtime"]["tensor_parallel_size"], 2)
         self.assertEqual(len(deployment["instances"]), 4)
@@ -306,6 +308,13 @@ class ModelDeploymentTests(unittest.TestCase):
                     "target_revision": "main",
                 }
             )
+        with self.assertRaisesRegex(ValueError, "目标来源"):
+            manager.plan_upgrade(
+                {
+                    "source_deployment_id": "legacy",
+                    "target_hub": "arbitrary-hub",
+                }
+            )
         inspector.assert_not_called()
 
     def test_ornith_upgrade_submit_persists_upgrade_metadata_before_background_start(self):
@@ -339,11 +348,45 @@ class ModelDeploymentTests(unittest.TestCase):
         manager = MODEL.DeploymentManager(self.paths)
         with mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus):
             snapshot = manager.snapshot()
-        self.assertEqual(
-            snapshot["upgrade_profiles"][0]["model_id"],
-            "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+        profiles = snapshot["upgrade_profiles"]
+        self.assertGreater(len(profiles), 10)
+        self.assertTrue(
+            any(
+                item["hub"] == "modelscope"
+                and item["model_id"] == "ornith-ai/Ornith-1.5-35B-A3B-FP8"
+                for item in profiles
+            )
+        )
+        self.assertTrue(
+            any(
+                item["hub"] == "huggingface"
+                and item["model_id"] == "ornith-ai/Ornith-1.5-9B"
+                for item in profiles
+            )
         )
         self.assertFalse(self.paths.registry.exists())
+
+    def test_upgrade_catalog_failure_surfaces_hub_error_instead_of_exit_code(self):
+        """Hub 失败原因必须穿透到页面，不能只剩无法排障的退出码 2。"""
+
+        runner = mock.Mock()
+        runner.run.return_value = subprocess.CompletedProcess(
+            args=["model_catalog"],
+            returncode=2,
+            stdout="[catalog] ERROR: ModelScope 请求失败: HTTP 403",
+        )
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        with self.assertRaisesRegex(RuntimeError, "ModelScope 请求失败: HTTP 403"):
+            manager._inspect_upgrade_target(
+                "modelscope",
+                "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+                "",
+                262144,
+                0.9,
+            )
+        command = runner.run.call_args.args[0]
+        self.assertIn("modelscope", command)
+        self.assertFalse(runner.run.call_args.kwargs["check"])
 
     def test_upgrade_inference_probe_requires_an_assistant_message(self):
         """升级发布前的真实探测不能把空 choices 或纯健康响应当成成功。"""

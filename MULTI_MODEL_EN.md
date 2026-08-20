@@ -48,7 +48,7 @@ For Qwen TP4, configure GPUs `4,5,6,7` as one instance. For four TP1 instances, 
 Do not overwrite the 1.0 weight directory or execute a mutable Hub `main` revision. The **Ornith version upgrade** panel at the top of the Model Deployments page follows this flow:
 
 1. Select the active Ornith deployment. The guided upgrade owns local Workers only; remote instances must be upgraded by their own control plane.
-2. Select the official `ornith-ai/Ornith-1.5-35B-A3B-FP8` target. The revision may be blank during planning; LLMCtl resolves and displays the full immutable SHA.
+2. Select a target from the official native-GPU Ornith weights grouped by ModelScope and Hugging Face. The page follows the current deployment Hub by default and prefers the size-compatible `ornith-ai/Ornith-1.5-35B-A3B-FP8`. The revision may be blank during planning; LLMCtl resolves and displays the full immutable SHA.
 3. Start conservatively with a `32768` context. The controller re-plans TP and replica count from the real GPUs, memory, and target weights instead of copying the 1.0 topology.
 4. Review the pinned SHA, affected Workers, target TP, retained old-weight path, and rollback behavior. Planning does not download weights or stop services.
 5. Confirm during a maintenance window. After the new Workers become healthy, the controller runs one real text generation against every instance and only then switches the public route.
@@ -57,8 +57,8 @@ Do not overwrite the 1.0 weight directory or execute a mutable Hub `main` revisi
 The CLI uses the same backend contract and does not require hand-written deployment JSON:
 
 ```bash
-sudo llmctl model upgrade plan legacy --max-model-len 32768
-sudo llmctl model upgrade apply legacy --max-model-len 32768
+sudo llmctl model upgrade plan legacy --hub modelscope --model ornith-ai/Ornith-1.5-35B-A3B-FP8 --max-model-len 32768
+sudo llmctl model upgrade apply legacy --hub modelscope --model ornith-ai/Ornith-1.5-35B-A3B-FP8 --max-model-len 32768
 sudo llmctl model job <upgrade-job-id>
 sudo llmctl model upgrade rollback <upgrade-job-id>
 ```

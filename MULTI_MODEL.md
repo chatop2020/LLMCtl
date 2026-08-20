@@ -48,7 +48,7 @@ LLMCtl 3.5 起可以在管理后台的“模型部署”页面下载、校验和
 不要覆盖 1.0 权重目录，也不要把 Hub 的 `main` 直接作为执行版本。管理后台“模型部署”页顶部的“Ornith 版本升级”使用以下流程：
 
 1. 选择当前已启用的 Ornith 部署。升级只支持本机 Worker；远程实例由其所属控制面升级。
-2. 选择官方 `ornith-ai/Ornith-1.5-35B-A3B-FP8` 目标。revision 可以留空；生成计划时会解析并显示完整不可变 SHA。
+2. 从按 ModelScope / Hugging Face 分组的官方 Ornith 原生 GPU 权重中选择目标；页面默认沿用当前部署的 Hub，并优先选择规格相近的 `ornith-ai/Ornith-1.5-35B-A3B-FP8`。revision 可以留空；生成计划时会解析并显示完整不可变 SHA。
 3. 保守起步时把最大上下文保持为 `32768`。控制服务使用真实 GPU、显存和模型权重重新规划 TP 与实例数，不照搬 1.0 拓扑。
 4. 核对固定 SHA、受影响 Worker、目标 TP、旧权重路径和回退说明。生成计划不会下载权重或停止服务。
 5. 安排维护窗口后确认升级。新 Worker 健康后，控制器会逐实例执行一次真实文本生成；全部通过后才切换公开路由。
@@ -57,8 +57,8 @@ LLMCtl 3.5 起可以在管理后台的“模型部署”页面下载、校验和
 命令行使用同一后端契约，不需要手写部署 JSON：
 
 ```bash
-sudo llmctl model upgrade plan legacy --max-model-len 32768
-sudo llmctl model upgrade apply legacy --max-model-len 32768
+sudo llmctl model upgrade plan legacy --hub modelscope --model ornith-ai/Ornith-1.5-35B-A3B-FP8 --max-model-len 32768
+sudo llmctl model upgrade apply legacy --hub modelscope --model ornith-ai/Ornith-1.5-35B-A3B-FP8 --max-model-len 32768
 sudo llmctl model job <升级任务ID>
 sudo llmctl model upgrade rollback <升级任务ID>
 ```

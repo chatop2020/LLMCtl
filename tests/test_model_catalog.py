@@ -89,6 +89,26 @@ class CatalogPlanningTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in results], ["example/Test-Instruct"])
         self.assertIn("MLX", error.getvalue())
 
+    def test_modelscope_branch_is_pinned_to_latest_repository_commit(self):
+        """ModelScope 的 master 也必须在升级计划中转换为不可变 SHA。"""
+
+        older = "a" * 40
+        latest = "b" * 40
+        response = {
+            "Data": {
+                "Files": [
+                    {"CommittedDate": 10, "Revision": older},
+                    {"CommittedDate": 20, "Revision": latest},
+                ]
+            }
+        }
+        with mock.patch.object(catalog, "request_json", return_value=response) as request:
+            revision = catalog.ms_resolve_revision(
+                "ornith-ai/Ornith-1.5-35B-A3B-FP8", "master", None
+            )
+        self.assertEqual(revision, latest)
+        self.assertIn("Revision=master", request.call_args.args[0])
+
     def test_host_resources_drive_startup_parallelism(self):
         hardware = self.hardware(
             8,

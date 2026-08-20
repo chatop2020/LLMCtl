@@ -8,8 +8,38 @@ from typing import Any
 
 
 DEFAULT_ORNITH_TARGET_MODEL = "ornith-ai/Ornith-1.5-35B-A3B-FP8"
+DEFAULT_ORNITH_TARGET_HUB = "modelscope"
 IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{40,64}$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+SUPPORTED_TARGET_HUBS = frozenset({"huggingface", "modelscope"})
+
+# 仅列出官方 ornith-ai 命名空间中可由本项目 NVIDIA/vLLM 部署链处理的原生
+# 权重；MLX 与 GGUF 属于不同运行时，不在这里伪装成可部署升级目标。
+OFFICIAL_ORNITH_GPU_TARGETS = {
+    "modelscope": (
+        "ornith-ai/Ornith-1.5-9B",
+        "ornith-ai/Ornith-1.5-35B-A3B",
+        DEFAULT_ORNITH_TARGET_MODEL,
+        "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
+        "ornith-ai/Ornith-1.5-397B",
+        "ornith-ai/Ornith-1.5-397B-FP8",
+        "ornith-ai/Ornith-1.5-397B-NVFP4",
+    ),
+    "huggingface": (
+        "ornith-ai/Ornith-1.0-9B",
+        "ornith-ai/Ornith-1.0-35B",
+        "ornith-ai/Ornith-1.0-35B-FP8",
+        "ornith-ai/Ornith-1.0-397B",
+        "ornith-ai/Ornith-1.0-397B-FP8",
+        "ornith-ai/Ornith-1.5-9B",
+        "ornith-ai/Ornith-1.5-35B-A3B",
+        DEFAULT_ORNITH_TARGET_MODEL,
+        "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
+        "ornith-ai/Ornith-1.5-397B",
+        "ornith-ai/Ornith-1.5-397B-FP8",
+        "ornith-ai/Ornith-1.5-397B-NVFP4",
+    ),
+}
 
 
 def upgrade_profiles() -> list[dict[str, Any]]:
@@ -19,17 +49,24 @@ def upgrade_profiles() -> list[dict[str, Any]]:
     接受已经固定的 SHA，因此上游 `main` 后续变化不会改变已确认计划。
     """
 
-    return [
-        {
-            "id": "ornith-1.5-35b-a3b-fp8",
-            "family": "ornith",
-            "label": "Ornith 1.5 35B-A3B FP8",
-            "model_id": DEFAULT_ORNITH_TARGET_MODEL,
-            "revision": "",
-            "recommended_max_model_len": 32768,
-            "description": "与现有 Ornith 1.0 35B FP8 规模接近的官方升级目标。",
-        }
-    ]
+    profiles: list[dict[str, Any]] = []
+    for hub, model_ids in OFFICIAL_ORNITH_GPU_TARGETS.items():
+        for model_id in model_ids:
+            model_name = model_id.rsplit("/", 1)[-1]
+            profiles.append(
+                {
+                    "id": f"{hub}-{model_name.lower()}",
+                    "family": "ornith",
+                    "hub": hub,
+                    "label": model_name,
+                    "model_id": model_id,
+                    "revision": "",
+                    "recommended": model_id == DEFAULT_ORNITH_TARGET_MODEL,
+                    "recommended_max_model_len": 32768,
+                    "description": "ornith-ai 官方原生 GPU 权重；计划阶段会按当前硬件执行部署门禁。",
+                }
+            )
+    return profiles
 
 
 def select_source_deployment(
@@ -84,6 +121,9 @@ def requested_upgrade_target(
         包含目标模型、可选 revision、上下文和显存利用率的目录检查参数。
     """
 
+    hub = str(payload.get("target_hub") or DEFAULT_ORNITH_TARGET_HUB).strip().lower()
+    if hub not in SUPPORTED_TARGET_HUBS:
+        raise ValueError("Ornith 升级目标来源只能是 ModelScope 或 Hugging Face")
     model_id = str(payload.get("target_model_id") or DEFAULT_ORNITH_TARGET_MODEL).strip()
     if not MODEL_ID_RE.fullmatch(model_id) or "ornith" not in model_id.lower():
         raise ValueError("Ornith 版本升级只能选择 Ornith 目标模型")
@@ -101,6 +141,7 @@ def requested_upgrade_target(
     if max_model_len < 8192 or max_model_len > 262144:
         raise ValueError("目标最大上下文必须位于 8192-262144")
     return {
+        "hub": hub,
         "model_id": model_id,
         "revision": revision,
         "max_model_len": max_model_len,
@@ -188,6 +229,8 @@ def build_upgrade_request(
         raise ValueError(f"目标模型未通过本机部署门禁：{reasons or '目录没有返回可执行计划'}")
     if str(catalog.get("id", "")) != target["model_id"]:
         raise ValueError("目录检查返回的模型身份与升级目标不一致")
+    if str(catalog.get("source", "")).lower() != target["hub"]:
+        raise ValueError("目录检查返回的模型来源与升级目标不一致")
     revision = str(catalog.get("revision", "")).lower()
     if not IMMUTABLE_REVISION_RE.fullmatch(revision):
         raise ValueError("目录检查没有解析出不可变目标 revision")
@@ -245,13 +288,14 @@ def build_upgrade_request(
         (
             item
             for item in upgrade_profiles()
-            if item["model_id"] == target["model_id"]
+            if item["hub"] == target["hub"]
+            and item["model_id"] == target["model_id"]
         ),
         None,
     )
     request = {
         "deployment_id": str(source["id"]),
-        "hub": "huggingface",
+        "hub": target["hub"],
         "model_id": target["model_id"],
         "revision": revision,
         "public_model_id": public_ids[0],
@@ -286,6 +330,7 @@ def build_upgrade_request(
         "current_model_id": str(source.get("model_id", "")),
         "current_revision": str(source_artifact.get("revision", "")),
         "current_artifact_path": str(source_artifact.get("path", "")),
+        "target_hub": target["hub"],
         "target_model_id": target["model_id"],
         "target_revision": revision,
         "target_weight_bytes": int(catalog.get("weight_bytes") or 0),

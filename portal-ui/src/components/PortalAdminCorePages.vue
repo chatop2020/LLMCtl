@@ -592,15 +592,25 @@ export default {
                     </label>
                     <label>
                       升级目标
-                      <select v-model="modelUpgradeForm.target_model_id">
-                        <option
-                          v-for="profile in modelUpgradeProfiles"
-                          :key="profile.id"
-                          :value="profile.model_id"
+                      <select v-model="modelUpgradeForm.target_profile_id">
+                        <optgroup
+                          v-for="group in modelUpgradeProfileGroups"
+                          :key="group.hub"
+                          :label="group.label"
                         >
-                          {{ profile.label }}
-                        </option>
+                          <option
+                            v-for="profile in group.profiles"
+                            :key="profile.id"
+                            :value="profile.id"
+                          >
+                            {{ profile.model_id }}
+                          </option>
+                        </optgroup>
                       </select>
+                      <small>
+                        {{ modelUpgradeForm.target_hub === "modelscope" ? "ModelScope" : "Hugging Face" }}
+                        · {{ modelUpgradeForm.target_model_id }}
+                      </small>
                     </label>
                     <label>
                       固定 revision（可留空）
@@ -639,7 +649,10 @@ export default {
                       </div>
                       <div>
                         <dt>目标版本</dt>
-                        <dd>{{ modelUpgradePlan.upgrade.target_model_id }}</dd>
+                        <dd>
+                          {{ modelUpgradePlan.upgrade.target_hub === "modelscope" ? "ModelScope" : "Hugging Face" }}
+                          · {{ modelUpgradePlan.upgrade.target_model_id }}
+                        </dd>
                       </div>
                       <div>
                         <dt>固定 SHA</dt>
