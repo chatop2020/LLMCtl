@@ -616,7 +616,8 @@ class DeploymentManager:
         self,
         paths: Paths,
         runner: CommandRunner | None = None,
-        upgrade_inspector: Callable[[str, str, int, float], dict[str, Any]] | None = None,
+        upgrade_inspector: Callable[[str, str, str, int, float], dict[str, Any]]
+        | None = None,
     ):
         """初始化注册表、任务存储、命令执行器和升级目录检查器。
 
@@ -677,6 +678,7 @@ class DeploymentManager:
 
     def _inspect_upgrade_target(
         self,
+        hub: str,
         model_id: str,
         revision: str,
         max_model_len: int,
@@ -685,7 +687,8 @@ class DeploymentManager:
         """通过固定模型目录助手解析 SHA、能力和真实主机拓扑计划。
 
         参数：
-            model_id: Hugging Face 上的目标模型身份。
+            hub: 目标模型所在的 ModelScope 或 Hugging Face。
+            model_id: Hub 上的目标模型身份。
             revision: 可选的不可变提交 SHA；空值由目录解析当前提交。
             max_model_len: 管理员希望保留的单请求上下文上限。
             gpu_memory_utilization: 来源部署已经使用的显存比例。
@@ -700,7 +703,7 @@ class DeploymentManager:
             "--lang",
             "zh",
             "inspect",
-            "huggingface",
+            hub,
             model_id,
         ]
         if revision:
@@ -719,10 +722,22 @@ class DeploymentManager:
         environment = os.environ.copy()
         environment.update(parse_env_file(self.paths.proxy_env))
         try:
-            result = self.runner.run(command, timeout=90, env=environment)
-            payload = json.loads(result.stdout or "")
-        except (OSError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            result = self.runner.run(
+                command, check=False, timeout=90, env=environment
+            )
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             raise RuntimeError(f"无法完成目标模型目录检查：{error}") from error
+        output = (result.stdout or "").strip()
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as error:
+            if result.returncode:
+                detail = "；".join(output.splitlines()[-4:])[-2000:]
+                raise RuntimeError(
+                    "无法完成目标模型目录检查："
+                    f"{detail or f'目录命令退出码 {result.returncode}'}"
+                ) from error
+            raise RuntimeError("目标模型目录返回了无效 JSON") from error
         if not isinstance(payload, dict):
             raise RuntimeError("目标模型目录返回结构无效")
         return payload
@@ -791,14 +806,28 @@ class DeploymentManager:
         source = select_source_deployment(
             current, str(payload.get("source_deployment_id") or "").strip()
         )
-        target = requested_upgrade_target(source, payload)
+        normalized_payload = dict(payload)
+        if not str(normalized_payload.get("target_hub") or "").strip():
+            source_artifact = current.get("artifacts", {}).get(
+                source.get("artifact_id"), {}
+            )
+            source_hub = str(source_artifact.get("hub") or "").strip().lower()
+            normalized_payload["target_hub"] = (
+                source_hub
+                if source_hub in {"huggingface", "modelscope"}
+                else "modelscope"
+            )
+        target = requested_upgrade_target(source, normalized_payload)
         catalog = self.upgrade_inspector(
+            target["hub"],
             target["model_id"],
             target["revision"],
             target["max_model_len"],
             target["gpu_memory_utilization"],
         )
-        request, summary = build_upgrade_request(current, source, payload, catalog)
+        request, summary = build_upgrade_request(
+            current, source, normalized_payload, catalog
+        )
         plan = self.plan(request)
         if int(self.registry.read().get("revision", 0)) != int(
             current.get("revision", 0)

@@ -26,11 +26,20 @@ describe("模型版本升级组合逻辑", () => {
       },
       upgrade_profiles: [
         {
-          id: "ornith-1.5",
+          id: "modelscope-ornith-1.5",
+          hub: "modelscope",
           label: "Ornith 1.5",
           model_id: "ornith-ai/Ornith-1.5-35B-A3B-FP8",
           revision: "",
+          recommended: true,
           recommended_max_model_len: 32768,
+        },
+        {
+          id: "huggingface-ornith-1.5-9b",
+          hub: "huggingface",
+          label: "Ornith 1.5 9B",
+          model_id: "ornith-ai/Ornith-1.5-9B",
+          revision: "",
         },
       ],
     };
@@ -66,6 +75,11 @@ describe("模型版本升级组合逻辑", () => {
     expect(state.modelUpgradeForm.target_model_id).toBe(
       "ornith-ai/Ornith-1.5-35B-A3B-FP8",
     );
+    expect(state.modelUpgradeForm.target_hub).toBe("modelscope");
+    expect(state.modelUpgradeProfileGroups.value.map((group) => group.label)).toEqual([
+      "ModelScope",
+      "Hugging Face",
+    ]);
     expect(state.modelUpgradeForm.max_model_len).toBe(262144);
 
     await state.planModelUpgrade();
@@ -74,6 +88,7 @@ describe("模型版本升级组合逻辑", () => {
     const submitted = calls.find((call) => call.path === "admin/model-upgrades/submit");
     expect(submitted.body).toMatchObject({
       source_deployment_id: "legacy",
+      target_hub: "modelscope",
       target_model_id: "ornith-ai/Ornith-1.5-35B-A3B-FP8",
       target_revision: "0".repeat(40),
       expected_registry_revision: 7,

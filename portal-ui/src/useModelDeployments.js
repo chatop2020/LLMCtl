@@ -23,6 +23,8 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   const modelUpgradeConfirmed = ref(false);
   const modelUpgradeForm = reactive({
     source_deployment_id: "",
+    target_profile_id: "",
+    target_hub: "",
     target_model_id: "",
     target_revision: "",
     max_model_len: 32768,
@@ -83,6 +85,22 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   const modelUpgradeProfiles = computed(
     () => modelDeployments.value?.upgrade_profiles || [],
   );
+  const modelUpgradeProfileGroups = computed(() => {
+    const source = modelDeploymentRows.value.find(
+      (deployment) => deployment.id === modelUpgradeForm.source_deployment_id,
+    );
+    const artifact = modelDeploymentRegistry.value.artifacts?.[source?.artifact_id] || {};
+    const preferredHub = ["modelscope", "huggingface"].includes(artifact.hub)
+      ? artifact.hub
+      : "modelscope";
+    return [preferredHub, ...["modelscope", "huggingface"].filter((hub) => hub !== preferredHub)]
+      .map((hub) => ({
+        hub,
+        label: hub === "modelscope" ? "ModelScope" : "Hugging Face",
+        profiles: modelUpgradeProfiles.value.filter((profile) => profile.hub === hub),
+      }))
+      .filter((group) => group.profiles.length);
+  });
   const modelUpgradeUnavailableReason = computed(() => {
     if (!modelDeployments.value || modelDeployments.value.available === false)
       return "";
@@ -138,6 +156,16 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
 
   let upgradeSourceDefaultsId = "";
 
+  function applyUpgradeProfile(profileId) {
+    const profile = modelUpgradeProfiles.value.find((item) => item.id === profileId);
+    if (!profile) return false;
+    modelUpgradeForm.target_profile_id = profile.id;
+    modelUpgradeForm.target_hub = profile.hub || "modelscope";
+    modelUpgradeForm.target_model_id = profile.model_id || "";
+    modelUpgradeForm.target_revision = profile.revision || "";
+    return true;
+  }
+
   /**
    * 从来源部署读取升级前真实生效的上下文。
    * 管理员切换来源时更新一次，后续自动刷新不覆盖其手工调整。
@@ -152,6 +180,22 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       Number.isInteger(maxModelLen) && maxModelLen >= 8192 && maxModelLen <= 262144
         ? maxModelLen
         : 32768;
+    const artifact = modelDeploymentRegistry.value.artifacts?.[source.artifact_id] || {};
+    const preferredHub = ["modelscope", "huggingface"].includes(artifact.hub)
+      ? artifact.hub
+      : "modelscope";
+    const preferredProfile =
+      modelUpgradeProfiles.value.find(
+        (profile) =>
+          profile.hub === preferredHub &&
+          profile.model_id === "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+      ) ||
+      modelUpgradeProfiles.value.find(
+        (profile) => profile.hub === preferredHub && profile.recommended,
+      ) ||
+      modelUpgradeProfiles.value.find((profile) => profile.hub === preferredHub) ||
+      modelUpgradeProfiles.value[0];
+    if (preferredProfile) applyUpgradeProfile(preferredProfile.id);
     upgradeSourceDefaultsId = deploymentId;
   }
 
@@ -161,6 +205,10 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       if (deploymentId && deploymentId !== upgradeSourceDefaultsId)
         applyUpgradeSourceRuntime(deploymentId);
     },
+  );
+  watch(
+    () => modelUpgradeForm.target_profile_id,
+    (profileId) => applyUpgradeProfile(profileId),
   );
 
   async function loadModelDeployments(options = {}) {
@@ -179,11 +227,6 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       }
       if (!result.gateway?.registry_publish)
         modelDeploymentForm.publish_requested = false;
-      const profile = (result.upgrade_profiles || [])[0];
-      if (!modelUpgradeForm.target_model_id && profile) {
-        modelUpgradeForm.target_model_id = profile.model_id || "";
-        modelUpgradeForm.target_revision = profile.revision || "";
-      }
       const sources = Object.values(result.registry?.deployments || {}).filter(
         (deployment) =>
           deployment.enabled !== false &&
@@ -197,6 +240,12 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
         !upgradeSourceDefaultsId
       ) {
         applyUpgradeSourceRuntime(modelUpgradeForm.source_deployment_id);
+      }
+      if (!modelUpgradeForm.target_profile_id) {
+        const profile = (result.upgrade_profiles || []).find(
+          (item) => item.hub === "modelscope" && item.recommended,
+        ) || (result.upgrade_profiles || [])[0];
+        if (profile) applyUpgradeProfile(profile.id);
       }
     } catch (error) {
       modelDeployments.value = { available: false, error: error.message };
@@ -484,11 +533,13 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       source_deployment_id: String(
         modelUpgradeForm.source_deployment_id || "",
       ).trim(),
+      target_hub: String(modelUpgradeForm.target_hub || "").trim(),
       target_model_id: String(modelUpgradeForm.target_model_id || "").trim(),
       target_revision: String(modelUpgradeForm.target_revision || "").trim(),
       max_model_len: Number(modelUpgradeForm.max_model_len),
     };
     if (!payload.source_deployment_id) throw new Error("请选择要升级的 Ornith 部署");
+    if (!payload.target_hub) throw new Error("请选择 Ornith 升级目标来源");
     if (!payload.target_model_id) throw new Error("请选择 Ornith 升级目标");
     return payload;
   }
@@ -566,6 +617,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     modelDeploymentRows,
     modelDeploymentJobs,
     modelUpgradeProfiles,
+    modelUpgradeProfileGroups,
     modelUpgradeUnavailableReason,
     ornithUpgradeSources,
     activeModelDeploymentJob,

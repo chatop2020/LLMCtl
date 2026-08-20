@@ -269,6 +269,9 @@ describe("LLMCtl portal contracts", () => {
       "回退到升级前",
       "模型部署控制服务仍在运行旧版本",
       "source.runtime?.max_model_len",
+      "modelUpgradeProfileGroups",
+      "profile.model_id",
+      "target_hub",
       "managed_runtime_corrected_count",
       "接入层旧值",
     ])

@@ -431,7 +431,7 @@ model_control_request() {
 # 从命令行构造与管理页面相同的 Ornith 升级契约。目标 revision 在计划阶段由
 # 控制服务解析成固定 SHA，apply 必须携带计划返回的注册表版本以拒绝陈旧确认。
 cmd_model_upgrade() {
-  local operation="${1:-plan}" source_id="" target_model="" target_revision=""
+  local operation="${1:-plan}" source_id="" target_hub="" target_model="" target_revision=""
   local max_model_len=32768 assume_yes=0 payload plan_file submit_file answer=""
   shift || true
   if [[ "${operation}" == rollback ]]; then
@@ -441,12 +441,13 @@ cmd_model_upgrade() {
   fi
   [[ "${operation}" == plan || "${operation}" == apply ]] || \
     die "model upgrade 子命令必须是 plan|apply|rollback"
-  (($# >= 1)) || die "用法：llmctl model upgrade ${operation} <部署ID> [--model MODEL_ID] [--revision SHA] [--max-model-len N] [--yes]"
+  (($# >= 1)) || die "用法：llmctl model upgrade ${operation} <部署ID> [--hub modelscope|huggingface] [--model MODEL_ID] [--revision SHA] [--max-model-len N] [--yes]"
   source_id="$1"
   shift
   [[ "${source_id}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "来源部署 ID 非法"
   while (($#)); do
     case "$1" in
+      --hub) target_hub="${2:?缺少目标模型来源}"; shift 2 ;;
       --model) target_model="${2:?缺少目标模型 ID}"; shift 2 ;;
       --revision) target_revision="${2:?缺少目标 revision}"; shift 2 ;;
       --max-model-len) max_model_len="${2:?缺少目标上下文}"; shift 2 ;;
@@ -454,6 +455,8 @@ cmd_model_upgrade() {
       *) die "未知 model upgrade 参数：$1" ;;
     esac
   done
+  [[ -z "${target_hub}" || "${target_hub}" == modelscope || "${target_hub}" == huggingface ]] || \
+    die "目标模型来源只能是 modelscope 或 huggingface"
   [[ "${max_model_len}" =~ ^[0-9]+$ ]] && \
     ((max_model_len >= 8192 && max_model_len <= 262144)) || \
     die "目标最大上下文必须位于 8192-262144"
@@ -463,10 +466,11 @@ cmd_model_upgrade() {
   chmod 0600 "${payload}" "${plan_file}" "${submit_file}"
   jq -n \
     --arg source_deployment_id "${source_id}" \
+    --arg target_hub "${target_hub}" \
     --arg target_model_id "${target_model}" \
     --arg target_revision "${target_revision}" \
     --argjson max_model_len "${max_model_len}" \
-    '{source_deployment_id:$source_deployment_id,target_model_id:$target_model_id,
+    '{source_deployment_id:$source_deployment_id,target_hub:$target_hub,target_model_id:$target_model_id,
       target_revision:$target_revision,max_model_len:$max_model_len}' >"${payload}"
   model_control_request upgrade-plan "${payload}" >"${plan_file}" || {
     rm -f "${payload}" "${plan_file}" "${submit_file}"
