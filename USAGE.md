@@ -411,7 +411,7 @@ sudo bash install-llm-cluster.sh --force-reconfigure
 sudo llmctl upgrade
 ```
 
-命令会询问是否从 GitHub 获取 `main` 最新提交。它同时预检 GitHub API 和 ZIP 归档下载站点；预检后真实下载仍可能失败，此时会自动检查已保存维护代理，仍不可用就询问新的代理并重试。升级内容限于 `llmctl` 与 `/usr/local/lib/llm-cluster/` 下由升级清单声明的控制面程序；当前模型、Worker、网关运行数据、配置、密钥、数据库和 Nginx 均保留。账户门户正在运行时会短暂停止并验收，失败自动从 `/var/backups/llmctl/` 回滚。
+命令会询问是否从 GitHub 获取 `main` 最新提交。它同时预检 GitHub API 和 ZIP 归档下载站点；预检后真实下载仍可能失败，此时会自动检查已保存维护代理，仍不可用就询问新的代理并重试。升级内容限于 `llmctl` 与 `/usr/local/lib/llm-cluster/` 下由升级清单声明的控制面程序；当前模型、Worker、网关运行数据、配置、密钥、数据库和 Nginx 均保留。账户门户会短暂停止并验收，模型部署控制服务会重启以加载新能力；失败时自动从 `/var/backups/llmctl/` 回滚。
 
 升级不会自动重写 Nginx。需要应用新版公网安全配置时再执行 `sudo llmctl nginx apply`；它只更新 LLMCtl 自己的 `/etc/nginx/conf.d/llm-cluster.conf`，不会重启 GPU Worker。
 

@@ -411,7 +411,7 @@ Upgrade the LLMCtl control plane itself without reinstalling or restarting worke
 sudo llmctl upgrade
 ```
 
-The command asks whether to fetch the latest `main` commit from GitHub. It preflights both the GitHub API and the ZIP archive host. If a real transfer still fails after preflight, it tries the saved maintenance proxy and then offers a new proxy before retrying. The upgrade is limited to `llmctl` and control-plane programs declared under `/usr/local/lib/llm-cluster/`. Models, workers, gateway runtime data, configuration, secrets, databases, and Nginx are preserved. A running account portal is stopped briefly for acceptance and automatically restored from `/var/backups/llmctl/` on failure.
+The command asks whether to fetch the latest `main` commit from GitHub. It preflights both the GitHub API and the ZIP archive host. If a real transfer still fails after preflight, it tries the saved maintenance proxy and then offers a new proxy before retrying. The upgrade is limited to `llmctl` and control-plane programs declared under `/usr/local/lib/llm-cluster/`. Models, workers, gateway runtime data, configuration, secrets, databases, and Nginx are preserved. The account portal is stopped briefly for acceptance, and the model deployment controller is restarted to load new capabilities; failures restore the old control plane from `/var/backups/llmctl/`.
 
 An upgrade does not rewrite Nginx automatically. Run `sudo llmctl nginx apply` when you want the newer public-edge hardening; it changes only LLMCtl's `/etc/nginx/conf.d/llm-cluster.conf` and does not restart GPU workers.
 

@@ -19,6 +19,7 @@ describe("模型版本升级组合逻辑", () => {
             enabled: true,
             model_id: "protoLabsAI/Ornith-1.0-35B-FP8",
             instances: [{ kind: "local", enabled: true, worker_id: 0 }],
+            runtime: { max_model_len: 262144 },
           },
         },
         artifacts: {},
@@ -65,6 +66,7 @@ describe("模型版本升级组合逻辑", () => {
     expect(state.modelUpgradeForm.target_model_id).toBe(
       "ornith-ai/Ornith-1.5-35B-A3B-FP8",
     );
+    expect(state.modelUpgradeForm.max_model_len).toBe(262144);
 
     await state.planModelUpgrade();
     state.modelUpgradeConfirmed.value = true;
@@ -80,5 +82,40 @@ describe("模型版本升级组合逻辑", () => {
       expect.stringContaining("公开切换前会先执行真实生成"),
       "working",
     );
+  });
+
+  it("旧模型控制进程缺少升级目录时显示明确恢复命令", async () => {
+    const api = vi.fn(async () => ({
+      available: true,
+      gateway: { registry_publish: true },
+      gpus: [{ id: 0 }],
+      jobs: [],
+      registry: {
+        deployments: {
+          legacy: {
+            id: "legacy",
+            enabled: true,
+            model_id: "protoLabsAI/Ornith-1.0-35B-FP8",
+            runtime: { max_model_len: 262144 },
+            instances: [{ kind: "local", enabled: true, worker_id: 0 }],
+          },
+        },
+        artifacts: {},
+      },
+    }));
+    const state = useModelDeployments({
+      api,
+      isAdmin: ref(true),
+      session: ref({ authenticated: true }),
+      notify: vi.fn(),
+    });
+
+    await state.loadModelDeployments();
+
+    expect(state.modelUpgradeProfiles.value).toEqual([]);
+    expect(state.modelUpgradeUnavailableReason.value).toContain(
+      "sudo llmctl model init",
+    );
+    expect(state.modelUpgradeForm.max_model_len).toBe(262144);
   });
 });

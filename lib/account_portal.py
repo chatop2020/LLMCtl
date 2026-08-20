@@ -39,15 +39,24 @@ class PortalControlPlane(
     业务规则。数据库、OmniRoute 和配置对象由服务组合根注入。
     """
 
-    def __init__(self, config: Config, db: Database, omni: OmniRouteClient):
+    def __init__(
+        self,
+        config: Config,
+        db: Database,
+        omni: OmniRouteClient,
+        models: ModelDeploymentClient | None = None,
+    ):
         """初始化共享状态。
 
         参数：
             config: 已完成启动校验的门户配置。
             db: 当前活动的门户数据库访问入口。
             omni: 访问 OmniRoute 管理 API 的受限客户端。
+            models: 可选的模型部署注册表客户端；用于让本机运行配置覆盖接入层
+                中陈旧的模型上下文元数据。
         """
         self.config, self.db, self.omni = config, db, omni
+        self.models = models
         self.lock = threading.RLock()
         self.usage_reconciled_at: dict[str, int] = {}
         self.free_visibility_reconciled_at = 0
@@ -68,7 +77,7 @@ class PortalServer:
         self.omni = OmniRouteClient(config)
         self.workflow = WorkflowClient()
         self.models = ModelDeploymentClient()
-        self.control = PortalControlPlane(config, self.db, self.omni)
+        self.control = PortalControlPlane(config, self.db, self.omni, self.models)
         self.monitor = SystemMonitor()
         # 首次升级进程可能仍是上一版本升级器；修改 OmniRoute 或任一 SQLite
         # 数据库前，先等待其健康验收和文件回滚窗口结束，避免控制面升级失败后

@@ -658,11 +658,13 @@ validate_installed_workflow_runtime() {
 }
 
 wait_for_model_control() {
-  local elapsed=0
+  local elapsed=0 snapshot=""
   while (( elapsed < 30 )); do
     if systemctl is-active --quiet "${MODEL_CONTROL_SERVICE}" && \
        [[ -S "${MODEL_CONTROL_SOCKET}" ]] && \
-       "${MODEL_CONTROL_RUNTIME}" snapshot >/dev/null 2>&1; then
+       snapshot=$("${MODEL_CONTROL_RUNTIME}" snapshot 2>/dev/null) && \
+       jq -e '.upgrade_profiles | type == "array" and length > 0' \
+         <<<"${snapshot}" >/dev/null; then
       return 0
     fi
     sleep 1
@@ -762,8 +764,12 @@ install_control_plane() {
 
   DEPLOYMENT_STARTED=1
   if (( ACCOUNT_WAS_ACTIVE )); then
-    log "$(l10n '仅短暂停止账户门户；Router、Nginx、Docker 和 GPU Worker 保持运行。' 'Stopping only the account portal briefly; Router, Nginx, Docker, and GPU workers remain running.')"
+    log "$(l10n '短暂停止账户门户；Router、Nginx、Docker 和 GPU Worker 保持运行。' 'Briefly stopping the account portal; the Router, Nginx, Docker, and GPU Workers remain running.')"
     systemctl stop "${ACCOUNT_SERVICE}"
+  fi
+  if (( MODEL_CONTROL_WAS_ACTIVE )); then
+    log "$(l10n '短暂停止模型部署控制服务以加载新版升级能力；Router 和 GPU Worker 不受影响。' 'Briefly stopping the model deployment controller to load the new upgrade capability; the Router and GPU Workers are unaffected.')"
+    systemctl stop "${MODEL_CONTROL_SERVICE}"
   fi
   while read -r entry_type source destination mode restart; do
     [[ -n "${entry_type}" && "${entry_type}" != \#* ]] || continue

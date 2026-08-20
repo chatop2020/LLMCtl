@@ -124,7 +124,7 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("cmd_responses() {", MANAGER)
         self.assertIn('responses) cmd_responses "$@"', MANAGER)
         self.assertIn("account_helper reconcile-public-routes", MANAGER)
-        self.assertIn("仅短暂停止账户门户", MANAGER)
+        self.assertIn("短暂停止账户门户", MANAGER)
         self.assertIn("workflow_require_runtime()", MANAGER)
         self.assertIn("llmctl upgrade --force", MANAGER)
 
@@ -169,6 +169,22 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("validate_installed_workflow_runtime()", source)
         self.assertIn('"${WORKFLOW_RUNTIME}" --version >/dev/null', source)
         self.assertIn("validate_installed_workflow_runtime", normal_upgrade)
+
+    def test_upgrader_restarts_model_control_and_requires_upgrade_capability(self):
+        """覆盖运行文件前必须停旧进程，启动验收必须证明新升级 API 已加载。"""
+
+        source = UPGRADER.read_text(encoding="utf-8")
+        install = source.split("install_control_plane() {", 1)[1].split(
+            "rollback_from_backup() {", 1
+        )[0]
+        stop = 'systemctl stop "${MODEL_CONTROL_SERVICE}"'
+        manifest_loop = 'while read -r entry_type source destination mode restart'
+        self.assertIn(stop, install)
+        self.assertLess(install.index(stop), install.index(manifest_loop))
+        wait = source.split("wait_for_model_control() {", 1)[1].split(
+            "configure_model_control_service() {", 1
+        )[0]
+        self.assertIn("upgrade_profiles", wait)
 
     def test_upgrade_backup_and_explicit_rollback_cover_runtime_sqlite(self):
         source = UPGRADER.read_text(encoding="utf-8")
