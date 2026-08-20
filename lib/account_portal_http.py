@@ -698,6 +698,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.models.request("upgrade-plan", payload)
             elif path == "/portal-api/admin/model-upgrades/submit":
                 result = self.app.models.request("upgrade-submit", payload)
+            elif path == "/portal-api/admin/model-download/proxy/test":
+                result = self.app.models.request("download-proxy-test", payload)
+            elif path == "/portal-api/admin/model-download/proxy/save":
+                result = self.app.models.request("download-proxy-save", payload)
+            elif path == "/portal-api/admin/model-download/proxy/clear":
+                result = self.app.models.request("download-proxy-clear", payload)
             elif path == "/portal-api/admin/model-deployments/job":
                 result = self.app.models.request(
                     "job", {"id": str(payload.get("id", ""))}

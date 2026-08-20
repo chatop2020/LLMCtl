@@ -12,6 +12,14 @@ describe("模型版本升级组合逻辑", () => {
       gateway: { registry_publish: true },
       gpus: [{ id: 0 }, { id: 1 }],
       jobs: [],
+      download_environment: {
+        maintenance_proxy: {
+          configured: false,
+          proxy_url: "",
+          no_proxy: "127.0.0.1,localhost,::1",
+        },
+        modelscope: { downloader_ready: false, auto_prepare: true },
+      },
       registry: {
         deployments: {
           legacy: {
@@ -93,10 +101,85 @@ describe("模型版本升级组合逻辑", () => {
       target_revision: "0".repeat(40),
       expected_registry_revision: 7,
     });
+    expect(state.modelUpgradePlan.value).toBeNull();
+    expect(state.activeModelDeploymentJob.value?.id).toBe("upgrade-job");
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining("公开切换前会先执行真实生成"),
       "working",
     );
+  });
+
+  it("在页面真实测试、保存并清除模型下载代理", async () => {
+    const calls = [];
+    const api = vi.fn(async (path, options = {}) => {
+      calls.push({ path, body: options.body ? JSON.parse(options.body) : null });
+      if (path === "admin/model-deployments") {
+        return {
+          available: true,
+          gateway: { registry_publish: true },
+          gpus: [],
+          jobs: [],
+          registry: { deployments: {}, artifacts: {} },
+          upgrade_profiles: [],
+          download_environment: {
+            maintenance_proxy: {
+              configured: false,
+              proxy_url: "",
+              no_proxy: "127.0.0.1,localhost,::1",
+            },
+            modelscope: { downloader_ready: false, auto_prepare: true },
+          },
+        };
+      }
+      if (path.endsWith("/proxy/test")) {
+        return { ok: true, hub: "huggingface", proxy_url: "http://proxy:7890" };
+      }
+      if (path.endsWith("/proxy/save")) {
+        return {
+          maintenance_proxy: {
+            configured: true,
+            proxy_url: "http://proxy:7890",
+            no_proxy: "127.0.0.1,localhost,::1",
+          },
+          modelscope: { downloader_ready: false, auto_prepare: true },
+        };
+      }
+      if (path.endsWith("/proxy/clear")) {
+        return {
+          maintenance_proxy: {
+            configured: false,
+            proxy_url: "",
+            no_proxy: "127.0.0.1,localhost,::1",
+          },
+          modelscope: { downloader_ready: false, auto_prepare: true },
+        };
+      }
+      throw new Error(`未处理的测试路径：${path}`);
+    });
+    const state = useModelDeployments({
+      api,
+      isAdmin: ref(true),
+      session: ref({ authenticated: true }),
+      notify: vi.fn(),
+    });
+    await state.loadModelDeployments();
+    Object.assign(state.modelDownloadProxyForm, {
+      proxy_url: "http://proxy:7890",
+      hub: "huggingface",
+    });
+
+    await state.testModelDownloadProxy();
+    expect(state.modelDownloadProxyMessage.value).toContain("测试通过");
+    await state.saveModelDownloadProxy();
+    expect(state.modelDeployments.value.download_environment.maintenance_proxy.configured).toBe(true);
+    await state.clearModelDownloadProxy();
+    expect(state.modelDownloadProxyForm.proxy_url).toBe("");
+    expect(calls.map((call) => call.path)).toEqual([
+      "admin/model-deployments",
+      "admin/model-download/proxy/test",
+      "admin/model-download/proxy/save",
+      "admin/model-download/proxy/clear",
+    ]);
   });
 
   it("旧模型控制进程缺少升级目录时显示明确恢复命令", async () => {

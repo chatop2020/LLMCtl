@@ -1,4 +1,4 @@
-import { computed, reactive, ref, watch } from "vue";
+import { computed, nextTick, reactive, ref, watch } from "vue";
 
 /**
  * 建立模型部署页面的状态、计划指纹和受限操作。
@@ -21,6 +21,14 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   const modelUpgradeSubmitting = ref(false);
   const modelUpgradePlan = ref(null);
   const modelUpgradeConfirmed = ref(false);
+  const modelUpgradeSubmitError = ref("");
+  const modelDownloadProxyBusy = ref(false);
+  const modelDownloadProxyMessage = ref("");
+  const modelDownloadProxyForm = reactive({
+    proxy_url: "",
+    no_proxy: "127.0.0.1,localhost,::1",
+    hub: "huggingface",
+  });
   const modelUpgradeForm = reactive({
     source_deployment_id: "",
     target_profile_id: "",
@@ -122,6 +130,12 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       (job) => !["succeeded", "failed", "cancelled", "rolled_back"].includes(job.state),
     ),
   );
+  const displayedModelUpgradeJob = computed(
+    () =>
+      activeModelDeploymentJob.value ||
+      modelDeploymentJobs.value.find((job) => job.kind === "upgrade") ||
+      null,
+  );
   const selectedDeploymentGpus = computed(() =>
     new Set(modelDeploymentForm.selected_gpu_ids.map((value) => Number(value))),
   );
@@ -155,6 +169,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   );
 
   let upgradeSourceDefaultsId = "";
+  let downloadProxyDefaultsLoaded = false;
 
   function applyUpgradeProfile(profileId) {
     const profile = modelUpgradeProfiles.value.find((item) => item.id === profileId);
@@ -218,6 +233,13 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     try {
       const result = await api("admin/model-deployments");
       modelDeployments.value = result;
+      const proxy = result.download_environment?.maintenance_proxy;
+      if (!downloadProxyDefaultsLoaded && proxy) {
+        modelDownloadProxyForm.proxy_url = proxy.proxy_url || "";
+        modelDownloadProxyForm.no_proxy =
+          proxy.no_proxy || "127.0.0.1,localhost,::1";
+        downloadProxyDefaultsLoaded = true;
+      }
       const gpuIds = (result.gpus || []).map((gpu) => Number(gpu.id));
       if (!modelDeploymentForm.selected_gpu_ids.length && gpuIds.length) {
         const midpoint = Math.max(1, Math.ceil(gpuIds.length / 2));
@@ -527,6 +549,111 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     }[value] || value || "未知";
   }
 
+  /** 返回 Web UI 代理测试与保存接口共享的最小配置。 */
+  function modelDownloadProxyPayload() {
+    return {
+      proxy_url: String(modelDownloadProxyForm.proxy_url || "").trim(),
+      no_proxy: String(modelDownloadProxyForm.no_proxy || "").trim(),
+      hub: String(modelDownloadProxyForm.hub || "huggingface").trim(),
+    };
+  }
+
+  /** 通过候选代理执行真实 Hub 元数据请求，但不修改服务器配置。 */
+  async function testModelDownloadProxy() {
+    if (modelDownloadProxyBusy.value) return;
+    modelDownloadProxyBusy.value = true;
+    modelDownloadProxyMessage.value = "正在通过代理访问目标 Hub…";
+    try {
+      const payload = modelDownloadProxyPayload();
+      const result = await api("admin/model-download/proxy/test", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      modelDownloadProxyMessage.value = `${result.hub} 代理测试通过；尚未保存。`;
+    } catch (error) {
+      modelDownloadProxyMessage.value = `代理测试失败：${error.message}`;
+    } finally {
+      modelDownloadProxyBusy.value = false;
+    }
+  }
+
+  /** 测试成功后保存维护代理，并立即更新页面显示的权威状态。 */
+  async function saveModelDownloadProxy() {
+    if (modelDownloadProxyBusy.value) return;
+    modelDownloadProxyBusy.value = true;
+    modelDownloadProxyMessage.value = "正在测试并保存维护代理…";
+    try {
+      const environment = await api("admin/model-download/proxy/save", {
+        method: "POST",
+        body: JSON.stringify(modelDownloadProxyPayload()),
+      });
+      if (modelDeployments.value) {
+        modelDeployments.value = {
+          ...modelDeployments.value,
+          download_environment: environment,
+        };
+      }
+      modelDownloadProxyMessage.value = "维护代理已测试并保存，后续目录检查和权重下载会自动使用。";
+    } catch (error) {
+      modelDownloadProxyMessage.value = `代理保存失败：${error.message}`;
+    } finally {
+      modelDownloadProxyBusy.value = false;
+    }
+  }
+
+  /** 清除维护代理；该操作不会修改 Router、Worker 或推理运行时代理。 */
+  async function clearModelDownloadProxy() {
+    if (modelDownloadProxyBusy.value) return;
+    modelDownloadProxyBusy.value = true;
+    try {
+      const environment = await api("admin/model-download/proxy/clear", {
+        method: "POST",
+        body: "{}",
+      });
+      modelDownloadProxyForm.proxy_url = "";
+      if (modelDeployments.value) {
+        modelDeployments.value = {
+          ...modelDeployments.value,
+          download_environment: environment,
+        };
+      }
+      modelDownloadProxyMessage.value = "维护代理已清除；后续下载恢复为直连。";
+    } catch (error) {
+      modelDownloadProxyMessage.value = `代理清除失败：${error.message}`;
+    } finally {
+      modelDownloadProxyBusy.value = false;
+    }
+  }
+
+  /**
+   * 把提交接口返回的任务立即写入当前快照，避免等待下一次轮询才显示反馈。
+   *
+   * @param {object|null} job 模型控制服务刚创建的完整任务对象。
+   * @returns {boolean} 任务包含有效 ID 且已经写入页面状态时返回真。
+   */
+  function recordModelDeploymentJob(job) {
+    if (!job?.id || !modelDeployments.value) return false;
+    const jobs = (modelDeployments.value.jobs || []).filter(
+      (item) => item?.id !== job.id,
+    );
+    modelDeployments.value = {
+      ...modelDeployments.value,
+      jobs: [job, ...jobs],
+    };
+    return true;
+  }
+
+  /**
+   * 在任务卡完成渲染后把它移入视口，让提交结果出现在原操作附近。
+   * 浏览器文档对象不存在的测试和服务端环境会安全跳过滚动。
+   */
+  async function focusActiveModelDeploymentJob() {
+    await nextTick();
+    globalThis.document
+      ?.querySelector("#model-deployment-active-job")
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
   function modelUpgradePayload() {
     /** 返回两端共用的最小升级契约，拓扑和能力由控制服务权威计算。 */
     const payload = {
@@ -575,11 +702,12 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       return;
     }
     modelUpgradeSubmitting.value = true;
+    modelUpgradeSubmitError.value = "";
     try {
       const payload = modelUpgradePayload();
       if (JSON.stringify(payload) !== modelUpgradePlan.value.request_fingerprint)
         throw new Error("升级参数已变化，请重新生成计划");
-      await api("admin/model-upgrades/submit", {
+      const job = await api("admin/model-upgrades/submit", {
         method: "POST",
         body: JSON.stringify({
           ...payload,
@@ -589,10 +717,19 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
             modelUpgradePlan.value.source_registry_revision,
         }),
       });
+      modelUpgradePlan.value = null;
+      modelUpgradeConfirmed.value = false;
       notify("Ornith 升级任务已进入后台；公开切换前会先执行真实生成", "working");
       await loadModelDeployments({ silent: true });
+      if (!(modelDeployments.value?.jobs || []).some((item) => item?.id === job?.id)) {
+        // 控制服务已持久化任务，但紧邻提交的快照可能仍由旧请求返回。
+        // 仅在权威快照缺少该 ID 时使用提交响应兜底，避免状态卡闪退。
+        recordModelDeploymentJob(job);
+      }
+      await focusActiveModelDeploymentJob();
     } catch (error) {
-      notify(`升级提交失败：${error.message}`, "bad");
+      modelUpgradeSubmitError.value = `升级提交失败：${error.message}`;
+      notify(modelUpgradeSubmitError.value, "bad");
     } finally {
       modelUpgradeSubmitting.value = false;
     }
@@ -609,6 +746,10 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     modelUpgradeSubmitting,
     modelUpgradePlan,
     modelUpgradeConfirmed,
+    modelUpgradeSubmitError,
+    modelDownloadProxyBusy,
+    modelDownloadProxyMessage,
+    modelDownloadProxyForm,
     modelUpgradeForm,
     modelDeploymentMode,
     modelDeploymentForm,
@@ -621,6 +762,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     modelUpgradeUnavailableReason,
     ornithUpgradeSources,
     activeModelDeploymentJob,
+    displayedModelUpgradeJob,
     selectedDeploymentGpus,
     assignedDeploymentGpus,
     loadModelDeployments,
@@ -636,6 +778,10 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     cancelModelDeployment,
     rollbackModelDeployment,
     deploymentJobStateLabel,
+    modelDownloadProxyPayload,
+    testModelDownloadProxy,
+    saveModelDownloadProxy,
+    clearModelDownloadProxy,
     modelUpgradePayload,
     planModelUpgrade,
     submitModelUpgrade,

@@ -48,11 +48,12 @@ For Qwen TP4, configure GPUs `4,5,6,7` as one instance. For four TP1 instances, 
 Do not overwrite the 1.0 weight directory or execute a mutable Hub `main` revision. The **Ornith version upgrade** panel at the top of the Model Deployments page follows this flow:
 
 1. Select the active Ornith deployment. The guided upgrade owns local Workers only; remote instances must be upgraded by their own control plane.
-2. Select a target from the official native-GPU Ornith weights grouped by ModelScope and Hugging Face. The page follows the current deployment Hub by default and prefers the size-compatible `ornith-ai/Ornith-1.5-35B-A3B-FP8`. The revision may be blank during planning; LLMCtl resolves and displays the full immutable SHA.
-3. Start conservatively with a `32768` context. The controller re-plans TP and replica count from the real GPUs, memory, and target weights instead of copying the 1.0 topology.
-4. Review the pinned SHA, affected Workers, target TP, retained old-weight path, and rollback behavior. Planning does not download weights or stop services.
-5. Confirm during a maintenance window. After the new Workers become healthy, the controller runs one real text generation against every instance and only then switches the public route.
-6. Download, load, generation, or route-publication failures restore the pre-upgrade snapshot automatically. After success, **Roll back before upgrade** reloads the retained 1.0 weights.
+2. If Hugging Face is not directly reachable, enter a proxy under **Download environment and maintenance proxy**, select Hugging Face, and choose **Test and save**. The proxy is limited to model catalog, dependency, and weight downloads and is never injected into the Router or Workers. A pinned ModelScope downloader is prepared automatically when missing.
+3. Select a target from the official native-GPU Ornith weights grouped by ModelScope and Hugging Face. The page follows the current deployment Hub by default and prefers the size-compatible `ornith-ai/Ornith-1.5-35B-A3B-FP8`. The revision may be blank during planning; LLMCtl resolves and displays the full immutable SHA.
+4. Start conservatively with a `32768` context. The controller re-plans TP and replica count from the real GPUs, memory, and target weights instead of copying the 1.0 topology.
+5. Review the pinned SHA, affected Workers, target TP, retained old-weight path, and rollback behavior. Planning does not download weights or stop services.
+6. Confirm during a maintenance window. The page immediately replaces the confirmation plan with task phase, progress, message, and logs. After the new Workers become healthy, the controller runs one real text generation against every instance and only then switches the public route.
+7. Download, load, generation, or route-publication failures restore the pre-upgrade snapshot automatically. After success, **Roll back before upgrade** reloads the retained 1.0 weights.
 
 The CLI uses the same backend contract and does not require hand-written deployment JSON:
 
