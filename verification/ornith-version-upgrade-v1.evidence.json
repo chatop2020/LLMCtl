@@ -1,0 +1,107 @@
+{
+  "plan_id": "ornith-version-upgrade",
+  "plan_version": 1,
+  "generated_at": "2026-08-20T09:09:23Z",
+  "source": {
+    "baseline_commit": "1ff6811120349d4dc54a8664a20fce2726865ff2",
+    "worktree": "dirty",
+    "input_sha256": "11a7dc2e4560d5866911d546ab11ea332cfc041ad5050df7a25a683d5ce06dc0",
+    "digest_scope": "git status records and current file bytes, excluding this evidence file"
+  },
+  "environment": {
+    "host": "macOS local development environment",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "target_production_environment": "Ubuntu 24.04 with NVIDIA GPUs"
+  },
+  "gates": [
+    {
+      "gate_id": "baseline",
+      "status": "Passed",
+      "evidence": [
+        "Baseline commit had a clean worktree.",
+        "196 Python tests passed before structural changes.",
+        "26 frontend tests and the baseline production build passed."
+      ]
+    },
+    {
+      "gate_id": "structural-split",
+      "status": "Passed",
+      "evidence": [
+        "account_portal.py: 9043 -> 283 physical lines; domain modules are each below 3000 lines.",
+        "App.vue: 7195 -> 2898 physical lines; page, dialog, shared component, context, and model-deployment modules are each below 3000 lines.",
+        "llmctl.sh: 4669 -> 2797 physical lines; workflow/model, optimizer, maintenance, and offline lifecycle modules are each below 3000 lines.",
+        "Installer and upgrade manifest include every new runtime module.",
+        "Source-structure regression tests passed."
+      ]
+    },
+    {
+      "gate_id": "upgrade-contract",
+      "status": "Passed",
+      "evidence": [
+        "The controller rejects unsafe model IDs, mutable revisions, stale registry confirmations, conflicting Worker/GPU plans, and unsupported gateway publication.",
+        "Planning resolves an immutable target SHA and re-plans TP/replicas from catalog and hardware evidence.",
+        "Upgrade jobs persist source/target/rollback metadata before the background thread starts.",
+        "Every target Worker must complete a real Chat Completions generation before public routing changes.",
+        "Automatic and explicit rollback wait for old Workers to become healthy before republishing the old route.",
+        "CLI, portal API, and Vue composable contract tests passed."
+      ]
+    },
+    {
+      "gate_id": "release-build",
+      "status": "Passed",
+      "evidence": [
+        "207 Python tests passed in 40.088 seconds.",
+        "28 frontend tests passed across 5 test files.",
+        "Portal production build passed with 25 transformed modules.",
+        "Control-plane ZIP validation, shell syntax, Python compilation, line-count checks, and git diff whitespace checks passed.",
+        "Built portal index SHA256: 9de949364314925517af8b5e8fa31f78e9ca51fdfe80fec6524f249cfeb1e249.",
+        "Built portal JavaScript SHA256: 44e0c531877d93438ef9e35e502f2ec0165fc488b2b3af74a5ac0491f0a62acf."
+      ]
+    },
+    {
+      "gate_id": "catalog-live-metadata",
+      "status": "Passed",
+      "evidence": [
+        "Hugging Face metadata resolved ornith-ai/Ornith-1.5-35B-A3B-FP8 to revision 0e048080ccd0ccf4296bfea5638036c196dccc0c.",
+        "Reported weights were 39365175520 bytes and architecture Qwen3_5MoeForConditionalGeneration was accepted by the pinned vLLM catalog.",
+        "A synthetic eight-by-80GB hardware plan produced TP1, eight replicas, 32768 context, and max_num_seqs 7. This is catalog evidence only, not target-host performance evidence."
+      ]
+    },
+    {
+      "gate_id": "local-browser-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "Authenticated administrator flow opened Model Deployments and rendered the Ornith version-upgrade panel.",
+        "The read-only plan showed current version, target model, immutable SHA, TP, affected Workers, old-weight path, and rollback warnings.",
+        "The submit button was disabled before explicit confirmation and enabled afterwards; local submission produced the expected background-task status.",
+        "At a 390x844 viewport the document width and viewport width were both 390 pixels, with no horizontal overflow."
+      ]
+    },
+    {
+      "gate_id": "gpu-field-acceptance",
+      "status": "Unverified",
+      "reason": "This local environment has no target Ubuntu/NVIDIA cluster and did not download or load the 39GB checkpoint.",
+      "required_actions": [
+        "Upgrade the control plane and initialize model-control if needed.",
+        "Run llmctl model upgrade plan against the real deployment.",
+        "Run apply in an approved maintenance window and wait for the real generation gate.",
+        "Run llmctl smoke --full and representative benchmarks.",
+        "Exercise llmctl model upgrade rollback and run llmctl smoke --full again."
+      ]
+    },
+    {
+      "gate_id": "operator-acceptance",
+      "status": "Unverified",
+      "reason": "A real cluster administrator has not yet approved a maintenance window or accepted live performance and rollback results."
+    }
+  ],
+  "artifacts": {
+    "verification_plan": "verification/ornith-version-upgrade-v1.json",
+    "built_portal": "lib/account_portal_ui",
+    "operator_runbook_zh": "MULTI_MODEL.md",
+    "operator_runbook_en": "MULTI_MODEL_EN.md"
+  },
+  "final_stage": "Implemented and locally verified; not deployed or field-accepted"
+}

@@ -32,7 +32,7 @@
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
 - 可选的 Go 工作流数据面支持把联网搜索、图片/音频/视频等 HTTP 适配器叠加到显式发布的模型；资源池使用可编辑的本机或远程 URL，普通模型请求继续走原有网关与 Worker 路径。详见 [WORKFLOW.md](WORKFLOW.md)。
-- 管理后台支持新增模型、复用本地权重、显式配置本机或远程 Worker、拆分 GPU、后台下载/验收、只重启受影响 Worker，以及失败后的任务级回滚。8 卡 Ornith/Qwen 拆分步骤见 [MULTI_MODEL.md](MULTI_MODEL.md)。
+- 管理后台支持新增模型、复用本地权重、显式配置本机或远程 Worker、拆分 GPU、后台下载/验收、只重启受影响 Worker，以及失败后的任务级回滚；另提供与 `llmctl model upgrade` 相同的 Ornith 版本升级向导，自动固定目标 revision、重新规划 TP，并保留旧权重和升级前回退点。8 卡拆分与版本升级步骤见 [MULTI_MODEL.md](MULTI_MODEL.md)。
 - `llmctl info` 提供分门别类的完整灾备清单：公开/内部入口、硬件、镜像、服务、自启、Worker、数据库、管理员、全部密钥/密码、SMTP、代理、模型与文件路径；默认仅供可信 root 终端明文查看，分享时用 `--redact`。
 - `llmctl optimize` 可采集流式 TTFT/ITL/E2E、聚合吞吐、GPU/显存/温度、CPU/内存/Swap 和 vLLM KV Cache/排队/抢占/前缀缓存指标；先解释候选原因、代价和边界，经用户确认后才备份配置、逐项重启试验、自动择优、完整冒烟，并在失败或中断时回滚。
 
@@ -47,15 +47,16 @@
 | 文件 | 用途 |
 |---|---|
 | `install-llm-cluster.sh` | 首次安装或重新选择模型/拓扑 |
-| `llmctl.sh` | 安装为全局命令 `/usr/local/sbin/llmctl` |
+| `llmctl.sh` / `lib/llmctl/` | 全局命令 `/usr/local/sbin/llmctl` 的薄入口与按命令域拆分的实现 |
 | `lib/model_catalog.py` | Hub 搜索、能力识别、显存估算和部署计划 |
 | `lib/runtime_optimizer.py` | 流式基准、GPU/vLLM 指标采集、保守候选生成与目标评分 |
 | `lib/gateway_config.py` | 四种接入层的无密钥配置生成及 New API/OmniRoute 状态同步 |
-| `lib/account_portal.py` | OmniRoute 企业账户门户、邮箱验证、预付余额和模型目录 |
+| `lib/account_portal.py` / `lib/account_portal_*.py` | OmniRoute 账户门户组合入口，以及按数据库、HTTP、网关、监控和业务策略拆分的实现 |
 | `lib/llm_benchmark.py` | 门户管理端的后台并发压测与流式性能指标执行器 |
 | `workflowd/` / `lib/workflowd/` | 可选 Go 工作流源码及 macOS 交叉编译的 Linux amd64/arm64 静态运行时 |
 | `lib/workflow_config.py` | 显式远程资源池、模型路由和适配器配置助手 |
 | `lib/model_deployment.py` | 多模型注册表、GPU/Worker 归属、后台部署与任务级回滚控制器 |
+| `lib/model_upgrade.py` | Ornith 版本升级目标、固定 revision、目标拓扑与旧版本保留规则 |
 | `portal-ui/` | Vue 3 企业门户源码与前端测试 |
 | `lib/account_portal_ui/` | 已构建、安装时直接复制的门户静态资源 |
 | `tests/test_model_catalog.py` | 目录与硬件规划单元测试 |

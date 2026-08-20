@@ -23,6 +23,7 @@ import shutil
 import socket
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +31,20 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Callable, Iterable
+
+
+# 测试和安装后的守护进程都可能按文件路径加载本模块。把同级目录作为领域
+# 模块解析根，确保升级规则不会依赖调用者当前工作目录。
+_MODEL_CONTROL_DIRECTORY = str(pathlib.Path(__file__).resolve().parent)
+if _MODEL_CONTROL_DIRECTORY not in sys.path:
+    sys.path.insert(0, _MODEL_CONTROL_DIRECTORY)
+
+from model_upgrade import (
+    build_upgrade_request,
+    requested_upgrade_target,
+    select_source_deployment,
+    upgrade_profiles,
+)
 
 
 APP_VERSION = "3.5.0"
@@ -133,6 +148,9 @@ class Paths:
     workers_dir: pathlib.Path
     proxy_env: pathlib.Path
     gateway_helper: pathlib.Path
+    catalog_helper: pathlib.Path = pathlib.Path(
+        "/usr/local/lib/llm-cluster/model_catalog.py"
+    )
 
     @classmethod
     def from_environment(cls) -> "Paths":
@@ -166,6 +184,12 @@ class Paths:
             gateway_helper=pathlib.Path(
                 os.environ.get(
                     "LLM_GATEWAY_HELPER", "/usr/local/lib/llm-cluster/gateway_config.py"
+                )
+            ),
+            catalog_helper=pathlib.Path(
+                os.environ.get(
+                    "LLM_CATALOG_HELPER",
+                    "/usr/local/lib/llm-cluster/model_catalog.py",
                 )
             ),
         )
@@ -588,13 +612,26 @@ class JobStore:
 class DeploymentManager:
     """执行计划、模型下载、局部 Worker 变更和失败回滚。"""
 
-    def __init__(self, paths: Paths, runner: CommandRunner | None = None):
-        """初始化注册表、任务存储和单任务互斥锁。"""
+    def __init__(
+        self,
+        paths: Paths,
+        runner: CommandRunner | None = None,
+        upgrade_inspector: Callable[[str, str, int, float], dict[str, Any]] | None = None,
+    ):
+        """初始化注册表、任务存储、命令执行器和升级目录检查器。
+
+        参数：
+            paths: 控制服务允许访问的受管路径。
+            runner: 可替换的外部命令执行器，用于故障测试和日志收集。
+            upgrade_inspector: 可选的目录检查函数；生产默认调用固定的
+                `model_catalog.py`，测试可注入无网络实现。
+        """
 
         self.paths = paths
         self.registry = RegistryStore(paths)
         self.jobs = JobStore(paths.jobs_dir)
         self.runner = runner or CommandRunner()
+        self.upgrade_inspector = upgrade_inspector or self._inspect_upgrade_target
         self._mutation_lock = threading.Lock()
         self._submission_lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
@@ -634,8 +671,61 @@ class DeploymentManager:
             "jobs": self.jobs.list(),
             "gpus": gpu_inventory(self.runner),
             "gateway": gateway_capabilities(self.paths),
+            "upgrade_profiles": upgrade_profiles(),
             "socket": str(self.paths.socket),
         }
+
+    def _inspect_upgrade_target(
+        self,
+        model_id: str,
+        revision: str,
+        max_model_len: int,
+        gpu_memory_utilization: float,
+    ) -> dict[str, Any]:
+        """通过固定模型目录助手解析 SHA、能力和真实主机拓扑计划。
+
+        参数：
+            model_id: Hugging Face 上的目标模型身份。
+            revision: 可选的不可变提交 SHA；空值由目录解析当前提交。
+            max_model_len: 管理员希望保留的单请求上下文上限。
+            gpu_memory_utilization: 来源部署已经使用的显存比例。
+
+        返回：
+            `model_catalog inspect --json` 的结构化结果。
+        """
+
+        command = [
+            sys.executable,
+            str(self.paths.catalog_helper),
+            "--lang",
+            "zh",
+            "inspect",
+            "huggingface",
+            model_id,
+        ]
+        if revision:
+            command.append(revision)
+        command.extend(
+            [
+                "--json",
+                "--model-root",
+                str(self.paths.model_root),
+                "--gpu-memory-utilization",
+                str(gpu_memory_utilization),
+                "--max-model-len",
+                str(max_model_len),
+            ]
+        )
+        environment = os.environ.copy()
+        environment.update(parse_env_file(self.paths.proxy_env))
+        try:
+            result = self.runner.run(command, timeout=90, env=environment)
+            payload = json.loads(result.stdout or "")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            raise RuntimeError(f"无法完成目标模型目录检查：{error}") from error
+        if not isinstance(payload, dict):
+            raise RuntimeError("目标模型目录返回结构无效")
+        return payload
 
     def plan(self, request: dict[str, Any]) -> dict[str, Any]:
         """校验部署请求并返回受影响 Worker、GPU 和兼容别名计划。"""
@@ -682,6 +772,92 @@ class DeploymentManager:
             "warnings": plan_warnings(current, candidate, normalized),
             "gateway": gateway,
         }
+
+    def plan_upgrade(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """为 Ornith 原地升级生成固定 revision、目标拓扑和回退说明。
+
+        参数：
+            payload: 来源部署、目标模型、可选目标 SHA 和上下文上限。
+
+        返回：
+            标准部署计划，以及当前/目标版本、资源变化和回退条件。
+
+        该方法只读访问注册表、GPU 和模型目录，不下载权重或修改服务。
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("升级请求必须是 JSON 对象")
+        current = self.registry.read()
+        source = select_source_deployment(
+            current, str(payload.get("source_deployment_id") or "").strip()
+        )
+        target = requested_upgrade_target(source, payload)
+        catalog = self.upgrade_inspector(
+            target["model_id"],
+            target["revision"],
+            target["max_model_len"],
+            target["gpu_memory_utilization"],
+        )
+        request, summary = build_upgrade_request(current, source, payload, catalog)
+        plan = self.plan(request)
+        if int(self.registry.read().get("revision", 0)) != int(
+            current.get("revision", 0)
+        ):
+            raise ValueError("升级检查期间部署注册表发生变化，请重新生成计划")
+        plan["source_registry_revision"] = int(current.get("revision", 0))
+        plan["upgrade"] = summary
+        plan["catalog"] = {
+            "id": catalog.get("id"),
+            "revision": catalog.get("revision"),
+            "weight_bytes": int(catalog.get("weight_bytes") or 0),
+            "architectures": list(catalog.get("supported_architectures") or []),
+            "capabilities": dict(catalog.get("capabilities") or {}),
+            "plan": dict(catalog.get("plan") or {}),
+        }
+        plan["warnings"] = [
+            "升级会重新加载全部受影响 Worker；提交前请安排维护窗口。",
+            "旧模型权重会保留，成功任务可从页面或 llmctl 回退到升级前快照。",
+            *plan.get("warnings", []),
+        ]
+        return plan
+
+    def submit_upgrade(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """提交已经确认且注册表版本未变化的 Ornith 升级任务。
+
+        参数：
+            payload: 与计划阶段相同的目标参数，并包含
+                `expected_registry_revision`。
+
+        返回：
+            已持久化的 waiting 状态升级任务。
+        """
+
+        with self._submission_lock:
+            if any(
+                item.get("state") not in TERMINAL_JOB_STATES
+                for item in self.jobs.list(limit=200)
+            ):
+                raise RuntimeError("已有模型部署或升级任务正在运行")
+            try:
+                expected_revision = int(payload.get("expected_registry_revision"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("升级提交缺少计划返回的注册表版本") from error
+            current_revision = int(self.registry.read().get("revision", 0))
+            if expected_revision != current_revision:
+                raise ValueError("部署注册表已变化，请重新生成升级计划")
+            plan = self.plan_upgrade(payload)
+            if int(plan["source_registry_revision"]) != expected_revision:
+                raise ValueError("升级检查期间部署注册表发生变化，请重新生成计划")
+            job = self.jobs.create(plan["normalized_request"], kind="upgrade")
+            job["upgrade"] = plan["upgrade"]
+            job["source_registry_revision"] = expected_revision
+            self.jobs.save(job)
+            thread = threading.Thread(
+                target=self._run_job, args=(job["id"],), daemon=True
+            )
+            self._threads[job["id"]] = thread
+            thread.start()
+        return job
 
     def submit(self, request: dict[str, Any]) -> dict[str, Any]:
         """提交后台部署任务；同一时间只允许一个 GPU 变更任务。"""
@@ -778,9 +954,22 @@ class DeploymentManager:
             self._apply_candidate(candidate, affected, request["deployment"]["id"])
             self._update_job(job, "starting", 72, "启动受影响 Worker 并等待健康")
             self._start_and_wait(candidate, affected)
+            is_upgrade = job.get("kind") == "upgrade"
+            if is_upgrade:
+                # 公开别名切换前必须让每个目标实例完成一次真实生成；仅有健康
+                # 端点不能证明量化内核、模板和推理路径可用。
+                self._update_job(
+                    job,
+                    "testing",
+                    84,
+                    "公开切换前逐实例执行真实文本生成",
+                )
+                self._verify_instances(
+                    candidate, request["deployment"]["id"], inference=True
+                )
             gateway = gateway_capabilities(self.paths)
             if gateway["registry_publish"]:
-                self._update_job(job, "publishing", 88, "同步多模型路由到当前 AI 接入层")
+                self._update_job(job, "publishing", 92, "同步多模型路由到当前 AI 接入层")
                 self._reconcile_gateway()
             else:
                 self._update_job(
@@ -789,21 +978,26 @@ class DeploymentManager:
                     88,
                     f"当前 AI 接入层 {gateway['kind']} 不支持注册表同步；已按计划跳过发布",
                 )
-            self._update_job(job, "testing", 95, "逐实例执行模型列表和健康检查")
-            self._verify_instances(candidate, request["deployment"]["id"])
+            if not is_upgrade:
+                self._update_job(job, "testing", 95, "逐实例执行模型列表和健康检查")
+                self._verify_instances(candidate, request["deployment"]["id"])
             job.update(
                 {
                     "state": "succeeded",
                     "phase": "succeeded",
                     "progress": 100,
-                    "message": "部署完成；公开模型可在门户中配置定价和授权",
+                    "message": (
+                        "升级完成；旧模型权重和升级前回退点均已保留"
+                        if is_upgrade
+                        else "部署完成；公开模型可在门户中配置定价和授权"
+                    ),
                     "backup": str(backup),
                 }
             )
             self.jobs.save(job)
         except InterruptedError as error:
             if backup:
-                self._restore_runtime(backup)
+                self._restore_runtime(backup, wait_for_health=True)
             job.update(
                 {
                     "state": "cancelled" if not backup else "rolled_back",
@@ -816,14 +1010,18 @@ class DeploymentManager:
             rollback_error = ""
             if backup:
                 try:
-                    self._restore_runtime(backup)
+                    self._restore_runtime(backup, wait_for_health=True)
                 except Exception as rollback_exception:
                     rollback_error = f"；自动回滚失败：{rollback_exception}"
             job.update(
                 {
                     "state": "failed" if not backup else "rolled_back",
                     "phase": "failed",
-                    "message": f"部署失败：{error}{rollback_error}",
+                    "message": (
+                        f"升级失败：{error}{rollback_error}"
+                        if job.get("kind") == "upgrade"
+                        else f"部署失败：{error}{rollback_error}"
+                    ),
                     "error": str(error)[:4000],
                 }
             )
@@ -1071,8 +1269,16 @@ class DeploymentManager:
             timeout=180,
         )
 
-    def _verify_instances(self, candidate: dict[str, Any], deployment_id: str) -> None:
-        """验证目标部署全部本机和远程实例均能响应健康检查。"""
+    def _verify_instances(
+        self, candidate: dict[str, Any], deployment_id: str, inference: bool = False
+    ) -> None:
+        """验证目标部署的健康端点，并按需执行真实文本生成。
+
+        参数：
+            candidate: 已写入 Worker 配置的候选注册表。
+            deployment_id: 本次需要验收的目标部署 ID。
+            inference: 为真时要求每个实例完成一次 Chat Completions 生成。
+        """
 
         deployment = candidate["deployments"][deployment_id]
         failures: list[str] = []
@@ -1086,6 +1292,13 @@ class DeploymentManager:
             )
             if not endpoint_healthy(origin, self.paths.secrets_env):
                 failures.append(str(instance["id"]))
+                continue
+            if inference and not endpoint_inference_ready(
+                origin,
+                self.paths.secrets_env,
+                str(deployment["served_model_name"]),
+            ):
+                failures.append(f"{instance['id']}:inference")
         if failures:
             raise RuntimeError(f"实例验收失败：{failures}")
 
@@ -1151,10 +1364,12 @@ class DeploymentManager:
         active_before = {int(item) for item in manifest.get("active_before", [])}
         for worker_id in sorted(affected & active_before):
             self.runner.run(["systemctl", "start", f"llm-worker@{worker_id}.service"])
+        if wait_for_health:
+            # 旧模型真实恢复健康后再把公开路由指回去，避免回退窗口把流量发送
+            # 到仍在加载权重的 Worker。
+            self._wait_worker_ids(affected & active_before)
         if gateway_capabilities(self.paths)["registry_publish"]:
             self._reconcile_gateway()
-        if wait_for_health:
-            self._wait_worker_ids(affected & active_before)
 
 
 def normalize_request(request: dict[str, Any], paths: Paths) -> dict[str, Any]:
@@ -1473,6 +1688,59 @@ def endpoint_healthy(origin: str, secrets_file: pathlib.Path) -> bool:
         return False
 
 
+def endpoint_inference_ready(
+    origin: str, secrets_file: pathlib.Path, served_model_name: str
+) -> bool:
+    """向单个 Worker 发送有界文本生成，验证真实模型执行路径。
+
+    参数：
+        origin: 不含 `/v1` 的 Worker 来源地址。
+        secrets_file: 保存内部 Worker API Key 的受保护环境文件。
+        served_model_name: 候选部署写入 vLLM 的服务模型名。
+
+    返回：
+        HTTP 成功且响应包含至少一个有效 assistant 消息时返回真。
+    """
+
+    key = parse_env_file(secrets_file).get("BACKEND_API_KEY", "")
+    body = json.dumps(
+        {
+            "model": served_model_name,
+            "messages": [{"role": "user", "content": "只回复 OK"}],
+            "temperature": 0,
+            "max_tokens": 16,
+            "stream": False,
+        },
+        ensure_ascii=False,
+    ).encode()
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(
+        f"{origin.rstrip('/')}/v1/chat/completions",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if not 200 <= response.status < 300:
+                return False
+            payload = json.loads(response.read(2 << 20))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return False
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return False
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        return False
+    return any(
+        isinstance(message.get(field), str) and bool(message.get(field).strip())
+        for field in ("content", "reasoning_content")
+    )
+
+
 def gpu_inventory(runner: CommandRunner) -> list[dict[str, Any]]:
     """读取 NVIDIA GPU 静态信息；无 GPU 或测试环境中返回空列表。"""
 
@@ -1579,6 +1847,10 @@ class ControlServer(socketserver.ThreadingUnixStreamServer):
             return self.manager.plan(payload)
         if operation == "submit":
             return self.manager.submit(payload)
+        if operation == "upgrade-plan":
+            return self.manager.plan_upgrade(payload)
+        if operation == "upgrade-submit":
+            return self.manager.submit_upgrade(payload)
         if operation == "job":
             return self.manager.jobs.get(str(payload.get("id", "")))
         if operation == "cancel":
@@ -1600,7 +1872,9 @@ def rpc_call(socket_path: pathlib.Path, operation: str, payload: dict[str, Any] 
 
     request = json.dumps({"operation": operation, "payload": payload or {}}, ensure_ascii=False).encode() + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(30)
+        # Hub 元数据和硬件目录检查可能跨越维护代理，升级计划使用独立的有界
+        # 等待；其他本机控制操作继续保持快速失败。
+        client.settimeout(120 if operation == "upgrade-plan" else 30)
         client.connect(str(socket_path))
         client.sendall(request)
         response = b""
@@ -1638,7 +1912,16 @@ def main() -> int:
     subparsers.add_parser("migrate")
     request_parser = subparsers.add_parser("request")
     request_parser.add_argument(
-        "operation", choices=["plan", "submit", "job", "cancel", "rollback"]
+        "operation",
+        choices=[
+            "plan",
+            "submit",
+            "upgrade-plan",
+            "upgrade-submit",
+            "job",
+            "cancel",
+            "rollback",
+        ],
     )
     request_parser.add_argument("json_file", type=pathlib.Path)
     args = parser.parse_args()

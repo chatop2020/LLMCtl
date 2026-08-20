@@ -20,11 +20,27 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: portal-ui/package-lock.json
+
       - name: Validate shell syntax
-        run: bash -n install-llm-cluster.sh llmctl.sh
+        run: bash -n install-llm-cluster.sh llmctl.sh upgrade-llmctl.sh lib/llmctl/*.sh
 
       - name: Compile Python sources
         run: python -m py_compile lib/*.py tests/*.py
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+      - name: Install portal dependencies
+        run: npm ci --prefix portal-ui
+
+      - name: Test and build portal
+        run: |
+          npm test --prefix portal-ui
+          npm run build --prefix portal-ui
+          git diff --exit-code -- lib/account_portal_ui

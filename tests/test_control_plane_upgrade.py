@@ -9,8 +9,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 UPGRADER = ROOT / "upgrade-llmctl.sh"
 MANIFEST = ROOT / "upgrade-manifest.tsv"
-MANAGER = (ROOT / "llmctl.sh").read_text(encoding="utf-8")
+MANAGER = "\n".join(
+    [
+        (ROOT / "llmctl.sh").read_text(encoding="utf-8"),
+        *(path.read_text(encoding="utf-8") for path in sorted((ROOT / "lib/llmctl").glob("*.sh"))),
+    ]
+)
 INSTALLER = (ROOT / "install-llm-cluster.sh").read_text(encoding="utf-8")
+ACCOUNT_PORTAL = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((ROOT / "lib").glob("account_portal*.py"))
+)
 
 
 class ControlPlaneUpgradeTests(unittest.TestCase):
@@ -23,6 +32,7 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/runtime_optimizer.py",
             "lib/gateway_config.py",
             "lib/model_deployment.py",
+            "lib/model_upgrade.py",
             "lib/account_portal.py",
             "lib/llm_benchmark.py",
             "lib/workflow_config.py",
@@ -35,6 +45,15 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "systemd/llm-workflow.service",
             "systemd/llm-model-control.service",
         ]
+        files.extend(
+            str(path.relative_to(ROOT))
+            for path in sorted((ROOT / "lib").glob("account_portal_*.py"))
+        )
+        files.extend(
+            str(path.relative_to(ROOT))
+            for path in sorted((ROOT / "lib/llmctl").rglob("*"))
+            if path.is_file()
+        )
         files.extend(
             str(path.relative_to(ROOT))
             for path in sorted((ROOT / "lib/account_portal_ui").rglob("*"))
@@ -120,9 +139,8 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
         self.assertIn("不需要安装额外软件", status)
         self.assertIn("不重启 Router 或 Worker", status)
 
-        account = (ROOT / "lib/account_portal.py").read_text(encoding="utf-8")
-        self.assertIn('"setup_command": "llmctl model init"', account)
-        self.assertIn("模型部署控制服务尚未注册；请运行 llmctl model init", account)
+        self.assertIn('"setup_command": "llmctl model init"', ACCOUNT_PORTAL)
+        self.assertIn("模型部署控制服务尚未注册；请运行 llmctl model init", ACCOUNT_PORTAL)
 
     def test_upgrader_preserves_runtime_and_only_refreshes_managed_nginx(self):
         source = UPGRADER.read_text(encoding="utf-8")

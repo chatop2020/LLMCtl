@@ -1,7 +1,17 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const source = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
+// 门户已经按页面和组合逻辑拆分；契约检查必须覆盖真实生产源码，同时排除
+// 测试文件本身，避免断言文本让检查产生假阳性。
+const componentSources = readdirSync(new URL("./components/", import.meta.url))
+  .filter((name) => name.endsWith(".vue"))
+  .map((name) => readFileSync(new URL(`./components/${name}`, import.meta.url), "utf8"));
+const source = [
+  readFileSync(new URL("./App.vue", import.meta.url), "utf8"),
+  readFileSync(new URL("./useModelDeployments.js", import.meta.url), "utf8"),
+  readFileSync(new URL("./portalWorkspaceContext.js", import.meta.url), "utf8"),
+  ...componentSources,
+].join("\n");
 const style = readFileSync(new URL("./style.css", import.meta.url), "utf8");
 
 describe("LLMCtl portal contracts", () => {
@@ -82,7 +92,7 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("usage_pagination?.total");
     expect(source).toContain("applyUsageFilters");
     expect(source).toContain(
-      "第 ${props.page} / ${props.pages} 页 · 共 ${props.total} 条",
+      "第 {{ page }} / {{ pages }} 页 · 共 {{ total }} 条",
     );
   });
 
@@ -245,6 +255,20 @@ describe("LLMCtl portal contracts", () => {
     ])
       expect(source).toContain(marker);
     expect(source).toContain("await Promise.all([refreshWorkspace(), loadWorkflow()])");
+  });
+
+  it("offers the same pinned Ornith upgrade and rollback contract as llmctl", () => {
+    for (const marker of [
+      "Ornith 版本升级",
+      "admin/model-upgrades/plan",
+      "admin/model-upgrades/submit",
+      "source_registry_revision",
+      "固定 SHA",
+      "公开切换前执行真实生成",
+      "确认升级并保留回退点",
+      "回退到升级前",
+    ])
+      expect(source).toContain(marker);
   });
 
   it("uses readable analytics tables and consistent accessible choice controls", () => {

@@ -43,6 +43,28 @@ For Qwen TP4, configure GPUs `4,5,6,7` as one instance. For four TP1 instances, 
 6. Confirm the impact and submit the background job. Jobs persist under `/var/lib/llm-cluster/model-control` and continue after leaving the page.
 7. Use rollback from the job details on failure. Rollback creates its own safety snapshot first.
 
+## Upgrade Ornith 1.0 to 1.5
+
+Do not overwrite the 1.0 weight directory or execute a mutable Hub `main` revision. The **Ornith version upgrade** panel at the top of the Model Deployments page follows this flow:
+
+1. Select the active Ornith deployment. The guided upgrade owns local Workers only; remote instances must be upgraded by their own control plane.
+2. Select the official `ornith-ai/Ornith-1.5-35B-A3B-FP8` target. The revision may be blank during planning; LLMCtl resolves and displays the full immutable SHA.
+3. Start conservatively with a `32768` context. The controller re-plans TP and replica count from the real GPUs, memory, and target weights instead of copying the 1.0 topology.
+4. Review the pinned SHA, affected Workers, target TP, retained old-weight path, and rollback behavior. Planning does not download weights or stop services.
+5. Confirm during a maintenance window. After the new Workers become healthy, the controller runs one real text generation against every instance and only then switches the public route.
+6. Download, load, generation, or route-publication failures restore the pre-upgrade snapshot automatically. After success, **Roll back before upgrade** reloads the retained 1.0 weights.
+
+The CLI uses the same backend contract and does not require hand-written deployment JSON:
+
+```bash
+sudo llmctl model upgrade plan legacy --max-model-len 32768
+sudo llmctl model upgrade apply legacy --max-model-len 32768
+sudo llmctl model job <upgrade-job-id>
+sudo llmctl model upgrade rollback <upgrade-job-id>
+```
+
+`apply` checks the registry revision again. If another administrator changed deployments after planning, submission is rejected and must be re-planned. `--yes` skips only the terminal prompt; it never bypasses immutable-revision, catalog, GPU, real-generation, or rollback gates.
+
 ## Command-Line Recovery Path
 
 ```bash

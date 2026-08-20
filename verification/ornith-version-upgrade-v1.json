@@ -1,0 +1,105 @@
+{
+  "plan_id": "ornith-version-upgrade",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L3",
+  "source": {
+    "baseline_commit": "1ff6811120349d4dc54a8664a20fce2726865ff2",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "先按稳定职责拆分超限源码，再提供可从命令行和管理页面执行的 Ornith 版本升级与回退流程。",
+    "acceptance": [
+      "account_portal.py、App.vue 和 llmctl.sh 不再承担多个独立职责，所有本次涉及的第一方源码文件不超过 3000 个物理行。",
+      "结构拆分不改变既有 HTTP、CLI、安装、升级打包和前端用户动线。",
+      "管理员可以预检 Ornith 升级，看到当前版本、目标版本、固定 revision、资源计划、受影响 Worker 和回退条件。",
+      "管理员可以从 llmctl 和管理页面提交同一份升级契约，并在成功后保留旧权重与可执行回退点。",
+      "失败、取消或显式回退只恢复受影响 Worker、注册表和接入层配置，不删除任一版本权重。"
+    ]
+  },
+  "risk": {
+    "level": "L3",
+    "assets": [
+      "模型权重与固定 revision",
+      "Worker/GPU 归属与服务可用性",
+      "公开模型 ID 和接入层映射",
+      "部署任务快照与回退入口"
+    ],
+    "trust_boundaries": [
+      "管理员浏览器到门户管理 API",
+      "门户到本机模型控制 Unix Socket",
+      "模型控制器到 systemd、Docker、模型 Hub 和接入层"
+    ],
+    "stop_conditions": [
+      "结构拆分后的既有 Required 门禁失败",
+      "目标 revision 未固定或模型身份校验失败",
+      "磁盘、GPU、Worker、端口或接入层不满足升级计划",
+      "部署后真实模型加载、能力冒烟或回退恢复失败"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "baseline",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "python3 -m unittest discover -s tests -v",
+        "npm test",
+        "npm run build"
+      ]
+    },
+    {
+      "gate_id": "structural-split",
+      "criticality": "Required",
+      "depends_on": ["baseline"],
+      "commands": [
+        "python3 -m py_compile lib/*.py tests/*.py",
+        "bash -n install-llm-cluster.sh llmctl.sh upgrade-llmctl.sh",
+        "python3 -m unittest discover -s tests -v",
+        "npm test",
+        "npm run build",
+        "first-party source line-count check"
+      ]
+    },
+    {
+      "gate_id": "upgrade-contract",
+      "criticality": "Required",
+      "depends_on": ["structural-split"],
+      "commands": [
+        "focused catalog, deployment, gateway, CLI and portal tests",
+        "failure, cancellation, stale-plan and rollback tests"
+      ]
+    },
+    {
+      "gate_id": "release-build",
+      "criticality": "Required",
+      "depends_on": ["upgrade-contract"],
+      "commands": [
+        "repository full unit test suite",
+        "portal production build",
+        "control-plane ZIP --check",
+        "final line-count and generated-asset consistency checks"
+      ]
+    },
+    {
+      "gate_id": "gpu-field-acceptance",
+      "criticality": "Required",
+      "depends_on": ["release-build"],
+      "environment": "Ubuntu 24.04 target host with supported NVIDIA GPUs and the configured gateway",
+      "commands": [
+        "llmctl model upgrade plan",
+        "llmctl model upgrade apply",
+        "llmctl smoke --full",
+        "llmctl model upgrade rollback",
+        "llmctl smoke --full"
+      ],
+      "expected_status_without_target_host": "Unverified"
+    },
+    {
+      "gate_id": "operator-acceptance",
+      "criticality": "Required",
+      "depends_on": ["gpu-field-acceptance"],
+      "actor": "真实集群管理员",
+      "expected_status_without_operator": "Unverified"
+    }
+  ]
+}
