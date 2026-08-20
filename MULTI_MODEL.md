@@ -43,6 +43,28 @@ LLMCtl 3.5 起可以在管理后台的“模型部署”页面下载、校验和
 6. 确认影响范围后提交后台任务。页面可以离开，任务状态持久化在 `/var/lib/llm-cluster/model-control`。
 7. 失败时在任务详情中执行回滚；回滚本身也先创建安全快照。
 
+## Ornith 1.0 升级到 1.5
+
+不要覆盖 1.0 权重目录，也不要把 Hub 的 `main` 直接作为执行版本。管理后台“模型部署”页顶部的“Ornith 版本升级”使用以下流程：
+
+1. 选择当前已启用的 Ornith 部署。升级只支持本机 Worker；远程实例由其所属控制面升级。
+2. 选择官方 `ornith-ai/Ornith-1.5-35B-A3B-FP8` 目标。revision 可以留空；生成计划时会解析并显示完整不可变 SHA。
+3. 保守起步时把最大上下文保持为 `32768`。控制服务使用真实 GPU、显存和模型权重重新规划 TP 与实例数，不照搬 1.0 拓扑。
+4. 核对固定 SHA、受影响 Worker、目标 TP、旧权重路径和回退说明。生成计划不会下载权重或停止服务。
+5. 安排维护窗口后确认升级。新 Worker 健康后，控制器会逐实例执行一次真实文本生成；全部通过后才切换公开路由。
+6. 下载、加载、生成或路由同步失败会自动恢复升级前快照。成功后，任务详情中的“回退到升级前”会重新加载保留的 1.0 权重。
+
+命令行使用同一后端契约，不需要手写部署 JSON：
+
+```bash
+sudo llmctl model upgrade plan legacy --max-model-len 32768
+sudo llmctl model upgrade apply legacy --max-model-len 32768
+sudo llmctl model job <升级任务ID>
+sudo llmctl model upgrade rollback <升级任务ID>
+```
+
+`apply` 会再次检查注册表版本；计划生成后如果其他管理员修改了部署，提交会拒绝并要求重新计划。`--yes` 只跳过命令行确认，不会跳过固定 revision、目录、GPU、真实生成或回滚门禁。
+
 ## 命令行兜底
 
 ```bash

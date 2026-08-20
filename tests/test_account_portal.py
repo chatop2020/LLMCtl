@@ -26,6 +26,11 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = portal
 SPEC.loader.exec_module(portal)
 
+# 结构拆分后，测试需要在实际持有依赖的领域模块上替换时钟和邮件发送器，
+# 避免只修改入口模块的兼容导出而没有触达运行中的方法全局变量。
+import account_portal_control_usage as portal_usage
+import account_portal_http as portal_http
+
 
 class FakeOmniRoute:
     def __init__(self):
@@ -541,7 +546,7 @@ class PortalIntegrationTests(unittest.TestCase):
         csrf = self.cookie_value(jar, portal.CSRF_COOKIE)
         captured = []
         with mock.patch.object(
-            portal,
+            portal_http,
             "send_verification_email",
             side_effect=lambda config, recipient, token: captured.append((recipient, token)),
         ):
@@ -738,7 +743,7 @@ class PortalIntegrationTests(unittest.TestCase):
         }
         captured = []
         with mock.patch.object(
-            portal,
+            portal_http,
             "send_verification_email",
             side_effect=lambda config, recipient, token: captured.append((recipient, token)),
         ):
@@ -835,7 +840,7 @@ class PortalIntegrationTests(unittest.TestCase):
             "recipient": "admin@example.com",
         }
         with mock.patch.object(
-            portal,
+            portal_http,
             "send_test_email",
             side_effect=lambda config, recipient: captured.append((config, recipient)),
         ):
@@ -1223,7 +1228,7 @@ class PortalIntegrationTests(unittest.TestCase):
                     ),
                 )
         with mock.patch.dict(portal.os.environ, {"TZ": "Asia/Shanghai"}), mock.patch.object(
-            portal, "now", return_value=current
+            portal_usage, "now", return_value=current
         ):
             result = self.server.control.admin_analytics(
                 range_key="today", selected_user_id="policy-user"
@@ -1273,7 +1278,7 @@ class PortalIntegrationTests(unittest.TestCase):
                 ),
             )
         with mock.patch.dict(portal.os.environ, {"TZ": "Asia/Shanghai"}), mock.patch.object(
-            portal, "now", return_value=current
+            portal_usage, "now", return_value=current
         ):
             first_page = self.server.control.admin_usage_report(
                 period="day", anchor="2026-08-03", page=1, page_size=1
@@ -1440,6 +1445,50 @@ class PortalIntegrationTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(event["status"], "success")
         self.assertIn('"requests_per_minute":100', event["detail"])
+
+    def test_admin_ornith_upgrade_routes_forward_only_to_model_control_socket(self):
+        """页面升级请求必须经管理员鉴权，并复用模型控制服务的白名单操作。"""
+
+        class FakeModels:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, operation, payload=None):
+                self.calls.append((operation, payload or {}))
+                if operation == "upgrade-plan":
+                    return {
+                        "source_registry_revision": 7,
+                        "upgrade": {"target_revision": "0" * 40},
+                    }
+                return {"id": "upgrade-job", "kind": "upgrade", "state": "waiting"}
+
+        models = FakeModels()
+        self.server.models = models
+        client, jar = self.login_admin_api()
+        payload = {
+            "source_deployment_id": "legacy",
+            "target_model_id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+            "target_revision": "",
+            "max_model_len": 32768,
+        }
+        status, plan, _ = self.json_post(
+            client, jar, "/portal-api/admin/model-upgrades/plan", payload
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(plan["source_registry_revision"], 7)
+        status, job, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/model-upgrades/submit",
+            {**payload, "expected_registry_revision": 7},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(job["kind"], "upgrade")
+        self.assertEqual(
+            [operation for operation, _payload in models.calls],
+            ["upgrade-plan", "upgrade-submit"],
+        )
+        self.assertEqual(models.calls[1][1]["expected_registry_revision"], 7)
 
     def test_system_monitor_http_route_is_admin_only_and_uses_shared_sampler(self):
         anonymous, _ = self.opener()

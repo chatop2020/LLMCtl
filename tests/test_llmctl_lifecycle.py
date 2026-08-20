@@ -12,6 +12,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANAGER = ROOT / "llmctl.sh"
 
 
+def manager_implementation() -> str:
+    """返回主入口和按命令域拆分模块组成的完整可审查源码。"""
+
+    return "\n".join(
+        [
+            MANAGER.read_text(encoding="utf-8"),
+            *(path.read_text(encoding="utf-8") for path in sorted((ROOT / "lib/llmctl").glob("*.sh"))),
+        ]
+    )
+
+
 def run_bash(body: str) -> str:
     script = textwrap.dedent(
         f"""
@@ -31,6 +42,52 @@ def run_bash(body: str) -> str:
 
 
 class LlmctlLifecycleTests(unittest.TestCase):
+    def test_model_upgrade_cli_reuses_plan_revision_and_submits_stale_guard(self):
+        """CLI apply 必须把计划版本带回控制服务，且不要求管理员手写 JSON。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = pathlib.Path(directory) / "state"
+            state_dir.mkdir()
+            submitted = state_dir / "submitted.json"
+            revision = "0" * 40
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLM_CLUSTER_STATE_DIR={state_dir!s}
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                model_control_request() {{
+                  local operation="$1" input="$2"
+                  case "${{operation}}" in
+                    upgrade-plan)
+                      jq -n --arg revision {revision!r} '{{
+                        source_registry_revision:7,
+                        upgrade:{{target_revision:$revision,target_model_id:"ornith-ai/Ornith-1.5-35B-A3B-FP8"}},
+                        affected_worker_ids:[0,1,2,3,4,5,6,7],warnings:[]
+                      }}'
+                      ;;
+                    upgrade-submit)
+                      cp "${{input}}" {submitted!s}
+                      printf '%s\n' '{{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","kind":"upgrade","state":"waiting"}}'
+                      ;;
+                    *) return 1 ;;
+                  esac
+                }}
+                cmd_model_upgrade apply legacy --yes
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = json.loads(submitted.read_text(encoding="utf-8"))
+        self.assertEqual(payload["source_deployment_id"], "legacy")
+        self.assertEqual(payload["target_revision"], revision)
+        self.assertEqual(payload["expected_registry_revision"], 7)
+        self.assertIn("ornith-ai/Ornith-1.5-35B-A3B-FP8", completed.stdout)
+
     def test_workflow_init_preserves_existing_config_and_prints_recovery_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = pathlib.Path(directory) / "state"
@@ -570,7 +627,7 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn("8 个 Worker", output)
 
     def test_uninstall_uses_bounded_visible_stop_before_deleting_units(self):
-        manager = MANAGER.read_text(encoding="utf-8")
+        manager = manager_implementation()
         uninstall = manager.split("cmd_uninstall() {", 1)[1].split(
             "managed_container_names() {", 1
         )[0]

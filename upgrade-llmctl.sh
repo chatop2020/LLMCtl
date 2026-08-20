@@ -548,7 +548,8 @@ validate_manifest() {
 
 validate_source() {
   validate_manifest
-  bash -n "${SOURCE_ROOT}/llmctl.sh" "${SOURCE_ROOT}/upgrade-llmctl.sh"
+  bash -n "${SOURCE_ROOT}/llmctl.sh" "${SOURCE_ROOT}/upgrade-llmctl.sh" \
+    "${SOURCE_ROOT}"/lib/llmctl/*.sh
   grep -q '^ExecStart=/usr/local/sbin/llmctl _keepwarm-tick$' "${SOURCE_ROOT}/systemd/llm-keepwarm.service" || die "$(l10n '保活 service 单元无效' 'Invalid keep-warm service unit')"
   grep -q '^Unit=llm-keepwarm.service$' "${SOURCE_ROOT}/systemd/llm-keepwarm.timer" || die "$(l10n '保活 timer 单元无效' 'Invalid keep-warm timer unit')"
   python3 -m py_compile \
@@ -556,7 +557,9 @@ validate_source() {
     "${SOURCE_ROOT}/lib/runtime_optimizer.py" \
     "${SOURCE_ROOT}/lib/gateway_config.py" \
     "${SOURCE_ROOT}/lib/model_deployment.py" \
+    "${SOURCE_ROOT}/lib/model_upgrade.py" \
     "${SOURCE_ROOT}/lib/account_portal.py" \
+    "${SOURCE_ROOT}"/lib/account_portal_*.py \
     "${SOURCE_ROOT}/lib/llm_benchmark.py" \
     "${SOURCE_ROOT}/lib/workflow_config.py"
   grep -q '^ExecStart=/usr/local/lib/llm-cluster/workflowd/llm-workflowd ' "${SOURCE_ROOT}/systemd/llm-workflow.service" || die "$(l10n '工作流 service 单元无效' 'Invalid workflow service unit')"

@@ -1,10 +1,21 @@
 # 类型    来源                           目标路径                                                权限    重启范围
 file    llmctl.sh                      /usr/local/sbin/llmctl                                  0755  none
+dir     lib/llmctl                     /usr/local/lib/llm-cluster/llmctl                       0755  none
 file    lib/model_catalog.py           /usr/local/lib/llm-cluster/model_catalog.py             0755  none
 file    lib/runtime_optimizer.py       /usr/local/lib/llm-cluster/runtime_optimizer.py         0755  none
 file    lib/gateway_config.py          /usr/local/lib/llm-cluster/gateway_config.py            0755  none
 file    lib/model_deployment.py        /usr/local/lib/llm-cluster/model_deployment.py           0755  none
+file    lib/model_upgrade.py           /usr/local/lib/llm-cluster/model_upgrade.py              0644  none
 file    lib/account_portal.py          /usr/local/lib/llm-cluster/account_portal.py            0755  account
+file    lib/account_portal_common.py   /usr/local/lib/llm-cluster/account_portal_common.py     0644  account
+file    lib/account_portal_database.py /usr/local/lib/llm-cluster/account_portal_database.py   0644  account
+file    lib/account_portal_gateway.py  /usr/local/lib/llm-cluster/account_portal_gateway.py    0644  account
+file    lib/account_portal_monitor.py  /usr/local/lib/llm-cluster/account_portal_monitor.py    0644  account
+file    lib/account_portal_http.py     /usr/local/lib/llm-cluster/account_portal_http.py       0644  account
+file    lib/account_portal_control_models.py /usr/local/lib/llm-cluster/account_portal_control_models.py 0644 account
+file    lib/account_portal_control_usage.py /usr/local/lib/llm-cluster/account_portal_control_usage.py 0644 account
+file    lib/account_portal_control_stress.py /usr/local/lib/llm-cluster/account_portal_control_stress.py 0644 account
+file    lib/account_portal_control_admin.py /usr/local/lib/llm-cluster/account_portal_control_admin.py 0644 account
 file    lib/llm_benchmark.py           /usr/local/lib/llm-cluster/llm_benchmark.py              0755  account
 file    lib/workflow_config.py         /usr/local/lib/llm-cluster/workflow_config.py             0755  none
 dir     lib/workflowd                  /usr/local/lib/llm-cluster/workflowd                      0755  none

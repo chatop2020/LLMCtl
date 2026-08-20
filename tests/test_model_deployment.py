@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,6 +118,34 @@ class ModelDeploymentTests(unittest.TestCase):
             ],
         }
 
+    @staticmethod
+    def ornith_15_catalog(tp: int = 2) -> dict:
+        """返回无需网络且覆盖升级拓扑与能力映射的目录结果。"""
+
+        return {
+            "source": "huggingface",
+            "id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+            "revision": "0" * 40,
+            "weight_bytes": 39_365_175_520,
+            "supported_architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "capabilities": {
+                "image_input": True,
+                "ocr_optimized": True,
+                "tool_parser": "qwen3_xml",
+                "reasoning_parser": "qwen3",
+                "thinking_toggle": True,
+            },
+            "trust_remote_code": False,
+            "plan": {
+                "tp": tp,
+                "replicas": 8 // tp,
+                "max_model_len": 32768,
+                "max_num_seqs": 7,
+            },
+            "installable": True,
+            "rejection_reasons": [],
+        }
+
     def test_legacy_registry_is_synthesized_without_runtime_changes(self):
         registry = MODEL.RegistryStore(self.paths).read()
         deployment = registry["deployments"]["legacy"]
@@ -207,6 +236,194 @@ class ModelDeploymentTests(unittest.TestCase):
         with mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus):
             with self.assertRaisesRegex(ValueError, "不支持 LLMCtl 多模型自动发布"):
                 manager.plan(request)
+
+    def test_ornith_upgrade_plan_pins_revision_replans_tp_and_retains_rollback(self):
+        """升级计划必须复用公开 ID、固定 SHA，并按目标模型重新分组 GPU。"""
+
+        manager = MODEL.DeploymentManager(
+            self.paths,
+            upgrade_inspector=lambda *_args: self.ornith_15_catalog(tp=2),
+        )
+        with mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus):
+            plan = manager.plan_upgrade(
+                {"source_deployment_id": "legacy", "max_model_len": 32768}
+            )
+        request = plan["normalized_request"]
+        deployment = request["deployment"]
+        self.assertEqual(deployment["id"], "legacy")
+        self.assertEqual(
+            deployment["model_id"], "ornith-ai/Ornith-1.5-35B-A3B-FP8"
+        )
+        self.assertEqual(request["artifact"]["revision"], "0" * 40)
+        self.assertEqual(deployment["public_model_ids"], ["ornith-1.0-35b-fp8"])
+        self.assertEqual(deployment["runtime"]["tensor_parallel_size"], 2)
+        self.assertEqual(len(deployment["instances"]), 4)
+        self.assertEqual(
+            [item["gpu_devices"] for item in deployment["instances"]],
+            [[0, 1], [2, 3], [4, 5], [6, 7]],
+        )
+        self.assertEqual(plan["affected_worker_ids"], list(range(8)))
+        self.assertTrue(plan["upgrade"]["retains_current_artifact"])
+        self.assertTrue(plan["upgrade"]["rollback_requires_worker_reload"])
+        self.assertEqual(plan["source_registry_revision"], 0)
+
+    def test_ornith_upgrade_submit_rejects_stale_registry_before_starting_job(self):
+        """页面或 CLI 的旧确认不得覆盖已经变化的部署注册表。"""
+
+        manager = MODEL.DeploymentManager(
+            self.paths,
+            upgrade_inspector=lambda *_args: self.ornith_15_catalog(),
+        )
+        with self.assertRaisesRegex(ValueError, "注册表已变化"):
+            manager.submit_upgrade(
+                {
+                    "source_deployment_id": "legacy",
+                    "max_model_len": 32768,
+                    "expected_registry_revision": 99,
+                }
+            )
+        self.assertEqual(manager.jobs.list(), [])
+
+    def test_ornith_upgrade_rejects_unsafe_identity_and_mutable_revision(self):
+        """目录调用前必须拒绝任意 URL、控制字符和可变 revision。"""
+
+        inspector = mock.Mock(return_value=self.ornith_15_catalog())
+        manager = MODEL.DeploymentManager(
+            self.paths,
+            upgrade_inspector=inspector,
+        )
+        with self.assertRaisesRegex(ValueError, "Ornith 目标模型"):
+            manager.plan_upgrade(
+                {
+                    "source_deployment_id": "legacy",
+                    "target_model_id": "https://example.test/ornith",
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "完整不可变提交 SHA"):
+            manager.plan_upgrade(
+                {
+                    "source_deployment_id": "legacy",
+                    "target_revision": "main",
+                }
+            )
+        inspector.assert_not_called()
+
+    def test_ornith_upgrade_submit_persists_upgrade_metadata_before_background_start(self):
+        """后台线程启动前必须持久化来源、目标和回退元数据。"""
+
+        manager = MODEL.DeploymentManager(
+            self.paths,
+            upgrade_inspector=lambda *_args: self.ornith_15_catalog(),
+        )
+        thread = mock.Mock()
+        with mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus), mock.patch.object(
+            MODEL.threading, "Thread", return_value=thread
+        ):
+            job = manager.submit_upgrade(
+                {
+                    "source_deployment_id": "legacy",
+                    "target_revision": "0" * 40,
+                    "max_model_len": 32768,
+                    "expected_registry_revision": 0,
+                }
+            )
+        saved = manager.jobs.get(job["id"])
+        self.assertEqual(saved["kind"], "upgrade")
+        self.assertEqual(saved["upgrade"]["current_model_id"], "protoLabsAI/Ornith-1.0-35B-FP8")
+        self.assertEqual(saved["upgrade"]["target_revision"], "0" * 40)
+        thread.start.assert_called_once_with()
+
+    def test_upgrade_profile_is_visible_in_snapshot_without_mutating_runtime(self):
+        """管理页面读取目标目录时不能创建注册表或重启 Worker。"""
+
+        manager = MODEL.DeploymentManager(self.paths)
+        with mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus):
+            snapshot = manager.snapshot()
+        self.assertEqual(
+            snapshot["upgrade_profiles"][0]["model_id"],
+            "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+        )
+        self.assertFalse(self.paths.registry.exists())
+
+    def test_upgrade_inference_probe_requires_an_assistant_message(self):
+        """升级发布前的真实探测不能把空 choices 或纯健康响应当成成功。"""
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload: dict):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit: int) -> bytes:
+                return json.dumps(self.payload).encode()
+
+        self.paths.secrets_env.write_text(
+            "BACKEND_API_KEY=test-internal-key\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            MODEL.urllib.request,
+            "urlopen",
+            return_value=Response(
+                {"choices": [{"message": {"content": "OK"}}]}
+            ),
+        ):
+            self.assertTrue(
+                MODEL.endpoint_inference_ready(
+                    "http://127.0.0.1:8100",
+                    self.paths.secrets_env,
+                    "ornith-1.5-35b-a3b-fp8",
+                )
+            )
+        with mock.patch.object(
+            MODEL.urllib.request,
+            "urlopen",
+            return_value=Response({"choices": []}),
+        ):
+            self.assertFalse(
+                MODEL.endpoint_inference_ready(
+                    "http://127.0.0.1:8100",
+                    self.paths.secrets_env,
+                    "ornith-1.5-35b-a3b-fp8",
+                )
+            )
+
+    def test_rollback_waits_for_old_workers_before_republishing_gateway(self):
+        """回退不能在旧权重恢复健康前把公开路由切回旧 Worker。"""
+
+        manager = MODEL.DeploymentManager(self.paths, runner=mock.Mock())
+        registry = manager.registry.read()
+        manager.registry.write(registry)
+        backup = self.paths.backups_dir / "rollback-order"
+        (backup / "workers").mkdir(parents=True)
+        (backup / "deployments.json").write_text(
+            json.dumps(registry), encoding="utf-8"
+        )
+        (backup / "cluster.env").write_text(
+            self.paths.cluster_env.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (backup / "workers/0.env").write_text(
+            "GPU_DEVICES=0\nWORKER_PORT=8100\n", encoding="utf-8"
+        )
+        (backup / "manifest.json").write_text(
+            json.dumps({"affected_worker_ids": [0], "active_before": [0]}),
+            encoding="utf-8",
+        )
+        order = []
+        manager._wait_worker_ids = mock.Mock(side_effect=lambda _ids: order.append("wait"))
+        manager._reconcile_gateway = mock.Mock(side_effect=lambda: order.append("publish"))
+        with mock.patch.object(
+            MODEL,
+            "gateway_capabilities",
+            return_value={"kind": "omniroute", "registry_publish": True},
+        ):
+            manager._restore_runtime(backup, wait_for_health=True)
+        self.assertEqual(order, ["wait", "publish"])
 
 
 if __name__ == "__main__":

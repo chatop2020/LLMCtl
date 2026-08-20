@@ -120,11 +120,14 @@ GATEWAY_EXPLICIT=0
 REGISTRATION_EXPLICIT=0
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MANAGER_SOURCE="${SCRIPT_DIR}/llmctl.sh"
+LLMCTL_MODULE_SOURCE="${SCRIPT_DIR}/lib/llmctl"
 CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 MODEL_DEPLOYMENT_SOURCE="${SCRIPT_DIR}/lib/model_deployment.py"
+MODEL_UPGRADE_SOURCE="${SCRIPT_DIR}/lib/model_upgrade.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
+ACCOUNT_MODULE_SOURCES=("${SCRIPT_DIR}"/lib/account_portal_*.py)
 BENCHMARK_SOURCE="${SCRIPT_DIR}/lib/llm_benchmark.py"
 WORKFLOW_CONFIG_SOURCE="${SCRIPT_DIR}/lib/workflow_config.py"
 WORKFLOW_RUNTIME_SOURCE="${SCRIPT_DIR}/lib/workflowd"
@@ -1076,11 +1079,14 @@ check_discovery_host() {
   source /etc/os-release
   [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04* ]] || die "$(l10n "仅支持 Ubuntu 24.04；检测到 ${PRETTY_NAME:-unknown}" "Only Ubuntu 24.04 is supported; detected ${PRETTY_NAME:-unknown}")"
   [[ -r "${MANAGER_SOURCE}" ]] || die "$(l10n 'llmctl.sh 必须与安装脚本放在同一目录' 'llmctl.sh must be in the same directory as the installer')"
+  [[ -d "${LLMCTL_MODULE_SOURCE}" ]] || die "$(l10n 'llmctl 命令模块不完整' 'llmctl command modules are incomplete')"
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
+  [[ -r "${MODEL_UPGRADE_SOURCE}" ]] || die "$(l10n '缺少模型版本升级规则 lib/model_upgrade.py' 'The model upgrade rules lib/model_upgrade.py are missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
+  ((${#ACCOUNT_MODULE_SOURCES[@]} >= 9)) || die "$(l10n '账户门户领域模块不完整' 'Account portal domain modules are incomplete')"
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -r "${WORKFLOW_CONFIG_SOURCE}" && -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd" ]] || die "$(l10n '缺少可插拔工作流控制面或运行时' 'The pluggable workflow control plane or runtime is missing')"
   [[ -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd-linux-amd64" && -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd-linux-arm64" ]] || die "$(l10n '缺少 Linux amd64/arm64 工作流运行时' 'The Linux amd64/arm64 workflow runtimes are missing')"
@@ -1112,11 +1118,14 @@ check_host() {
   source /etc/os-release
   [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04* ]] || die "$(l10n "仅支持 Ubuntu 24.04；检测到 ${PRETTY_NAME:-unknown}" "Only Ubuntu 24.04 is supported; detected ${PRETTY_NAME:-unknown}")"
   [[ -x "${MANAGER_SOURCE}" ]] || [[ -r "${MANAGER_SOURCE}" ]] || die "$(l10n 'llmctl.sh 必须与安装脚本放在同一目录' 'llmctl.sh must be in the same directory as the installer')"
+  [[ -d "${LLMCTL_MODULE_SOURCE}" ]] || die "$(l10n 'llmctl 命令模块不完整' 'llmctl command modules are incomplete')"
   [[ -r "${CATALOG_SOURCE}" ]] || die "$(l10n 'lib/model_catalog.py 必须与安装脚本放在同一目录' 'lib/model_catalog.py must be in the same directory as the installer')"
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
+  [[ -r "${MODEL_UPGRADE_SOURCE}" ]] || die "$(l10n '缺少模型版本升级规则 lib/model_upgrade.py' 'The model upgrade rules lib/model_upgrade.py are missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
+  ((${#ACCOUNT_MODULE_SOURCES[@]} >= 9)) || die "$(l10n '账户门户领域模块不完整' 'Account portal domain modules are incomplete')"
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
   [[ -r "${WORKFLOW_CONFIG_SOURCE}" && -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd" ]] || die "$(l10n '缺少可插拔工作流控制面或运行时' 'The pluggable workflow control plane or runtime is missing')"
   [[ -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd-linux-amd64" && -x "${WORKFLOW_RUNTIME_SOURCE}/llm-workflowd-linux-arm64" ]] || die "$(l10n '缺少 Linux amd64/arm64 工作流运行时' 'The Linux amd64/arm64 workflow runtimes are missing')"
@@ -1711,12 +1720,20 @@ install_manager() {
   install -m 755 "${MANAGER_SOURCE}" /usr/local/sbin/llmctl
   install -d -m 755 /usr/local/lib/llm-cluster
   install -d -m 755 /usr/local/lib/llm-cluster/systemd
+  rm -rf /usr/local/lib/llm-cluster/llmctl
+  cp -a "${LLMCTL_MODULE_SOURCE}" /usr/local/lib/llm-cluster/llmctl
+  chown -R root:root /usr/local/lib/llm-cluster/llmctl
   install -m 755 "${UPGRADER_SOURCE}" /usr/local/lib/llm-cluster/upgrade-llmctl.sh
   install -m 755 "${CATALOG_SOURCE}" /usr/local/lib/llm-cluster/model_catalog.py
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
   install -m 755 "${MODEL_DEPLOYMENT_SOURCE}" /usr/local/lib/llm-cluster/model_deployment.py
+  install -m 644 "${MODEL_UPGRADE_SOURCE}" /usr/local/lib/llm-cluster/model_upgrade.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
+  local account_module
+  for account_module in "${ACCOUNT_MODULE_SOURCES[@]}"; do
+    install -m 644 "${account_module}" "/usr/local/lib/llm-cluster/$(basename "${account_module}")"
+  done
   install -m 755 "${BENCHMARK_SOURCE}" /usr/local/lib/llm-cluster/llm_benchmark.py
   install -m 755 "${WORKFLOW_CONFIG_SOURCE}" /usr/local/lib/llm-cluster/workflow_config.py
   rm -rf /usr/local/lib/llm-cluster/workflowd

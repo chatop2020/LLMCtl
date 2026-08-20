@@ -5,10 +5,18 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = (ROOT / "install-llm-cluster.sh").read_text(encoding="utf-8")
-MANAGER = (ROOT / "llmctl.sh").read_text(encoding="utf-8")
+MANAGER = "\n".join(
+    [
+        (ROOT / "llmctl.sh").read_text(encoding="utf-8"),
+        *(path.read_text(encoding="utf-8") for path in sorted((ROOT / "lib/llmctl").glob("*.sh"))),
+    ]
+)
 OPTIMIZER = (ROOT / "lib" / "runtime_optimizer.py").read_text(encoding="utf-8")
 GATEWAY = (ROOT / "lib" / "gateway_config.py").read_text(encoding="utf-8")
-ACCOUNT = (ROOT / "lib" / "account_portal.py").read_text(encoding="utf-8")
+ACCOUNT = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((ROOT / "lib").glob("account_portal*.py"))
+)
 UPGRADER = (ROOT / "upgrade-llmctl.sh").read_text(encoding="utf-8")
 MANIFEST = (ROOT / "upgrade-manifest.tsv").read_text(encoding="utf-8")
 
