@@ -27,6 +27,10 @@ MANAGED_TAG = "llmctl-managed"
 MANAGED_TOKEN = "llmctl-default"
 OMNIROUTE_MANAGED_KEY = "llmctl-management"
 OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually."
+PORTAL_PUBLIC_COMBO_DESCRIPTION = "Managed by LLMCtl account portal public model"
+LLMCTL_MANAGED_COMBO_DESCRIPTIONS = frozenset(
+    {OMNIROUTE_DESCRIPTION, PORTAL_PUBLIC_COMBO_DESCRIPTION}
+)
 # OmniRoute 只负责路由，具体请求调度交给 vLLM。上游默认会在已饱和的 Combo
 # 成员后排队 30 秒才尝试下一个成员，即使其他 Worker 空闲，多模态请求也会
 # 稳定卡住 30 秒。OmniRoute 当前每个目标最多接受 20 个在途请求，队列超时
@@ -35,6 +39,12 @@ OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually.
 # 不进入 OmniRoute 不透明的 semaphore 队列。
 OMNIROUTE_INFLIGHT_PER_WORKER = 20
 OMNIROUTE_QUEUE_TIMEOUT_MS = 1000
+
+
+def is_llmctl_managed_combo(combo: dict[str, Any] | None) -> bool:
+    """判断 Combo 是否由模型注册表或账户门户任一 LLMCtl 控制面管理。"""
+
+    return str((combo or {}).get("description", "")) in LLMCTL_MANAGED_COMBO_DESCRIPTIONS
 
 
 def worker_origin(worker_id: int) -> str:
@@ -645,7 +655,7 @@ def reconcile_omniroute(
         "context_length": int(required_env("MAX_MODEL_LEN")),
     }
     if existing_combo:
-        if existing_combo.get("description") != OMNIROUTE_DESCRIPTION:
+        if not is_llmctl_managed_combo(existing_combo):
             raise RuntimeError(
                 f"OmniRoute combo '{model}' already exists and is not managed by LLMCtl"
             )
@@ -903,7 +913,7 @@ def reconcile_omniroute_registry(
                 "context_length": spec["max_model_len"],
             }
             if existing_combo:
-                if existing_combo.get("description") != OMNIROUTE_DESCRIPTION:
+                if not is_llmctl_managed_combo(existing_combo):
                     raise RuntimeError(
                         f"OmniRoute 模型组合 {public_model_id} 不是由 LLMCtl 管理"
                     )

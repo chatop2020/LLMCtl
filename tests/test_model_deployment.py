@@ -506,6 +506,20 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertIn("modelscope", command)
         self.assertFalse(runner.run.call_args.kwargs["check"])
 
+    def test_command_runner_includes_last_output_lines_on_failure(self):
+        """网关助手失败必须把真实原因带回任务，不能只留下退出码 1。"""
+
+        completed = subprocess.CompletedProcess(
+            args=["gateway-helper"],
+            returncode=1,
+            stdout="preparing\nOmniRoute combo gdn-inside ownership conflict\n",
+        )
+        with mock.patch.object(MODEL.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                RuntimeError, "gdn-inside ownership conflict"
+            ):
+                MODEL.CommandRunner().run(["gateway-helper"])
+
     def test_upgrade_inference_probe_requires_an_assistant_message(self):
         """升级发布前的真实探测不能把空 choices 或纯健康响应当成成功。"""
 

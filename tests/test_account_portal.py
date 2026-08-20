@@ -1609,6 +1609,43 @@ class PortalIntegrationTests(unittest.TestCase):
         self.assertEqual(model["context_window_tokens"], 200000)
         self.assertEqual(model["metadata_sync_status"], "synced")
 
+    def test_portal_accepts_model_registry_managed_public_combo(self):
+        """账户门户必须接管模型注册表创建的同名公开 Combo，而不是报所有权冲突。"""
+
+        self.fake_omni.combo_items = [
+            {
+                "id": "source-combo",
+                "name": "ornith-1.0-35b-fp8",
+                "models": [
+                    {
+                        "kind": "model",
+                        "providerId": "local-a",
+                        "modelId": "ornith-1.5-35b-a3b-fp8",
+                    }
+                ],
+                "strategy": "round-robin",
+            },
+            {
+                "id": "public-combo",
+                "name": "gdn-inside",
+                "description": portal.MODEL_REGISTRY_COMBO_MANAGED_DESCRIPTION,
+                "models": [],
+                "strategy": "round-robin",
+            },
+        ]
+        route = self.server.control.ensure_public_combo_route(
+            "gdn-inside",
+            "source-combo",
+            "ornith-1.0-35b-fp8",
+            True,
+        )
+        self.assertEqual(route["mapping_id"], "public-combo")
+        self.assertEqual(route["source_model"], "ornith-1.0-35b-fp8")
+        self.assertEqual(
+            self.fake_omni.combo_upserts[-1][1]["description"],
+            portal.PUBLIC_COMBO_MANAGED_DESCRIPTION,
+        )
+
     def test_managed_runtime_context_overrides_stale_gateway_metadata(self):
         """本机 Worker 的有效上下文必须覆盖 OmniRoute 中残留的旧数值。"""
 

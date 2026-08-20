@@ -648,7 +648,12 @@ class CommandRunner:
             for line in result.stdout.splitlines():
                 self.logger(line[:2000])
         if check and result.returncode:
-            raise RuntimeError(f"命令执行失败，退出码 {result.returncode}")
+            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            detail = "；".join(lines[-3:])[-2000:]
+            raise RuntimeError(
+                f"命令执行失败，退出码 {result.returncode}"
+                f"{f'：{detail}' if detail else ''}"
+            )
         return result
 
 

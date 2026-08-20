@@ -570,7 +570,7 @@ class PortalModelControlMixin:
             (combo for combo in combos if str(combo.get("name", "")) == public_id),
             None,
         )
-        if existing and str(existing.get("description", "")) != PUBLIC_COMBO_MANAGED_DESCRIPTION:
+        if existing and str(existing.get("description", "")) not in LLMCTL_MANAGED_COMBO_DESCRIPTIONS:
             raise RuntimeError(
                 f"OmniRoute combo {public_id!r} already exists and is not managed by LLMCtl"
             )
@@ -711,7 +711,7 @@ class PortalModelControlMixin:
                 public_id == str(row["source_model"] or "")
                 and live_id == str(row["source_ref"] or "")
             )
-            managed_route = description == PUBLIC_COMBO_MANAGED_DESCRIPTION
+            managed_route = description in LLMCTL_MANAGED_COMBO_DESCRIPTIONS
             mirrored_route = self._public_combo_mirrors_source(live, source)
             ready = bool(live) and (
                 (
