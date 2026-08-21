@@ -13,6 +13,46 @@ export default {
 </script>
 
 <template>
+    <dialog id="pending-user-approval">
+      <form method="dialog" class="dialog-head">
+        <div>
+          <h2>手动通过邮箱验证</h2>
+          <p>仅在已经通过其他可信方式核实邮箱属于该用户时使用。</p>
+        </div>
+        <button class="icon-button" aria-label="关闭">×</button>
+      </form>
+      <div class="form-stack">
+        <div class="warning">
+          通过后将立即创建 API Key、发放配置的注册余额并同步模型权限；现有验证链接会失效。
+        </div>
+        <p>
+          目标邮箱：<strong>{{ pendingUserApproval.email }}</strong>
+        </p>
+        <label>
+          输入完整邮箱确认手动通过
+          <input
+            v-model="pendingUserApproval.confirmation"
+            autocomplete="off"
+            :placeholder="pendingUserApproval.email"
+          />
+        </label>
+        <button
+          type="button"
+          class="primary"
+          :disabled="
+            busy ||
+            pendingUserApproval.confirmation.trim() !== pendingUserApproval.email
+          "
+          @click="approvePendingUser"
+        >
+          {{
+            operation === "pending-user-approval"
+              ? "开通中…"
+              : "确认并开通账户"
+          }}
+        </button>
+      </div>
+    </dialog>
     <dialog id="pending-user-delete">
       <form method="dialog" class="dialog-head">
         <div>

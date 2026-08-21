@@ -3,6 +3,7 @@ const ACTION_LABELS = Object.freeze({
   "usage.detail.view": "用户查看请求详情",
   "admin/billing/reconcile": "结算并同步用量",
   "admin/users/key/reveal": "管理员查看用户 API Key",
+  "admin/users/verification/approve": "管理员手动通过邮箱验证",
   "admin/users/verification/resend": "管理员补发验证邮件",
   "admin/users/pending/delete": "管理员删除未验证用户",
   "admin/users/update": "更新用户资料与权限",

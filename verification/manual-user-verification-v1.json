@@ -1,0 +1,98 @@
+{
+  "plan_id": "manual-user-verification",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L3",
+  "source": {
+    "baseline_commit": "e86eca826398991f66f061f549140874a7541428",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "允许管理员在通过其他可信方式核实邮箱归属后，手动完成待验证用户的完整开户，同时保持邮箱验证路径的安全、补偿和审计语义一致。",
+    "acceptance": [
+      "只有已认证管理员可以调用手动通过接口，普通用户和未登录请求必须被拒绝。",
+      "管理员必须输入与目标用户完全一致的完整邮箱，且目标仍为未验证、无 API Key 的普通用户。",
+      "邮箱域名仍须符合当前注册策略；手动通过不能绕过允许域名。",
+      "成功后创建 API Key、写入验证时间、初始化账务与默认用户组、发放一次性欢迎余额、同步模型权限并使旧验证链接失效。",
+      "管理员响应与审计不得包含 API Key 明文，操作必须保存管理员身份、目标用户和结果。",
+      "API Key 创建、数据库状态变更或权限同步任一步失败时删除本次半成品 Key，并保持用户为待验证状态和原验证链接可重试。",
+      "重复或并发开通不能发放第二份欢迎余额，也不能把另一笔已经完成的开通回滚为待验证。",
+      "管理页面明确说明手动通过的责任和结果，并要求完整邮箱二次确认。"
+    ]
+  },
+  "risk": {
+    "level": "L3",
+    "assets": [
+      "邮箱所有权验证状态",
+      "用户登录资格与 API Key",
+      "模型访问权限和调用限额",
+      "注册欢迎余额与账务记录",
+      "验证令牌和管理员审计"
+    ],
+    "trust_boundaries": [
+      "管理员浏览器与门户 API",
+      "门户数据库中的待验证状态机",
+      "门户与 OmniRoute Key 管理 API"
+    ],
+    "abuse_cases": [
+      "普通用户越权激活他人账户",
+      "管理员误选用户或输错邮箱后直接开通",
+      "手动通过绕过企业邮箱域名策略",
+      "重复或并发请求创建多个 Key 或重复欢迎余额",
+      "权限同步失败后留下可用半成品 Key",
+      "旧验证链接在管理员通过后再次开通账户",
+      "API Key 明文进入管理员响应或审计"
+    ],
+    "controls": [
+      "沿用管理员会话、CSRF 和对象级目标校验",
+      "服务端再次比对完整邮箱并验证 pending、verified_at 和 api_key_id",
+      "邮件验证和手动通过复用同一个开户状态机",
+      "条件状态更新防止并发覆盖，欢迎余额按稳定 source_ref 幂等",
+      "开户失败删除本次 Key，并按本次 api_key_id 条件回滚账户",
+      "成功后消费该用户全部未使用验证令牌",
+      "管理员接口只返回用户 ID，完整结果进入脱敏审计"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "focused-security-contracts",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "python3 -m unittest tests.test_pending_user_admin",
+        "npm test -- --run src/usePendingUserActions.test.js src/auditDisplay.test.js src/App.test.js"
+      ]
+    },
+    {
+      "gate_id": "production-build-and-static",
+      "criticality": "Required",
+      "depends_on": ["focused-security-contracts"],
+      "commands": [
+        "npm run build",
+        "python3 -m unittest tests.test_static_contracts tests.test_source_structure",
+        "git diff --check"
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "criticality": "Required",
+      "depends_on": ["production-build-and-static"],
+      "commands": [
+        "python3 -m unittest discover -s tests",
+        "npm test"
+      ]
+    },
+    {
+      "gate_id": "isolated-browser-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-regression"],
+      "environment": "隔离门户、Fake OmniRoute、虚构待验证用户和管理员会话"
+    },
+    {
+      "gate_id": "production-operator-acceptance",
+      "criticality": "Required",
+      "depends_on": ["isolated-browser-acceptance"],
+      "actor": "真实门户管理员",
+      "expected_status_without_operator": "Unverified"
+    }
+  ]
+}
