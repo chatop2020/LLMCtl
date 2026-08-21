@@ -13,6 +13,42 @@ export default {
 </script>
 
 <template>
+    <dialog id="pending-user-delete">
+      <form method="dialog" class="dialog-head">
+        <div>
+          <h2>删除未验证用户</h2>
+          <p>仅删除尚未完成邮箱验证、没有 API Key 和调用记录的注册占位。</p>
+        </div>
+        <button class="icon-button" aria-label="关闭">×</button>
+      </form>
+      <div class="form-stack">
+        <div class="warning">
+          删除后，现有验证链接立即失效；用户需要重新注册才能继续。
+        </div>
+        <p>
+          目标邮箱：<strong>{{ pendingUserDelete.email }}</strong>
+        </p>
+        <label>
+          输入完整邮箱确认删除
+          <input
+            v-model="pendingUserDelete.confirmation"
+            autocomplete="off"
+            :placeholder="pendingUserDelete.email"
+          />
+        </label>
+        <button
+          type="button"
+          class="danger"
+          :disabled="
+            busy ||
+            pendingUserDelete.confirmation.trim() !== pendingUserDelete.email
+          "
+          @click="deletePendingUser"
+        >
+          {{ operation === "pending-user-delete" ? "删除中…" : "确认删除注册记录" }}
+        </button>
+      </div>
+    </dialog>
     <dialog id="user-editor">
       <form method="dialog" class="dialog-head">
         <h2>管理用户</h2>

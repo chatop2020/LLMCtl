@@ -478,6 +478,41 @@ class OmniRouteClient:
             raise RuntimeError("OmniRoute returned an invalid call-log detail")
         return response
 
+    def ensure_request_content_logging(self) -> bool:
+        """确保 OmniRoute 保存调用的请求正文和最终响应制品。
+
+        返回：
+            本次把日志管线从关闭改为开启时返回 True；原本已开启返回 False。
+
+        异常：
+            RuntimeError: OmniRoute 未返回完整日志设置，或更新后仍未启用日志管线。
+
+        该方法只改变 OmniRoute 的日志捕获设置，不修改 API Key、模型路由或
+        Worker。日志内容仍受每个 Key 的 noLog 开关约束。
+        """
+
+        current = self.request("GET", "/api/settings/database")
+        logs = current.get("logs") if isinstance(current, dict) else None
+        if not isinstance(logs, dict):
+            raise RuntimeError("OmniRoute did not return database log settings")
+        if logs.get("callLogPipelineEnabled") is True:
+            return False
+        payload = {
+            "logs": {
+                "detailedLogsEnabled": bool(logs.get("detailedLogsEnabled", False)),
+                "callLogPipelineEnabled": True,
+                "maxDetailSizeKb": max(0, int(logs.get("maxDetailSizeKb", 10))),
+                "ringBufferSize": max(100, int(logs.get("ringBufferSize", 500))),
+            }
+        }
+        updated = self.request("PATCH", "/api/settings/database", payload)
+        updated_logs = updated.get("logs") if isinstance(updated, dict) else None
+        if not isinstance(updated_logs, dict) or updated_logs.get(
+            "callLogPipelineEnabled"
+        ) is not True:
+            raise RuntimeError("OmniRoute did not enable request content logging")
+        return True
+
     def patch_key_permissions(
         self,
         key_id: str,

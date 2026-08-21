@@ -1,0 +1,105 @@
+{
+  "plan_id": "portal-operations-ux",
+  "plan_version": 1,
+  "generated_at": "2026-08-21T07:42:00Z",
+  "source": {
+    "baseline_commit": "9b2f020f849e757f3e7609a625aba1dcf19d37dd",
+    "worktree": "dirty",
+    "input_sha256": "9fd2b42e98b0b5a6626f32c3d8041e159e7047d5efd050d4db20a8ec9c448481",
+    "digest_scope": "git diff and untracked file hashes before this evidence file was created"
+  },
+  "environment": {
+    "host": "macOS local development environment",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "browser": "Codex in-app browser against an isolated portal and Fake OmniRoute",
+    "target": "Ubuntu 24.04 LLMCtl portal with OmniRoute 3.8.48"
+  },
+  "gates": [
+    {
+      "gate_id": "focused-security-contracts",
+      "status": "Passed",
+      "evidence": [
+        "8 request-content logging and pending-user lifecycle tests passed after removing accidental imported-fixture test collection.",
+        "The logging client preserves existing OmniRoute database log settings and only enables callLogPipelineEnabled.",
+        "Request and final-response extraction retained a 120000-character body without truncation.",
+        "Successful resend replaced the old token only after SMTP delivery; failed delivery removed the new token and kept the old hash.",
+        "Pending-user deletion removed the registration and verification token, while verified-user deletion was rejected.",
+        "Audit storage preserved a 7000-character detail beyond the previous 2000-character limit."
+      ]
+    },
+    {
+      "gate_id": "frontend-contract",
+      "status": "Passed",
+      "evidence": [
+        "44 frontend tests passed across 8 files.",
+        "Status copy distinguishes email verification, API Key creation, and permission synchronization.",
+        "Audit JSON formatting preserves long nested content and maps common internal actions to Chinese labels.",
+        "Pending-user resend and exact-email delete confirmation composable tests passed.",
+        "Stress selection contract contains a stable detail anchor, selected-state feedback, and scrollIntoView behavior."
+      ]
+    },
+    {
+      "gate_id": "production-build",
+      "status": "Passed",
+      "evidence": [
+        "Portal production build passed with 29 transformed modules.",
+        "10 control-plane upgrade package tests passed.",
+        "Built portal index SHA256: 171d66a38a8b636e245234101aa4accaf3b0366efdf9f945b48322c93baeaac7.",
+        "Built portal JavaScript SHA256: 2d0884a0e9621613397ed2cfe299fca040006204d40f5a321e58a9ca2ce45fc9.",
+        "Built portal CSS SHA256: ceb654822f1a5b47fefc6ba0e5f45c683381b0d6cbf72fef05ee02d19228a8da."
+      ]
+    },
+    {
+      "gate_id": "local-browser-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "With a 500-pixel viewport, the sidebar remained sticky at 58 pixels, had overflow-y=auto, could scroll independently, and contained no redundant side-note card.",
+        "The pending user row displayed 邮箱未验证, 验证邮箱后自动创建, 等待邮箱验证, 补发验证邮件, and 删除未验证用户.",
+        "The delete dialog explained scope and impact; its destructive button remained disabled before the exact email was entered.",
+        "The audit page displayed 结算并同步用量 while retaining admin/billing/reconcile and expanded a 4101-character JSON detail including its tail.",
+        "Selecting a historical stress run produced one selected row and one 当前查看 button, then settled the result panel at 72 pixels below the viewport top.",
+        "The usage detail rendered four complete retained sections with lengths 13, 12009, 4000, and 12009 characters and showed both request and final response text."
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "status": "Passed",
+      "evidence": [
+        "238 Python tests passed in 47.422 seconds.",
+        "Python compilation and git diff whitespace checks passed.",
+        "style.css was split at the existing LLMCtl 2.6 theme boundary into 2123-line base styles and 1929-line operations-theme.css without changing import order.",
+        "All modified handwritten source files remained below 3000 physical lines; App.vue had 2972 lines and the existing account-portal integration test remained at 2995 lines."
+      ]
+    },
+    {
+      "gate_id": "upstream-runtime-evidence",
+      "status": "Passed",
+      "evidence": [
+        "OmniRoute 3.8.48 source confirms detailed capture is controlled by database setting logs.callLogPipelineEnabled and persists unified call-log artifacts with requestBody and responseBody.",
+        "The official database settings API supports authenticated GET/PATCH at /api/settings/database.",
+        "Router environment disables stream-chunk capture, raises the artifact ceiling to 4096 KiB, raises the text limit to 1048576 characters, and retains call summaries for 30 days."
+      ]
+    },
+    {
+      "gate_id": "production-operator-acceptance",
+      "status": "Unverified",
+      "reason": "The user's production Router and portal have not loaded this commit, and no real SMTP delivery, request artifact, audit expansion, stress selection, or pending-user deletion was executed.",
+      "required_actions": [
+        "Run sudo llmctl upgrade and sudo llmctl router restart.",
+        "Send a new test request and confirm request input and final output are visible; historical unretained requests cannot be reconstructed.",
+        "Expand one production audit detail and verify the full retained JSON.",
+        "Select an older stress run and confirm the page scrolls to the matching result.",
+        "Resend verification mail to an approved pending test user and verify delivery before testing deletion on a separate disposable pending account."
+      ]
+    }
+  ],
+  "artifacts": {
+    "verification_plan": "verification/portal-operations-ux-v1.json",
+    "built_portal": "lib/account_portal_ui",
+    "base_styles": "portal-ui/src/style.css",
+    "operations_theme": "portal-ui/src/operations-theme.css"
+  },
+  "final_stage": "Implemented and locally verified; not deployed or production-accepted"
+}

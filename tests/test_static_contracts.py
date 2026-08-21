@@ -179,6 +179,10 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("MAX_OUTPUT_TOKENS=32768", INSTALLER)
         self.assertIn("--override-generation-config", MANAGER)
         self.assertIn("vLLM 服务端硬上限", MANAGER)
+        self.assertIn("CALL_LOG_PIPELINE_CAPTURE_STREAM_CHUNKS=false", MANAGER)
+        self.assertIn("CALL_LOG_PIPELINE_MAX_SIZE_KB=4096", MANAGER)
+        self.assertIn("CHAT_LOG_TEXT_LIMIT=1048576", MANAGER)
+        self.assertIn("ensure_request_content_logging", ACCOUNT)
 
     def test_worker_keepwarm_is_direct_bounded_observable_and_upgrade_safe(self):
         keepwarm = MANAGER.split("keepwarm_one_worker() {", 1)[1].split(

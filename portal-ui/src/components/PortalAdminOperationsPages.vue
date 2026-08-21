@@ -973,7 +973,11 @@ export default {
                 </div>
               </section>
 
-              <section class="panel stress-live" v-if="selectedStressRun">
+              <section
+                id="stress-run-detail"
+                class="panel stress-live"
+                v-if="selectedStressRun"
+              >
                 <div class="panel-head">
                   <div>
                     <h2>实时结果</h2>
@@ -1093,7 +1097,7 @@ export default {
               <div class="table-wrap">
                 <table><thead><tr><th>开始时间</th><th>模型</th><th>计划</th><th>结果</th><th>吞吐</th><th></th></tr></thead>
                   <tbody><tr v-for="run in pageRows('admin-stress', filteredRows('admin-stress', stressRuns))" :key="run.id" :class="{ selected: selectedStressRunId === run.id }">
-                    <td>{{ date(run.created_at) }}</td><td><code>{{ run.public_model_id }}</code></td><td>并发 {{ run.concurrency }} · 输入 {{ compactTokens(run.target_input_tokens) }} · {{ run.request_count }} 请求</td><td><span class="status" :class="run.status === 'completed' ? 'ok' : run.status === 'failed' ? 'bad' : 'warn'">{{ statusLabel(run.status) }}</span><small>{{ metricNumber(run.metrics?.success_rate, 1) }}% 成功</small></td><td>{{ metricNumber(run.metrics?.request_rps, 2) }} RPS<br><small>{{ metricNumber(run.metrics?.output_tokens_per_second, 1) }} tok/s</small></td><td><button class="ghost compact" type="button" @click="selectedStressRunId = run.id; pollStressRun()">查看</button></td>
+                    <td>{{ date(run.created_at) }}</td><td><code>{{ run.public_model_id }}</code></td><td>并发 {{ run.concurrency }} · 输入 {{ compactTokens(run.target_input_tokens) }} · {{ run.request_count }} 请求</td><td><span class="status" :class="run.status === 'completed' ? 'ok' : run.status === 'failed' ? 'bad' : 'warn'">{{ statusLabel(run.status) }}</span><small>{{ metricNumber(run.metrics?.success_rate, 1) }}% 成功</small></td><td>{{ metricNumber(run.metrics?.request_rps, 2) }} RPS<br><small>{{ metricNumber(run.metrics?.output_tokens_per_second, 1) }} tok/s</small></td><td><button :class="selectedStressRunId === run.id ? 'primary' : 'ghost'" type="button" :disabled="selectedStressRunId === run.id" @click="selectStressRun(run)">{{ selectedStressRunId === run.id ? '当前查看' : '查看详情' }}</button></td>
                   </tr></tbody>
                 </table>
               </div>
@@ -1337,7 +1341,10 @@ export default {
               <div>
                 <span class="eyebrow">AUDIT TRAIL</span>
                 <h1>审计日志</h1>
-                <p>LLMCtl 持久记录管理操作、失败结果与操作者。</p>
+                <p>
+                  记录谁在什么时间执行了什么操作、作用于哪个对象以及结果。
+                  展开“完整详情”可以查看未截断的审计数据。
+                </p>
               </div>
             </div>
             <ListFilterBar
@@ -1373,10 +1380,11 @@ export default {
                   >
                     <td>{{ date(row.created_at) }}</td>
                     <td>{{ row.actor }}</td>
-                    <td>
+                    <td class="audit-action">
+                      <strong>{{ auditActionLabel(row.action) }}</strong>
                       <code>{{ row.action }}</code>
                     </td>
-                    <td>{{ row.target }}</td>
+                    <td><code class="audit-target">{{ row.target || "—" }}</code></td>
                     <td>
                       <span
                         class="status"
@@ -1384,7 +1392,12 @@ export default {
                         >{{ statusLabel(row.status) }}</span
                       >
                     </td>
-                    <td class="detail">{{ row.detail }}</td>
+                    <td class="audit-detail-cell">
+                      <details class="audit-detail">
+                        <summary>查看完整详情</summary>
+                        <pre>{{ formatAuditDetail(row.detail) }}</pre>
+                      </details>
+                    </td>
                   </tr>
                 </tbody>
               </table>

@@ -22,8 +22,8 @@ class SourceStructureTests(unittest.TestCase):
             ROOT / "llmctl.sh",
             *sorted((ROOT / "lib/llmctl").glob("*.sh")),
             ROOT / "portal-ui/src/App.vue",
-            ROOT / "portal-ui/src/useModelDeployments.js",
-            ROOT / "portal-ui/src/portalWorkspaceContext.js",
+            *sorted((ROOT / "portal-ui/src").glob("*.js")),
+            *sorted((ROOT / "portal-ui/src").glob("*.css")),
             *sorted((ROOT / "portal-ui/src/components").glob("*.vue")),
         ]
         oversized = {

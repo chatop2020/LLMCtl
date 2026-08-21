@@ -44,6 +44,62 @@ class PortalAdminControlMixin:
             "api_key": self.omni.reveal_user_key(key_id),
         }
 
+    def delete_pending_user(self, user_id: str) -> dict[str, Any]:
+        """删除尚未验证且没有凭据、用量或资金记录的注册占位。
+
+        参数：
+            user_id: 管理员明确选择的普通用户 ID。
+
+        返回：
+            删除结果与目标用户 ID，不返回邮箱、密码哈希或验证令牌。
+
+        异常：
+            ValueError: 用户不存在、已经验证、已经创建 Key，或存在不可删除的
+                账单、赠额和调用记录。
+
+        正式用户必须通过停用保留账单和审计链，不能使用本方法删除。
+        """
+
+        normalized_user_id = str(user_id).strip()
+        if not normalized_user_id or len(normalized_user_id) > 200:
+            raise ValueError("用户 ID 无效")
+        with self.db.connect() as connection:
+            user = connection.execute(
+                "SELECT id,status,verified_at,api_key_id FROM users "
+                "WHERE id=? AND role='user'",
+                (normalized_user_id,),
+            ).fetchone()
+            if not user:
+                raise ValueError("用户不存在")
+            if (
+                user["status"] != "pending"
+                or user["verified_at"] is not None
+                or user["api_key_id"]
+            ):
+                raise ValueError("只能删除尚未验证且未创建 API Key 的用户")
+            related = sum(
+                int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE user_id=?",
+                        (normalized_user_id,),
+                    ).fetchone()[0]
+                )
+                for table in ("usage_ledger", "balance_transactions", "token_grants")
+            )
+            account = connection.execute(
+                "SELECT balance_micros FROM billing_accounts WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchone()
+            if related or (account and int(account["balance_micros"] or 0) != 0):
+                raise ValueError("该用户已有账单、赠额或调用记录，只能停用，不能删除")
+            deleted = connection.execute(
+                "DELETE FROM users WHERE id=? AND status='pending' AND api_key_id IS NULL",
+                (normalized_user_id,),
+            ).rowcount
+        if deleted != 1:
+            raise ValueError("用户状态已经变化，请刷新页面后重试")
+        return {"ok": True, "user_id": normalized_user_id}
+
     def admin_snapshot(self) -> dict[str, Any]:
         stamp = now()
         if stamp - self.free_visibility_reconciled_at >= 30:
