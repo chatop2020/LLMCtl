@@ -11,6 +11,39 @@ from account_portal_gateway import *
 class PortalAdminControlMixin:
     """门户管理员快照、用户策略、用户组与后台周期任务。该类型只提供领域方法，运行状态由组合控制器持有。"""
 
+    def reveal_user_api_key(self, user_id: str) -> dict[str, str]:
+        """按管理员指定的用户 ID 读取当前 API Key，不创建或轮换凭据。
+
+        参数：
+            user_id: 门户普通用户的稳定 ID；管理员账号不属于可读取目标。
+
+        返回：
+            目标用户 ID 与 OmniRoute 返回的当前 API Key 明文。调用方只可把
+            明文返回给已认证管理员，不能写入门户数据库、日志或审计详情。
+
+        异常：
+            ValueError: 用户不存在、不是普通用户，或尚未配置 API Key。
+            RuntimeError: OmniRoute 无法安全返回现有 Key。
+        """
+
+        normalized_user_id = str(user_id).strip()
+        if not normalized_user_id or len(normalized_user_id) > 200:
+            raise ValueError("用户 ID 无效")
+        with self.db.connect() as connection:
+            user = connection.execute(
+                "SELECT id,api_key_id FROM users WHERE id=? AND role='user'",
+                (normalized_user_id,),
+            ).fetchone()
+        if not user:
+            raise ValueError("用户不存在")
+        key_id = str(user["api_key_id"] or "")
+        if not key_id:
+            raise ValueError("该用户尚未配置 API Key")
+        return {
+            "user_id": str(user["id"]),
+            "api_key": self.omni.reveal_user_key(key_id),
+        }
+
     def admin_snapshot(self) -> dict[str, Any]:
         stamp = now()
         if stamp - self.free_visibility_reconciled_at >= 30:

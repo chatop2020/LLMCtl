@@ -661,6 +661,10 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/portal-api/admin/users/update":
                 self.app.control.update_user(payload, user_identity(user))
                 result = {"ok": True}
+            elif path == "/portal-api/admin/users/key/reveal":
+                result = self.app.control.reveal_user_api_key(
+                    str(payload.get("user_id", ""))
+                )
             elif path == "/portal-api/admin/users/bulk-policy":
                 result = self.app.control.bulk_update_user_policies(
                     payload, user_identity(user)
@@ -741,17 +745,32 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 return
         except Exception as error:
             with contextlib.suppress(Exception):
-                self.app.db.audit(user_identity(user), path.removeprefix("/portal-api/"), str(payload.get("id", "")), "failed", self.remote_addr(), str(error))
+                self.app.db.audit(
+                    user_identity(user),
+                    path.removeprefix("/portal-api/"),
+                    str(payload.get("id") or payload.get("user_id") or ""),
+                    "failed",
+                    self.remote_addr(),
+                    str(error),
+                )
             status = 409 if isinstance(error, (DatabaseMigrationError, DatabaseCapabilityError)) else 400 if isinstance(error, ValueError) else 502
             self.json_response(status, {"error": str(error)})
             return
         # 审计账本不持久化凭据明文；事件只证明发生展示/轮换，不复制秘密。
-        audit_result = (
-            {"ok": bool(result.get("ok"))}
-            if path in {"/portal-api/key/reveal", "/portal-api/key/rotate"}
-            and isinstance(result, dict)
-            else result
-        )
+        secret_response_paths = {
+            "/portal-api/key/reveal",
+            "/portal-api/key/rotate",
+            "/portal-api/admin/users/key/reveal",
+        }
+        if path == "/portal-api/admin/users/key/reveal" and isinstance(result, dict):
+            audit_result = {
+                "ok": True,
+                "user_id": str(result.get("user_id", "")),
+            }
+        elif path in secret_response_paths and isinstance(result, dict):
+            audit_result = {"ok": bool(result.get("ok"))}
+        else:
+            audit_result = result
         audit_status = (
             "partial"
             if path == "/portal-api/admin/users/bulk-policy"
@@ -763,7 +782,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             self.app.db.audit(
                 user_identity(user),
                 path.removeprefix("/portal-api/"),
-                str(payload.get("id", "")),
+                str(payload.get("id") or payload.get("user_id") or ""),
                 audit_status,
                 self.remote_addr(),
                 audit_result,

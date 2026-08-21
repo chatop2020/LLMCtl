@@ -1,0 +1,95 @@
+{
+  "plan_id": "admin-api-key-reveal",
+  "plan_version": 1,
+  "generated_at": "2026-08-21T06:56:00Z",
+  "source": {
+    "baseline_commit": "472dd75918eda9c6331bfefe3baeef9a7c499c1f",
+    "worktree": "dirty",
+    "input_sha256": "d57c336ab2bfcb742de3697a5a55fb7ec843fb1e690b83ac78c7dfcb66da56fe",
+    "digest_scope": "git diff and untracked file hashes before this evidence file was created"
+  },
+  "environment": {
+    "host": "macOS local development environment",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "browser": "Codex in-app browser against an isolated local portal and Fake OmniRoute",
+    "target_production_environment": "Ubuntu 24.04 LLMCtl account portal with OmniRoute"
+  },
+  "attempts": [
+    {
+      "attempt": 1,
+      "status": "Failed",
+      "classification": "命令或工作目录错误",
+      "evidence": "Repository-root wc, py_compile, and unittest commands were mistakenly invoked from portal-ui; the first App contract run also showed that the new composable was absent from its aggregated source fixture."
+    },
+    {
+      "attempt": 2,
+      "status": "Passed",
+      "evidence": "The same backend commands were rerun from the repository root, the composable was added to the frontend contract fixture, and all affected gates passed."
+    }
+  ],
+  "gates": [
+    {
+      "gate_id": "backend-security-contract",
+      "status": "Passed",
+      "evidence": [
+        "A normal user received HTTP 403 from the administrator reveal route.",
+        "An authenticated administrator with valid CSRF received the existing Key for one ordinary user without creating or rotating it.",
+        "A missing target received HTTP 400 and a readable user-not-found error.",
+        "The response used Cache-Control: no-store.",
+        "The raw Key was absent from the SQLite database and audit detail; the successful audit retained only ok=true and the target user ID.",
+        "79 focused account-portal tests and Python compilation passed."
+      ]
+    },
+    {
+      "gate_id": "frontend-contract",
+      "status": "Passed",
+      "evidence": [
+        "35 frontend tests passed across 6 files, including on-demand reveal, one-Key-at-a-time memory retention, copy, hide, and no-Key behavior.",
+        "The production portal build passed with 26 transformed modules.",
+        "The administrator Key is not written to sessionStorage or localStorage and is cleared on section exit and logout.",
+        "Built portal index SHA256: ef9bc743a231ce42835dac7d5253c23f5f6a4cd3ab38884bd587df525ccdcbcc.",
+        "Built portal JavaScript SHA256: 2b1b7046c5a1b97e389f238f141da7fc338c9b02a92c7e8e33223f07009c77db.",
+        "Built portal CSS SHA256: 6407aef75471c7a8b645520c13f9964ebc9471e3d64c7c5db2ce022239ed9dbc."
+      ]
+    },
+    {
+      "gate_id": "local-browser-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "A real production build was served by an isolated account portal populated with 45 fictional users, long email addresses, pagination, active and pending states.",
+        "Users without a Key displayed 未创建; provisioned users displayed a mask and an accessible 显示 action.",
+        "Revealing one fictional Key showed the complete value with hide and copy actions without obscuring status, balance, policy, synchronization, or management controls.",
+        "Hiding removed the plaintext from the DOM; no browser console errors were observed."
+      ]
+    },
+    {
+      "gate_id": "repository-release-build",
+      "status": "Passed",
+      "evidence": [
+        "230 Python tests passed in 43.299 seconds.",
+        "10 control-plane upgrade tests passed.",
+        "git diff whitespace and Python compilation checks passed.",
+        "All modified handwritten source files remained below 3000 physical lines; the largest affected test file had 2995 lines and App.vue had 2947 lines."
+      ]
+    },
+    {
+      "gate_id": "production-operator-acceptance",
+      "status": "Unverified",
+      "reason": "This environment did not upgrade the user's production portal or reveal a real user's API Key.",
+      "required_actions": [
+        "Upgrade the control plane from the merged main commit.",
+        "Sign in as an administrator and open User Management.",
+        "Reveal, copy, hide, and re-reveal one authorized test user's current Key.",
+        "Confirm the user's existing client still works and the security audit contains no plaintext Key."
+      ]
+    }
+  ],
+  "artifacts": {
+    "verification_plan": "verification/admin-api-key-reveal-v1.json",
+    "built_portal": "lib/account_portal_ui",
+    "frontend_logic": "portal-ui/src/useAdminApiKeys.js"
+  },
+  "final_stage": "Implemented and locally verified; not deployed or production-accepted"
+}

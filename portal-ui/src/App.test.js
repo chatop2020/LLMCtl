@@ -14,6 +14,7 @@ const adminCoreSource = readFileSync(
 );
 const source = [
   appSource,
+  readFileSync(new URL("./useAdminApiKeys.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useModelDeployments.js", import.meta.url), "utf8"),
   readFileSync(new URL("./portalWorkspaceContext.js", import.meta.url), "utf8"),
   ...componentSources,
@@ -88,6 +89,15 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("userEdit.requests_per_minute");
     expect(source).toContain("允许注册邮箱");
     expect(source).toContain("allowedRegistrationEmails");
+  });
+
+  it("reveals a managed user's current API Key only after an admin action", () => {
+    expect(source).toContain('api("admin/users/key/reveal"');
+    expect(source).toContain("adminUserApiKeys[user.id]");
+    expect(source).toContain("hideAdminUserApiKey");
+    expect(source).toContain("copyAdminUserApiKey");
+    expect(source).toContain("••••••••••••••••");
+    expect(source).not.toContain('sessionStorage.setItem("admin_user_api_key"');
   });
 
   it("gives scoped progress feedback and a non-blocking dismissible toast", () => {

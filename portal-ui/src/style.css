@@ -1399,6 +1399,35 @@ dialog::backdrop {
   width: 34px;
   text-align: center;
 }
+.admin-user-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  max-width: 430px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.admin-user-key > span {
+  flex: 0 0 auto;
+  font-weight: 680;
+}
+.admin-user-key > em {
+  font-style: normal;
+}
+.admin-user-key > code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.35;
+}
+.admin-key-action {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 3px 7px;
+  font-size: 10px;
+}
 .choice-control {
   appearance: none;
   -webkit-appearance: none;

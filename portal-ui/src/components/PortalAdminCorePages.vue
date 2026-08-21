@@ -1189,6 +1189,43 @@ export default {
                     <td>
                       <strong>{{ user.email }}</strong
                       ><small>{{ date(user.created_at) }}</small>
+                      <div class="admin-user-key">
+                        <span>API Key</span>
+                        <em v-if="!user.api_key_id">未创建</em>
+                        <template v-else>
+                          <code>{{
+                            adminUserApiKeys[user.id] || "••••••••••••••••"
+                          }}</code>
+                          <button
+                            type="button"
+                            class="ghost admin-key-action"
+                            :disabled="adminUserApiKeyLoading[user.id]"
+                            :aria-label="`${adminUserApiKeys[user.id] ? '隐藏' : '显示'} ${user.email} 的 API Key`"
+                            @click="
+                              adminUserApiKeys[user.id]
+                                ? hideAdminUserApiKey(user.id)
+                                : revealAdminUserApiKey(user)
+                            "
+                          >
+                            {{
+                              adminUserApiKeyLoading[user.id]
+                                ? "读取中…"
+                                : adminUserApiKeys[user.id]
+                                  ? "隐藏"
+                                  : "显示"
+                            }}
+                          </button>
+                          <button
+                            v-if="adminUserApiKeys[user.id]"
+                            type="button"
+                            class="ghost admin-key-action"
+                            :aria-label="`复制 ${user.email} 的 API Key`"
+                            @click="copyAdminUserApiKey(user)"
+                          >
+                            复制
+                          </button>
+                        </template>
+                      </div>
                     </td>
                     <td>
                       <span
