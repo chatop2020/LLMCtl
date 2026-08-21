@@ -67,6 +67,18 @@ class LlmctlLifecycleTests(unittest.TestCase):
             '--served-model-name "${served_model_names[@]}"', worker_start
         )
 
+    def test_worker_start_enforces_server_side_output_token_ceiling(self):
+        """客户端省略或放大 max_tokens 时，vLLM 仍必须限制单次输出。"""
+
+        manager = manager_implementation()
+        worker_start = manager.split("cmd_worker_start() {", 1)[1].split(
+            "set_env_value() {", 1
+        )[0]
+        self.assertIn("MAX_OUTPUT_TOKENS_CEILING=32768", manager)
+        self.assertIn("--override-generation-config", worker_start)
+        self.assertIn('max_new_tokens\\\":${MAX_OUTPUT_TOKENS}', worker_start)
+        self.assertIn("output<=${MAX_OUTPUT_TOKENS}", worker_start)
+
     def test_status_prefers_registry_and_worker_model_over_legacy_cluster_name(self):
         """多模型环境的状态页必须显示实际 1.5 部署，不能继续报告全局 1.0。"""
 
@@ -120,6 +132,7 @@ class LlmctlLifecycleTests(unittest.TestCase):
                   MODEL_ARCHITECTURE=Qwen3_5MoeForConditionalGeneration; MODEL_PRECISION=fp8; MODEL_TASK=vision
                   MODEL_ROOT=/data/models; ACTIVE_WORKERS=0,1,2,3,4,5,6,7; TP_SIZE=1; PHYSICAL_GPU_COUNT=8
                   INSTANCE_COUNT=8; MAX_NUM_SEQS=7; ESTIMATED_MAX_NUM_SEQS=11; STARTUP_PARALLELISM=8
+                  MAX_OUTPUT_TOKENS=32768
                   SUPPORTS_IMAGE_INPUT=1; MM_LIMIT='{{"image":8}}'; SUPPORTS_TOOL_CALLING=1; TOOL_CALL_PARSER=qwen3_xml
                   SUPPORTS_REASONING=1; REASONING_PARSER=qwen3; SUPPORTS_THINKING_TOGGLE=1
                   API_BIND=0.0.0.0; API_PORT=8000; SERVED_MODEL_NAME=ornith-1.0-35b-fp8

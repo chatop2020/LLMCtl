@@ -57,6 +57,7 @@ KEEPWARM_ENABLED=1
 KEEPWARM_INTERVAL_SECONDS=300
 KEEPWARM_TIMEOUT_SECONDS=90
 MAX_MODEL_LEN=0
+MAX_OUTPUT_TOKENS=32768
 MAX_NUM_SEQS=7
 ESTIMATED_MAX_NUM_SEQS=7
 MAX_NUM_BATCHED_TOKENS=8192
@@ -1008,6 +1009,7 @@ validate_scalar_config() {
   [[ "${ESTIMATED_MAX_NUM_SEQS}" =~ ^[0-9]+$ ]] && (( ESTIMATED_MAX_NUM_SEQS >= 1 && ESTIMATED_MAX_NUM_SEQS <= 16 )) || die "$(l10n '目录返回的序列容量估算无效' 'The catalog returned an invalid sequence-capacity estimate')"
   (( MAX_NUM_SEQS <= ESTIMATED_MAX_NUM_SEQS )) || die "$(l10n "max-num-seqs=${MAX_NUM_SEQS} 超过当前模型/显存估算上限 ${ESTIMATED_MAX_NUM_SEQS}" "max-num-seqs=${MAX_NUM_SEQS} exceeds the model/VRAM estimate of ${ESTIMATED_MAX_NUM_SEQS}")"
   [[ "${MAX_MODEL_LEN}" =~ ^[0-9]+$ ]] && (( MAX_MODEL_LEN >= 8192 && MAX_MODEL_LEN <= 262144 )) || die "$(l10n 'max-model-len 范围 8192-262144' 'max-model-len must be between 8192 and 262144')"
+  [[ "${MAX_OUTPUT_TOKENS}" =~ ^[0-9]+$ ]] && (( MAX_OUTPUT_TOKENS >= 1 && MAX_OUTPUT_TOKENS <= 32768 )) || die "$(l10n 'max-output-tokens 范围 1-32768' 'max-output-tokens must be between 1 and 32768')"
   [[ "${MAX_NUM_BATCHED_TOKENS}" =~ ^[0-9]+$ ]] && (( MAX_NUM_BATCHED_TOKENS >= 1024 && MAX_NUM_BATCHED_TOKENS <= 65536 )) || die "$(l10n 'max-num-batched-tokens 范围 1024-65536' 'max-num-batched-tokens must be between 1024 and 65536')"
   if (( STARTUP_PARALLELISM_EXPLICIT )); then
     [[ "${STARTUP_PARALLELISM}" =~ ^[0-9]+$ ]] && (( STARTUP_PARALLELISM >= 1 && STARTUP_PARALLELISM <= 8 )) || die "$(l10n 'startup-parallelism 范围 1-8' 'startup-parallelism must be between 1 and 8')"
@@ -1593,6 +1595,7 @@ ACCOUNT_QUOTA_RESET_TIME=${ACCOUNT_QUOTA_RESET_TIME}
 ACCOUNT_ADMIN_USERNAME_B64=${encoded_admin_username}
 ACCOUNT_DB_PATH=${STATE_DIR}/omniroute/portal/account-portal.db
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
+MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 ESTIMATED_MAX_NUM_SEQS=${ESTIMATED_MAX_NUM_SEQS}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}

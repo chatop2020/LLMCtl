@@ -58,6 +58,7 @@ readonly MODEL_CONTROL_UNIT_SOURCE="${LLM_MODEL_CONTROL_UNIT_SOURCE:-/usr/local/
 readonly MODEL_CONTROL_SERVICE_UNIT="/etc/systemd/system/llm-model-control.service"
 readonly MODEL_CONTROL_STATE_DIR="${LLM_MODEL_CONTROL_STATE_DIR:-${STATE_DIR}/model-control}"
 readonly MODEL_CONTROL_BACKUP_DIR="${LLM_MODEL_BACKUPS_DIR:-/var/backups/llmctl/model-deployments}"
+readonly MAX_OUTPUT_TOKENS_CEILING=32768
 
 OPTIMIZER_ROLLBACK_ACTIVE=0
 OPTIMIZER_ROLLBACK_FILE=""
@@ -113,6 +114,9 @@ load_config() {
   MODEL_WEIGHT_BYTES="${MODEL_WEIGHT_BYTES:-0}"
   MODEL_PARAMS="${MODEL_PARAMS:-0}"
   MODEL_NATIVE_CONTEXT="${MODEL_NATIVE_CONTEXT:-${MAX_MODEL_LEN:-32768}}"
+  # 旧控制面没有该键。升级后统一补成 32K，并拒绝通过手工配置绕过
+  # 服务端安全上限；客户端仍可为普通请求选择更小的 max_tokens。
+  MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-${MAX_OUTPUT_TOKENS_CEILING}}"
   ESTIMATED_MAX_NUM_SEQS="${ESTIMATED_MAX_NUM_SEQS:-${MAX_NUM_SEQS:-7}}"
   TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
   REASONING_PARSER="${REASONING_PARSER:-qwen3}"
@@ -210,6 +214,8 @@ load_config() {
   [[ "${KEEPWARM_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_INTERVAL_SECONDS >= 60 && KEEPWARM_INTERVAL_SECONDS <= 86400 )) || die "KEEPWARM_INTERVAL_SECONDS 范围 60-86400"
   [[ "${KEEPWARM_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] && (( KEEPWARM_TIMEOUT_SECONDS >= 5 && KEEPWARM_TIMEOUT_SECONDS <= 300 )) || die "KEEPWARM_TIMEOUT_SECONDS 范围 5-300"
   [[ "${WORKFLOW_ENABLED}" == 0 || "${WORKFLOW_ENABLED}" == 1 ]] || die "WORKFLOW_ENABLED 必须是 0 或 1"
+  [[ "${MAX_OUTPUT_TOKENS}" =~ ^[0-9]+$ ]] && (( MAX_OUTPUT_TOKENS >= 1 && MAX_OUTPUT_TOKENS <= MAX_OUTPUT_TOKENS_CEILING )) || \
+    die "MAX_OUTPUT_TOKENS 范围 1-${MAX_OUTPUT_TOKENS_CEILING}"
 }
 
 cmd_gateway_start() {
@@ -317,6 +323,7 @@ cmd_worker_start() {
     --api-key "${BACKEND_API_KEY}"
     --tensor-parallel-size "${TP_SIZE}"
     --max-model-len "${MAX_MODEL_LEN}"
+    --override-generation-config "{\"max_new_tokens\":${MAX_OUTPUT_TOKENS}}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
     --max-num-seqs "${MAX_NUM_SEQS}"
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
@@ -332,7 +339,7 @@ cmd_worker_start() {
   if (( SUPPORTS_IMAGE_INPUT == 1 )); then
     docker_args+=(--limit-mm-per-prompt "${MM_LIMIT}" --allowed-media-domains llm.invalid)
   fi
-  log "Worker ${id} 启动：GPU=${GPU_DEVICES}，TP=${TP_SIZE}，ctx=${MAX_MODEL_LEN}，seq=${MAX_NUM_SEQS}，模型=${MODEL_ID}"
+  log "Worker ${id} 启动：GPU=${GPU_DEVICES}，TP=${TP_SIZE}，ctx=${MAX_MODEL_LEN}，output<=${MAX_OUTPUT_TOKENS}，seq=${MAX_NUM_SEQS}，模型=${MODEL_ID}"
   exec "${docker_args[@]}"
 }
 
@@ -915,7 +922,7 @@ gateway_ui_path() {
 }
 
 gateway_helper() {
-  export SERVED_MODEL_NAME WORKER_BASE_PORT MAX_NUM_SEQS MAX_MODEL_LEN ROUTING_STRATEGY
+  export SERVED_MODEL_NAME WORKER_BASE_PORT MAX_NUM_SEQS MAX_MODEL_LEN MAX_OUTPUT_TOKENS ROUTING_STRATEGY
   export GATEWAY_DB_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD BACKEND_API_KEY
   export GATEWAY_API_KEY BIFROST_ENCRYPTION_KEY UI_USERNAME UI_PASSWORD DATABASE_URL
   export SUPPORTS_IMAGE_INPUT SUPPORTS_OCR OMNIROUTE_JWT_SECRET OMNIROUTE_API_KEY_SECRET
@@ -1532,6 +1539,7 @@ cmd_status() {
       "${TP_SIZE}" "${PHYSICAL_GPU_COUNT}" "${INSTANCE_COUNT}" "${MAX_NUM_SEQS}" "$((active_worker_count * MAX_NUM_SEQS))"
   fi
   printf '规划参考: 当前模型/显存估算每实例 32K 级请求最多约 %s 个；长请求会降低实际并发\n' "${ESTIMATED_MAX_NUM_SEQS}"
+  printf '单请求最大输出: %s Token（vLLM 服务端硬上限）\n' "${MAX_OUTPUT_TOKENS}"
   printf '启动并行度: 每批最多 %s 个 Worker\n' "${STARTUP_PARALLELISM}"
   if (( SUPPORTS_IMAGE_INPUT == 1 )); then
     max_images=$(jq -r '.image // "unknown"' <<<"${MM_LIMIT}" 2>/dev/null || printf unknown)
@@ -1772,6 +1780,7 @@ cmd_info() {
     "${PHYSICAL_GPU_COUNT}" "${TP_SIZE}" "${INSTANCE_COUNT}" "${ACTIVE_WORKERS}" "${STARTUP_PARALLELISM}"
   printf 'Context/max-seqs/batched-tokens/GPU-memory: %s / %s / %s / %s\n' \
     "${MAX_MODEL_LEN}" "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GPU_MEMORY_UTILIZATION}"
+  printf '单请求最大输出 Token: %s（vLLM 服务端硬上限）\n' "${MAX_OUTPUT_TOKENS}"
   printf '图片/OCR/工具/思考/关闭思考: %s / %s / %s / %s / %s\n' \
     "${SUPPORTS_IMAGE_INPUT}" "${SUPPORTS_OCR}" "${SUPPORTS_TOOL_CALLING}" "${SUPPORTS_REASONING}" "${SUPPORTS_THINKING_TOGGLE}"
   printf 'vLLM 镜像: %s (ID=%s)\nPostgreSQL 镜像: %s (ID=%s)\n' \

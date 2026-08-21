@@ -321,10 +321,10 @@ export default {
                 v-model="modelEdit.max_output_tokens"
                 type="number"
                 min="1"
-                max="10000000"
+                :max="MAX_OUTPUT_TOKENS_LIMIT"
                 @input="modelEdit.sync_max_output_tokens = true"
               /><span class="field-hint"
-                >写入接入层 max_token 覆盖值</span
+                >写入接入层覆盖值；vLLM 单次生成硬上限为 32,768</span
               ></label
             >
           </div>

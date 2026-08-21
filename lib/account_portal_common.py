@@ -936,6 +936,23 @@ def positive_int_or_none(value: Any, label: str, maximum: int = 10_000_000) -> i
     return result
 
 
+def max_output_tokens_limit() -> int:
+    """读取门户与 vLLM 共用的单请求最大输出 Token。
+
+    返回：
+        当前控制面允许声明和保存的正整数输出上限。
+
+    异常：
+        ValueError: 环境配置不是正整数，或者超过平台固定的 32768 Token 边界。
+    """
+
+    return positive_int_or_none(
+        os.environ.get("MAX_OUTPUT_TOKENS", "32768"),
+        "MAX_OUTPUT_TOKENS",
+        32768,
+    ) or 32768
+
+
 def portal_ui_url(value: str) -> str:
     """把门户公开来源规范为 Nginx 的 `/ui` 入口。"""
     value = value.rstrip("/")

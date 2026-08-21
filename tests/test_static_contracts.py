@@ -176,6 +176,9 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("SUPPORTS_IMAGE_INPUT == 1", MANAGER)
         self.assertIn("SUPPORTS_TOOL_CALLING == 1", MANAGER)
         self.assertIn("SUPPORTS_REASONING == 1", MANAGER)
+        self.assertIn("MAX_OUTPUT_TOKENS=32768", INSTALLER)
+        self.assertIn("--override-generation-config", MANAGER)
+        self.assertIn("vLLM 服务端硬上限", MANAGER)
 
     def test_worker_keepwarm_is_direct_bounded_observable_and_upgrade_safe(self):
         keepwarm = MANAGER.split("keepwarm_one_worker() {", 1)[1].split(
