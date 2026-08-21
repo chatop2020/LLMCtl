@@ -29,6 +29,7 @@ import PortalAdminOperationsPages from "./components/PortalAdminOperationsPages.
 import PortalDialogs from "./components/PortalDialogs.vue";
 import PortalUserPages from "./components/PortalUserPages.vue";
 import { PORTAL_WORKSPACE_KEY } from "./portalWorkspaceContext.js";
+import { useAdminApiKeys } from "./useAdminApiKeys.js";
 import { useModelDeployments } from "./useModelDeployments.js";
 
 // 与 vLLM Worker 的服务端 max_new_tokens 保持一致，避免管理页再次保存
@@ -134,6 +135,14 @@ const userEdit = reactive({
   group_ids: [],
   note: "",
 });
+const {
+  adminUserApiKeys,
+  adminUserApiKeyLoading,
+  clearAdminUserApiKeys,
+  hideAdminUserApiKey,
+  revealAdminUserApiKey,
+  copyAdminUserApiKey,
+} = useAdminApiKeys({ api, copy, notify });
 const selectedUserIds = ref([]);
 const analyticsFilters = reactive({
   range: "today",
@@ -634,6 +643,7 @@ async function load() {
 
 function clearAuthenticatedClientState() {
   sessionStorage.removeItem("llmctl_api_key");
+  clearAdminUserApiKeys();
   keyOnce.value = "";
   showApiKey.value = false;
   dashboard.value = null;
@@ -927,6 +937,7 @@ async function syncUsageAndRefresh(options = {}) {
 }
 
 async function selectSection(nextSection) {
+  if (nextSection !== "users") clearAdminUserApiKeys();
   section.value = nextSection;
   try {
     if (nextSection === "monitoring" && isAdmin.value) {
@@ -2488,6 +2499,8 @@ provide(PORTAL_WORKSPACE_KEY, {
   keyLoading,
   apiKeyField,
   userEdit,
+  adminUserApiKeys,
+  adminUserApiKeyLoading,
   selectedUserIds,
   analyticsFilters,
   usageReportFilters,
@@ -2637,6 +2650,9 @@ provide(PORTAL_WORKSPACE_KEY, {
   responseError,
   sendChat,
   editUser,
+  hideAdminUserApiKey,
+  revealAdminUserApiKey,
+  copyAdminUserApiKey,
   editGroup,
   editModel,
   publishFree,

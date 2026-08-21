@@ -1,0 +1,98 @@
+{
+  "plan_id": "admin-api-key-reveal",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L3",
+  "source": {
+    "baseline_commit": "472dd75918eda9c6331bfefe3baeef9a7c499c1f",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "允许门户管理员从用户管理列表按需查看和复制某个普通用户当前的 API Key，同时不扩大明文凭据的持久化与暴露范围。",
+    "acceptance": [
+      "用户管理列表对已有 Key 的用户默认只显示掩码，并对尚未创建 Key 的用户显示明确状态。",
+      "只有已认证管理员携带有效 CSRF 才能读取指定普通用户的当前 Key，普通用户和不存在的目标均失败关闭。",
+      "读取只调用 OmniRoute 的现有 Key reveal 能力，不创建、轮换、停用或修改用户凭据。",
+      "Key 明文不进入管理员快照、门户数据库、日志、审计详情、sessionStorage 或 localStorage。",
+      "页面同时只展示一个用户的 Key，支持隐藏和复制，离开用户页面或退出登录后从页面内存清除。",
+      "长邮箱、45 个用户、未创建 Key、已显示 Key 和分页状态下页面无明显错位或不可操作按钮。"
+    ]
+  },
+  "risk": {
+    "level": "L3",
+    "assets": [
+      "用户当前 API Key 明文",
+      "管理员会话与 CSRF 令牌",
+      "OmniRoute Key reveal 能力",
+      "安全审计账本"
+    ],
+    "trust_boundaries": [
+      "管理员浏览器到门户管理 API",
+      "门户管理 API 到对象级用户授权",
+      "门户到 OmniRoute 管理 API",
+      "API 响应到当前页面短期内存与系统剪贴板"
+    ],
+    "abuse_cases": [
+      "普通用户调用管理员揭示接口读取他人 Key",
+      "管理员列表快照批量返回全部 Key",
+      "成功或失败审计、日志和错误详情保存 Key 明文",
+      "浏览器刷新、切页或退出后仍持久保留 Key",
+      "查看操作意外创建或轮换 Key，导致在线客户端失效"
+    ],
+    "controls": [
+      "管理员专用 POST 路由、对象级普通用户查询和统一 CSRF 校验",
+      "现有 no-store 响应头与 OmniRoute 原生 reveal，不引入第二份 Key 存储",
+      "成功审计只保存用户 ID 和结果，失败审计只保存脱敏错误",
+      "前端按需读取、一次仅展示一个、切页与退出清理，且不写浏览器持久存储"
+    ],
+    "stop_conditions": [
+      "任一非管理员或无效 CSRF 请求能够读取 Key",
+      "Key 明文出现在数据库、日志、审计或管理员快照",
+      "查看动作改变 Key ID 或返回新凭据",
+      "用户管理页出现横向溢出、遮挡或无法隐藏/复制"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "backend-security-contract",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "python3 -m py_compile lib/account_portal_control_admin.py lib/account_portal_http.py",
+        "python3 -m unittest tests.test_account_portal"
+      ]
+    },
+    {
+      "gate_id": "frontend-contract",
+      "criticality": "Required",
+      "depends_on": ["backend-security-contract"],
+      "commands": [
+        "npm test -- --run",
+        "npm run build"
+      ]
+    },
+    {
+      "gate_id": "local-browser-acceptance",
+      "criticality": "Required",
+      "depends_on": ["frontend-contract"],
+      "environment": "本机隔离门户、Fake OmniRoute、45 个虚构用户和生产构建资源"
+    },
+    {
+      "gate_id": "repository-release-build",
+      "criticality": "Required",
+      "depends_on": ["local-browser-acceptance"],
+      "commands": [
+        "python3 -m unittest discover -s tests",
+        "control-plane upgrade tests",
+        "git diff --check",
+        "first-party source line-count check"
+      ]
+    },
+    {
+      "gate_id": "production-operator-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-release-build"],
+      "actor": "真实门户管理员",
+      "expected_status_without_operator": "Unverified"
+    }
+  ]
+}

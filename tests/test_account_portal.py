@@ -688,6 +688,58 @@ class PortalIntegrationTests(unittest.TestCase):
             ]
         self.assertEqual(audit_details, ['{"ok":true}', '{"ok":true}'])
 
+    def test_admin_reveals_one_users_current_key_without_leaking_it_to_audit(self):
+        """普通用户必须被拒绝，管理员读取成功后审计也不能保存 Key 明文。"""
+
+        raw_key = "sk-admin-visible-current-key-abcdefghijklmnopqrstuvwxyz"
+        stamp = portal.now()
+        with self.server.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id,email,login_name,password_hash,role,status,api_key_id,quota_tokens,quota_reset,quota_reset_time,created_at,verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "admin-target", "target@example.com", "target@example.com",
+                    portal.hash_password("a secure password 123"), "user", "active",
+                    "target-key", 0, "monthly", "00:00", stamp, stamp,
+                ),
+            )
+        self.fake_omni.created.append(
+            ("target-key", "admin-target", "target@example.com", raw_key)
+        )
+
+        user_client, user_jar = self.opener()
+        self.get(user_client, "/portal-api/public")
+        self.json_post(
+            user_client, user_jar, "/portal-api/auth/login",
+            {"identity": "target@example.com", "password": "a secure password 123"},
+        )
+        denied, _, _ = self.json_post(
+            user_client, user_jar, "/portal-api/admin/users/key/reveal",
+            {"user_id": "admin-target"},
+        )
+        self.assertEqual(denied, 403)
+
+        admin_client, admin_jar = self.login_admin_api()
+        status, result, headers = self.json_post(
+            admin_client, admin_jar, "/portal-api/admin/users/key/reveal",
+            {"user_id": "admin-target"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result, {"user_id": "admin-target", "api_key": raw_key})
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertNotIn(raw_key.encode(), self.db_path.read_bytes())
+        with self.server.db.connect() as connection:
+            audit = connection.execute(
+                "SELECT target,detail FROM audit_events WHERE action='admin/users/key/reveal' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(audit["target"], "admin-target")
+        self.assertNotIn(raw_key, audit["detail"])
+        missing_status, missing, _ = self.json_post(
+            admin_client, admin_jar, "/portal-api/admin/users/key/reveal",
+            {"user_id": "missing-user"},
+        )
+        self.assertEqual(missing_status, 400)
+        self.assertEqual(missing["error"], "用户不存在")
+
     def test_disabling_user_invalidates_existing_session(self):
         client, jar = self.opener()
         token = self.register(client, jar)
