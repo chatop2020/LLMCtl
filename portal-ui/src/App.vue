@@ -24,6 +24,7 @@ import {
   visualInputCount,
 } from "./attachments.js";
 import { writeClipboardText } from "./clipboard.js";
+import { auditActionLabel, formatAuditDetail } from "./auditDisplay.js";
 import PortalAdminCorePages from "./components/PortalAdminCorePages.vue";
 import PortalAdminOperationsPages from "./components/PortalAdminOperationsPages.vue";
 import PortalDialogs from "./components/PortalDialogs.vue";
@@ -31,6 +32,7 @@ import PortalUserPages from "./components/PortalUserPages.vue";
 import { PORTAL_WORKSPACE_KEY } from "./portalWorkspaceContext.js";
 import { useAdminApiKeys } from "./useAdminApiKeys.js";
 import { useModelDeployments } from "./useModelDeployments.js";
+import { usePendingUserActions } from "./usePendingUserActions.js";
 
 // 与 vLLM Worker 的服务端 max_new_tokens 保持一致，避免管理页再次保存
 // 一个运行时永远无法兑现的 64K/256K 输出值。
@@ -143,6 +145,12 @@ const {
   revealAdminUserApiKey,
   copyAdminUserApiKey,
 } = useAdminApiKeys({ api, copy, notify });
+const {
+  pendingUserDelete,
+  resendUserVerification,
+  openPendingUserDelete,
+  deletePendingUser,
+} = usePendingUserActions({ api, action, notify });
 const selectedUserIds = ref([]);
 const analyticsFilters = reactive({
   range: "today",
@@ -1345,9 +1353,11 @@ function replaceStressRun(run) {
   selectedStressRunId.value = run.id;
 }
 
-async function pollStressRun() {
+async function pollStressRun(runId = "") {
   if (!isAdmin.value || document.hidden || section.value !== "stress") return;
-  const target = activeStressRun.value || selectedStressRun.value;
+  const target = runId
+    ? stressRuns.value.find((run) => run.id === runId)
+    : activeStressRun.value || selectedStressRun.value;
   if (!target?.id) return;
   try {
     replaceStressRun(
@@ -1356,6 +1366,18 @@ async function pollStressRun() {
   } catch (error) {
     notify(`读取压测进度失败：${error.message}`, "bad");
   }
+}
+
+/** 选择一条历史压测并把用户带到实际发生变化的结果区域。 */
+async function selectStressRun(run) {
+  if (!run?.id) return;
+  selectedStressRunId.value = run.id;
+  await pollStressRun(run.id);
+  await nextTick();
+  document.querySelector("#stress-run-detail")?.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  });
 }
 
 async function startStressRun() {
@@ -2462,6 +2484,8 @@ provide(PORTAL_WORKSPACE_KEY, {
   prepareAttachment,
   visualInputCount,
   writeClipboardText,
+  auditActionLabel,
+  formatAuditDetail,
   session,
   publicConfig,
   dashboard,
@@ -2501,6 +2525,7 @@ provide(PORTAL_WORKSPACE_KEY, {
   userEdit,
   adminUserApiKeys,
   adminUserApiKeyLoading,
+  pendingUserDelete,
   selectedUserIds,
   analyticsFilters,
   usageReportFilters,
@@ -2653,6 +2678,10 @@ provide(PORTAL_WORKSPACE_KEY, {
   hideAdminUserApiKey,
   revealAdminUserApiKey,
   copyAdminUserApiKey,
+  resendUserVerification,
+  openPendingUserDelete,
+  deletePendingUser,
+  selectStressRun,
   editGroup,
   editModel,
   publishFree,
@@ -2921,10 +2950,6 @@ onBeforeUnmount(() => {
             <span class="nav-dot"></span>{{ item[1] }}
           </button>
         </nav>
-        <div class="side-note">
-          <strong>请求直达推理 API</strong>
-          <p>/v1 请求不经过账户管理服务。</p>
-        </div>
       </aside>
       <main class="content">
         <div v-if="workspaceRefreshing" class="refresh-indicator" role="status">

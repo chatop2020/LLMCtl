@@ -1125,7 +1125,10 @@ export default {
               <div>
                 <span class="eyebrow">IDENTITY & QUOTA</span>
                 <h1>用户管理</h1>
-                <p>禁用、分组、现金余额调整与调用限制集中完成。</p>
+                <p>
+                  注册用户需先完成邮箱验证；系统随后自动创建 API Key
+                  并同步模型权限。也可在这里管理分组、余额和调用限制。
+                </p>
               </div>
               <div class="button-row">
                 <span v-if="selectedUserIds.length" class="selection-count"
@@ -1144,9 +1147,11 @@ export default {
             <ListFilterBar
               v-model="listFilters['admin-users'].query"
               v-model:status="listFilters['admin-users'].status"
-              :status-options="
-                statusOptions.slice(0, 1).concat(statusOptions.slice(2, 3))
-              "
+              :status-options="[
+                { value: 'pending', label: '邮箱未验证' },
+                { value: 'active', label: '正常' },
+                { value: 'disabled', label: '已停用' },
+              ]"
               status-label="全部账户状态"
               :count="filteredAdminUsers.length"
               placeholder="搜索邮箱或同步状态"
@@ -1191,7 +1196,11 @@ export default {
                       ><small>{{ date(user.created_at) }}</small>
                       <div class="admin-user-key">
                         <span>API Key</span>
-                        <em v-if="!user.api_key_id">未创建</em>
+                        <em v-if="!user.api_key_id">{{
+                          user.status === "pending"
+                            ? "验证邮箱后自动创建"
+                            : "尚未创建"
+                        }}</em>
                         <template v-else>
                           <code>{{
                             adminUserApiKeys[user.id] || "••••••••••••••••"
@@ -1230,8 +1239,18 @@ export default {
                     <td>
                       <span
                         class="status"
-                        :class="user.status === 'active' ? 'ok' : 'bad'"
-                        >{{ statusLabel(user.status) }}</span
+                        :class="
+                          user.status === 'active'
+                            ? 'ok'
+                            : user.status === 'pending'
+                              ? 'warn'
+                              : 'bad'
+                        "
+                        >{{
+                          user.status === "pending"
+                            ? "邮箱未验证"
+                            : statusLabel(user.status)
+                        }}</span
                       >
                     </td>
                     <td>${{ user.balance }}</td>
@@ -1247,14 +1266,44 @@ export default {
                           user.permission_status === 'synced' ? 'ok' : 'warn'
                         "
                         >{{
-                          statusLabel(user.permission_status || "pending")
+                          !user.api_key_id && user.status === "pending"
+                            ? "等待邮箱验证"
+                            : user.permission_status === "pending" ||
+                                !user.permission_status
+                              ? "等待权限同步"
+                              : statusLabel(user.permission_status)
                         }}</span
-                      ><small v-if="user.permission_error">{{
+                      ><small v-if="!user.api_key_id && user.status === 'pending'">
+                        验证后自动创建 Key 并同步权限
+                      </small>
+                      <small v-else-if="user.permission_error">{{
                         user.permission_error
                       }}</small>
                     </td>
-                    <td>
-                      <button class="ghost" @click="editUser(user)">
+                    <td class="user-row-actions">
+                      <template v-if="user.status === 'pending'">
+                        <button
+                          type="button"
+                          class="ghost"
+                          :disabled="busy"
+                          @click="resendUserVerification(user)"
+                        >
+                          {{
+                            operation === `user-verification-resend:${user.id}`
+                              ? "发送中…"
+                              : "补发验证邮件"
+                          }}
+                        </button>
+                        <button
+                          type="button"
+                          class="danger"
+                          :disabled="busy"
+                          @click="openPendingUserDelete(user)"
+                        >
+                          删除未验证用户
+                        </button>
+                      </template>
+                      <button v-else class="ghost" @click="editUser(user)">
                         管理
                       </button>
                     </td>
@@ -1483,9 +1532,13 @@ export default {
                                   <strong>{{ message.role }}</strong>
                                   <pre>{{ message.content }}</pre>
                                 </article>
+                                <small
+                                  v-if="requestDetails[row.request_id].truncated"
+                                >输入超过单次安全显示上限，当前已显示前 1,000,000 个字符。</small>
                               </div>
                               <p v-else class="muted">
-                                该请求未保留可显示的输入内容。
+                                该请求产生时未开启详细日志，或内容已过保留期。
+                                详细日志启用后仅新请求可查看，历史内容无法补录。
                               </p>
                             </section>
                             <section class="admin-response-detail">
@@ -1506,9 +1559,13 @@ export default {
                                   <strong>{{ message.role }}</strong>
                                   <pre>{{ message.content }}</pre>
                                 </article>
+                                <small
+                                  v-if="requestDetails[row.request_id].response_truncated"
+                                >输出超过单次安全显示上限，当前已显示前 1,000,000 个字符。</small>
                               </div>
                               <p v-else class="muted">
-                                当前接入层没有保留可显示的最终响应；请检查请求日志保留设置。
+                                该请求产生时未保留最终响应，或内容已过保留期。
+                                详细日志启用后仅新请求可查看，历史输出无法补录。
                               </p>
                             </section>
                           </div>

@@ -14,12 +14,16 @@ const adminCoreSource = readFileSync(
 );
 const source = [
   appSource,
+  readFileSync(new URL("./auditDisplay.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useAdminApiKeys.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useModelDeployments.js", import.meta.url), "utf8"),
+  readFileSync(new URL("./usePendingUserActions.js", import.meta.url), "utf8"),
   readFileSync(new URL("./portalWorkspaceContext.js", import.meta.url), "utf8"),
   ...componentSources,
 ].join("\n");
-const style = readFileSync(new URL("./style.css", import.meta.url), "utf8");
+const style = ["style.css", "operations-theme.css"]
+  .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
+  .join("\n");
 
 describe("LLMCtl portal contracts", () => {
   it("provides every root field referenced by the split admin page", () => {
@@ -156,6 +160,49 @@ describe("LLMCtl portal contracts", () => {
     );
   });
 
+  it("distinguishes email verification from API Key permission synchronization", () => {
+    expect(source).toContain("邮箱未验证");
+    expect(source).toContain("验证邮箱后自动创建");
+    expect(source).toContain("等待邮箱验证");
+    expect(source).toContain("验证后自动创建 Key 并同步权限");
+    expect(source).toContain("等待权限同步");
+  });
+
+  it("keeps desktop navigation fixed and removes the redundant routing note", () => {
+    expect(source).not.toContain("请求直达推理 API");
+    expect(style).toContain("height: calc(100vh - 58px)");
+    expect(style).toContain("overflow-y: auto");
+    expect(style).toContain("overscroll-behavior: contain");
+    expect(style).toMatch(
+      /@media \(max-width: 700px\)[\s\S]*?\.sidebar\s*\{[\s\S]*?height:\s*auto;[\s\S]*?overflow-x:\s*auto;[\s\S]*?overflow-y:\s*hidden;/,
+    );
+  });
+
+  it("expands complete audit details with human-readable action names", () => {
+    expect(source).toContain("auditActionLabel(row.action)");
+    expect(source).toContain("formatAuditDetail(row.detail)");
+    expect(source).toContain("查看完整详情");
+    expect(source).toContain("管理员查看请求详情");
+    expect(style).toContain(".audit-detail pre");
+    expect(style).toContain("max-height: 60vh");
+  });
+
+  it("moves historical stress-test selection to the result that changed", () => {
+    expect(source).toContain('id="stress-run-detail"');
+    expect(source).toContain("selectStressRun(run)");
+    expect(source).toContain('scrollIntoView({');
+    expect(source).toContain("当前查看");
+    expect(source).toContain("查看详情");
+  });
+
+  it("offers explicit pending-user resend and safe delete actions", () => {
+    expect(source).toContain("admin/users/verification/resend");
+    expect(source).toContain("admin/users/pending/delete");
+    expect(source).toContain("补发验证邮件");
+    expect(source).toContain("删除未验证用户");
+    expect(source).toContain("输入完整邮箱确认删除");
+  });
+
   it("marks disabled models and keeps compact status badges readable", () => {
     expect(source).toContain("'model-row-disabled': model.status === 'disabled'");
     expect(source).toContain('v-if="model.status === \'disabled\'"');
@@ -172,7 +219,9 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("尚无请求用量；点击“同步用量”");
     expect(source).toContain("模型输出 <small>仅管理员可见</small>");
     expect(source).toContain("response_messages");
-    expect(source).toContain("该请求没有保留可显示的文本内容");
+    expect(source).toContain("该请求产生时未开启详细日志");
+    expect(source).toContain("历史输入无法补录");
+    expect(source).toContain("1,000,000 个字符");
     expect(source).toContain("现金余额");
     expect(source).toContain("历史 Token 赠额折现");
     expect(source).toContain("cashTokenCapacity");

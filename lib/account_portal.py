@@ -86,6 +86,8 @@ class PortalServer:
             time.monotonic() + PUBLIC_COMBO_MIGRATION_DELAY_SECONDS
         )
         self.route_migration_finished = False
+        self.request_content_logging_due = time.monotonic()
+        self.request_content_logging_ready = False
         try:
             self.control.prepare_public_combo_migration_backup()
             self.control.seed_managed_model()
@@ -99,6 +101,31 @@ class PortalServer:
         self.stop_event = threading.Event()
         self.httpd = PortalHTTPServer((config.bind, config.port), PortalHandler)
         self.httpd.app = self  # type: ignore[attr-defined]
+
+    def reconcile_request_content_logging(self) -> None:
+        """在 OmniRoute 可用后开启受控请求正文与最终响应保留，并有限重试。"""
+
+        current = time.monotonic()
+        if current < self.request_content_logging_due:
+            return
+        try:
+            changed = self.omni.ensure_request_content_logging()
+        except Exception as error:
+            self.request_content_logging_ready = False
+            self.request_content_logging_due = current + 30
+            print(
+                f"[account-portal] request content logging warning: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        self.request_content_logging_ready = True
+        self.request_content_logging_due = current + 300
+        if changed:
+            print(
+                "[account-portal] OmniRoute request and response content logging enabled",
+                flush=True,
+            )
 
     def reconcile_public_routes_after_acceptance(self) -> None:
         current = time.monotonic()
@@ -157,6 +184,7 @@ class PortalServer:
             return
         while not self.stop_event.is_set():
             try:
+                self.reconcile_request_content_logging()
                 self.reconcile_public_routes_after_acceptance()
                 self.control.background_tick()
             except Exception as error:

@@ -840,12 +840,19 @@ class Database:
     def audit(
         self, actor: str, action: str, target: str, status: str, remote: str, detail: Any = ""
     ) -> None:
+        """保存完整可审查详情，并在极端输入超过安全上限时明确标记截断。"""
+
         if not isinstance(detail, str):
             detail = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
+        if len(detail) > REQUEST_DETAIL_TEXT_LIMIT:
+            detail = (
+                detail[:REQUEST_DETAIL_TEXT_LIMIT]
+                + "\n…[详情超过 1,000,000 个字符，已按安全上限截断]"
+            )
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO audit_events(created_at,actor,action,target,status,remote_addr,detail) VALUES(?,?,?,?,?,?,?)",
-                (now(), actor, action, target, status, remote, detail[:2000]),
+                (now(), actor, action, target, status, remote, detail),
             )
 
 

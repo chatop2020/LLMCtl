@@ -1,0 +1,98 @@
+{
+  "plan_id": "portal-operations-ux",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L3",
+  "source": {
+    "baseline_commit": "9b2f020f849e757f3e7609a625aba1dcf19d37dd",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "修复门户中状态文案、固定导航、请求内容、审计详情、压测历史查看与待验证用户生命周期的可理解性和真实操作闭环。",
+    "acceptance": [
+      "待验证用户明确显示邮箱未验证、验证后创建 Key 和等待邮箱验证，不再把账户状态误写成待同步。",
+      "桌面侧栏固定在页头下方，右侧滚动不带走菜单；矮屏下侧栏可以独立滚动；冗余请求直达说明卡片删除。",
+      "审计动作有中文说明，原始动作标识仍可追溯，详情可展开并查看完整保留内容。",
+      "历史压测任务的查看操作会选择目标、显示当前查看状态并自动定位到实际变化的结果区域。",
+      "OmniRoute 详细日志管线自动启用；新请求的输入与最终输出可按现有权限查看至 1,000,000 字符，历史未保留内容得到诚实说明。",
+      "管理员可以补发待验证用户的验证邮件；发送成功后旧链接失效，发送失败保留旧链接。",
+      "管理员只能删除无 Key、无账单、无赠额、无用量的未验证注册占位，且必须输入完整邮箱确认。",
+      "样式文件按主题职责拆分，所有本次涉及的第一方手写源码文件不超过 3000 行。"
+    ]
+  },
+  "risk": {
+    "level": "L3",
+    "assets": [
+      "请求提示词与模型输出正文",
+      "审计日志与操作者身份",
+      "邮箱验证令牌和 SMTP 投递",
+      "用户注册记录、账单、赠额、用量和 API Key",
+      "生产门户导航与管理操作可用性"
+    ],
+    "trust_boundaries": [
+      "用户或管理员浏览器到门户 API",
+      "门户到 OmniRoute 管理 API 与日志制品",
+      "门户到 SMTP 服务",
+      "管理员删除确认到门户数据库级联删除"
+    ],
+    "abuse_cases": [
+      "普通用户越权读取模型输出或审计详情",
+      "详细日志无限增长或把流式块重复保存",
+      "补发失败后使原验证链接意外失效",
+      "删除正式用户或带账单、赠额、调用记录的用户",
+      "审计详情静默截断导致无法追责",
+      "查看历史压测后没有可见反馈而误重复操作"
+    ],
+    "controls": [
+      "沿用本人输入与管理员输出的对象级权限边界",
+      "OmniRoute 30 天摘要保留、100000 行上限、4 MiB 制品和关闭流式块捕获",
+      "门户请求、响应和审计详情分别执行 1,000,000 字符安全上限并明确标记截断",
+      "补发先保留旧令牌，SMTP 成功后才删除旧令牌；一分钟内重复发送失败关闭",
+      "删除只接受 pending、无 Key、无验证时间且无账单/赠额/用量的用户，并要求准确输入邮箱",
+      "浏览器真实交互与多数据量视觉验收"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "focused-security-contracts",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "python3 -m unittest tests.test_request_content_logging tests.test_pending_user_admin",
+        "npm test -- --run"
+      ]
+    },
+    {
+      "gate_id": "production-build",
+      "criticality": "Required",
+      "depends_on": ["focused-security-contracts"],
+      "commands": [
+        "npm run build",
+        "python3 tests/test_control_plane_upgrade.py",
+        "python3 -m unittest tests.test_static_contracts tests.test_source_structure"
+      ]
+    },
+    {
+      "gate_id": "local-browser-acceptance",
+      "criticality": "Required",
+      "depends_on": ["production-build"],
+      "environment": "隔离门户、Fake OmniRoute、45 个虚构用户、长请求/响应、长审计和三条压测历史"
+    },
+    {
+      "gate_id": "repository-regression",
+      "criticality": "Required",
+      "depends_on": ["local-browser-acceptance"],
+      "commands": [
+        "python3 -m unittest discover -s tests",
+        "git diff --check",
+        "first-party source line-count check"
+      ]
+    },
+    {
+      "gate_id": "production-operator-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-regression"],
+      "actor": "真实门户管理员",
+      "expected_status_without_operator": "Unverified"
+    }
+  ]
+}

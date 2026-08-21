@@ -530,8 +530,13 @@ def normalize_group_name(value: str) -> str:
     return result
 
 
-def request_content_summary(request_body: Any, max_characters: int = 20_000) -> dict[str, Any]:
-    """提取可展示的请求正文，不返回任意请求元数据。"""
+REQUEST_DETAIL_TEXT_LIMIT = 1_000_000
+
+
+def request_content_summary(
+    request_body: Any, max_characters: int = REQUEST_DETAIL_TEXT_LIMIT
+) -> dict[str, Any]:
+    """提取接入层保留的完整请求文本，并限制单次管理响应的最大内存占用。"""
     if isinstance(request_body, str):
         try:
             request_body = json.loads(request_body)
@@ -606,8 +611,10 @@ def request_content_summary(request_body: Any, max_characters: int = 20_000) -> 
     return {"available": bool(result), "messages": result, "truncated": truncated}
 
 
-def response_content_summary(response_body: Any, max_characters: int = 40_000) -> dict[str, Any]:
-    """从保留的 OpenAI 兼容响应制品中提取模型最终文本。"""
+def response_content_summary(
+    response_body: Any, max_characters: int = REQUEST_DETAIL_TEXT_LIMIT
+) -> dict[str, Any]:
+    """从保留的 OpenAI 兼容响应制品中提取完整模型文本并执行同一安全上限。"""
     if isinstance(response_body, str):
         stripped = response_body.strip()
         if stripped.startswith("data:"):

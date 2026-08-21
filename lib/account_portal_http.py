@@ -665,6 +665,12 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.control.reveal_user_api_key(
                     str(payload.get("user_id", ""))
                 )
+            elif path == "/portal-api/admin/users/verification/resend":
+                result = self.api_resend_user_verification(payload)
+            elif path == "/portal-api/admin/users/pending/delete":
+                result = self.app.control.delete_pending_user(
+                    str(payload.get("user_id", ""))
+                )
             elif path == "/portal-api/admin/users/bulk-policy":
                 result = self.app.control.bulk_update_user_policies(
                     payload, user_identity(user)
@@ -788,6 +794,77 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 audit_result,
             )
         self.json_response(200, result)
+
+    def api_resend_user_verification(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """为一个未验证用户发送新链接；发送成功后才使旧链接失效。
+
+        参数：
+            payload: 必须包含管理员当前选择的普通用户 ID。
+
+        返回：
+            只包含结果和用户 ID，不返回验证令牌或邮箱正文。
+
+        异常：
+            ValueError: 用户不存在、已经验证或一分钟内刚发送过验证邮件。
+            RuntimeError: SMTP 发送失败；此时删除新令牌并保留此前有效链接。
+        """
+
+        user_id = str(payload.get("user_id", "")).strip()
+        if not user_id or len(user_id) > 200:
+            raise ValueError("用户 ID 无效")
+        stamp = now()
+        raw_token = secrets.token_urlsafe(40)
+        raw_token_hash = token_hash(raw_token)
+        with self.app.db.connect() as connection:
+            user = connection.execute(
+                "SELECT id,email,status,verified_at,api_key_id FROM users "
+                "WHERE id=? AND role='user'",
+                (user_id,),
+            ).fetchone()
+            if not user:
+                raise ValueError("用户不存在")
+            if (
+                user["status"] != "pending"
+                or user["verified_at"] is not None
+                or user["api_key_id"]
+            ):
+                raise ValueError("该用户已经验证或已创建 API Key")
+            latest = connection.execute(
+                "SELECT created_at FROM verification_tokens WHERE user_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if latest and stamp - int(latest["created_at"]) < 60:
+                raise ValueError("验证邮件刚刚发送，请一分钟后再试")
+            connection.execute(
+                "INSERT INTO verification_tokens(token_hash,user_id,expires_at,created_at) "
+                "VALUES(?,?,?,?)",
+                (
+                    raw_token_hash,
+                    user_id,
+                    stamp + self.app.config.verification_ttl,
+                    stamp,
+                ),
+            )
+        try:
+            send_verification_email(
+                effective_mail_config(self.app.config, self.app.db.settings()),
+                str(user["email"]),
+                raw_token,
+            )
+        except Exception as error:
+            with self.app.db.connect() as connection:
+                connection.execute(
+                    "DELETE FROM verification_tokens WHERE token_hash=?",
+                    (raw_token_hash,),
+                )
+            raise RuntimeError(f"验证邮件发送失败：{error}") from error
+        with self.app.db.connect() as connection:
+            connection.execute(
+                "DELETE FROM verification_tokens WHERE user_id=? AND token_hash<>?",
+                (user_id, raw_token_hash),
+            )
+        return {"ok": True, "user_id": user_id}
 
     def api_login(self, payload: dict[str, Any]) -> None:
         if not self.api_csrf_valid():

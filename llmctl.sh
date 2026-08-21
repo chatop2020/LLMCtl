@@ -270,6 +270,11 @@ cmd_gateway_start() {
         -e AUTH_COOKIE_SECURE=false -e OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS=true \
         -e ALLOW_API_KEY_REVEAL=true \
         -e ALLOW_MULTI_CONNECTIONS_PER_COMPAT_NODE=true \
+        -e CALL_LOG_RETENTION_DAYS=30 \
+        -e CALL_LOGS_TABLE_MAX_ROWS=100000 \
+        -e CALL_LOG_PIPELINE_CAPTURE_STREAM_CHUNKS=false \
+        -e CALL_LOG_PIPELINE_MAX_SIZE_KB=4096 \
+        -e CHAT_LOG_TEXT_LIMIT=1048576 \
         -v "${STATE_DIR}/omniroute/gateway:/app/data" \
         "${GATEWAY_IMAGE}"
       ;;

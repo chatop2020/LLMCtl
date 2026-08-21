@@ -110,8 +110,7 @@ export default {
                             "
                             class="muted"
                           >
-                            该请求没有保留可显示的文本内容，可能启用了 noLog
-                            或日志详情已经清理。
+                            该请求产生时未开启详细日志、启用了 noLog，或内容已过保留期；历史输入无法补录。
                           </div>
                           <div v-else class="request-messages">
                             <article
@@ -125,7 +124,7 @@ export default {
                             </article>
                             <small
                               v-if="requestDetails[row.request_id].truncated"
-                              >内容过长，当前仅显示前 20,000 个字符。</small
+                              >内容超过单次安全显示上限，当前已显示前 1,000,000 个字符。</small
                             >
                           </div>
                         </td>
@@ -723,8 +722,7 @@ export default {
                             "
                             class="muted"
                           >
-                            该请求没有保留可显示的文本内容，可能启用了 noLog
-                            或日志详情已经清理。
+                            该请求产生时未开启详细日志、启用了 noLog，或内容已过保留期；历史输入无法补录。
                           </div>
                           <div v-else class="request-messages">
                             <article
@@ -738,7 +736,7 @@ export default {
                             </article>
                             <small
                               v-if="requestDetails[row.request_id].truncated"
-                              >内容过长，当前仅显示前 20,000 个字符。</small
+                              >内容超过单次安全显示上限，当前已显示前 1,000,000 个字符。</small
                             >
                           </div>
                         </td>
