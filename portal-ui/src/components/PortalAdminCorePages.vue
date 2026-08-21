@@ -1280,32 +1280,35 @@ export default {
                         user.permission_error
                       }}</small>
                     </td>
-                    <td class="user-row-actions">
-                      <template v-if="user.status === 'pending'">
-                        <button
-                          type="button"
-                          class="ghost"
-                          :disabled="busy"
-                          @click="resendUserVerification(user)"
-                        >
-                          {{
-                            operation === `user-verification-resend:${user.id}`
-                              ? "发送中…"
-                              : "补发验证邮件"
-                          }}
+                    <td class="user-row-actions-cell">
+                      <div class="user-row-actions">
+                        <template v-if="user.status === 'pending'">
+                          <button
+                            type="button"
+                            class="ghost"
+                            :disabled="busy"
+                            @click="resendUserVerification(user)"
+                          >
+                            {{
+                              operation ===
+                              `user-verification-resend:${user.id}`
+                                ? "发送中…"
+                                : "补发验证邮件"
+                            }}
+                          </button>
+                          <button
+                            type="button"
+                            class="danger"
+                            :disabled="busy"
+                            @click="openPendingUserDelete(user)"
+                          >
+                            删除未验证用户
+                          </button>
+                        </template>
+                        <button v-else class="ghost" @click="editUser(user)">
+                          管理
                         </button>
-                        <button
-                          type="button"
-                          class="danger"
-                          :disabled="busy"
-                          @click="openPendingUserDelete(user)"
-                        >
-                          删除未验证用户
-                        </button>
-                      </template>
-                      <button v-else class="ghost" @click="editUser(user)">
-                        管理
-                      </button>
+                      </div>
                     </td>
                   </tr>
                 </tbody>

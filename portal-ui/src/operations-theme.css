@@ -54,16 +54,21 @@
   overflow-wrap: anywhere;
   font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+/* 表格单元格必须保留 table-cell；仅内部容器使用 flex，避免行高与分隔线错位。 */
+.user-row-actions-cell {
+  min-width: 215px;
+}
 .user-row-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
-  min-width: 170px;
+  align-items: center;
 }
 .user-row-actions button {
   min-height: 30px;
   padding: 5px 8px;
   font-size: 11px;
+  white-space: nowrap;
 }
 body {
   color: var(--text);
