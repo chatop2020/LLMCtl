@@ -44,6 +44,225 @@ class PortalAdminControlMixin:
             "api_key": self.omni.reveal_user_key(key_id),
         }
 
+    def activate_pending_user(
+        self, user_id: str, *, verification_token_hash: str = ""
+    ) -> dict[str, str]:
+        """把待验证用户完整开通为可登录、可同步权限的正式账户。
+
+        参数：
+            user_id: 待开通普通用户的稳定 ID。
+            verification_token_hash: 用户通过邮件确认时提供的令牌哈希。管理员
+                手动通过时留空；成功后仍会使该用户的全部旧验证链接失效。
+
+        返回：
+            用户 ID、邮箱和 OmniRoute 仅在创建时返回的 API Key 明文。调用方
+            只能在用户本人完成邮件验证时展示明文，管理员入口不得返回它。
+
+        异常：
+            ValueError: 用户不存在、已开通、邮箱域名不再允许，或验证令牌失效。
+            RuntimeError: API Key 创建或权限同步失败。失败时会删除半成品 Key，
+                并只回滚本次状态变更，不覆盖并发完成的另一笔开通。
+
+        本方法是邮件验证和管理员手动通过共用的唯一开户状态机。它负责 API
+        Key、欢迎余额、默认用户组、权限同步、令牌失效和失败补偿。
+        """
+
+        normalized_user_id = str(user_id).strip()
+        normalized_token_hash = str(verification_token_hash).strip()
+        if not normalized_user_id or len(normalized_user_id) > 200:
+            raise ValueError("用户 ID 无效")
+        if normalized_token_hash and len(normalized_token_hash) != 64:
+            raise ValueError("验证令牌无效")
+
+        with self.db.connect() as connection:
+            user = connection.execute(
+                "SELECT * FROM users WHERE id=? AND role='user'",
+                (normalized_user_id,),
+            ).fetchone()
+            if not user:
+                raise ValueError("用户不存在")
+            if (
+                user["status"] != "pending"
+                or user["verified_at"] is not None
+                or user["api_key_id"]
+            ):
+                raise ValueError("该用户已经验证或已创建 API Key")
+            billing_preexisting = bool(
+                connection.execute(
+                    "SELECT 1 FROM billing_accounts WHERE user_id=?",
+                    (normalized_user_id,),
+                ).fetchone()
+            )
+            membership_preexisting = bool(
+                connection.execute(
+                    "SELECT 1 FROM user_group_members WHERE user_id=? AND group_id='default'",
+                    (normalized_user_id,),
+                ).fetchone()
+            )
+            permission_row = connection.execute(
+                "SELECT status,error,updated_at FROM permission_sync WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchone()
+            permission_preexisting = dict(permission_row) if permission_row else None
+
+        settings = self.db.settings()
+        _, domain = normalize_email(str(user["email"]))
+        if domain not in normalize_domains(settings.get("allowed_domains", "")):
+            raise ValueError("该用户邮箱域名已不在允许注册范围内")
+
+        key_id = ""
+        welcome_credit_micros = 0
+        welcome_source_ref = ""
+        claimed = False
+        token_consumed = False
+        stamp = now()
+        try:
+            key_id, raw_key = self.omni.create_user_key(
+                normalized_user_id,
+                str(user["email"]),
+                int(user["max_sessions"]),
+            )
+            with self.db.connect() as connection:
+                if normalized_token_hash:
+                    token_consumed = connection.execute(
+                        "UPDATE verification_tokens SET used_at=? "
+                        "WHERE token_hash=? AND user_id=? AND used_at IS NULL AND expires_at>?",
+                        (
+                            stamp,
+                            normalized_token_hash,
+                            normalized_user_id,
+                            stamp,
+                        ),
+                    ).rowcount == 1
+                    if not token_consumed:
+                        raise ValueError("验证链接已失效")
+                claimed = connection.execute(
+                    "UPDATE users SET status='active',verified_at=?,api_key_id=?,"
+                    "token_limit_id=NULL WHERE id=? AND status='pending' "
+                    "AND verified_at IS NULL AND api_key_id IS NULL",
+                    (stamp, key_id, normalized_user_id),
+                ).rowcount == 1
+                if not claimed:
+                    raise ValueError("用户状态已经变化，请刷新页面后重试")
+                connection.execute(
+                    "INSERT OR IGNORE INTO billing_accounts"
+                    "(user_id,balance_micros,suspended,updated_at) VALUES(?,0,0,?)",
+                    (normalized_user_id, stamp),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO user_group_members"
+                    "(user_id,group_id,created_at) VALUES(?,'default',?)",
+                    (normalized_user_id, stamp),
+                )
+                welcome_credit_micros, welcome_source_ref = apply_welcome_credit(
+                    connection, normalized_user_id, settings, stamp
+                )
+            self.sync_user(normalized_user_id)
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE verification_tokens SET used_at=? "
+                    "WHERE user_id=? AND used_at IS NULL",
+                    (stamp, normalized_user_id),
+                )
+            return {
+                "user_id": normalized_user_id,
+                "email": str(user["email"]),
+                "api_key": raw_key,
+            }
+        except Exception:
+            if key_id:
+                with contextlib.suppress(Exception):
+                    self.omni.delete_key(key_id)
+            # 只有本次成功认领了待验证状态时才回滚账户数据；并发完成的另一笔
+            # 开通拥有不同 api_key_id，条件更新不会把它重新降级为 pending。
+            with self.db.connect() as connection:
+                if claimed:
+                    if welcome_credit_micros > 0 and welcome_source_ref:
+                        rollback_source_credit(
+                            connection,
+                            normalized_user_id,
+                            welcome_source_ref,
+                            now(),
+                        )
+                    if permission_preexisting:
+                        connection.execute(
+                            "INSERT INTO permission_sync(user_id,status,error,updated_at) "
+                            "VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                            "status=excluded.status,error=excluded.error,"
+                            "updated_at=excluded.updated_at",
+                            (
+                                normalized_user_id,
+                                permission_preexisting["status"],
+                                permission_preexisting["error"],
+                                permission_preexisting["updated_at"],
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            "DELETE FROM permission_sync WHERE user_id=?",
+                            (normalized_user_id,),
+                        )
+                    if not membership_preexisting:
+                        connection.execute(
+                            "DELETE FROM user_group_members "
+                            "WHERE user_id=? AND group_id='default'",
+                            (normalized_user_id,),
+                        )
+                    if not billing_preexisting:
+                        connection.execute(
+                            "DELETE FROM billing_accounts WHERE user_id=? AND NOT EXISTS "
+                            "(SELECT 1 FROM balance_transactions WHERE user_id=?) AND NOT EXISTS "
+                            "(SELECT 1 FROM usage_ledger WHERE user_id=?)",
+                            (
+                                normalized_user_id,
+                                normalized_user_id,
+                                normalized_user_id,
+                            ),
+                        )
+                    connection.execute(
+                        "UPDATE users SET status='pending',verified_at=NULL,api_key_id=NULL,"
+                        "token_limit_id=NULL WHERE id=? AND status='active' AND api_key_id=?",
+                        (normalized_user_id, key_id),
+                    )
+                if normalized_token_hash and token_consumed:
+                    connection.execute(
+                        "UPDATE verification_tokens SET used_at=NULL "
+                        "WHERE token_hash=? AND user_id=? AND used_at=?",
+                        (normalized_token_hash, normalized_user_id, stamp),
+                    )
+            raise
+
+    def manually_verify_pending_user(
+        self, user_id: str, confirmation_email: str
+    ) -> dict[str, Any]:
+        """由管理员在准确确认邮箱后手动开通一个待验证用户。
+
+        参数：
+            user_id: 管理列表中明确选择的待验证普通用户 ID。
+            confirmation_email: 管理员在确认框中重新输入的完整目标邮箱。
+
+        返回：
+            只包含成功状态和用户 ID；API Key 明文不会返回管理员入口。
+
+        异常：
+            ValueError: 用户不存在、确认邮箱不匹配，或用户不再处于待验证状态。
+            RuntimeError: 开户或权限同步失败；账户保持待验证且半成品 Key 被删除。
+        """
+
+        normalized_user_id = str(user_id).strip()
+        normalized_confirmation = str(confirmation_email).strip()
+        with self.db.connect() as connection:
+            user = connection.execute(
+                "SELECT id,email FROM users WHERE id=? AND role='user'",
+                (normalized_user_id,),
+            ).fetchone()
+        if not user:
+            raise ValueError("用户不存在")
+        if not normalized_confirmation or normalized_confirmation != str(user["email"]):
+            raise ValueError("确认邮箱与目标用户不一致")
+        result = self.activate_pending_user(normalized_user_id)
+        return {"ok": True, "user_id": str(result["user_id"])}
+
     def delete_pending_user(self, user_id: str) -> dict[str, Any]:
         """删除尚未验证且没有凭据、用量或资金记录的注册占位。
 

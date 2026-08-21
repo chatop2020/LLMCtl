@@ -195,9 +195,12 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("查看详情");
   });
 
-  it("offers explicit pending-user resend and safe delete actions", () => {
+  it("为待验证用户提供手动通过、补发和安全删除操作", () => {
+    expect(source).toContain("admin/users/verification/approve");
     expect(source).toContain("admin/users/verification/resend");
     expect(source).toContain("admin/users/pending/delete");
+    expect(source).toContain("手动通过验证");
+    expect(source).toContain("输入完整邮箱确认手动通过");
     expect(source).toContain("补发验证邮件");
     expect(source).toContain("删除未验证用户");
     expect(source).toContain("输入完整邮箱确认删除");

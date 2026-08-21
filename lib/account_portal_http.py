@@ -667,6 +667,11 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 )
             elif path == "/portal-api/admin/users/verification/resend":
                 result = self.api_resend_user_verification(payload)
+            elif path == "/portal-api/admin/users/verification/approve":
+                result = self.app.control.manually_verify_pending_user(
+                    str(payload.get("user_id", "")),
+                    str(payload.get("confirmation_email", "")),
+                )
             elif path == "/portal-api/admin/users/pending/delete":
                 result = self.app.control.delete_pending_user(
                     str(payload.get("user_id", ""))
@@ -1019,58 +1024,13 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if not record:
             self.json_response(410, {"error": "verification link expired"})
             return
-        settings = self.app.db.settings()
-        key_id = ""
-        welcome_source_ref = ""
         try:
-            _, domain = normalize_email(record["email"])
-            if domain not in normalize_domains(settings.get("allowed_domains", "")):
-                raise ValueError("email domain is no longer allowed")
-            key_id, raw_key = self.app.omni.create_user_key(
-                record["user_id"], record["email"], int(record["max_sessions"])
+            provisioned = self.app.control.activate_pending_user(
+                str(record["user_id"]),
+                verification_token_hash=token_hash(raw_token),
             )
-            stamp = now()
-            with self.app.db.connect() as connection:
-                changed = connection.execute(
-                    "UPDATE verification_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL",
-                    (stamp, token_hash(raw_token)),
-                ).rowcount
-                if changed != 1:
-                    raise RuntimeError("verification token already consumed")
-                connection.execute("UPDATE users SET status='active',verified_at=?,api_key_id=?,token_limit_id=NULL WHERE id=?", (stamp, key_id, record["user_id"]))
-                connection.execute("INSERT OR IGNORE INTO billing_accounts(user_id,balance_micros,suspended,updated_at) VALUES(?,0,0,?)", (record["user_id"], stamp))
-                connection.execute("INSERT OR IGNORE INTO user_group_members(user_id,group_id,created_at) VALUES(?,'default',?)", (record["user_id"], stamp))
-                _credited, welcome_source_ref = apply_welcome_credit(
-                    connection, record["user_id"], settings, stamp
-                )
-            self.app.control.sync_user(record["user_id"])
+            raw_key = provisioned["api_key"]
         except Exception as error:
-            if key_id:
-                with contextlib.suppress(Exception):
-                    self.app.omni.delete_key(key_id)
-            # 开通跨越门户数据库和 OmniRoute；后续权限同步失败时恢复待注册状态，
-            # 避免临时网关错误消耗验证链接或留下绑定已删除 Key 的活动账户。
-            with self.app.db.connect() as connection:
-                if welcome_source_ref:
-                    rollback_source_credit(
-                        connection, record["user_id"], welcome_source_ref, now()
-                    )
-                connection.execute("DELETE FROM permission_sync WHERE user_id=?", (record["user_id"],))
-                connection.execute("DELETE FROM user_group_members WHERE user_id=?", (record["user_id"],))
-                connection.execute(
-                    "DELETE FROM billing_accounts WHERE user_id=? AND NOT EXISTS "
-                    "(SELECT 1 FROM balance_transactions WHERE user_id=?) AND NOT EXISTS "
-                    "(SELECT 1 FROM usage_ledger WHERE user_id=?)",
-                    (record["user_id"], record["user_id"], record["user_id"]),
-                )
-                connection.execute(
-                    "UPDATE users SET status='pending',verified_at=NULL,api_key_id=NULL,token_limit_id=NULL WHERE id=?",
-                    (record["user_id"],),
-                )
-                connection.execute(
-                    "UPDATE verification_tokens SET used_at=NULL WHERE token_hash=?",
-                    (token_hash(raw_token),),
-                )
             self.json_response(502, {"error": f"provisioning failed: {error}"})
             return
         raw_session, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
@@ -1545,74 +1505,13 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
         if not record:
             self.response(410, page("Expired", '<div class="card error">验证链接已失效 / Verification link expired.</div>'))
             return
-        settings = self.app.db.settings()
-        key_id = ""
-        welcome_source_ref = ""
         try:
-            _, domain = normalize_email(record["email"])
-            if domain not in normalize_domains(settings.get("allowed_domains", "")):
-                raise ValueError("email domain is no longer allowed")
-            key_id, raw_key = self.app.omni.create_user_key(
-                record["user_id"], record["email"], int(record["max_sessions"])
+            provisioned = self.app.control.activate_pending_user(
+                str(record["user_id"]),
+                verification_token_hash=token_hash(raw_token),
             )
-            stamp = now()
-            with self.app.db.connect() as connection:
-                changed = connection.execute(
-                    "UPDATE verification_tokens SET used_at=? "
-                    "WHERE token_hash=? AND used_at IS NULL",
-                    (stamp, token_hash(raw_token)),
-                ).rowcount
-                if changed != 1:
-                    raise RuntimeError("verification token was already consumed")
-                connection.execute(
-                    "UPDATE users SET status='active',verified_at=?,api_key_id=?,"
-                    "token_limit_id=NULL WHERE id=?",
-                    (stamp, key_id, record["user_id"]),
-                )
-                connection.execute(
-                    "INSERT OR IGNORE INTO billing_accounts"
-                    "(user_id,balance_micros,suspended,updated_at) VALUES(?,0,0,?)",
-                    (record["user_id"], stamp),
-                )
-                connection.execute(
-                    "INSERT OR IGNORE INTO user_group_members"
-                    "(user_id,group_id,created_at) VALUES(?,'default',?)",
-                    (record["user_id"], stamp),
-                )
-                _credited, welcome_source_ref = apply_welcome_credit(
-                    connection, record["user_id"], settings, stamp
-                )
-            self.app.control.sync_user(record["user_id"])
+            raw_key = provisioned["api_key"]
         except Exception as error:
-            if key_id:
-                with contextlib.suppress(Exception):
-                    self.app.omni.delete_key(key_id)
-            with self.app.db.connect() as connection:
-                if welcome_source_ref:
-                    rollback_source_credit(
-                        connection, record["user_id"], welcome_source_ref, now()
-                    )
-                connection.execute(
-                    "DELETE FROM permission_sync WHERE user_id=?", (record["user_id"],)
-                )
-                connection.execute(
-                    "DELETE FROM user_group_members WHERE user_id=?", (record["user_id"],)
-                )
-                connection.execute(
-                    "DELETE FROM billing_accounts WHERE user_id=? AND NOT EXISTS "
-                    "(SELECT 1 FROM balance_transactions WHERE user_id=?) AND NOT EXISTS "
-                    "(SELECT 1 FROM usage_ledger WHERE user_id=?)",
-                    (record["user_id"], record["user_id"], record["user_id"]),
-                )
-                connection.execute(
-                    "UPDATE users SET status='pending',verified_at=NULL,api_key_id=NULL,"
-                    "token_limit_id=NULL WHERE id=?",
-                    (record["user_id"],),
-                )
-                connection.execute(
-                    "UPDATE verification_tokens SET used_at=NULL WHERE token_hash=?",
-                    (token_hash(raw_token),),
-                )
             self.app.db.audit(record["email"], "verify.provision", record["user_id"], "failed", self.client_address[0], type(error).__name__)
             self.response(503, page("Provisioning failed", '<div class="card error">账户开通失败，未保留半成品 API Key；请重试或联系管理员。<br>Provisioning failed and the partial key was revoked.</div>'))
             return

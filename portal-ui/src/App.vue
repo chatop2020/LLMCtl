@@ -146,7 +146,10 @@ const {
   copyAdminUserApiKey,
 } = useAdminApiKeys({ api, copy, notify });
 const {
+  pendingUserApproval,
   pendingUserDelete,
+  openPendingUserApproval,
+  approvePendingUser,
   resendUserVerification,
   openPendingUserDelete,
   deletePendingUser,
@@ -2525,6 +2528,7 @@ provide(PORTAL_WORKSPACE_KEY, {
   userEdit,
   adminUserApiKeys,
   adminUserApiKeyLoading,
+  pendingUserApproval,
   pendingUserDelete,
   selectedUserIds,
   analyticsFilters,
@@ -2678,6 +2682,8 @@ provide(PORTAL_WORKSPACE_KEY, {
   hideAdminUserApiKey,
   revealAdminUserApiKey,
   copyAdminUserApiKey,
+  openPendingUserApproval,
+  approvePendingUser,
   resendUserVerification,
   openPendingUserDelete,
   deletePendingUser,

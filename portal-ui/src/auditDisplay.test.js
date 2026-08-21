@@ -10,6 +10,9 @@ describe("审计日志展示", () => {
     expect(auditActionLabel("admin/users/key/reveal")).toBe(
       "管理员查看用户 API Key",
     );
+    expect(auditActionLabel("admin/users/verification/approve")).toBe(
+      "管理员手动通过邮箱验证",
+    );
     expect(auditActionLabel("custom.action")).toBe("custom.action");
   });
 

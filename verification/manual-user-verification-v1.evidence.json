@@ -1,0 +1,87 @@
+{
+  "plan_id": "manual-user-verification",
+  "plan_version": 1,
+  "generated_at": "2026-08-21T09:06:06Z",
+  "source": {
+    "baseline_commit": "e86eca826398991f66f061f549140874a7541428",
+    "worktree": "dirty",
+    "input_sha256": "b6fc994bd11baa359a5cbb3ed7dda149962f0a7382c2675790ab35ac4469a92f",
+    "digest_scope": "git diff --binary and SHA256 lines for every untracked file before this evidence file was created"
+  },
+  "environment": {
+    "host": "macOS local development environment",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "browser": "Codex in-app browser against an isolated portal and Fake OmniRoute",
+    "target": "Ubuntu 24.04 LLMCtl account portal"
+  },
+  "gates": [
+    {
+      "gate_id": "focused-security-contracts",
+      "status": "Passed",
+      "evidence": [
+        "12 pending-user lifecycle tests passed with isolated SQLite, fake SMTP, and Fake OmniRoute.",
+        "Only an authenticated administrator could approve; an authenticated ordinary user received HTTP 403.",
+        "Wrong confirmation email, disallowed domain, repeated approval, and a concurrent completed activation were rejected without creating or retaining an unintended Key.",
+        "Permission synchronization failure deleted the new Key, restored pending state, kept the verification token retryable, and removed only data created by that attempt.",
+        "A preexisting welcome-credit transaction survived a failed retry, proving compensation does not delete earlier account value.",
+        "The legacy HTML verification flow and the current API verification flow both passed through the shared provisioning state machine.",
+        "33 focused frontend tests passed for the confirmation composable, audit label, and page contracts."
+      ]
+    },
+    {
+      "gate_id": "production-build-and-static",
+      "status": "Passed",
+      "evidence": [
+        "Portal production build passed with 29 transformed modules.",
+        "10 control-plane upgrade package tests passed.",
+        "25 static deployment and source-structure tests passed.",
+        "Python compilation and git diff whitespace checks passed.",
+        "Built portal index SHA256: 15dfcf7964ba9dec904528a267942fc058173b85c6b61806803aa42dbb8a189d.",
+        "Built portal CSS SHA256: a6b7d58c1d2b34dfc095d60d25ac40ab21e91c65f145b6dd55619fd6c63d2f41.",
+        "Built portal JavaScript SHA256: 2be9ce9d1ce798ecbd4b212f2807706a1277bca84d7f68db528c2c535c0d5758."
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "status": "Passed",
+      "evidence": [
+        "245 Python tests passed in 54.118 seconds.",
+        "46 frontend tests passed across 8 files.",
+        "All modified handwritten source files remained below 3000 physical lines; App.vue had 2978 lines, account_portal_http.py 1658, and account_portal_control_admin.py 614."
+      ]
+    },
+    {
+      "gate_id": "isolated-browser-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "A pending user displayed 手动通过验证 alongside resend and restricted delete actions.",
+        "The confirmation dialog explained that another trusted verification channel is required and that approval creates the API Key, applies the configured welcome balance, synchronizes permissions, and expires old links.",
+        "The approval button was disabled for an empty or wrong email and enabled only after the exact full target email was entered.",
+        "After approval, the dialog closed, a success notice appeared, the user displayed 正常 and 已同步, and the pending-user actions disappeared.",
+        "The audit page displayed 管理员手动通过邮箱验证 for the resulting event.",
+        "A final rerun against the final backend source confirmed defaultDisabled=true, exactEnabled=true, manualButtonCount=0, toastCount=1, and one readable audit label."
+      ]
+    },
+    {
+      "gate_id": "production-operator-acceptance",
+      "status": "Unverified",
+      "reason": "The user's production portal has not loaded this commit, and the real pending account has not been manually approved by a human administrator after independent mailbox-ownership confirmation.",
+      "required_actions": [
+        "Run sudo llmctl upgrade.",
+        "Confirm the target user's mailbox ownership through a trusted channel outside the failed verification email delivery.",
+        "In 用户管理, choose 手动通过验证, type the exact full email, and confirm account creation.",
+        "Verify that the account changes to 正常, permission status becomes 已同步, and the audit page records 管理员手动通过邮箱验证."
+      ]
+    }
+  ],
+  "artifacts": {
+    "verification_plan": "verification/manual-user-verification-v1.json",
+    "built_portal": "lib/account_portal_ui",
+    "shared_provisioning": "lib/account_portal_control_admin.py",
+    "admin_api": "lib/account_portal_http.py",
+    "browser_interaction": "portal-ui/src/usePendingUserActions.js"
+  },
+  "final_stage": "Implemented and locally verified; not deployed or production-accepted"
+}

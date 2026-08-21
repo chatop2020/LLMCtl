@@ -1285,6 +1285,14 @@ export default {
                         <template v-if="user.status === 'pending'">
                           <button
                             type="button"
+                            class="primary"
+                            :disabled="busy"
+                            @click="openPendingUserApproval(user)"
+                          >
+                            手动通过验证
+                          </button>
+                          <button
+                            type="button"
                             class="ghost"
                             :disabled="busy"
                             @click="resendUserVerification(user)"
