@@ -203,6 +203,14 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("输入完整邮箱确认删除");
   });
 
+  it("确保用户操作按钮位于标准表格单元格内部", () => {
+    expect(source).toContain('<td class="user-row-actions-cell">');
+    expect(source).toContain('<div class="user-row-actions">');
+    expect(style).toMatch(/\.user-row-actions-cell\s*\{[\s\S]*?min-width:/);
+    expect(style).toMatch(/\.user-row-actions\s*\{[\s\S]*?display:\s*flex/);
+    expect(style).not.toMatch(/td\.user-row-actions\s*\{[\s\S]*?display:\s*flex/);
+  });
+
   it("marks disabled models and keeps compact status badges readable", () => {
     expect(source).toContain("'model-row-disabled': model.status === 'disabled'");
     expect(source).toContain('v-if="model.status === \'disabled\'"');
