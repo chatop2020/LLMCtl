@@ -21,6 +21,7 @@ BASE_ENV = {
     "WORKER_BASE_PORT": "8100",
     "MAX_NUM_SEQS": "7",
     "MAX_MODEL_LEN": "32768",
+    "MAX_OUTPUT_TOKENS": "32768",
     "ROUTING_STRATEGY": "least-busy",
     "GATEWAY_DB_PORT": "15432",
     "POSTGRES_DB": "llm_gateway",
@@ -179,6 +180,23 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertIn("os.environ/BACKEND_API_KEY", content)
         self.assertNotIn("sk-backend-secret", content)
 
+    def test_gateway_metadata_never_advertises_output_above_worker_hard_limit(self):
+        """接入层必须区分 256K 上下文与 32K 单次生成硬上限。"""
+
+        environment = {**BASE_ENV, "MAX_MODEL_LEN": "262144"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            content = gateway.litellm_config([0])
+        self.assertIn("max_input_tokens: 262144", content)
+        self.assertIn("max_output_tokens: 32768", content)
+
+    def test_gateway_rejects_output_limit_above_platform_ceiling(self):
+        """root 配置也不能把服务端硬上限提高到 32768 以上。"""
+
+        environment = {**BASE_ENV, "MAX_OUTPUT_TOKENS": "32769"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(SystemExit, "between 1 and 32768"):
+                gateway.litellm_config([0])
+
     def test_render_bifrost_has_weighted_vllm_keys_postgres_and_virtual_key(self):
         with mock.patch.dict(os.environ, BASE_ENV, clear=True):
             config = json.loads(gateway.bifrost_config(range(8)))
@@ -267,6 +285,15 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertIn(
             ("PATCH", "/api/settings", {"visionBridgeEnabled": False}),
             client.calls,
+        )
+        model_updates = [
+            call[2]
+            for call in client.calls
+            if call[0] in {"POST", "PUT"} and call[1] == "/api/provider-models"
+        ]
+        self.assertTrue(model_updates)
+        self.assertTrue(
+            all(payload["max_output_tokens"] == 32768 for payload in model_updates)
         )
 
     def test_omniroute_reconcile_leaves_vision_bridge_untouched_for_text_model(self):

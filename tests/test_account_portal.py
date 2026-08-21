@@ -1716,7 +1716,7 @@ class PortalIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(inspected["context_window_tokens"], 262144)
-        self.assertEqual(inspected["max_output_tokens"], 64144)
+        self.assertEqual(inspected["max_output_tokens"], 32768)
         self.assertEqual(inspected["managed_runtime_count"], 2)
         self.assertEqual(inspected["managed_runtime_corrected_count"], 2)
         self.assertEqual(
@@ -1727,6 +1727,25 @@ class PortalIntegrationTests(unittest.TestCase):
             [item["gateway_context_window_tokens"] for item in inspected["targets"]],
             [256144, 256144],
         )
+        self.assertEqual(
+            [item["gateway_max_output_tokens"] for item in inspected["targets"]],
+            [64144, 64144],
+        )
+
+    def test_model_save_rejects_output_limit_above_vllm_ceiling(self):
+        """门户不能保存一个底层 Worker 永远无法兑现的最大输出值。"""
+
+        with self.assertRaisesRegex(ValueError, "1-32,768"):
+            self.server.control.save_model(
+                {
+                    "public_model_id": "gdn-inside",
+                    "source_kind": "combo",
+                    "source_ref": "combo-1",
+                    "source_model": "ornith-cluster",
+                    "max_output_tokens": 32769,
+                },
+                "admin@example.com",
+            )
 
     def test_permission_sync_exposes_only_public_model_id(self):
         self.insert_control_user_and_model()

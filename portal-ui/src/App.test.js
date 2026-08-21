@@ -66,6 +66,8 @@ describe("LLMCtl portal contracts", () => {
     ])
       expect(source).toContain(marker);
     expect(source).toContain('model.description || "未填写模型描述"');
+    expect(source).toContain("MAX_OUTPUT_TOKENS_LIMIT = 32768");
+    expect(source).toContain(':max="MAX_OUTPUT_TOKENS_LIMIT"');
   });
 
   it("keeps registration, SMTP, free resources and audit in the admin UI", () => {

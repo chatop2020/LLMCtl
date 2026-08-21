@@ -31,6 +31,9 @@ import PortalUserPages from "./components/PortalUserPages.vue";
 import { PORTAL_WORKSPACE_KEY } from "./portalWorkspaceContext.js";
 import { useModelDeployments } from "./useModelDeployments.js";
 
+// 与 vLLM Worker 的服务端 max_new_tokens 保持一致，避免管理页再次保存
+// 一个运行时永远无法兑现的 64K/256K 输出值。
+const MAX_OUTPUT_TOKENS_LIMIT = 32768;
 const session = ref(null);
 const publicConfig = ref({
   registration_enabled: false,
@@ -2103,7 +2106,9 @@ function editModel(model = {}) {
     source_model: model.source_model || "",
     capabilities: model.capabilities ? [...model.capabilities] : ["chat"],
     context_window_tokens: model.context_window_tokens || "",
-    max_output_tokens: model.max_output_tokens || "",
+    max_output_tokens: model.max_output_tokens
+      ? Math.min(Number(model.max_output_tokens), MAX_OUTPUT_TOKENS_LIMIT)
+      : "",
     sync_context_window: false,
     sync_max_output_tokens: false,
     metadata: model.metadata || null,
@@ -2437,6 +2442,7 @@ provide(PORTAL_WORKSPACE_KEY, {
   chunkParts,
   consumeChatResponse,
   splitThinkingMarkup,
+  MAX_OUTPUT_TOKENS_LIMIT,
   ACCEPTED_ATTACHMENTS,
   MAX_TOTAL_ATTACHMENT_BYTES,
   MAX_VISUAL_INPUTS,

@@ -254,7 +254,17 @@ class PortalModelControlMixin:
         return result
 
     def inspect_model(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """读取实际目标元数据，并优先采用受管 Worker 的有效上下文。"""
+        """读取实际目标元数据，并采用受管 Worker 的有效上下文与输出上限。
+
+        参数：
+            payload: 已发布模型或待编辑来源的标识、类型和底层模型信息。
+
+        返回：
+            各底层目标的原生能力，以及路由组合可以安全公开的保守值。
+
+        异常：
+            ValueError: 模型不存在，或接入层无法解析任何底层目标。
+        """
         if payload.get("id") and not payload.get("source_model"):
             with self.db.connect() as connection:
                 row = connection.execute(
@@ -286,6 +296,7 @@ class PortalModelControlMixin:
                     lookup[(q_provider or provider_id, q_model or model_id)] = model_entry
 
         managed_contexts = self._managed_runtime_contexts()
+        managed_output_limit = max_output_tokens_limit()
         enriched: list[dict[str, Any]] = []
         capabilities: set[str] = set()
         corrected_contexts = 0
@@ -319,9 +330,17 @@ class PortalModelControlMixin:
             )
             max_output = option.get("outputTokenLimit", limits.get("maxOutputTokens"))
             gateway_context = int(context_window) if context_window else None
+            gateway_max_output = int(max_output) if max_output else None
             managed_context = managed_contexts.get(model_id)
             if managed_context is not None:
                 context_window = managed_context
+                # 受管 Worker 已在 vLLM 层执行同一硬上限。门户必须展示实际可用值，
+                # 不能继续把接入层残留的 64K/256K 元数据当成真实输出能力。
+                max_output = min(
+                    gateway_max_output or managed_output_limit,
+                    managed_output_limit,
+                    managed_context,
+                )
                 if gateway_context != managed_context:
                     corrected_contexts += 1
             for key, portal_cap in {
@@ -341,6 +360,7 @@ class PortalModelControlMixin:
                     "qualified_id": qualified,
                     "context_window_tokens": int(context_window) if context_window else None,
                     "gateway_context_window_tokens": gateway_context,
+                    "gateway_max_output_tokens": gateway_max_output,
                     "managed_runtime_context": managed_context is not None,
                     "max_output_tokens": int(max_output) if max_output else None,
                     "family": str(
@@ -999,6 +1019,20 @@ class PortalModelControlMixin:
         return {"status": status, "latency_ms": latency, "response": content}
 
     def save_model(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        """校验、测试并保存公开模型，同时同步管理员明确修改的原生上限。
+
+        参数：
+            payload: 公开 ID、来源、能力、价格、访问范围和可选原生参数。
+            actor: 执行本次管理操作的审计主体。
+
+        返回：
+            保存后的模型、测试状态和接入层参数同步结果。
+
+        异常：
+            ValueError: 字段、来源、权限或输出上限违反公开模型契约。
+            RuntimeError: 接入层测试、映射或参数同步失败。
+        """
+
         public_id = str(payload.get("public_model_id", "")).strip()
         source_kind = str(payload.get("source_kind", "")).strip()
         source_model = str(payload.get("source_model", "")).strip()
@@ -1032,7 +1066,9 @@ class PortalModelControlMixin:
             payload.get("context_window_tokens"), "最大上下文"
         )
         requested_output = positive_int_or_none(
-            payload.get("max_output_tokens"), "最大输出 Token"
+            payload.get("max_output_tokens"),
+            "最大输出 Token",
+            max_output_tokens_limit(),
         )
         sync_context = bool(payload.get("sync_context_window"))
         sync_output = bool(payload.get("sync_max_output_tokens"))

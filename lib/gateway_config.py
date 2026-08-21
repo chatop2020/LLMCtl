@@ -39,6 +39,7 @@ LLMCTL_MANAGED_COMBO_DESCRIPTIONS = frozenset(
 # 不进入 OmniRoute 不透明的 semaphore 队列。
 OMNIROUTE_INFLIGHT_PER_WORKER = 20
 OMNIROUTE_QUEUE_TIMEOUT_MS = 1000
+MAX_OUTPUT_TOKENS_CEILING = 32768
 
 
 def is_llmctl_managed_combo(combo: dict[str, Any] | None) -> bool:
@@ -59,6 +60,31 @@ def required_env(name: str) -> str:
     if not value:
         raise SystemExit(f"missing required environment variable: {name}")
     return value
+
+
+def managed_output_token_limit(max_model_len: int) -> int:
+    """返回 LLMCtl 受管模型对外声明的单请求输出硬上限。
+
+    参数：
+        max_model_len: 当前模型实际启用的输入与输出总上下文长度。
+
+    返回：
+        不超过模型上下文和 32768 Token 平台安全边界的输出上限。
+
+    异常：
+        SystemExit: 配置不是整数，或者管理员尝试把上限提高到平台边界之外。
+    """
+
+    raw_value = os.environ.get("MAX_OUTPUT_TOKENS", str(MAX_OUTPUT_TOKENS_CEILING))
+    try:
+        configured = int(raw_value)
+    except ValueError as error:
+        raise SystemExit("MAX_OUTPUT_TOKENS must be an integer") from error
+    if configured < 1 or configured > MAX_OUTPUT_TOKENS_CEILING:
+        raise SystemExit(
+            f"MAX_OUTPUT_TOKENS must be between 1 and {MAX_OUTPUT_TOKENS_CEILING}"
+        )
+    return min(max_model_len, configured)
 
 
 def parse_worker_ids(value: str) -> list[int]:
@@ -95,6 +121,8 @@ def atomic_write(path: pathlib.Path, content: str, mode: int = 0o640) -> None:
 
 
 def litellm_config(worker_ids: Iterable[int]) -> str:
+    """为旧版 LiteLLM 接入层生成逐 Worker 路由和真实模型能力上限。"""
+
     model = required_env("SERVED_MODEL_NAME")
     base_port = int(required_env("WORKER_BASE_PORT"))
     max_seqs = int(required_env("MAX_NUM_SEQS"))
@@ -115,7 +143,7 @@ def litellm_config(worker_ids: Iterable[int]) -> str:
                 f'      id: "llm-instance-{worker_id}"',
                 '      mode: "chat"',
                 f"      max_input_tokens: {max_len}",
-                f"      max_output_tokens: {max_len}",
+                f"      max_output_tokens: {managed_output_token_limit(max_len)}",
             ]
         )
     lines.extend(
@@ -477,7 +505,7 @@ def ensure_omniroute_management_key(
 def reconcile_omniroute(
     client: OmniRouteClient, worker_ids: list[int], secrets_file: pathlib.Path
 ) -> None:
-    """Reconcile compatible nodes, connections, model metadata, and routing combo."""
+    """同步兼容节点、连接、真实模型能力元数据和路由组合。"""
     client.login()
     ensure_omniroute_management_key(client, secrets_file)
     model = required_env("SERVED_MODEL_NAME")
@@ -599,6 +627,7 @@ def reconcile_omniroute(
             (item for item in models if item.get("id") == model or item.get("modelId") == model),
             None,
         )
+        max_model_len = int(required_env("MAX_MODEL_LEN"))
         model_payload: dict[str, Any] = {
             "provider": node_id,
             "modelId": model,
@@ -607,9 +636,9 @@ def reconcile_omniroute(
             "apiFormat": "chat-completions",
             "supportedEndpoints": ["chat"],
             "targetFormat": "openai",
-            "max_input_tokens": int(required_env("MAX_MODEL_LEN")),
-            "max_output_tokens": int(required_env("MAX_MODEL_LEN")),
-            "contextWindowOverride": int(required_env("MAX_MODEL_LEN")),
+            "max_input_tokens": max_model_len,
+            "max_output_tokens": managed_output_token_limit(max_model_len),
+            "contextWindowOverride": max_model_len,
             "supportsVision": supports_vision,
         }
         if existing_model:
@@ -867,7 +896,7 @@ def reconcile_omniroute_registry(
                 "supportedEndpoints": ["chat"],
                 "targetFormat": "openai",
                 "max_input_tokens": spec["max_model_len"],
-                "max_output_tokens": spec["max_model_len"],
+                "max_output_tokens": managed_output_token_limit(spec["max_model_len"]),
                 "contextWindowOverride": spec["max_model_len"],
                 "supportsVision": spec["supports_vision"],
             }
