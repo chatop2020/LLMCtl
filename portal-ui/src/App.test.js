@@ -17,6 +17,7 @@ const source = [
   readFileSync(new URL("./auditDisplay.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useAdminApiKeys.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useModelDeployments.js", import.meta.url), "utf8"),
+  readFileSync(new URL("./useOmniRouteMaintenance.js", import.meta.url), "utf8"),
   readFileSync(new URL("./usePendingUserActions.js", import.meta.url), "utf8"),
   readFileSync(new URL("./portalWorkspaceContext.js", import.meta.url), "utf8"),
   ...componentSources,
@@ -193,6 +194,16 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain('scrollIntoView({');
     expect(source).toContain("当前查看");
     expect(source).toContain("查看详情");
+  });
+
+  it("exposes OmniRoute upgrade and SQLite maintenance through one operations page", () => {
+    expect(source).toContain('["omniroute", "OmniRoute 维护"]');
+    expect(source).toContain("admin/omniroute/submit");
+    expect(source).toContain("UPDATE OMNIROUTE");
+    expect(source).toContain("MAINTAIN ONLINE");
+    expect(source).toContain("COMPACT SQLITE");
+    expect(source).toContain("备份、升级并自动验收");
+    expect(source).toContain("备份当前状态并执行回滚");
   });
 
   it("为待验证用户提供手动通过、补发和安全删除操作", () => {
@@ -392,13 +403,17 @@ describe("LLMCtl portal contracts", () => {
   });
 
   it("uses public-project LLMCtl language and a light operations-console visual system", () => {
+    const userFacingSource = readFileSync(
+      new URL("./components/PortalUserPages.vue", import.meta.url),
+      "utf8",
+    );
     for (const marker of [
       "OmniRoute",
       "独立 SQLite",
       "企业 AI 门户",
       "公司模型",
     ]) {
-      expect(source).not.toContain(marker);
+      expect(userFacingSource).not.toContain(marker);
     }
     expect(source).toContain("{{ portalTitle }} 模型服务门户");
     expect(source).toContain("document.title = `${title} 模型服务门户`");

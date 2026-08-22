@@ -33,6 +33,7 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/gateway_config.py",
             "lib/model_deployment.py",
             "lib/model_upgrade.py",
+            "lib/omniroute_maintenance.py",
             "lib/account_portal.py",
             "lib/llm_benchmark.py",
             "lib/workflow_config.py",

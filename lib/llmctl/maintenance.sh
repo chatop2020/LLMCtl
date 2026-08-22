@@ -440,6 +440,13 @@ cmd_update() {
       *) die "未知 update 参数：$1" ;;
     esac
   done
+  if [[ "${GATEWAY_KIND}" == omniroute && "${new_gateway}" != "${GATEWAY_IMAGE}" ]]; then
+    [[ "${new_vllm}" == "${VLLM_IMAGE}" && "${new_postgres}" == "${POSTGRES_IMAGE}" ]] || \
+      die "OmniRoute 安全升级不能与 vLLM/PostgreSQL 镜像更新合并；请分别执行"
+    warn "OmniRoute 镜像更新必须先评估并备份 SQLite；正在转交安全升级状态机。"
+    cmd_omniroute update "${new_gateway}"
+    return
+  fi
   [[ "${new_vllm}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "vLLM 镜像名格式无效"
   [[ "${new_gateway}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "网关镜像名格式无效"
   [[ "${new_postgres}" =~ ^[A-Za-z0-9./:_@-]+$ ]] || die "PostgreSQL 镜像名格式无效"

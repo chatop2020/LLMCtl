@@ -155,7 +155,7 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("calciumion/new-api:v1.0.0-rc.22", INSTALLER)
         self.assertIn("ghcr.io/berriai/litellm:v1.94.0", INSTALLER)
         self.assertIn("maximhq/bifrost:v1.6.7", INSTALLER)
-        self.assertIn("diegosouzapw/omniroute:3.8.48", INSTALLER)
+        self.assertIn("diegosouzapw/omniroute:3.8.49", INSTALLER)
         pull = INSTALLER.split("pull_images() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('selected_gateway_image=$(gateway_image)', pull)
         self.assertIn('ensure_image "${selected_gateway_image}"', pull)
@@ -351,6 +351,50 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("curl", ACCOUNT)
         self.assertIn("audit_events", ACCOUNT)
         self.assertIn("API Key 明文只返回一次", ACCOUNT)
+
+    def test_omniroute_lifecycle_has_shared_backup_recovery_and_bilingual_docs(self):
+        """CLI、root 控制服务、升级包和文档必须描述同一套安全运维入口。"""
+
+        maintenance = (ROOT / "lib" / "omniroute_maintenance.py").read_text(
+            encoding="utf-8"
+        )
+        manifest = (ROOT / "upgrade-manifest.tsv").read_text(encoding="utf-8")
+        for marker in (
+            "cmd_omniroute()",
+            "omniroute sqlite assess",
+            "MAINTAIN ONLINE",
+            "COMPACT SQLITE",
+            "UPDATE OMNIROUTE",
+            "ROLLBACK ${backup_id}",
+            "正在转交安全升级状态机",
+        ):
+            self.assertIn(marker, MANAGER)
+        for marker in (
+            "source.backup",
+            "PRAGMA quick_check",
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "VACUUM",
+            "_restore_database",
+            "_restart_and_smoke",
+            "MUTABLE_IMAGE_TAGS",
+        ):
+            self.assertIn(marker, maintenance)
+        self.assertIn("lib/omniroute_maintenance.py", manifest)
+        self.assertIn("diegosouzapw/omniroute:3.8.49", INSTALLER)
+        for chinese_name, english_name in (
+            ("README.md", "README_EN.md"),
+            ("USAGE.md", "USAGE_EN.md"),
+        ):
+            chinese = (ROOT / chinese_name).read_text(encoding="utf-8")
+            english = (ROOT / english_name).read_text(encoding="utf-8")
+            for command in (
+                "llmctl omniroute sqlite assess",
+                "llmctl omniroute sqlite maintain online",
+                "llmctl omniroute update",
+                "llmctl omniroute rollback",
+            ):
+                self.assertIn(command, chinese)
+                self.assertIn(command, english)
 
 
 if __name__ == "__main__":

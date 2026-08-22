@@ -581,6 +581,7 @@ const nav = computed(() =>
         ["billing", "账单"],
         ["reports", "用量报表"],
         ["database", "数据库"],
+        ["omniroute", "OmniRoute 维护"],
         ["monitoring", "系统监控"],
         ["workflow", "能力编排"],
         ["stress", "性能压测"],

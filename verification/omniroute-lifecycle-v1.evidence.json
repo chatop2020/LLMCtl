@@ -1,0 +1,122 @@
+{
+  "plan_id": "omniroute-lifecycle-maintenance",
+  "plan_version": 1,
+  "generated_at": "2026-08-22T04:51:19Z",
+  "source": {
+    "baseline_commit": "8338c033ad3b4782f32cbfde12cf026e831581c4",
+    "worktree": "dirty",
+    "input_sha256": "9f6c715f21f71e38c7644a3fdd9142dd87a1263bb3979fa7910064a548afca63",
+    "digest_scope": "git diff --binary and SHA256 lines for every untracked file except this evidence file"
+  },
+  "environment": {
+    "host": "macOS local development environment",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "sqlite": "3.51.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "browser": "Codex in-app browser against an isolated portal with a fake root control service",
+    "target": "Ubuntu 24.04 LLMCtl with systemd, Docker, OmniRoute, and NVIDIA GPU Workers"
+  },
+  "gates": [
+    {
+      "gate_id": "sqlite-domain-and-recovery",
+      "status": "Passed",
+      "evidence": [
+        "17 OmniRoute lifecycle tests passed using real temporary SQLite databases and a deterministic Docker/systemd runner.",
+        "Assessment covered deep integrity, foreign-key violations, WAL, free pages, disk headroom, and stale backup recommendations.",
+        "Online backup used sqlite3 backup, quick_check, SHA256, size, ownership, and mode metadata; manual rollback restored the exact business row and image configuration.",
+        "Online maintenance created a backup and preserved data without issuing any Router or systemd command.",
+        "Maintenance-window compaction executed stop, VACUUM, restart, and full smoke semantics; injected smoke failure restored the pre-maintenance snapshot.",
+        "A failed Router stop restarted the account portal without touching the database.",
+        "A corrupted current database was preserved as a non-restorable incident DB/WAL/SHM copy before a verified snapshot was restored.",
+        "A tampered backup was rejected by size/SHA256 validation before any systemd command.",
+        "Mutable image tags, wrong confirmations, path traversal, non-OmniRoute mode, active model jobs, and interrupted controller tasks all failed closed."
+      ]
+    },
+    {
+      "gate_id": "image-upgrade-and-rollback",
+      "status": "Passed",
+      "evidence": [
+        "A successful fixed-image upgrade pulled the image, recorded its immutable image ID, backed up SQLite, switched both compatible image keys, restarted Router, and ran full smoke semantics.",
+        "Injected post-start smoke failure restored the original database, image configuration, and running image.",
+        "A configured/running image drift was rejected before backup creation because the original runtime could not be reproduced reliably.",
+        "A running image ID different from the ID inspected after pull triggered automatic database and image rollback.",
+        "The published 3.8.49 Docker manifest was inspected as available for linux/amd64 and linux/arm64. No production image was pulled or started."
+      ]
+    },
+    {
+      "gate_id": "cli-api-and-permission-contracts",
+      "status": "Passed",
+      "evidence": [
+        "The llmctl entry point loaded cmd_omniroute, omniroute_wait_job, and omniroute_request successfully with LLMCTL_SOURCE_ONLY=1.",
+        "bash -n passed for llmctl.sh, every lib/llmctl module, and install-llm-cluster.sh.",
+        "The legacy llmctl update --omniroute-image path delegates to the backup-protected state machine and rejects a combined vLLM/OmniRoute update.",
+        "2 portal permission/forwarding tests proved administrator-only access and exact mapping to status, assess, submit, job, and cancel allowlist operations.",
+        "High-frequency job polling produced no audit event, while assessment, submission, and cancellation remained audited.",
+        "20 model deployment tests passed, including construction with the shared OmniRoute submission lock; model and Router mutations cannot be submitted concurrently.",
+        "36 static/source/upgrade-package tests passed, and the new Python and Shell modules are present in the installer and upgrade manifest."
+      ]
+    },
+    {
+      "gate_id": "frontend-contract-and-build",
+      "status": "Passed",
+      "evidence": [
+        "50 frontend tests passed across 9 files.",
+        "The OmniRoute composable tests covered status/recommended image loading, deep assessment, and exact update/rollback payloads.",
+        "The portal production build passed with 30 transformed modules.",
+        "Built portal index SHA256: e9a1b4c228a9e23c695d032d539d1ea28af8206f16ebf698b25f8f23aaea61b0.",
+        "Built portal CSS SHA256: b05bb3440bf398a344dceb8a44bcd09da8fc06ff16d4a069eac8c96bc1282a50.",
+        "Built portal JavaScript SHA256: e1e4a4772d6f52787573d8e1ed196efe74ce1e795aa96a5220b0f68025104ae1."
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "status": "Passed",
+      "evidence": [
+        "265 Python tests passed in 56.560 seconds.",
+        "Python compilation, strict JSON parsing, bash syntax, command-module loading, and git diff whitespace checks passed.",
+        "All modified handwritten sources remained below 3000 physical lines; App.vue had 2979 lines, llmctl.sh 2870, model_deployment.py 2524, and omniroute_maintenance.py 1350."
+      ]
+    },
+    {
+      "gate_id": "isolated-browser-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "The administrator navigation exposed OmniRoute 维护 and rendered configured/running/recommended images, database/WAL/SHM sizes, assessment status, recommendations, actions, tasks, and backup inventory.",
+        "Online maintenance, compaction, and update buttons were disabled by default and for a wrong phrase, then enabled only for MAINTAIN ONLINE, COMPACT SQLITE, and UPDATE OMNIROUTE respectively.",
+        "Rollback remained disabled until the exact selected backup ID was included in the ROLLBACK phrase.",
+        "Read-only assessment produced visible warning feedback; an isolated backup task reached 100 percent, showed a success result, and added a second backup row.",
+        "At a 680-pixel viewport the summary and action sections used one column, the backup table scrolled inside its container, and body scrollWidth equaled clientWidth.",
+        "A final run against the final built assets showed one maintenance heading, one healthy assessment, the backup ID and SHA256 prefix, an initially disabled upgrade action, and no page-level horizontal overflow."
+      ]
+    },
+    {
+      "gate_id": "shellcheck",
+      "status": "Unverified",
+      "criticality": "Informational",
+      "reason": "shellcheck is not installed in the local development environment. Bash parsing, module loading, static contracts, and command-source tests passed, but shellcheck diagnostics were not executed."
+    },
+    {
+      "gate_id": "ubuntu-production-acceptance",
+      "status": "Unverified",
+      "reason": "No real Ubuntu systemd service, Docker Router, production storage.sqlite, or GPU-backed full smoke was modified or executed from this development machine.",
+      "required_actions": [
+        "Run sudo llmctl upgrade, then sudo llmctl model init if the model-control socket is not ready.",
+        "Run sudo llmctl omniroute status and sudo llmctl omniroute sqlite assess --deep; confirm no critical result and sufficient disk headroom.",
+        "Create a managed backup and verify it appears under /var/backups/llmctl/omniroute and in the WebUI backup inventory.",
+        "During a maintenance window, upgrade with sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 and confirm the task reaches succeeded, the actual image ID changes, /v1 passes full smoke, and GPU Workers remain running.",
+        "Keep the printed backup ID until production traffic, dashboard, API keys, Combos, call logs, and portal reconciliation have been accepted."
+      ]
+    }
+  ],
+  "artifacts": {
+    "verification_plan": "verification/omniroute-lifecycle-v1.json",
+    "domain_runtime": "lib/omniroute_maintenance.py",
+    "cli_module": "lib/llmctl/omniroute.sh",
+    "root_control": "lib/model_deployment.py",
+    "portal_composable": "portal-ui/src/useOmniRouteMaintenance.js",
+    "portal_page": "portal-ui/src/components/PortalAdminOperationsPages.vue",
+    "built_portal": "lib/account_portal_ui"
+  },
+  "final_stage": "Implemented and locally verified; not deployed or production-accepted"
+}

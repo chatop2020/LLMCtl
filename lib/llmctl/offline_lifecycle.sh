@@ -170,6 +170,8 @@ cmd_uninstall() {
   remove_tree_with_progress "${MODEL_CONTROL_STATE_DIR}" "模型部署任务状态" 2
   [[ "${MODEL_CONTROL_BACKUP_DIR}" == /var/backups/llmctl/model-deployments ]] || die "模型部署回滚路径安全检查失败"
   remove_tree_with_progress "${MODEL_CONTROL_BACKUP_DIR}" "模型部署回滚快照" 2
+  [[ "${OMNIROUTE_MAINTENANCE_STATE_DIR}" == /var/lib/llm-cluster/omniroute-maintenance ]] || die "OmniRoute 运维状态路径安全检查失败"
+  remove_tree_with_progress "${OMNIROUTE_MAINTENANCE_STATE_DIR}" "OmniRoute 运维任务状态" 2
   if (( purge_images )); then
     log "删除锁定的 LLM 容器镜像。"
     if [[ "${GATEWAY_KIND}" == omniroute ]]; then
@@ -190,6 +192,8 @@ cmd_uninstall() {
     if [[ -d "${STATE_DIR}/omniroute" ]]; then
       remove_tree_with_progress "${STATE_DIR}/omniroute" "OmniRoute 与账户门户 SQLite 数据" 5
     fi
+    [[ "${OMNIROUTE_MAINTENANCE_BACKUP_DIR}" == /var/backups/llmctl/omniroute ]] || die "OmniRoute 恢复快照路径安全检查失败"
+    remove_tree_with_progress "${OMNIROUTE_MAINTENANCE_BACKUP_DIR}" "OmniRoute 受管恢复快照" 5
     if getent passwd llm-account 2>/dev/null | awk -F: '$6=="/nonexistent" && $7=="/usr/sbin/nologin" {found=1} END{exit !found}'; then
       userdel llm-account 2>/dev/null || true
       groupdel llm-account 2>/dev/null || true
@@ -197,7 +201,7 @@ cmd_uninstall() {
     fi
     rm -f "${RETAINED_SECRETS}"
   else
-    log "接入层 PostgreSQL/SQLite 状态和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装相同接入层时可继续使用。"
+    log "接入层 PostgreSQL/SQLite 状态、OmniRoute 恢复快照和 root-only 恢复凭据 ${RETAINED_SECRETS} 已保留；重装相同接入层时可继续使用。"
   fi
   if getent passwd llm-workflow 2>/dev/null | awk -F: '$6=="/nonexistent" && $7=="/usr/sbin/nologin" {found=1} END{exit !found}'; then
     [[ "${WORKFLOW_STATE_DIR}" == /var/lib/llm-cluster/workflow ]] || die "工作流状态路径安全检查失败"

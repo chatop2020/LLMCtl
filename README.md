@@ -76,7 +76,7 @@
 | New API 镜像 | `calciumion/new-api:v1.0.0-rc.22` |
 | LiteLLM 镜像 | `ghcr.io/berriai/litellm:v1.94.0` |
 | Bifrost 镜像 | `maximhq/bifrost:v1.6.7` |
-| OmniRoute 镜像 | `diegosouzapw/omniroute:3.8.48` |
+| OmniRoute 镜像 | `diegosouzapw/omniroute:3.8.49` |
 | PostgreSQL | `postgres:16-alpine` |
 | 统一 API | `http://服务器IP:8000/v1` |
 | 统一 Web UI | `http://服务器IP:8000/ui/` |
@@ -291,6 +291,27 @@ sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
 
 仅下载/校验而不替换文件可加 `--check`。升级记录保存在 `/var/lib/llm-cluster/control-plane-version.env`，备份保存在 `/var/backups/llmctl/`，并由 `llmctl info` 显示当前控制面提交。
 
+## OmniRoute 安全升级与 SQLite 维护
+
+OmniRoute 自身固定使用 `gateway/storage.sqlite`。LLMCtl 通过现有 root-only 控制服务为 CLI 与 WebUI 提供同一套只读评估、在线备份、在线维护、维护窗压缩、镜像升级和回滚状态机；账户门户进程无权直接读取该数据库、调用 Docker 或操作 systemd。
+
+```bash
+sudo llmctl omniroute status
+sudo llmctl omniroute sqlite assess
+sudo llmctl omniroute sqlite assess --deep
+sudo llmctl omniroute backup
+sudo llmctl omniroute sqlite maintain online
+sudo llmctl omniroute sqlite maintain compact
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute backups
+sudo llmctl omniroute rollback <备份ID>
+```
+
+评估会检查 quick/integrity check、外键、WAL、页空闲率、磁盘余量、备份年龄、配置镜像和实际运行镜像。所有写操作都先用 SQLite 在线备份 API 创建一致性快照，并记录 SHA256、大小、quick_check、原镜像和文件权限。在线维护只执行 `PRAGMA optimize` 与 `PASSIVE checkpoint`，不停止 Router；`compact` 会在维护窗口短暂停止 Router，执行 WAL 截断、`VACUUM` 和完整性检查。升级只接受固定版本或 digest，新版本、路由同步或完整模型冒烟失败时会同时恢复原镜像和升级前数据库。回滚前也会先保存当前状态。以上操作均不重启 GPU Worker。
+
+管理端左侧“OmniRoute 维护”提供相同能力、实时阶段与备份列表。高风险操作必须输入页面给出的完整确认短语。备份保存在 `/var/backups/llmctl/omniroute/`，不会自动删除；请纳入磁盘容量与异机备份策略。
+旧命令 `llmctl update --omniroute-image ...` 会自动转交上述安全升级流程，不能绕过 SQLite 备份和回滚。
+
 ## 可选 MySQL 门户数据库
 
 LLMCtl 账户门户默认继续使用 SQLite；小型和中型部署无需因为新增 MySQL 能力而迁移。MySQL 只替代 `/var/lib/llm-cluster/omniroute/portal/account-portal.db` 承载的门户用户、授权、计费、用量与审计数据，不替代 OmniRoute 自身的 `storage.sqlite`，也不参与 `/v1` 推理数据路径。
@@ -348,6 +369,8 @@ sudo llmctl models current
 | `/etc/nginx/conf.d/llm-cluster.conf` | LLMCtl 独立 Nginx 统一入口配置 |
 | `/var/lib/llm-cluster/cache` | 可再生成的 vLLM 缓存 |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute 自身 SQLite 数据库 |
+| `/var/lib/llm-cluster/omniroute-maintenance` | OmniRoute 评估结果与后台任务状态 |
+| `/var/backups/llmctl/omniroute` | 带 SHA256、完整性结果与镜像元数据的受管恢复快照 |
 | `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | 账户门户默认 SQLite 数据库；切换 MySQL 后作为迁移前回退副本保留 |
 | `/data/llm-cluster/models` | 默认模型根目录 |
 | `llm-cluster.service` | 总控 oneshot 服务 |

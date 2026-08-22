@@ -1,5 +1,7 @@
 <script>
+import { onBeforeUnmount, watch } from "vue";
 import { usePortalWorkspaceContext } from "../portalWorkspaceContext.js";
+import { useOmniRouteMaintenance } from "../useOmniRouteMaintenance.js";
 import ListFilterBar from "./ListFilterBar.vue";
 import PaginationBar from "./PaginationBar.vue";
 
@@ -7,12 +9,382 @@ export default {
   name: "PortalAdminOperationsPages",
   components: { ListFilterBar, PaginationBar },
   setup() {
-    return usePortalWorkspaceContext();
+    const workspace = usePortalWorkspaceContext();
+    const maintenance = useOmniRouteMaintenance({
+      api: workspace.api,
+      notify: workspace.notify,
+    });
+    const stopSectionWatch = watch(
+      () => workspace.section.value,
+      (section) => {
+        if (section === "omniroute") maintenance.loadOmniRouteMaintenance();
+        else maintenance.stopOmniRoutePolling();
+      },
+      { immediate: true },
+    );
+    onBeforeUnmount(() => {
+      stopSectionWatch();
+      maintenance.stopOmniRoutePolling();
+    });
+    return { ...workspace, ...maintenance };
   },
 };
 </script>
 
 <template>
+          <section v-if="section === 'omniroute'" class="page omniroute-maintenance-page">
+            <div class="page-head">
+              <div>
+                <span class="eyebrow">ROUTER LIFECYCLE & SQLITE</span>
+                <h1>OmniRoute 维护</h1>
+                <p>
+                  评估并维护 OmniRoute 自身的 SQLite，或在自动备份和失败回滚保护下升级 Router。
+                </p>
+              </div>
+              <div class="button-row">
+                <button
+                  class="ghost"
+                  type="button"
+                  :disabled="omnirouteLoading || omnirouteActionLoading"
+                  @click="loadOmniRouteMaintenance"
+                >
+                  {{ omnirouteLoading ? "读取中…" : "刷新状态" }}
+                </button>
+                <button
+                  class="primary"
+                  type="button"
+                  :disabled="omnirouteActionLoading || omnirouteJobActive"
+                  @click="assessOmniRouteSqlite(false)"
+                >
+                  立即评估
+                </button>
+              </div>
+            </div>
+
+            <div v-if="!omnirouteMaintenance && omnirouteLoading" class="panel">
+              正在读取 OmniRoute 镜像、SQLite、备份和任务状态…
+            </div>
+
+            <template v-if="omnirouteMaintenance">
+              <div class="metrics omniroute-summary">
+                <article>
+                  <span>配置镜像</span>
+                  <strong>{{ omnirouteMaintenance.configured_image || "未知" }}</strong>
+                  <small>推荐：{{ omnirouteMaintenance.recommended_image }}</small>
+                </article>
+                <article>
+                  <span>实际运行镜像</span>
+                  <strong>{{ omnirouteMaintenance.running_image || "未运行" }}</strong>
+                  <small class="mono">{{ omnirouteMaintenance.running_image_id || "未读取镜像 ID" }}</small>
+                </article>
+                <article>
+                  <span>SQLite 主库</span>
+                  <strong>{{ formatBytes(omnirouteMaintenance.database?.size || 0) }}</strong>
+                  <small>
+                    WAL {{ formatBytes(omnirouteMaintenance.database?.wal_size || 0) }} ·
+                    SHM {{ formatBytes(omnirouteMaintenance.database?.shm_size || 0) }}
+                  </small>
+                </article>
+                <article>
+                  <span>可校验备份</span>
+                  <strong>{{ omnirouteMaintenance.backups?.length || 0 }}</strong>
+                  <small>升级、维护和回滚前均自动新增，不自动删除</small>
+                </article>
+              </div>
+              <div v-if="omnirouteMaintenance.image_drift" class="warning">
+                配置镜像与实际运行镜像不一致。为保证回退点可复现，升级会被拒绝；
+                请先在维护窗口执行 <code>llmctl router restart</code>，再重新评估。
+              </div>
+
+              <section v-if="omnirouteJob" class="panel omniroute-job-panel">
+                <div class="omniroute-job-head">
+                  <div>
+                    <span
+                      class="status"
+                      :class="
+                        omnirouteJob.state === 'succeeded'
+                          ? 'ok'
+                          : ['failed', 'rolled_back'].includes(omnirouteJob.state)
+                            ? 'bad'
+                            : 'warn'
+                      "
+                    >{{ deploymentJobStateLabel(omnirouteJob.state) }}</span>
+                    <strong>{{ omnirouteJob.message }}</strong>
+                  </div>
+                  <button
+                    v-if="omnirouteJobActive"
+                    type="button"
+                    class="danger"
+                    @click="cancelOmniRouteJob"
+                  >
+                    安全取消
+                  </button>
+                </div>
+                <progress :value="Number(omnirouteJob.progress || 0)" max="100"></progress>
+                <p>
+                  阶段 {{ omnirouteJob.phase }} · {{ omnirouteJob.progress || 0 }}% ·
+                  任务 <code>{{ omnirouteJob.id }}</code>
+                </p>
+                <div v-if="omnirouteJob.logs?.length" class="deployment-log">
+                  <p v-for="(entry, index) in omnirouteJob.logs.slice(-8)" :key="index">
+                    <time>{{ entry.time }}</time>{{ entry.message }}
+                  </p>
+                </div>
+              </section>
+
+              <section class="panel omniroute-assessment-panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>SQLite 可靠性评估</h2>
+                    <p>
+                      日常评估使用 quick_check；深度评估读取全库，适合升级或维护窗口前。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    class="ghost"
+                    :disabled="omnirouteActionLoading || omnirouteJobActive"
+                    @click="assessOmniRouteSqlite(true)"
+                  >
+                    深度完整性检查
+                  </button>
+                </div>
+                <div v-if="omnirouteAssessment" class="omniroute-assessment-grid">
+                  <dl>
+                    <dt>总体状态</dt>
+                    <dd>
+                      <span
+                        class="status"
+                        :class="
+                          omnirouteAssessment.health === 'healthy'
+                            ? 'ok'
+                            : omnirouteAssessment.health === 'critical'
+                              ? 'bad'
+                              : 'warn'
+                        "
+                      >{{
+                        omnirouteAssessment.health === "healthy"
+                          ? "健康"
+                          : omnirouteAssessment.health === "critical"
+                            ? "严重异常"
+                            : "需要维护"
+                      }}</span>
+                    </dd>
+                  </dl>
+                  <dl>
+                    <dt>完整性 / 外键</dt>
+                    <dd>
+                      {{ omnirouteAssessment.integrity?.ok ? "通过" : "失败" }} /
+                      {{ omnirouteAssessment.foreign_keys?.ok ? "通过" : "失败" }}
+                    </dd>
+                  </dl>
+                  <dl>
+                    <dt>Journal / 空闲页</dt>
+                    <dd>
+                      {{ String(omnirouteAssessment.sqlite?.journal_mode || "").toUpperCase() }} /
+                      {{ (Number(omnirouteAssessment.sqlite?.free_ratio || 0) * 100).toFixed(1) }}%
+                    </dd>
+                  </dl>
+                  <dl>
+                    <dt>磁盘可用</dt>
+                    <dd>{{ formatBytes(omnirouteAssessment.storage?.disk_free || 0) }}</dd>
+                  </dl>
+                </div>
+                <div v-else class="empty">
+                  尚未评估。点击“立即评估”读取完整性、WAL、空间和备份准备度。
+                </div>
+                <div
+                  v-if="omnirouteAssessment?.recommendations?.length"
+                  class="omniroute-recommendations"
+                >
+                  <article
+                    v-for="item in omnirouteAssessment.recommendations"
+                    :key="item.code"
+                    :class="item.severity"
+                  >
+                    <strong>{{ item.severity === "critical" ? "必须处理" : "维护建议" }}</strong>
+                    <p>{{ item.message }}</p>
+                  </article>
+                </div>
+              </section>
+
+              <div class="omniroute-action-grid">
+                <section class="panel">
+                  <h2>备份与在线维护</h2>
+                  <p>
+                    在线维护先备份，再执行 <code>PRAGMA optimize</code> 与
+                    <code>PASSIVE checkpoint</code>；不会停止 Router 或 GPU Worker。
+                  </p>
+                  <button
+                    type="button"
+                    class="ghost wide-button"
+                    :disabled="omnirouteActionLoading || omnirouteJobActive"
+                    @click="backupOmniRouteSqlite"
+                  >
+                    仅创建可校验备份
+                  </button>
+                  <label>
+                    输入 <code>MAINTAIN ONLINE</code> 确认在线写入维护
+                    <input
+                      v-model="omnirouteForm.online_confirmation"
+                      autocomplete="off"
+                      placeholder="MAINTAIN ONLINE"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="primary wide-button"
+                    :disabled="
+                      omnirouteActionLoading ||
+                      omnirouteJobActive ||
+                      omnirouteForm.online_confirmation.trim() !== 'MAINTAIN ONLINE'
+                    "
+                    @click="maintainOmniRouteOnline"
+                  >
+                    备份并在线维护
+                  </button>
+                </section>
+
+                <section class="panel">
+                  <h2>维护窗口压缩</h2>
+                  <p>
+                    备份后短暂停止 Router，执行 WAL 截断、VACUUM 和完整性检查；
+                    GPU Worker 保持运行，失败时自动恢复数据库。
+                  </p>
+                  <label>
+                    输入 <code>COMPACT SQLITE</code> 确认短暂中断 /v1
+                    <input
+                      v-model="omnirouteForm.compact_confirmation"
+                      autocomplete="off"
+                      placeholder="COMPACT SQLITE"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="danger wide-button"
+                    :disabled="
+                      omnirouteActionLoading ||
+                      omnirouteJobActive ||
+                      omnirouteForm.compact_confirmation.trim() !== 'COMPACT SQLITE'
+                    "
+                    @click="compactOmniRouteSqlite"
+                  >
+                    备份并压缩 SQLite
+                  </button>
+                </section>
+
+                <section class="panel">
+                  <h2>升级 OmniRoute</h2>
+                  <p>
+                    拉取固定版本，深度评估并备份后切换；新版本或完整冒烟失败时，
+                    自动恢复原镜像和升级前 SQLite。
+                  </p>
+                  <label>
+                    固定版本镜像
+                    <input v-model.trim="omnirouteForm.update_image" autocomplete="off" />
+                  </label>
+                  <label>
+                    输入 <code>UPDATE OMNIROUTE</code> 确认短暂中断 /v1
+                    <input
+                      v-model="omnirouteForm.update_confirmation"
+                      autocomplete="off"
+                      placeholder="UPDATE OMNIROUTE"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="primary wide-button"
+                    :disabled="
+                      omnirouteActionLoading ||
+                      omnirouteJobActive ||
+                      !omnirouteForm.update_image.trim() ||
+                      omnirouteForm.update_confirmation.trim() !== 'UPDATE OMNIROUTE'
+                    "
+                    @click="updateOmniRoute"
+                  >
+                    备份、升级并自动验收
+                  </button>
+                </section>
+              </div>
+
+              <section class="panel omniroute-backups-panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>可恢复备份</h2>
+                    <p>每个备份都包含 SHA256、SQLite quick_check、原镜像和文件权限。</p>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>时间</th>
+                        <th>用途</th>
+                        <th>数据库</th>
+                        <th>来源镜像</th>
+                        <th>备份 ID</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="backup in omnirouteMaintenance.backups" :key="backup.id">
+                        <td>{{ date(backup.created_at) }}</td>
+                        <td>{{ backup.purpose }}</td>
+                        <td>{{ formatBytes(backup.database_size) }}</td>
+                        <td><code>{{ backup.source_image }}</code></td>
+                        <td>
+                          <code>{{ backup.id }}</code>
+                          <small>SHA256 {{ backup.database_sha256.slice(0, 16) }}…</small>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            class="ghost"
+                            :disabled="omnirouteJobActive"
+                            @click="selectOmniRouteBackup(backup.id)"
+                          >
+                            选择回滚
+                          </button>
+                        </td>
+                      </tr>
+                      <tr v-if="!omnirouteMaintenance.backups?.length">
+                        <td colspan="6" class="empty">尚无受管备份。</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div v-if="omnirouteForm.rollback_id" class="omniroute-rollback-confirm">
+                  <div class="warning">
+                    回滚会短暂停止 Router，并恢复备份时的 OmniRoute 镜像与 SQLite；
+                    操作前会再次备份当前状态。
+                  </div>
+                  <p>目标备份：<code>{{ omnirouteForm.rollback_id }}</code></p>
+                  <label>
+                    输入 <code>ROLLBACK {{ omnirouteForm.rollback_id }}</code> 确认
+                    <input
+                      v-model="omnirouteForm.rollback_confirmation"
+                      autocomplete="off"
+                      :placeholder="`ROLLBACK ${omnirouteForm.rollback_id}`"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="danger"
+                    :disabled="
+                      omnirouteActionLoading ||
+                      omnirouteJobActive ||
+                      omnirouteForm.rollback_confirmation.trim() !==
+                        `ROLLBACK ${omnirouteForm.rollback_id}`
+                    "
+                    @click="rollbackOmniRoute"
+                  >
+                    备份当前状态并执行回滚
+                  </button>
+                </div>
+              </section>
+            </template>
+          </section>
+
           <section v-if="section === 'reports'" class="page usage-report-page">
             <div class="page-head">
               <div>

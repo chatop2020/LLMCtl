@@ -13,6 +13,9 @@ describe("审计日志展示", () => {
     expect(auditActionLabel("admin/users/verification/approve")).toBe(
       "管理员手动通过邮箱验证",
     );
+    expect(auditActionLabel("admin/omniroute/submit")).toBe(
+      "提交 OmniRoute 运维任务",
+    );
     expect(auditActionLabel("custom.action")).toBe("custom.action");
   });
 

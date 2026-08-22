@@ -46,6 +46,10 @@ from model_upgrade import (
     select_source_deployment,
     upgrade_profiles,
 )
+from omniroute_maintenance import (
+    OmniRouteMaintenanceManager,
+    OmniRouteMaintenancePaths,
+)
 
 
 APP_VERSION = "3.5.0"
@@ -739,10 +743,31 @@ class DeploymentManager:
         self.registry = RegistryStore(paths)
         self.jobs = JobStore(paths.jobs_dir)
         self.runner = runner or CommandRunner()
+        maintenance_runner = runner or CommandRunner()
         self.upgrade_inspector = upgrade_inspector or self._inspect_upgrade_target
         self._mutation_lock = threading.Lock()
         self._submission_lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
+        self.omniroute = OmniRouteMaintenanceManager(
+            OmniRouteMaintenancePaths.from_control_paths(paths),
+            maintenance_runner,
+            active_model_job=self._has_active_model_job,
+            submission_lock=self._submission_lock,
+        )
+
+    def _has_active_model_job(self) -> bool:
+        """返回模型部署、升级、发布或回滚任务是否仍在执行。"""
+
+        return any(
+            item.get("state") not in TERMINAL_JOB_STATES
+            for item in self.jobs.list(limit=200)
+        )
+
+    def _reject_omniroute_conflict(self) -> None:
+        """阻止模型路由变更与 OmniRoute 维护同时提交。"""
+
+        if self.omniroute.has_active_job():
+            raise RuntimeError("OmniRoute 升级或 SQLite 维护任务正在运行")
 
     def recover_interrupted_jobs(self) -> None:
         """把守护进程重启前遗留的非终态任务标记为中断，避免永久阻塞新任务。"""
@@ -1088,6 +1113,7 @@ class DeploymentManager:
         """
 
         with self._submission_lock:
+            self._reject_omniroute_conflict()
             if any(
                 item.get("state") not in TERMINAL_JOB_STATES
                 for item in self.jobs.list(limit=200)
@@ -1118,6 +1144,7 @@ class DeploymentManager:
         """提交后台部署任务；同一时间只允许一个 GPU 变更任务。"""
 
         with self._submission_lock:
+            self._reject_omniroute_conflict()
             plan = self.plan(request)
             if any(
                 item.get("state") not in TERMINAL_JOB_STATES
@@ -1143,6 +1170,7 @@ class DeploymentManager:
         """
 
         with self._submission_lock:
+            self._reject_omniroute_conflict()
             if any(
                 item.get("state") not in TERMINAL_JOB_STATES
                 for item in self.jobs.list(limit=200)
@@ -1183,6 +1211,7 @@ class DeploymentManager:
         """把运行配置恢复到指定成功任务执行前的快照。"""
 
         with self._submission_lock:
+            self._reject_omniroute_conflict()
             if any(
                 item.get("state") not in TERMINAL_JOB_STATES
                 for item in self.jobs.list(limit=200)
@@ -2383,6 +2412,16 @@ class ControlServer(socketserver.ThreadingUnixStreamServer):
             return self.manager.cancel(str(payload.get("id", "")))
         if operation == "rollback":
             return self.manager.rollback(str(payload.get("id", "")))
+        if operation == "omniroute-status":
+            return self.manager.omniroute.status()
+        if operation == "omniroute-assess":
+            return self.manager.omniroute.assess(bool(payload.get("deep", False)))
+        if operation == "omniroute-submit":
+            return self.manager.omniroute.submit(payload)
+        if operation == "omniroute-job":
+            return self.manager.omniroute.jobs.get(str(payload.get("id", "")))
+        if operation == "omniroute-cancel":
+            return self.manager.omniroute.cancel(str(payload.get("id", "")))
         raise ValueError("未知模型控制操作")
 
     def server_close(self) -> None:
@@ -2400,7 +2439,13 @@ def rpc_call(socket_path: pathlib.Path, operation: str, payload: dict[str, Any] 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         # Hub 元数据和硬件目录检查可能跨越维护代理，升级计划使用独立的有界
         # 等待；其他本机控制操作继续保持快速失败。
-        client.settimeout(120 if operation == "upgrade-plan" else 30)
+        client.settimeout(
+            300
+            if operation == "omniroute-assess" and bool((payload or {}).get("deep"))
+            else 120
+            if operation in {"upgrade-plan", "omniroute-assess"}
+            else 30
+        )
         client.connect(str(socket_path))
         client.sendall(request)
         response = b""
@@ -2451,6 +2496,11 @@ def main() -> int:
             "job",
             "cancel",
             "rollback",
+            "omniroute-status",
+            "omniroute-assess",
+            "omniroute-submit",
+            "omniroute-job",
+            "omniroute-cancel",
         ],
     )
     request_parser.add_argument("json_file", type=pathlib.Path)

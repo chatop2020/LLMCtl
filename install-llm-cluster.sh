@@ -45,7 +45,7 @@ VLLM_IMAGE="vllm/vllm-openai:v0.22.1"
 LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.94.0"
 NEWAPI_IMAGE="calciumion/new-api:v1.0.0-rc.22"
 BIFROST_IMAGE="maximhq/bifrost:v1.6.7"
-OMNIROUTE_IMAGE="diegosouzapw/omniroute:3.8.48"
+OMNIROUTE_IMAGE="diegosouzapw/omniroute:3.8.49"
 POSTGRES_IMAGE="postgres:16-alpine"
 GATEWAY_KIND="newapi"
 TP_SIZE=1
@@ -127,6 +127,7 @@ OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 MODEL_DEPLOYMENT_SOURCE="${SCRIPT_DIR}/lib/model_deployment.py"
 MODEL_UPGRADE_SOURCE="${SCRIPT_DIR}/lib/model_upgrade.py"
+OMNIROUTE_MAINTENANCE_SOURCE="${SCRIPT_DIR}/lib/omniroute_maintenance.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
 ACCOUNT_MODULE_SOURCES=("${SCRIPT_DIR}"/lib/account_portal_*.py)
 BENCHMARK_SOURCE="${SCRIPT_DIR}/lib/llm_benchmark.py"
@@ -1087,6 +1088,7 @@ check_discovery_host() {
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
   [[ -r "${MODEL_UPGRADE_SOURCE}" ]] || die "$(l10n '缺少模型版本升级规则 lib/model_upgrade.py' 'The model upgrade rules lib/model_upgrade.py are missing')"
+  [[ -r "${OMNIROUTE_MAINTENANCE_SOURCE}" ]] || die "$(l10n '缺少 OmniRoute 生命周期维护模块' 'The OmniRoute lifecycle maintenance module is missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   ((${#ACCOUNT_MODULE_SOURCES[@]} >= 9)) || die "$(l10n '账户门户领域模块不完整' 'Account portal domain modules are incomplete')"
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
@@ -1126,6 +1128,7 @@ check_host() {
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
   [[ -r "${MODEL_UPGRADE_SOURCE}" ]] || die "$(l10n '缺少模型版本升级规则 lib/model_upgrade.py' 'The model upgrade rules lib/model_upgrade.py are missing')"
+  [[ -r "${OMNIROUTE_MAINTENANCE_SOURCE}" ]] || die "$(l10n '缺少 OmniRoute 生命周期维护模块' 'The OmniRoute lifecycle maintenance module is missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
   ((${#ACCOUNT_MODULE_SOURCES[@]} >= 9)) || die "$(l10n '账户门户领域模块不完整' 'Account portal domain modules are incomplete')"
   [[ -r "${BENCHMARK_SOURCE}" ]] || die "$(l10n '缺少后台压测执行器 lib/llm_benchmark.py' 'The backend benchmark runner lib/llm_benchmark.py is missing')"
@@ -1732,6 +1735,7 @@ install_manager() {
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
   install -m 755 "${MODEL_DEPLOYMENT_SOURCE}" /usr/local/lib/llm-cluster/model_deployment.py
   install -m 644 "${MODEL_UPGRADE_SOURCE}" /usr/local/lib/llm-cluster/model_upgrade.py
+  install -m 644 "${OMNIROUTE_MAINTENANCE_SOURCE}" /usr/local/lib/llm-cluster/omniroute_maintenance.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py
   local account_module
   for account_module in "${ACCOUNT_MODULE_SOURCES[@]}"; do
