@@ -20,6 +20,8 @@ readonly BIFROST_CONFIG="${BIFROST_DIR}/config.json"
 readonly NEWAPI_PLAN="${CONFIG_DIR}/newapi-plan.json"
 readonly OMNIROUTE_PLAN="${CONFIG_DIR}/omniroute-plan.json"
 readonly OMNIROUTE_SQLITE="${STATE_DIR}/omniroute/gateway/storage.sqlite"
+readonly OMNIROUTE_MAINTENANCE_STATE_DIR="${STATE_DIR}/omniroute-maintenance"
+readonly OMNIROUTE_MAINTENANCE_BACKUP_DIR="${LLM_OMNIROUTE_BACKUPS_DIR:-/var/backups/llmctl/omniroute}"
 readonly ACCOUNT_SQLITE="${STATE_DIR}/omniroute/portal/account-portal.db"
 readonly ACCOUNT_HELPER="${LLM_ACCOUNT_HELPER:-/usr/local/lib/llm-cluster/account_portal.py}"
 readonly ACCOUNT_MYSQL_VENV="${STATE_DIR}/omniroute/portal/mysql-venv"
@@ -130,7 +132,7 @@ load_config() {
   LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.94.0}"
   NEWAPI_IMAGE="${NEWAPI_IMAGE:-calciumion/new-api:v1.0.0-rc.22}"
   BIFROST_IMAGE="${BIFROST_IMAGE:-maximhq/bifrost:v1.6.7}"
-  OMNIROUTE_IMAGE="${OMNIROUTE_IMAGE:-diegosouzapw/omniroute:3.8.48}"
+  OMNIROUTE_IMAGE="${OMNIROUTE_IMAGE:-diegosouzapw/omniroute:3.8.49}"
   case "${GATEWAY_KIND}" in
     newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}" ;;
     litellm) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${LITELLM_IMAGE}}" ;;
@@ -405,6 +407,11 @@ usage() {
   llmctl responses status                      检查公开模型 ID 是否可被 Responses API 原生解析
   llmctl responses repair                      备份数据并修复 Responses API 原生 Combo 与用户权限
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
+  llmctl omniroute status|backup|backups           查看状态或管理可校验 SQLite 备份
+  llmctl omniroute update [固定镜像] [--yes]       备份后升级；失败自动恢复镜像和数据库
+  llmctl omniroute rollback <备份ID> [--yes]       回滚前再备份，并恢复镜像与 SQLite
+  llmctl omniroute sqlite assess [--deep]          评估完整性、WAL、空间和备份准备度
+  llmctl omniroute sqlite maintain online|compact  在线优化或维护窗 VACUUM
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl database enable-mysql                激活门户 MySQL 驱动；连接配置与迁移在 WebUI 完成
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户
@@ -1824,6 +1831,11 @@ cmd_info() {
     printf '部署/GPU 分配: %s\n' \
       "$("${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot 2>/dev/null | jq -c '{revision:.registry.revision,deployments:[.registry.deployments|to_entries[]|{id:.key,status:.value.status,public_ids:.value.public_model_ids,instances:[.value.instances[]|{id,kind,worker_id,gpu_devices,base_url,enabled}]}],active_jobs:[.jobs[]|select(.state|IN("waiting","running"))|{id,kind,state,phase,progress}]}' 2>/dev/null || printf unavailable)"
   fi
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf 'OmniRoute 运维: 状态=%s；备份=%s；最近评估=%s\n' \
+      "${OMNIROUTE_MAINTENANCE_STATE_DIR}" "${OMNIROUTE_MAINTENANCE_BACKUP_DIR}" \
+      "${OMNIROUTE_MAINTENANCE_STATE_DIR}/last-assessment.json"
+  fi
   [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemctl is-active llm-account.service 2>/dev/null || printf unknown)"
   [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemctl is-active llm-database.service 2>/dev/null || printf unknown)"
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
@@ -2780,7 +2792,7 @@ load_llmctl_command_modules() {
   else
     module_dir="${LLMCTL_MODULE_DIR:-/usr/local/lib/llm-cluster/llmctl}"
   fi
-  for module in workflow_model optimizer maintenance offline_lifecycle; do
+  for module in workflow_model optimizer maintenance offline_lifecycle omniroute; do
     [[ -r "${module_dir}/${module}.sh" ]] || die "llmctl 命令模块缺失：${module_dir}/${module}.sh"
     # shellcheck disable=SC1090
     source "${module_dir}/${module}.sh"
@@ -2821,6 +2833,7 @@ main() {
     model) cmd_model "$@" ;;
     responses) cmd_responses "$@" ;;
     router) cmd_router "$@" ;;
+    omniroute) cmd_omniroute "$@" ;;
     database) cmd_database "$@" ;;
     account) cmd_account "$@" ;;
     nginx) cmd_nginx "$@" ;;

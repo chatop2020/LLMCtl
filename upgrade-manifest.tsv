@@ -6,6 +6,7 @@ file    lib/runtime_optimizer.py       /usr/local/lib/llm-cluster/runtime_optimi
 file    lib/gateway_config.py          /usr/local/lib/llm-cluster/gateway_config.py            0755  none
 file    lib/model_deployment.py        /usr/local/lib/llm-cluster/model_deployment.py           0755  none
 file    lib/model_upgrade.py           /usr/local/lib/llm-cluster/model_upgrade.py              0644  none
+file    lib/omniroute_maintenance.py   /usr/local/lib/llm-cluster/omniroute_maintenance.py      0644  none
 file    lib/account_portal.py          /usr/local/lib/llm-cluster/account_portal.py            0755  account
 file    lib/account_portal_common.py   /usr/local/lib/llm-cluster/account_portal_common.py     0644  account
 file    lib/account_portal_database.py /usr/local/lib/llm-cluster/account_portal_database.py   0644  account

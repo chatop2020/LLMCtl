@@ -191,6 +191,36 @@ sudo llmctl database enable-mysql
 
 迁移前 SQLite 和带时间戳的备份都会保留。WebUI 的应急回退要求输入 `ROLLBACK_TO_SQLITE`；它只把门户重新指向迁移前 SQLite，不会把切换后新增的 MySQL 写入合并回去。OmniRoute 自身的 `storage.sqlite` 始终保持独立，不参与这次迁移。
 
+### OmniRoute 镜像与 SQLite 生命周期
+
+OmniRoute 自身的 `storage.sqlite` 由 root-only 的 `llm-model-control.service` 维护。CLI 和 WebUI 共用这一个权威入口；`llm-account.service` 只能通过 0660 Unix Socket 提交白名单任务，不能直接读取数据库、执行任意命令或选择任意恢复路径。
+
+```bash
+sudo llmctl omniroute status
+sudo llmctl omniroute sqlite assess
+sudo llmctl omniroute sqlite assess --deep
+sudo llmctl omniroute backup
+sudo llmctl omniroute sqlite maintain online
+sudo llmctl omniroute sqlite maintain compact
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute backups
+sudo llmctl omniroute rollback <备份ID>
+sudo llmctl omniroute job <任务ID>
+sudo llmctl omniroute cancel <任务ID>
+```
+
+`assess` 是只读操作：默认执行 quick_check，`--deep` 执行完整 integrity_check；两者都会检查外键、WAL、同步级别、页大小/数量、空闲页比例、磁盘余量、最近备份年龄、配置镜像和实际运行镜像。检查结果会给出 `healthy`、`warning` 或 `critical`，严重异常会阻止升级和写入维护。
+
+`backup`、`maintain`、`update` 和 `rollback` 都是持久化后台任务。每次写操作先使用 Python sqlite3 在线备份 API 创建一致性快照，再验证 quick_check、大小和 SHA256，并记录原镜像、UID/GID 和文件权限。备份目录固定为 `/var/backups/llmctl/omniroute/<备份ID>/`，任务状态位于 `/var/lib/llm-cluster/omniroute-maintenance/jobs/`；控制服务重启后未完成任务会变为明确失败，不会永久显示运行中。
+
+- `maintain online`：Router 运行期间执行 `PRAGMA optimize` 与 `PASSIVE wal_checkpoint`，不停止 Router、账户门户或 GPU Worker。
+- `maintain compact`：检查至少可容纳约两份数据库的磁盘余量，备份后停止账户门户和 Router，执行 `TRUNCATE checkpoint`、`VACUUM`、`PRAGMA optimize` 与完整性检查，再启动 Router 并运行 `llmctl smoke --full`；失败时自动恢复维护前数据库。
+- `update`：拒绝 `latest`、`main`、`next` 等可变标签，只拉取固定版本或 digest；深度评估和备份通过后才写入镜像配置并重启 Router。实际容器镜像、路由同步、完整模型冒烟或升级后数据库检查任一步失败，都会停止 Router，恢复原镜像与升级前 SQLite，再次启动和冒烟。GPU Worker 始终不重启。
+- `rollback`：只接受备份列表中的 ID，恢复前先为当前状态创建 `pre-rollback` 备份；目标大小、SHA256 或 quick_check 不匹配时拒绝。恢复数据库时 Router 已停止，主文件原子替换并移除旧 WAL/SHM，再恢复备份记录的镜像配置并完整验收。
+
+管理端左侧“OmniRoute 维护”提供相同评估、任务进度、备份列表和回滚入口。在线维护要求输入 `MAINTAIN ONLINE`，压缩要求 `COMPACT SQLITE`，升级要求 `UPDATE OMNIROUTE`，回滚要求包含目标备份 ID 的完整短语。受管备份不会自动删除；运维应监控 `/var/backups` 容量，并把关键恢复点复制到异机介质。
+兼容入口 `llmctl update --omniroute-image ...` 会自动转交这套安全升级状态机；它不再提供绕过数据库备份的更新旁路。若还要更新 vLLM 镜像，必须拆成独立维护步骤。
+
 默认关闭公开注册。启用时必须配置精确邮箱域名白名单、公开门户地址和外部 SMTP。例如：
 
 ```bash
@@ -439,10 +469,10 @@ sudo llmctl runtime-proxy show
 sudo llmctl runtime-proxy clear
 ```
 
-安装器默认使用已发布的 OmniRoute `diegosouzapw/omniroute:3.8.48`。若镜像标签不存在或仓库不可达，安装器会保留 Docker 的原始错误并给出对应的 `--*-image` 覆盖参数，不会只报告一个脚本行号。例如可显式指定：
+安装器默认使用已发布的 OmniRoute `diegosouzapw/omniroute:3.8.49`。若镜像标签不存在或仓库不可达，安装器会保留 Docker 的原始错误并给出对应的 `--*-image` 覆盖参数，不会只报告一个脚本行号。例如可显式指定：
 
 ```bash
-sudo ./install-llm-cluster.sh --omniroute-image diegosouzapw/omniroute:3.8.48
+sudo ./install-llm-cluster.sh --omniroute-image diegosouzapw/omniroute:3.8.49
 ```
 
 导出/导入：

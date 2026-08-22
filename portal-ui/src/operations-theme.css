@@ -1375,6 +1375,117 @@ td {
   margin-left: 5px;
   color: var(--text);
 }
+
+/* OmniRoute 运维页把只读评估、在线维护和维护窗口动作分区，避免误把三者视为同等风险。 */
+.omniroute-summary {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.omniroute-summary article strong {
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.omniroute-summary .mono {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.omniroute-job-panel,
+.omniroute-assessment-panel,
+.omniroute-backups-panel {
+  margin-top: 18px;
+}
+.omniroute-job-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.omniroute-job-head > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.omniroute-job-panel progress {
+  width: 100%;
+}
+.omniroute-assessment-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+.omniroute-assessment-grid dl {
+  margin: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface2);
+}
+.omniroute-assessment-grid dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+.omniroute-assessment-grid dd {
+  margin: 7px 0 0;
+  font-weight: 700;
+}
+.omniroute-recommendations {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+.omniroute-recommendations article {
+  padding: 11px 13px;
+  border: 1px solid #e9cc8c;
+  border-radius: 9px;
+  background: #fff9ec;
+}
+.omniroute-recommendations article.critical {
+  border-color: #efb0ba;
+  background: #fff4f5;
+}
+.omniroute-recommendations p {
+  margin: 4px 0 0;
+}
+.omniroute-action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+.omniroute-action-grid .panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.omniroute-action-grid .panel h2,
+.omniroute-action-grid .panel p {
+  margin: 0;
+}
+.omniroute-action-grid label,
+.omniroute-rollback-confirm label {
+  display: grid;
+  gap: 7px;
+}
+.omniroute-action-grid button {
+  margin-top: auto;
+}
+.omniroute-backups-panel table {
+  min-width: 1040px;
+}
+.omniroute-backups-panel td code {
+  max-width: 260px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.omniroute-rollback-confirm {
+  display: grid;
+  gap: 12px;
+  margin: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
 .monitor-table td {
   vertical-align: middle;
 }
@@ -1817,6 +1928,13 @@ td {
   color: #8fd5f1;
 }
 @media (max-width: 1100px) {
+  .omniroute-summary,
+  .omniroute-assessment-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .omniroute-action-grid {
+    grid-template-columns: 1fr;
+  }
   .deployment-workspace {
     grid-template-columns: 1fr;
   }
@@ -1852,6 +1970,15 @@ td {
   }
 }
 @media (max-width: 700px) {
+  .omniroute-summary,
+  .omniroute-assessment-grid {
+    grid-template-columns: 1fr;
+  }
+  .omniroute-job-head,
+  .omniroute-job-head > div {
+    align-items: stretch;
+    flex-direction: column;
+  }
   .topbar {
     height: 54px;
   }

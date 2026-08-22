@@ -19,6 +19,7 @@ class SourceStructureTests(unittest.TestCase):
             *sorted((ROOT / "lib").glob("account_portal*.py")),
             ROOT / "lib/model_deployment.py",
             ROOT / "lib/model_upgrade.py",
+            ROOT / "lib/omniroute_maintenance.py",
             ROOT / "llmctl.sh",
             *sorted((ROOT / "lib/llmctl").glob("*.sh")),
             ROOT / "portal-ui/src/App.vue",
@@ -42,6 +43,7 @@ class SourceStructureTests(unittest.TestCase):
         for path in [
             *sorted((ROOT / "lib").glob("account_portal_*.py")),
             ROOT / "lib/model_upgrade.py",
+            ROOT / "lib/omniroute_maintenance.py",
         ]:
             self.assertIn(str(path.relative_to(ROOT)), manifest)
         self.assertIn("dir     lib/llmctl", manifest)

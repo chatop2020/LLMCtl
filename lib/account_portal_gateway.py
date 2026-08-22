@@ -804,7 +804,7 @@ class WorkflowClient:
 
 
 class ModelDeploymentClient:
-    """通过本机 Unix Socket 调用具备 root 权限的模型部署控制服务。"""
+    """通过本机 Unix Socket 调用具备 root 权限的模型与 OmniRoute 控制服务。"""
 
     def __init__(self) -> None:
         self.socket_path = pathlib.Path(
@@ -817,7 +817,7 @@ class ModelDeploymentClient:
     def request(
         self, operation: str, payload: dict[str, Any] | None = None
     ) -> Any:
-        """发送白名单操作；门户进程不执行 systemctl、Docker 或文件写入。"""
+        """发送模型/OmniRoute 白名单操作；门户不执行 systemctl、Docker 或文件写入。"""
 
         if operation not in {
             "snapshot",
@@ -832,6 +832,11 @@ class ModelDeploymentClient:
             "job",
             "cancel",
             "rollback",
+            "omniroute-status",
+            "omniroute-assess",
+            "omniroute-submit",
+            "omniroute-job",
+            "omniroute-cancel",
         }:
             raise ValueError("不支持的模型部署操作")
         encoded = json.dumps(
@@ -845,7 +850,14 @@ class ModelDeploymentClient:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 # 升级计划需要访问模型目录并检查真实硬件，允许比普通本机状态
                 # 请求更长的有界等待；执行任务仍然只提交后立即返回。
-                client.settimeout(120 if operation == "upgrade-plan" else 30)
+                client.settimeout(
+                    300
+                    if operation == "omniroute-assess"
+                    and bool((payload or {}).get("deep"))
+                    else 120
+                    if operation in {"upgrade-plan", "omniroute-assess"}
+                    else 30
+                )
                 client.connect(str(self.socket_path))
                 client.sendall(encoded)
                 response = b""

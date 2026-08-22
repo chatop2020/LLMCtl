@@ -544,6 +544,16 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                         },
                     )
             return
+        if path == "/portal-api/admin/omniroute":
+            user, _ = self.api_require(admin=True)
+            if user:
+                try:
+                    self.json_response(
+                        200, self.app.models.request("omniroute-status", {})
+                    )
+                except Exception as error:
+                    self.json_response(503, {"error": str(error), "available": False})
+            return
         if path == "/portal-api/admin/database":
             user, _ = self.api_require(admin=True)
             if user:
@@ -733,6 +743,20 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.models.request(
                     "rollback", {"id": str(payload.get("id", ""))}
                 )
+            elif path == "/portal-api/admin/omniroute/assess":
+                result = self.app.models.request(
+                    "omniroute-assess", {"deep": bool(payload.get("deep", False))}
+                )
+            elif path == "/portal-api/admin/omniroute/submit":
+                result = self.app.models.request("omniroute-submit", payload)
+            elif path == "/portal-api/admin/omniroute/job":
+                result = self.app.models.request(
+                    "omniroute-job", {"id": str(payload.get("id", ""))}
+                )
+            elif path == "/portal-api/admin/omniroute/cancel":
+                result = self.app.models.request(
+                    "omniroute-cancel", {"id": str(payload.get("id", ""))}
+                )
             elif path == "/portal-api/admin/database/config":
                 result = self.app.database_migration.save_config(payload)
             elif path == "/portal-api/admin/database/test":
@@ -789,7 +813,14 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             and result.get("failed")
             else "success"
         )
-        if path != "/portal-api/admin/database/migrate":
+        # 高频任务轮询只读取阶段，不代表新的管理员决定；不把每两秒一次的
+        # 状态刷新写成审计事件。提交、取消、升级、维护和回滚仍完整审计。
+        non_audited_paths = {
+            "/portal-api/admin/database/migrate",
+            "/portal-api/admin/model-deployments/job",
+            "/portal-api/admin/omniroute/job",
+        }
+        if path not in non_audited_paths:
             self.app.db.audit(
                 user_identity(user),
                 path.removeprefix("/portal-api/"),

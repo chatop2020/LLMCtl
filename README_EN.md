@@ -76,7 +76,7 @@ Tool calling, reasoning, and OCR cannot be guaranteed merely because a model nam
 | New API image | `calciumion/new-api:v1.0.0-rc.22` |
 | LiteLLM image | `ghcr.io/berriai/litellm:v1.94.0` |
 | Bifrost image | `maximhq/bifrost:v1.6.7` |
-| OmniRoute image | `diegosouzapw/omniroute:3.8.48` |
+| OmniRoute image | `diegosouzapw/omniroute:3.8.49` |
 | PostgreSQL | `postgres:16-alpine` |
 | Unified API | `http://SERVER_IP:8000/v1` |
 | Unified Web UI | `http://SERVER_IP:8000/ui/` |
@@ -291,6 +291,27 @@ sudo bash /root/llmctl-upgrade-bootstrap/LLMCtl-main/upgrade-llmctl.sh \
 
 Add `--check` to download and validate without replacing files. Upgrade metadata is stored in `/var/lib/llm-cluster/control-plane-version.env`, backups are kept under `/var/backups/llmctl/`, and `llmctl info` reports the installed control-plane commit.
 
+## Safe OmniRoute Upgrades and SQLite Maintenance
+
+OmniRoute itself uses `gateway/storage.sqlite`. LLMCtl exposes one shared state machine through its existing root-only control service for CLI and WebUI assessment, online backup, online maintenance, maintenance-window compaction, image upgrades, and rollback. The account portal process cannot read the database directly or invoke Docker/systemd.
+
+```bash
+sudo llmctl omniroute status
+sudo llmctl omniroute sqlite assess
+sudo llmctl omniroute sqlite assess --deep
+sudo llmctl omniroute backup
+sudo llmctl omniroute sqlite maintain online
+sudo llmctl omniroute sqlite maintain compact
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute backups
+sudo llmctl omniroute rollback <backup-id>
+```
+
+Assessment covers quick/integrity checks, foreign keys, WAL, free-page ratio, disk headroom, backup age, configured image, and the image actually running. Every write operation first creates a consistent snapshot with SQLite's online backup API and records SHA256, size, quick_check, source image, and file ownership/mode. Online maintenance runs only `PRAGMA optimize` and a `PASSIVE checkpoint` without stopping the Router. `compact` briefly stops the Router in a maintenance window for WAL truncation, `VACUUM`, and integrity verification. Upgrades accept only a fixed version or digest; a failed new image, route reconciliation, or full model smoke test restores both the previous image and pre-upgrade database. Manual rollback also snapshots the current state first. GPU Workers are never restarted by these operations.
+
+The WebUI exposes the same workflow, live phases, and backup inventory under “OmniRoute Maintenance”. Risky operations require the exact confirmation phrase shown on screen. Managed snapshots are stored under `/var/backups/llmctl/omniroute/` and are not deleted automatically; include them in disk-capacity and off-host backup planning.
+The legacy `llmctl update --omniroute-image ...` entry point delegates to this safe upgrade workflow and cannot bypass the SQLite backup and rollback contract.
+
 ## Optional MySQL Portal Database
 
 The LLMCtl account portal continues to use SQLite by default; small and medium deployments do not need to migrate merely because MySQL support is available. MySQL replaces only the portal users, permissions, billing, usage, and audit data stored in `/var/lib/llm-cluster/omniroute/portal/account-portal.db`. It does not replace OmniRoute's own `storage.sqlite` and is never inserted into the `/v1` inference data path.
@@ -348,6 +369,8 @@ For daily commands and API examples, see [USAGE_EN.md](USAGE_EN.md).
 | `/etc/nginx/conf.d/llm-cluster.conf` | Isolated LLMCtl Nginx front-door configuration |
 | `/var/lib/llm-cluster/cache` | Regenerable vLLM cache |
 | `/var/lib/llm-cluster/omniroute/gateway/storage.sqlite` | OmniRoute's SQLite database |
+| `/var/lib/llm-cluster/omniroute-maintenance` | OmniRoute assessment results and background task state |
+| `/var/backups/llmctl/omniroute` | Managed recovery snapshots with SHA256, integrity results, and image metadata |
 | `/var/lib/llm-cluster/omniroute/portal/account-portal.db` | Default portal SQLite database; retained as the pre-migration rollback copy after MySQL cutover |
 | `/data/llm-cluster/models` | Default model root |
 | `llm-cluster.service` | Top-level oneshot service |

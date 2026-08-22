@@ -191,6 +191,36 @@ Every remaining action is performed in the `/ui/` administration console under *
 
 The pre-migration SQLite file and timestamped backup remain available. Emergency rollback in the Web UI requires `ROLLBACK_TO_SQLITE`; it points the portal back to the pre-migration SQLite data and does not merge subsequent MySQL writes into it. OmniRoute's own `storage.sqlite` remains separate throughout.
 
+### OmniRoute image and SQLite lifecycle
+
+OmniRoute's own `storage.sqlite` is maintained by the root-only `llm-model-control.service`. CLI and WebUI share that single authoritative implementation. `llm-account.service` can only submit allowlisted tasks through a mode-0660 Unix Socket; it cannot read the database directly, execute arbitrary commands, or select arbitrary restore paths.
+
+```bash
+sudo llmctl omniroute status
+sudo llmctl omniroute sqlite assess
+sudo llmctl omniroute sqlite assess --deep
+sudo llmctl omniroute backup
+sudo llmctl omniroute sqlite maintain online
+sudo llmctl omniroute sqlite maintain compact
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute backups
+sudo llmctl omniroute rollback <backup-id>
+sudo llmctl omniroute job <job-id>
+sudo llmctl omniroute cancel <job-id>
+```
+
+`assess` is read-only. It runs quick_check by default and full integrity_check with `--deep`; both inspect foreign keys, WAL, synchronous mode, page size/count, free-page ratio, disk headroom, recent backup age, configured image, and the image actually running. Results are classified as `healthy`, `warning`, or `critical`; a critical result blocks upgrades and write maintenance.
+
+`backup`, `maintain`, `update`, and `rollback` are persistent background tasks. Every write operation first uses Python's sqlite3 online backup API to create a consistent snapshot, then verifies quick_check, size, and SHA256 while recording the source image, UID/GID, and file mode. Backups live only under `/var/backups/llmctl/omniroute/<backup-id>/`; task state lives under `/var/lib/llm-cluster/omniroute-maintenance/jobs/`. A controller restart moves unfinished tasks to an explicit failure state instead of leaving them running forever.
+
+- `maintain online` runs `PRAGMA optimize` and a `PASSIVE wal_checkpoint` while the Router is live. It does not stop the Router, account portal, or GPU Workers.
+- `maintain compact` requires enough disk space for roughly two database copies, backs up, stops the account portal and Router, runs a `TRUNCATE checkpoint`, `VACUUM`, `PRAGMA optimize`, and integrity verification, then restarts the Router and runs `llmctl smoke --full`. Failure restores the pre-maintenance database automatically.
+- `update` rejects mutable tags such as `latest`, `main`, and `next`; it pulls only a fixed version or digest. It writes the image configuration and restarts only after deep assessment and backup pass. If the actual container image, route reconciliation, full model smoke, or post-upgrade database check fails, LLMCtl stops the Router, restores both the prior image and pre-upgrade SQLite, then starts and validates the rollback. GPU Workers are never restarted.
+- `rollback` accepts only an ID from the managed backup inventory and creates a `pre-rollback` snapshot first. It refuses size, SHA256, or quick_check mismatches. With the Router stopped, it atomically replaces the main database, removes stale WAL/SHM companions, restores the image entries captured by the backup, and runs full acceptance.
+
+The administration console exposes the same assessment, task progress, backup inventory, and rollback workflow under **OmniRoute Maintenance**. Online maintenance requires `MAINTAIN ONLINE`, compaction requires `COMPACT SQLITE`, update requires `UPDATE OMNIROUTE`, and rollback requires the full phrase containing the selected backup ID. Managed backups are never auto-deleted; monitor `/var/backups` capacity and copy important recovery points off-host.
+The compatibility entry point `llmctl update --omniroute-image ...` delegates to this safe state machine and no longer bypasses database backup. A vLLM image update must be performed as a separate maintenance step.
+
 Public registration is disabled by default. Enabling it requires an exact email-domain allowlist, the public portal origin, and external SMTP:
 
 ```bash
@@ -439,10 +469,10 @@ sudo llmctl runtime-proxy show
 sudo llmctl runtime-proxy clear
 ```
 
-The installer defaults to the published OmniRoute image `diegosouzapw/omniroute:3.8.48`. If an image tag is absent or the registry is unreachable, the installer preserves Docker's original error and prints the corresponding `--*-image` override instead of reporting only a script line number. For example:
+The installer defaults to the published OmniRoute image `diegosouzapw/omniroute:3.8.49`. If an image tag is absent or the registry is unreachable, the installer preserves Docker's original error and prints the corresponding `--*-image` override instead of reporting only a script line number. For example:
 
 ```bash
-sudo ./install-llm-cluster.sh --omniroute-image diegosouzapw/omniroute:3.8.48
+sudo ./install-llm-cluster.sh --omniroute-image diegosouzapw/omniroute:3.8.49
 ```
 
 Export or import an offline bundle:

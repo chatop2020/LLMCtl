@@ -1,0 +1,114 @@
+{
+  "plan_id": "omniroute-lifecycle-maintenance",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L3",
+  "source": {
+    "baseline_commit": "8338c033ad3b4782f32cbfde12cf026e831581c4",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "为 OmniRoute 提供 CLI 与 WebUI 共用的安全升级、SQLite 健康评估、在线维护、维护窗压缩、备份和回滚闭环。",
+    "acceptance": [
+      "CLI 和 WebUI 通过同一个 root-only Unix Socket 白名单控制服务执行操作，门户进程不能直接读写 OmniRoute 数据库或调用 systemctl/Docker。",
+      "只读评估展示完整性、外键、WAL、页空闲率、磁盘余量、数据库大小、运行/配置镜像、备份年龄和可操作建议。",
+      "任何升级、在线维护、压缩或人工回滚前都使用 SQLite 在线备份 API 创建一致性快照，并校验 quick_check、SHA256、大小和元数据。",
+      "在线维护只执行 PRAGMA optimize 与 PASSIVE WAL checkpoint，不停止 Router 或 Worker。",
+      "维护窗压缩停止 Router 后执行 TRUNCATE checkpoint、VACUUM、完整性检查，再恢复 Router 并做完整冒烟；失败时恢复快照。",
+      "升级只接受固定版本或 digest 镜像，拉取和校验成功后才备份和切换；Router/账户门户重启，GPU Worker 不重启。",
+      "升级后的 Router 健康、管理 API、路由同步和真实模型冒烟任一步失败时，自动恢复原镜像和升级前数据库，并再次验收回滚结果。",
+      "人工回滚只能选择受管备份 ID；回滚前再备份当前状态，目标哈希或完整性不符时拒绝操作。",
+      "后台任务有等待、执行、成功、失败、已回滚和取消状态，持久化阶段、进度、日志与恢复入口；控制服务重启后遗留任务进入明确终态。",
+      "WebUI 清楚区分只读评估、在线维护、维护窗压缩、升级和回滚的影响，并对高风险操作要求精确确认短语。"
+    ]
+  },
+  "risk": {
+    "level": "L3",
+    "assets": [
+      "OmniRoute storage.sqlite 中的 API Key、Provider、Combo、路由、设置和调用日志",
+      "OmniRoute 镜像版本与 cluster.env",
+      "Router、账户门户和公开 /v1 可用性",
+      "GPU Worker 持续运行状态",
+      "升级前和维护前恢复快照"
+    ],
+    "trust_boundaries": [
+      "管理员浏览器到门户 API",
+      "llm-account 用户到 root model-control Unix Socket",
+      "root 控制服务到 Docker、systemd、cluster.env 与 storage.sqlite",
+      "新 OmniRoute 镜像启动迁移到旧 SQLite 数据"
+    ],
+    "abuse_cases": [
+      "普通用户或伪造请求触发升级、VACUUM 或回滚",
+      "路径穿越选择任意文件作为备份或恢复目标",
+      "使用 latest/main/next 等可变镜像导致无法重现或回滚",
+      "备份损坏、未落盘或与元数据不匹配却继续升级",
+      "Router 运行时直接替换主库或删除 WAL 导致损坏",
+      "升级失败只回滚镜像但保留不兼容数据库迁移",
+      "回滚覆盖升级后配置但没有保留当前状态",
+      "在线维护长时间独占 SQLite 写锁并影响请求",
+      "并发模型发布与 OmniRoute 维护互相覆盖路由状态",
+      "控制服务重启后任务永久显示执行中"
+    ],
+    "controls": [
+      "管理员会话与 CSRF，Unix Socket 0660 且操作白名单",
+      "备份 ID 与镜像格式白名单，所有路径从固定根目录解析并校验父目录",
+      "Python sqlite3 backup API、一致性检查、SHA256、fsync、原子替换与原权限恢复",
+      "所有写操作先备份；人工回滚前创建 pre-rollback 快照",
+      "在线维护使用有界 busy_timeout、PASSIVE checkpoint 和 PRAGMA optimize",
+      "VACUUM、恢复和数据库文件替换只在 Router 停止后执行",
+      "升级同时回滚原镜像与原数据库，回滚后重新启动并做完整冒烟",
+      "模型变更任务和 OmniRoute 维护任务共享冲突检查，不允许并行提交",
+      "后台任务持久化、阶段安全检查点、取消标记和守护进程重启恢复"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "sqlite-domain-and-recovery",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "python3 -m unittest tests.test_omniroute_maintenance"
+      ]
+    },
+    {
+      "gate_id": "cli-api-and-permission-contracts",
+      "criticality": "Required",
+      "depends_on": ["sqlite-domain-and-recovery"],
+      "commands": [
+        "bash -n llmctl.sh lib/llmctl/*.sh",
+        "python3 -m unittest tests.test_static_contracts tests.test_source_structure tests.test_control_plane_upgrade"
+      ]
+    },
+    {
+      "gate_id": "frontend-contract-and-build",
+      "criticality": "Required",
+      "depends_on": ["cli-api-and-permission-contracts"],
+      "commands": [
+        "npm test",
+        "npm run build"
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "criticality": "Required",
+      "depends_on": ["frontend-contract-and-build"],
+      "commands": [
+        "python3 -m unittest discover -s tests",
+        "git diff --check",
+        "modified first-party source line-count check"
+      ]
+    },
+    {
+      "gate_id": "isolated-browser-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-regression"],
+      "environment": "隔离门户、虚构 OmniRoute 状态、备份和后台任务；不触发真实 systemd、Docker 或生产数据库写入"
+    },
+    {
+      "gate_id": "ubuntu-production-acceptance",
+      "criticality": "Required",
+      "depends_on": ["isolated-browser-acceptance"],
+      "actor": "真实 LLMCtl 运维管理员",
+      "expected_status_without_operator": "Unverified"
+    }
+  ]
+}
