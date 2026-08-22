@@ -1602,6 +1602,7 @@ cmd_info() {
   local redact=0 value public_host public_origin effective_public_origin id state portal_inventory="" portal_inventory_status=unavailable
   local portal_users="n/a" portal_groups="n/a" portal_models="n/a" portal_free="n/a"
   local portal_usage="n/a" portal_transactions="n/a" portal_audits="n/a" portal_integrity="n/a"
+  local portal_grant_conversion_status="not-required"
   local portal_db_backend="sqlite" mysql_capability="disabled" mysql_driver="<未激活>"
   local mysql_host="<未配置>" mysql_port="3306" mysql_database="<未配置>" mysql_username="<未配置>"
   local mysql_password="" mysql_tls="preferred" mysql_ca="<empty>"
@@ -1634,6 +1635,7 @@ cmd_info() {
       ACCOUNT_DEFAULT_QUOTA_TOKENS=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_tokens // "0"')
       ACCOUNT_QUOTA_RESET=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset // "monthly"')
       ACCOUNT_QUOTA_RESET_TIME=$(printf '%s' "${portal_inventory}" | jq -r '.settings.default_quota_reset_time // "00:00"')
+      portal_grant_conversion_status=$(printf '%s' "${portal_inventory}" | jq -r '.settings.token_grant_conversion_status // "not-required"')
       ACCOUNT_PORTAL_TITLE=$(printf '%s' "${portal_inventory}" | jq -r '.settings.portal_title // "LLMCtl"')
       ACCOUNT_PUBLISHED_ORIGIN=$(printf '%s' "${portal_inventory}" | jq -r '.settings.published_origin // ""')
       ACCOUNT_PUBLIC_URL=$(printf '%s' "${portal_inventory}" | jq -r '.settings.public_url // ""')
@@ -1772,7 +1774,7 @@ cmd_info() {
   printf '\n[注册、余额与 SMTP / Registration, balance and SMTP]\n'
   printf '门户品牌名称: %s\n允许注册: %s\n允许邮箱后缀: %s\n新用户一次性赠款（USD）: %s\n旧版 Token 迁移状态: %s\n对外发布地址: %s\n门户公开 URL: %s\nAPI 公开 URL: %s\n' \
     "${ACCOUNT_PORTAL_TITLE}" "${ACCOUNT_REGISTRATION_ENABLED}" "${ACCOUNT_ALLOWED_EMAIL_DOMAINS:-<empty>}" "${ACCOUNT_DEFAULT_WELCOME_BALANCE}" \
-    "$(printf '%s' "${portal_inventory:-{}}" | jq -r '.settings.token_grant_conversion_status // "not-required"' 2>/dev/null || printf unknown)" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动>}" \
+    "${portal_grant_conversion_status}" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动>}" \
     "${effective_public_origin}/ui/" "${effective_public_origin}"
   printf 'SMTP: %s:%s (%s)\nSMTP 用户名: %s\nSMTP 密码: %s\n发件人: %s\n' \
     "${SMTP_HOST:-<empty>}" "${SMTP_PORT}" "${SMTP_SECURITY}" "${SMTP_USERNAME:-<empty>}" "$(secret_value "${SMTP_PASSWORD}")" "${SMTP_FROM:-<empty>}"

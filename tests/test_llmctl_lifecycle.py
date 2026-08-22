@@ -590,6 +590,64 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertTrue(completed.stdout.strip().startswith(directory))
         self.assertNotIn("/tmp/", completed.stdout.removeprefix(directory))
 
+    def test_omniroute_request_writes_exactly_one_json_object(self):
+        """OmniRoute CLI 不得在调用 Python 前给有效 JSON 追加右花括号。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                omniroute_require_control() {{ :; }}
+                model_control_request() {{
+                  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$2"
+                }}
+                omniroute_request omniroute-assess '{{"deep":true}}'
+                omniroute_request omniroute-status
+                """
+            )
+            environment = os.environ.copy()
+            environment["LLM_CLUSTER_STATE_DIR"] = directory
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+        payloads = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual(payloads, [{"deep": True}, {}])
+
+    def test_omniroute_request_rejects_multiple_json_documents(self):
+        """内部调用意外拼接两段 JSON 时必须在 Shell 层失败关闭。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                omniroute_require_control() {{ :; }}
+                model_control_request() {{ printf 'unexpected call\n'; }}
+                omniroute_request omniroute-assess '{{"deep":true}}}}'
+                """
+            )
+            environment = os.environ.copy()
+            environment["LLM_CLUSTER_STATE_DIR"] = directory
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=False,
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("不是单个有效 JSON 对象", completed.stderr)
+        self.assertNotIn("unexpected call", completed.stdout)
+
     def test_optimizer_workload_is_bounded_by_active_scheduling_slots(self):
         output = run_bash(
             r"""

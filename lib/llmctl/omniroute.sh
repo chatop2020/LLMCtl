@@ -8,15 +8,24 @@ omniroute_require_control() {
     die "OmniRoute 运维控制服务未就绪；请先运行 llmctl model init"
 }
 
+# 把一个 OmniRoute 白名单操作及其单个 JSON 对象发送给 root 控制服务。
+# 第二个参数可省略，此时使用空对象；写入前会规范化并拒绝多段或畸形 JSON，
+# 避免把 Shell 参数展开错误泄漏成 Python traceback。
 omniroute_request() {
-  local operation="${1:?}" payload="${2:-{}}" temporary
+  local operation="${1:?}" payload="${2:-}" temporary status
+  [[ -n "${payload}" ]] || payload='{}'
   omniroute_require_control
   temporary=$(mktemp "${STATE_DIR}/omniroute-request.XXXXXX.json")
+  if ! printf '%s' "${payload}" | \
+      jq -s -ce 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected one object") end' \
+      >"${temporary}"; then
+    rm -f "${temporary}"
+    die "内部 OmniRoute 请求不是单个有效 JSON 对象"
+  fi
   chmod 0600 "${temporary}"
-  printf '%s\n' "${payload}" >"${temporary}"
   set +e
   model_control_request "${operation}" "${temporary}"
-  local status=$?
+  status=$?
   set -e
   rm -f "${temporary}"
   return "${status}"
@@ -189,4 +198,3 @@ cmd_omniroute() {
       ;;
   esac
 }
-
