@@ -2335,10 +2335,21 @@ smoke_fail_response() {
   die "${reason}；响应摘要=${summary}；完整响应=${diagnostic}"
 }
 
+# 创建 Docker 守护进程与当前调用进程都能看到的 OCR 夹具目录。
+# systemd 的 PrivateTmp 会让服务进程和 Docker 对 /tmp、/var/tmp 看到不同目录，
+# 因此必须使用 LLMCtl 的持久状态根；调用者负责在冒烟结束时删除返回目录。
+smoke_fixture_directory() {
+  install -d -m 700 "${SMOKE_DIAGNOSTIC_DIR}"
+  mktemp -d "${SMOKE_DIAGNOSTIC_DIR}/.fixture.XXXXXX"
+}
+
+# 使用当前 vLLM 镜像中的 Pillow 生成确定性的合成 OCR 图片。
+# 第一个参数是宿主机可见的输出目录；函数成功时保证 PNG 已实际写回宿主机。
 make_ocr_fixture() {
   local out_dir="${1:?}"
   docker run --rm --network none \
     -v "${out_dir}:/out" \
+    --user 0:0 \
     --entrypoint python3 "${VLLM_IMAGE}" -c '
 from PIL import Image, ImageDraw, ImageFont
 img = Image.new("RGB", (1400, 360), "white")
@@ -2354,8 +2365,12 @@ else:
     draw.text((80, 105), "LLM OCR 7319", fill="black", font=font)
 img.save("/out/llm-ocr-test.png")
 ' >/dev/null
+  [[ -s "${out_dir}/llm-ocr-test.png" ]] || \
+    die "OCR 冒烟测试图片未写回宿主机；请检查 Docker bind mount 和 ${out_dir}"
 }
 
+# 把本地图片编码成 OpenAI 兼容的 data URL 请求。
+# 参数依次为可读图片路径、识别提示和需要写入的 JSON 请求文件。
 ocr_request_file() {
   local image_file="${1:?}" prompt="${2:-请逐字识别图片中的全部文字，只输出识别结果。}" out_json="${3:?}"
   local mime b64_file
@@ -2427,7 +2442,7 @@ smoke_endpoint() {
 
   if [[ "${full}" == 1 && "${SUPPORTS_IMAGE_INPUT}" == 1 ]]; then
     log "开始图片/OCR 与单请求 6 图冒烟测试..."
-    tmp_dir=$(mktemp -d)
+    tmp_dir=$(smoke_fixture_directory)
     make_ocr_fixture "${tmp_dir}"
     ocr_json=$(mktemp)
     ocr_request_file "${tmp_dir}/llm-ocr-test.png" "识别图片文字，只输出文字。" "${ocr_json}"
