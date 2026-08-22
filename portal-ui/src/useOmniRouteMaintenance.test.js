@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useOmniRouteMaintenance } from "./useOmniRouteMaintenance.js";
+import {
+  OMNIROUTE_MAX_JOB_POLL_FAILURES,
+  useOmniRouteMaintenance,
+} from "./useOmniRouteMaintenance.js";
 
 describe("OmniRoute 生命周期维护", () => {
   beforeEach(() => {
@@ -83,5 +86,118 @@ describe("OmniRoute 生命周期维护", () => {
         confirmation: "ROLLBACK upgrade-20260822t000000z-12345678",
       }),
     });
+  });
+
+  it("任务接口短暂失败时从总快照恢复，不误报任务失败", async () => {
+    const activeJob = {
+      id: "22222222-2222-4222-8222-222222222222",
+      state: "running",
+      phase: "starting",
+      progress: 80,
+      message: "恢复 Router 并执行完整模型冒烟",
+    };
+    const api = vi.fn(async (path) => {
+      if (path === "admin/omniroute/job") throw new Error("HTTP 502");
+      return { active_job: activeJob, jobs: [activeJob], backups: [] };
+    });
+    const notify = vi.fn();
+    const state = useOmniRouteMaintenance({ api, notify });
+    state.omnirouteJob.value = activeJob;
+
+    const result = await state.pollOmniRouteJob(activeJob.id);
+
+    expect(result).toEqual(activeJob);
+    expect(state.omnirouteJobActive.value).toBe(true);
+    expect(state.omniroutePollFailures.value).toBe(0);
+    expect(state.omniroutePollingPaused.value).toBe(false);
+    expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("读取失败"), "bad");
+  });
+
+  it("账户门户维护中持续 502 时保留后台任务并自动重试", async () => {
+    const activeJob = {
+      id: "33333333-3333-4333-8333-333333333333",
+      state: "running",
+      phase: "starting",
+      progress: 80,
+    };
+    const api = vi.fn().mockRejectedValue(new Error("HTTP 502"));
+    const notify = vi.fn();
+    const state = useOmniRouteMaintenance({ api, notify });
+    state.omnirouteJob.value = activeJob;
+
+    await state.pollOmniRouteJob(activeJob.id);
+
+    expect(state.omnirouteJob.value).toEqual(activeJob);
+    expect(state.omnirouteJobActive.value).toBe(true);
+    expect(state.omniroutePollFailures.value).toBe(1);
+    expect(state.omniroutePollError.value).toBe("HTTP 502");
+    expect(state.omniroutePollingPaused.value).toBe(false);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("活动任务期间手动刷新失败时说明任务未被取消", async () => {
+    const activeJob = {
+      id: "66666666-6666-4666-8666-666666666666",
+      state: "running",
+      phase: "starting",
+      progress: 80,
+    };
+    const api = vi.fn().mockRejectedValue(new Error("HTTP 502"));
+    const notify = vi.fn();
+    const state = useOmniRouteMaintenance({ api, notify });
+    state.omnirouteJob.value = activeJob;
+
+    await state.loadOmniRouteMaintenance();
+
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("后台任务未被取消"),
+      "working",
+    );
+    expect(state.omnirouteJob.value).toEqual(activeJob);
+  });
+
+  it("长时间不可读后提供手动恢复，并在恢复后读取真实终态", async () => {
+    const activeJob = {
+      id: "44444444-4444-4444-8444-444444444444",
+      state: "running",
+      phase: "starting",
+      progress: 80,
+    };
+    const succeededJob = {
+      ...activeJob,
+      state: "succeeded",
+      phase: "succeeded",
+      progress: 100,
+      message: "OmniRoute 升级完成",
+    };
+    const api = vi.fn().mockRejectedValue(new Error("HTTP 502"));
+    const notify = vi.fn();
+    const state = useOmniRouteMaintenance({ api, notify });
+    state.omnirouteJob.value = activeJob;
+
+    for (let attempt = 0; attempt < OMNIROUTE_MAX_JOB_POLL_FAILURES; attempt += 1) {
+      await state.pollOmniRouteJob(activeJob.id);
+    }
+
+    expect(state.omniroutePollingPaused.value).toBe(true);
+    expect(state.omnirouteJobActive.value).toBe(true);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("后台任务未被取消"),
+      "bad",
+    );
+
+    expect(state.resumeOmniRoutePolling()).toBe(true);
+    expect(state.omniroutePollingPaused.value).toBe(false);
+    expect(state.omniroutePollFailures.value).toBe(0);
+    api.mockReset().mockResolvedValueOnce(succeededJob).mockResolvedValueOnce({
+      active_job: null,
+      jobs: [succeededJob],
+      backups: [],
+    });
+
+    await state.pollOmniRouteJob(activeJob.id);
+
+    expect(state.omnirouteJob.value).toEqual(succeededJob);
+    expect(state.omnirouteJobActive.value).toBe(false);
   });
 });
