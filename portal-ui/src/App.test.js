@@ -204,6 +204,10 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("COMPACT SQLITE");
     expect(source).toContain("备份、升级并自动验收");
     expect(source).toContain("备份当前状态并执行回滚");
+    expect(source).toContain("账户门户正在恢复，系统会自动重试");
+    expect(source).toContain("重新读取任务");
+    expect(source).toContain("账户门户恢复连接后才能提交取消请求");
+    expect(source).toContain("后台任务未被取消，系统会继续重试");
   });
 
   it("为待验证用户提供手动通过、补发和安全删除操作", () => {

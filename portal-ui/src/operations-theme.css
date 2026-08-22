@@ -1406,8 +1406,23 @@ td {
   gap: 10px;
   min-width: 0;
 }
+.omniroute-job-actions {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 .omniroute-job-panel progress {
   width: 100%;
+}
+.omniroute-poll-warning {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+.omniroute-poll-warning p {
+  flex: 1 1 520px;
+  margin: 0;
 }
 .omniroute-assessment-grid {
   display: grid;

@@ -111,20 +111,61 @@ export default {
                     >{{ deploymentJobStateLabel(omnirouteJob.state) }}</span>
                     <strong>{{ omnirouteJob.message }}</strong>
                   </div>
-                  <button
-                    v-if="omnirouteJobActive"
-                    type="button"
-                    class="danger"
-                    @click="cancelOmniRouteJob"
-                  >
-                    安全取消
-                  </button>
+                  <div v-if="omnirouteJobActive" class="omniroute-job-actions">
+                    <button
+                      v-if="omniroutePollingPaused"
+                      type="button"
+                      class="ghost"
+                      @click="resumeOmniRoutePolling"
+                    >
+                      重新读取任务
+                    </button>
+                    <button
+                      type="button"
+                      class="danger"
+                      :disabled="omniroutePollFailures > 0"
+                      :title="
+                        omniroutePollFailures > 0
+                          ? '账户门户恢复连接后才能提交取消请求'
+                          : ''
+                      "
+                      @click="cancelOmniRouteJob"
+                    >
+                      安全取消
+                    </button>
+                  </div>
                 </div>
                 <progress :value="Number(omnirouteJob.progress || 0)" max="100"></progress>
                 <p>
                   阶段 {{ omnirouteJob.phase }} · {{ omnirouteJob.progress || 0 }}% ·
                   任务 <code>{{ omnirouteJob.id }}</code>
                 </p>
+                <div
+                  v-if="omniroutePollFailures"
+                  class="warning omniroute-poll-warning"
+                  role="status"
+                >
+                  <strong>
+                    {{
+                      omniroutePollingPaused
+                        ? "暂时无法确认最新进度"
+                        : "账户门户正在恢复，系统会自动重试"
+                    }}
+                  </strong>
+                  <p>
+                    Router 维护期间账户门户会短暂停止，这不会取消后台任务。
+                    已连续读取失败 {{ omniroutePollFailures }} 次；最近错误：
+                    {{ omniroutePollError }}。
+                  </p>
+                  <button
+                    v-if="omniroutePollingPaused"
+                    type="button"
+                    class="ghost"
+                    @click="resumeOmniRoutePolling"
+                  >
+                    重新读取任务
+                  </button>
+                </div>
                 <div v-if="omnirouteJob.logs?.length" class="deployment-log">
                   <p v-for="(entry, index) in omnirouteJob.logs.slice(-8)" :key="index">
                     <time>{{ entry.time }}</time>{{ entry.message }}

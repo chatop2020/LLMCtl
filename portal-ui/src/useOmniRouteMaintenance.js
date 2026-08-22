@@ -7,6 +7,10 @@ const TERMINAL_STATES = new Set([
   "rolled_back",
 ]);
 
+// Router 维护会按设计短暂停止账户门户。30 分钟重试窗口覆盖镜像切换、
+// 完整冒烟和一次自动回滚，同时避免永久显示无法确认的运行中状态。
+export const OMNIROUTE_MAX_JOB_POLL_FAILURES = 180;
+
 /**
  * 管理 OmniRoute 只读评估和 root 后台维护任务的页面状态。
  *
@@ -21,6 +25,9 @@ export function useOmniRouteMaintenance({ api, notify }) {
   const omnirouteJob = ref(null);
   const omnirouteLoading = ref(false);
   const omnirouteActionLoading = ref(false);
+  const omniroutePollFailures = ref(0);
+  const omniroutePollingPaused = ref(false);
+  const omniroutePollError = ref("");
   const omnirouteForm = reactive({
     update_image: "",
     update_confirmation: "",
@@ -43,10 +50,31 @@ export function useOmniRouteMaintenance({ api, notify }) {
     pollTimer = null;
   }
 
+  /** 清空连接失败状态；不改变当前任务或服务端执行状态。 */
+  function resetOmniRoutePollHealth() {
+    omniroutePollFailures.value = 0;
+    omniroutePollingPaused.value = false;
+    omniroutePollError.value = "";
+  }
+
+  /**
+   * 返回下一次状态读取的退避时间，单位为毫秒。
+   *
+   * @returns {number} 正常时为两秒；连续失败后逐步放缓，最多十秒。
+   */
+  function omniroutePollDelay() {
+    if (!omniroutePollFailures.value) return 2000;
+    return Math.min(10000, 2000 * 2 ** Math.min(3, omniroutePollFailures.value));
+  }
+
   /**
    * 合并控制服务快照，并用推荐镜像初始化尚未编辑的升级目标。
    *
+   * 快照是当前任务是否仍在执行的权威来源。若快照已经没有对应活动任务，
+   * 本地遗留的 waiting/running 状态会被终态替换或清除，避免永久锁住按钮。
+   *
    * @param {object} snapshot 门户 API 返回的非敏感 OmniRoute 状态。
+   * @returns {object|null} 快照中解析到的当前或最近任务。
    */
   function applyOmniRouteSnapshot(snapshot) {
     omnirouteMaintenance.value = snapshot;
@@ -56,7 +84,17 @@ export function useOmniRouteMaintenance({ api, notify }) {
       omnirouteForm.update_image =
         snapshot?.recommended_image || snapshot?.configured_image || "";
     }
-    if (snapshot?.active_job) omnirouteJob.value = snapshot.active_job;
+    const currentJob = omnirouteJob.value;
+    const currentId = String(currentJob?.id || "");
+    const matchingJob = currentId
+      ? (snapshot?.jobs || []).find((job) => String(job?.id || "") === currentId)
+      : null;
+    const nextJob =
+      matchingJob ||
+      snapshot?.active_job ||
+      (TERMINAL_STATES.has(String(currentJob?.state || "")) ? currentJob : null);
+    omnirouteJob.value = nextJob || null;
+    return omnirouteJob.value;
   }
 
   /**
@@ -71,11 +109,18 @@ export function useOmniRouteMaintenance({ api, notify }) {
     try {
       const snapshot = await api("admin/omniroute");
       applyOmniRouteSnapshot(snapshot);
+      resetOmniRoutePollHealth();
       if (snapshot?.active_job) startOmniRoutePolling(snapshot.active_job.id);
       return snapshot;
     } catch (error) {
-      if (!options.silent)
-        notify(`OmniRoute 状态读取失败：${error.message}`, "bad");
+      if (!options.silent) {
+        notify(
+          omnirouteJobActive.value
+            ? "OmniRoute 任务状态暂时无法读取；Router 维护期间账户门户可能短暂停止，后台任务未被取消，系统会继续重试"
+            : `OmniRoute 状态读取失败：${error.message}`,
+          omnirouteJobActive.value ? "working" : "bad",
+        );
+      }
       return null;
     } finally {
       omnirouteLoading.value = false;
@@ -127,7 +172,9 @@ export function useOmniRouteMaintenance({ api, notify }) {
         method: "POST",
         body: JSON.stringify({ id: jobId }),
       });
+      const recovered = omniroutePollFailures.value > 0;
       omnirouteJob.value = job;
+      resetOmniRoutePollHealth();
       if (TERMINAL_STATES.has(String(job.state || ""))) {
         stopOmniRoutePolling();
         await loadOmniRouteMaintenance({ silent: true });
@@ -135,28 +182,72 @@ export function useOmniRouteMaintenance({ api, notify }) {
           job.message || "OmniRoute 任务已结束",
           job.state === "succeeded" ? "ok" : "bad",
         );
+      } else if (recovered) {
+        notify("OmniRoute 任务状态连接已恢复，后台任务仍在执行", "working");
       }
       return job;
     } catch (error) {
-      stopOmniRoutePolling();
-      notify(`OmniRoute 任务读取失败：${error.message}`, "bad");
-      return null;
+      omniroutePollFailures.value += 1;
+      omniroutePollError.value = String(error?.message || "连接失败");
+
+      // 单个任务接口失败时尝试读取总快照。快照可以在浏览器漏掉终态更新后
+      // 恢复真实状态；账户门户整体暂停时，两条路径都会失败并进入有界重试。
+      try {
+        const snapshot = await api("admin/omniroute");
+        const recoveredJob = applyOmniRouteSnapshot(snapshot);
+        resetOmniRoutePollHealth();
+        if (TERMINAL_STATES.has(String(recoveredJob?.state || ""))) {
+          stopOmniRoutePolling();
+          notify(
+            recoveredJob.message || "OmniRoute 任务已结束",
+            recoveredJob.state === "succeeded" ? "ok" : "bad",
+          );
+        }
+        return recoveredJob;
+      } catch {
+        if (
+          omniroutePollFailures.value >= OMNIROUTE_MAX_JOB_POLL_FAILURES
+        ) {
+          stopOmniRoutePolling();
+          omniroutePollingPaused.value = true;
+          notify(
+            "OmniRoute 任务状态已连续 30 分钟无法读取；后台任务未被取消，请点击“重新读取任务”恢复监控",
+            "bad",
+          );
+        }
+        return null;
+      }
     }
   }
 
   /**
-   * 每两秒轮询后台任务；重复调用只保留一个定时器。
+   * 正常时每两秒轮询后台任务；连接失败时退避到十秒。重复调用只保留一个定时器。
    *
    * @param {string} jobId 后台任务 UUID。
+   * @param {object} options 轮询选项；resetHealth 为假时保留失败计数。
    */
-  function startOmniRoutePolling(jobId) {
+  function startOmniRoutePolling(jobId, options = {}) {
     stopOmniRoutePolling();
+    if (options.resetHealth !== false) resetOmniRoutePollHealth();
     const tick = async () => {
-      await pollOmniRouteJob(jobId);
-      if (omnirouteJobActive.value)
-        pollTimer = window.setTimeout(tick, 2000);
+      pollTimer = null;
+      await pollOmniRouteJob(String(omnirouteJob.value?.id || jobId));
+      if (omnirouteJobActive.value && !omniroutePollingPaused.value)
+        pollTimer = window.setTimeout(tick, omniroutePollDelay());
     };
     pollTimer = window.setTimeout(tick, 300);
+  }
+
+  /**
+   * 在自动重试暂停后重新读取当前任务。
+   *
+   * @returns {boolean} 存在可继续监控的活动任务时返回 true。
+   */
+  function resumeOmniRoutePolling() {
+    if (!omnirouteJobActive.value) return false;
+    startOmniRoutePolling(omnirouteJob.value.id);
+    notify("正在重新连接账户门户并读取 OmniRoute 任务状态…", "working");
+    return true;
   }
 
   /**
@@ -263,10 +354,15 @@ export function useOmniRouteMaintenance({ api, notify }) {
     omnirouteJob,
     omnirouteLoading,
     omnirouteActionLoading,
+    omniroutePollFailures,
+    omniroutePollingPaused,
+    omniroutePollError,
     omnirouteForm,
     omnirouteJobActive,
     stopOmniRoutePolling,
+    resumeOmniRoutePolling,
     loadOmniRouteMaintenance,
+    pollOmniRouteJob,
     assessOmniRouteSqlite,
     backupOmniRouteSqlite,
     maintainOmniRouteOnline,
