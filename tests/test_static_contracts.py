@@ -22,6 +22,11 @@ MANIFEST = (ROOT / "upgrade-manifest.tsv").read_text(encoding="utf-8")
 
 
 class StaticDeploymentContracts(unittest.TestCase):
+    def test_shell_json_defaults_do_not_append_a_literal_closing_brace(self):
+        """`${value:-{}}` 会在 Bash 中追加 `}`，所有受管脚本必须禁用该写法。"""
+
+        self.assertNotIn(":-{}}", MANAGER)
+
     def test_llmctl_info_is_a_comprehensive_root_recovery_inventory(self):
         info = MANAGER.split("cmd_info() {", 1)[1].split("cmd_health() {", 1)[0]
         for marker in (
