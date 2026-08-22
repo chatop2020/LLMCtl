@@ -228,6 +228,17 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("detected_format", MANAGER)
         self.assertIn("finish_reason", smoke)
         self.assertIn("smoke_fail_response", smoke)
+        self.assertIn("tmp_dir=$(smoke_fixture_directory)", smoke)
+        fixture = MANAGER.split("smoke_fixture_directory() {", 1)[1].split(
+            "make_ocr_fixture() {", 1
+        )[0]
+        self.assertIn('"${SMOKE_DIAGNOSTIC_DIR}/.fixture.XXXXXX"', fixture)
+        self.assertNotIn("mktemp -d /tmp", fixture)
+        make_fixture = MANAGER.split("make_ocr_fixture() {", 1)[1].split(
+            "ocr_request_file() {", 1
+        )[0]
+        self.assertIn("--user 0:0", make_fixture)
+        self.assertIn('[[ -s "${out_dir}/llm-ocr-test.png" ]]', make_fixture)
         self.assertIn('local target="${1:-all}"', logs)
         self.assertIn("llm-router.service", logs)
         self.assertIn("llm-database.service", logs)

@@ -549,6 +549,47 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["detected_format"], "sse")
         self.assertGreater(summary["body_chars"], 0)
 
+    def test_ocr_fixture_is_written_outside_systemd_private_tmp(self):
+        """后台维护必须在宿主机共享目录生成并回读 OCR 图片。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                VLLM_IMAGE=fake-vllm
+                docker() {{
+                  local mount=""
+                  while (($#)); do
+                    if [[ "$1" == -v ]]; then mount="$2"; shift 2; else shift; fi
+                  done
+                  [[ -n "${{mount}}" ]]
+                  printf 'synthetic-png' >"${{mount%:/out}}/llm-ocr-test.png"
+                }}
+                fixture=$(smoke_fixture_directory)
+                printf '%s\n' "${{fixture}}"
+                [[ "${{fixture}}" == "${{LLM_CLUSTER_STATE_DIR}}/diagnostics/smoke/.fixture."* ]]
+                [[ -d "${{fixture}}" ]]
+                make_ocr_fixture "${{fixture}}"
+                [[ -s "${{fixture}}/llm-ocr-test.png" ]]
+                rm "${{fixture}}/llm-ocr-test.png"
+                rmdir "${{fixture}}"
+                """
+            )
+            environment = os.environ.copy()
+            environment["LLM_CLUSTER_STATE_DIR"] = directory
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+        self.assertTrue(completed.stdout.strip().startswith(directory))
+        self.assertNotIn("/tmp/", completed.stdout.removeprefix(directory))
+
     def test_optimizer_workload_is_bounded_by_active_scheduling_slots(self):
         output = run_bash(
             r"""
