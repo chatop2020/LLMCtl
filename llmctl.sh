@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.10"
+readonly CTL_VERSION="3.6.11"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -313,7 +313,7 @@ cmd_worker_start() {
   fi
   : "${GPU_DEVICES:?缺少 GPU_DEVICES}"
   : "${WORKER_PORT:?缺少 WORKER_PORT}"
-  local runtime_switch
+  local runtime_switch numa_binding="" numa_node="" numa_cpus=""
   for runtime_switch in PLE_CPU_OFFLOAD ENABLE_EXPERT_PARALLEL ENABLE_PREFIX_CACHING ENABLE_FLASHINFER_AUTOTUNE DISABLE_CUSTOM_ALL_REDUCE; do
     [[ "${!runtime_switch}" == 0 || "${!runtime_switch}" == 1 ]] || die "Worker ${id} 的 ${runtime_switch} 必须是 0 或 1"
   done
@@ -359,6 +359,10 @@ cmd_worker_start() {
     -v "${MODEL_LOCAL_DIR}:/model:ro"
     -v "${CACHE_DIR}/shared:/root/.cache"
   )
+  if (( PLE_CPU_OFFLOAD == 1 )) && numa_binding=$(worker_numa_binding "${GPU_DEVICES}"); then
+    IFS=$'\t' read -r numa_node numa_cpus <<<"${numa_binding}"
+    docker_args+=(--cpuset-mems "${numa_node}" --cpuset-cpus "${numa_cpus}")
+  fi
   if (( PLE_CPU_OFFLOAD == 1 )); then
     docker_args+=(--cap-add SYS_PTRACE -e VLLM_PLE_CPU_OFFLOAD=1)
   fi
@@ -403,7 +407,7 @@ cmd_worker_start() {
   if (( SUPPORTS_IMAGE_INPUT == 1 )); then
     docker_args+=(--limit-mm-per-prompt "${MM_LIMIT}" --allowed-media-domains llm.invalid)
   fi
-  log "Worker ${id} 启动：GPU=${GPU_DEVICES}，TP=${TP_SIZE}，ctx=${MAX_MODEL_LEN}，output<=${MAX_OUTPUT_TOKENS}，seq=${MAX_NUM_SEQS}，KV=${KV_CACHE_DTYPE}，MTP=${MTP_SPECULATIVE_TOKENS}，PLE=${PLE_CPU_OFFLOAD}，模型=${MODEL_ID}"
+  log "Worker ${id} 启动：GPU=${GPU_DEVICES}，TP=${TP_SIZE}，NUMA=${numa_node:-系统默认}，ctx=${MAX_MODEL_LEN}，output<=${MAX_OUTPUT_TOKENS}，seq=${MAX_NUM_SEQS}，KV=${KV_CACHE_DTYPE}，MTP=${MTP_SPECULATIVE_TOKENS}，PLE=${PLE_CPU_OFFLOAD}，模型=${MODEL_ID}"
   exec "${docker_args[@]}"
 }
 
@@ -2916,7 +2920,7 @@ load_llmctl_command_modules() {
   else
     module_dir="${LLMCTL_MODULE_DIR:-/usr/local/lib/llm-cluster/llmctl}"
   fi
-  for module in workflow_model optimizer maintenance offline_lifecycle omniroute; do
+  for module in topology workflow_model optimizer maintenance offline_lifecycle omniroute; do
     [[ -r "${module_dir}/${module}.sh" ]] || die "llmctl 命令模块缺失：${module_dir}/${module}.sh"
     # shellcheck disable=SC1090
     source "${module_dir}/${module}.sh"
