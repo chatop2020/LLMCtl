@@ -20,6 +20,7 @@ class SourceStructureTests(unittest.TestCase):
             ROOT / "lib/model_deployment.py",
             ROOT / "lib/model_upgrade.py",
             ROOT / "lib/model_profiles.py",
+            ROOT / "lib/model_verification.py",
             ROOT / "lib/qwen38_deployment.py",
             ROOT / "lib/omniroute_maintenance.py",
             ROOT / "llmctl.sh",
@@ -46,6 +47,7 @@ class SourceStructureTests(unittest.TestCase):
             *sorted((ROOT / "lib").glob("account_portal_*.py")),
             ROOT / "lib/model_upgrade.py",
             ROOT / "lib/model_profiles.py",
+            ROOT / "lib/model_verification.py",
             ROOT / "lib/qwen38_deployment.py",
             ROOT / "lib/omniroute_maintenance.py",
         ]:

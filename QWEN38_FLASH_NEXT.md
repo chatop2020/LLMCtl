@@ -6,11 +6,11 @@
 
 ## 推荐的一键部署
 
-升级到 LLMCtl 3.6.2 后，进入管理后台“模型部署”，使用首屏的“Qwen3.8 Flash Next 一键部署”：
+升级到 LLMCtl 3.6.3 后，进入管理后台“模型部署”，使用首屏的“Qwen3.8 Flash Next 一键部署”：
 
 1. 页面自动读取八张 GPU 的实际拓扑并显示四个 TP2 分组。
 2. 推荐参数已经填好；“高级设置”默认折叠，一般无需修改。
-3. 点击“开始自动部署并上线”。后台会依次检查、下载、备份、部署、逐实例真实生成并把 `gdn-inside` 切换到 Qwen。
+3. 点击“开始自动部署并上线”。后台会从 ModelScope 下载固定 revision，依次备份、部署，并在逐实例真实图文生成通过后把 `gdn-inside` 切换到 Qwen。
 4. 下载或预检失败不会修改当前服务；修改 Worker 后失败会自动恢复。
 5. 成功后页面显示“恢复到部署前状态”，可一键恢复原模型、Worker 和路由。
 
@@ -22,8 +22,8 @@
 
 | 项目 | 统一配置 | 原因 |
 | --- | --- | --- |
-| 模型 | `Inferact/Qwen3.8-Flash-Next-NVFP4` | 当前 vLLM 官方 recipe 采用的 NVFP4 检查点 |
-| revision | `103a7608316173ca6edd49929544244de7ffda70` | 避免预览权重更新后静默改变行为 |
+| 模型 | ModelScope `RadixArk/Qwen3.8-Flash-Next-NVFP4` | 约 135GB；NVFP4 路由专家 + FP8 PLE，减少国内下载和主机存储压力 |
+| revision | `a6cc3dfc4d4d4617b6ede29f53e751215510e681` | 与 HF RadixArk `7b719225...` 的关键清单和抽样权重哈希一致 |
 | vLLM | `vllm/vllm-openai:qwen38-flash-next` | 普通 vLLM 0.22.1 不支持该架构 |
 | 拓扑 | 4×TP2，并开启 EP | 两卡通信可控；避免 TP8 在 PCIe 上放大 AllReduce 与专家通信 |
 | 上下文 | 原生 `262144`，YaRN=`1` | 不牺牲常用短上下文质量；满足不少于 256K 的要求 |
@@ -32,7 +32,8 @@
 | KV Cache | `auto`，当前为 BF16 | 当前专用 QSA 后端的稳定路径 |
 | MTP | 初始 `0`；验收后 A/B `2` | 先建立可解释基线，再判断投机解码是否真正降低业务延迟 |
 | 前缀缓存 | 初始关闭 | 当前预览分支存在混合 GDN/QSA 前缀缓存稳定性报告 |
-| 显存比例 | `0.92` | 在 84GB 卡上保留 CUDA Graph、GDN/QSA 与多模态工作区余量 |
+| 显存比例 | `0.90` | 在 84GB 卡上保留 CUDA Graph、GDN/QSA 与多模态工作区余量 |
+| 图片输入 | 每请求最多 `4` 张，可调 `1–16` | checkpoint 已包含视觉编码器；图片数、分辨率和文本共同占用 262K 上下文与处理预算 |
 | 批处理 Token | `8192` | 兼顾 chunked prefill、并发和 GDN 状态要求 |
 | 启动并行度 | `1` | 四个实例的 PLE 常驻主内存较大，串行加载避免主内存与模型盘瞬时压力 |
 
@@ -54,15 +55,15 @@ numactl -H
 ```bash
 sudo bash install-llm-cluster.sh \
   --yes \
-  --model-source huggingface \
-  --model-id Inferact/Qwen3.8-Flash-Next-NVFP4 \
-  --model-revision 103a7608316173ca6edd49929544244de7ffda70 \
+  --model-source modelscope \
+  --model-id RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --model-revision a6cc3dfc4d4d4617b6ede29f53e751215510e681 \
   --tp-size 2 \
   --max-model-len 262144 \
   --max-num-seqs 8 \
   --active-instances 1 \
   --startup-parallelism 1 \
-  --gpu-memory-utilization 0.92 \
+  --gpu-memory-utilization 0.90 \
   --max-num-batched-tokens 8192 \
   --ple-cpu-offload enabled \
   --expert-parallel enabled \
@@ -76,6 +77,8 @@ sudo bash install-llm-cluster.sh \
 已有集群应在管理后台打开“模型部署”，点击“Qwen3.8 NVFP4 预设”，第一次只选择拓扑最优的一组两张 GPU。金丝雀通过后编辑同一部署，再选择全部八张 GPU 并核对四个 TP2 分组。四组运行参数保持一致。页面会先生成只读计划；只有确认后才下载、备份、重载 Worker 和发布路由。
 
 不要在第一次加载时同时开启 MTP、前缀缓存、NVFP4 KV 或 1M YaRN。多个优化一起变化会让失败无法归因。
+
+视觉能力不需要再安装第二个模型。该 checkpoint 的 `vision_config` 和视觉权重会与语言模型一起下载、加载；Worker 通过 `--limit-mm-per-prompt` 强制执行每请求图片数。图片经视觉处理器转换成 Token，所以“最多 4 张”不是容量保证：高分辨率图片、长文本、较大输出和并发请求仍需共同落在 262K 上下文与显存预算内。LLMCtl 上线前发送最多两张内嵌小图验证真实图文链路，`llmctl smoke --full` 再按配置验证多图输入。
 
 ## 验收并尝试 MTP2
 
@@ -138,6 +141,7 @@ sudo llmctl model rollback DEPLOYMENT_JOB_ID
 | 现象 | 处理 |
 | --- | --- |
 | 镜像不注册 `Qwen4ExpForConditionalGeneration` | 使用专用 `qwen38-flash-next` 镜像，不下载权重 |
+| 图片请求被拒绝为数量超限 | 在一键页面调整“每请求最大图片数”；推荐保持 4，不要只修改客户端 |
 | NVFP4 QSA KV 能力校验失败 | 改回 `auto`；不要用普通 NVFP4 KV patch 冒充 QSA 支持 |
 | PLE 进程无法交接 CUDA 句柄 | 确认容器具有最小的 `SYS_PTRACE` capability；LLMCtl 只在 PLE 开启时添加 |
 | 主内存持续接近耗尽 | 保持启动并行度 1；先只运行一个 TP2 金丝雀，检查 PLE 实际 RSS 后再扩容 |

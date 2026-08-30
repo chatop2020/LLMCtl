@@ -6,6 +6,7 @@ file    lib/runtime_optimizer.py       /usr/local/lib/llm-cluster/runtime_optimi
 file    lib/gateway_config.py          /usr/local/lib/llm-cluster/gateway_config.py            0755  none
 file    lib/model_deployment.py        /usr/local/lib/llm-cluster/model_deployment.py           0755  none
 file    lib/model_profiles.py          /usr/local/lib/llm-cluster/model_profiles.py             0644  none
+file    lib/model_verification.py      /usr/local/lib/llm-cluster/model_verification.py         0644  none
 file    lib/qwen38_deployment.py       /usr/local/lib/llm-cluster/qwen38_deployment.py          0644  none
 file    lib/model_upgrade.py           /usr/local/lib/llm-cluster/model_upgrade.py              0644  none
 file    lib/omniroute_maintenance.py   /usr/local/lib/llm-cluster/omniroute_maintenance.py      0644  none

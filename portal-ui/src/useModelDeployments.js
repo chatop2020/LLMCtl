@@ -27,6 +27,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     mtp_speculative_tokens: 0,
     kv_cache_dtype: "auto",
     enable_prefix_caching: false,
+    max_images_per_request: 4,
   });
   const modelUpgradePlanning = ref(false);
   const modelUpgradeSubmitting = ref(false);
@@ -285,6 +286,9 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
         for (const key of Object.keys(qwen38QuickForm)) {
           if (Object.hasOwn(runtime, key)) qwen38QuickForm[key] = runtime[key];
         }
+        qwen38QuickForm.max_images_per_request = Number(
+          result.qwen38_quick.max_images_per_request || 4,
+        );
         qwen38DefaultsLoaded = true;
       }
       const sources = Object.values(result.registry?.deployments || {}).filter(
@@ -401,7 +405,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     const runtime = profile.runtime || {};
     Object.assign(modelDeploymentForm, {
       deployment_id: "qwen38-flash-next",
-      hub: "huggingface",
+      hub: profile.hub,
       model_id: profile.model_id,
       revision: profile.revision,
       public_model_id: profile.public_model_id,
@@ -424,6 +428,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       mtp_speculative_tokens: Number(qwen38QuickForm.mtp_speculative_tokens),
       kv_cache_dtype: String(qwen38QuickForm.kv_cache_dtype || "auto"),
       enable_prefix_caching: Boolean(qwen38QuickForm.enable_prefix_caching),
+      max_images_per_request: Number(qwen38QuickForm.max_images_per_request),
     };
   }
 

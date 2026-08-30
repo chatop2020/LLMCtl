@@ -562,7 +562,7 @@ export default {
                   <div>
                     <span class="eyebrow">RECOMMENDED FOR THIS SERVER</span>
                     <h2>Qwen3.8 Flash Next 一键部署</h2>
-                    <p>点击一次，自动下载固定模型、备份当前状态、部署四个 TP2 实例、逐实例测试并上线为 <code>gdn-inside</code>。</p>
+                    <p>点击一次，从 ModelScope 下载固定模型，连同视觉编码器部署四个 TP2 实例；逐实例完成真实图文测试后上线为 <code>gdn-inside</code>。</p>
                   </div>
                   <span class="status" :class="qwen38Quick.profile?.active ? 'ok' : qwen38Quick.profile?.available ? 'warn' : 'bad'">
                     {{ qwen38Quick.profile?.active ? "已上线" : qwen38Quick.profile?.available ? "可以部署" : "需要处理" }}
@@ -579,7 +579,7 @@ export default {
                   <article class="target">
                     <small>自动部署目标</small>
                     <strong>Qwen3.8 Flash Next NVFP4</strong>
-                    <span>公开调用仍使用 <code>gdn-inside</code></span>
+                    <span>ModelScope 固定版本；公开调用仍使用 <code>gdn-inside</code></span>
                   </article>
                 </div>
 
@@ -587,6 +587,7 @@ export default {
                   <article><strong>8 张 GPU</strong><span>自动分为 4 个 TP2 实例</span></article>
                   <article><strong>262K 上下文</strong><span>原生窗口，不启用 YaRN</span></article>
                   <article><strong>NVFP4 + BF16 KV</strong><span>PLE 放入主内存，开启 EP</span></article>
+                  <article><strong>图文多模态</strong><span>包含视觉编码器，默认每请求最多 4 张图</span></article>
                   <article><strong>自动保护</strong><span>失败自动恢复，成功可一键回滚</span></article>
                 </div>
 
@@ -618,7 +619,11 @@ export default {
                     </label>
                     <label>显存利用率
                       <input v-model.number="qwen38Quick.form.gpu_memory_utilization" type="number" min="0.7" max="0.96" step="0.01" />
-                      <small>推荐 0.92，为图、状态和多模态工作区留余量。</small>
+                      <small>推荐 0.90，为图、状态和多模态工作区留余量。</small>
+                    </label>
+                    <label>每请求最大图片数
+                      <input v-model.number="qwen38Quick.form.max_images_per_request" type="number" min="1" max="16" />
+                      <small>推荐 4；图片越多、分辨率越高，占用的视觉 Token 和处理时间越多。</small>
                     </label>
                     <label>MTP 草稿 Token
                       <select v-model.number="qwen38Quick.form.mtp_speculative_tokens">

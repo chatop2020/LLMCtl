@@ -271,16 +271,18 @@ describe("模型版本升级组合逻辑", () => {
       available: true,
       blockers: [],
       warnings: [],
-      model_id: "Inferact/Qwen3.8-Flash-Next-NVFP4",
-      revision: "103a7608316173ca6edd49929544244de7ffda70",
+      hub: "modelscope",
+      model_id: "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+      revision: "a6cc3dfc4d4d4617b6ede29f53e751215510e681",
       public_model_id: "gdn-inside",
       display_name: "Qwen3.8 Flash Next NVFP4",
+      max_images_per_request: 4,
       gpu_groups: { groups: [[0, 1], [2, 3], [4, 5], [6, 7]], source: "nvidia-smi" },
       runtime: {
         image: "vllm/vllm-openai:qwen38-flash-next",
         tensor_parallel_size: 2,
         max_model_len: 262144,
-        gpu_memory_utilization: 0.92,
+        gpu_memory_utilization: 0.90,
         max_num_seqs: 8,
         max_num_batched_tokens: 8192,
         ple_cpu_offload: true,
@@ -333,8 +335,9 @@ describe("模型版本升级组合逻辑", () => {
     state.applyQwen38FlashNextPreset();
     const payload = state.modelDeploymentPayload();
 
-    expect(payload.model_id).toBe("Inferact/Qwen3.8-Flash-Next-NVFP4");
-    expect(payload.revision).toBe("103a7608316173ca6edd49929544244de7ffda70");
+    expect(payload.hub).toBe("modelscope");
+    expect(payload.model_id).toBe("RadixArk/Qwen3.8-Flash-Next-NVFP4");
+    expect(payload.revision).toBe("a6cc3dfc4d4d4617b6ede29f53e751215510e681");
     expect(payload.image).toBe("vllm/vllm-openai:qwen38-flash-next");
     expect(payload.tensor_parallel_size).toBe(2);
     expect(payload.instances).toHaveLength(4);
@@ -365,6 +368,7 @@ describe("模型版本升级组合逻辑", () => {
       max_model_len: 262144,
       max_num_seqs: 8,
       mtp_speculative_tokens: 0,
+      max_images_per_request: 4,
     });
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining("失败会自动恢复"),

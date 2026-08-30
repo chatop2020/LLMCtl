@@ -1,0 +1,150 @@
+{
+  "plan_id": "qwen38-modelscope-vision",
+  "plan_version": 1,
+  "generated_at": "2026-08-30T13:53:22Z",
+  "source": {
+    "baseline_commit": "c24a029c6e24d2215736319c8d672086ac60a005",
+    "worktree": "dirty",
+    "tracked_diff_sha256": "5de7a438674c42f397c328ef25046955d4ab3d4d680b30e2412a92f267e90928",
+    "untracked": {
+      "lib/model_verification.py": "b9439f54e1de8a77b65ca139dd6b716ae275bf1b070d53157dddb9d5637a26db",
+      "lib/account_portal_ui/assets/index-DSq_ZRtZ.css": "a6cc717a3e16611f4997f80a8ad4117a3df7b1ab3950021aa24f8d3eba9c36ee",
+      "lib/account_portal_ui/assets/index-MPnoWC8i.js": "d60db5a216d22435ff47dc7949be1be172da22cc74c61e7f0deee7096f6dc50f",
+      "verification/qwen38-modelscope-vision-v1.json": "c14cbaee047d8e7d050ac15e5326f5026e83a6e1f610c479a668e5b279332cd1"
+    },
+    "digest_scope": "Tracked binary diff plus separately hashed untracked implementation, built assets and plan; this evidence file is excluded."
+  },
+  "environment": {
+    "host": "macOS local development environment without NVIDIA GPUs",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "npm": "11.19.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "target": "8×RTX PRO 6000D, 512GB RAM, PCIe 4.0, no NVLink"
+  },
+  "source_integrity": {
+    "modelscope_repository": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "modelscope_commit": "a6cc3dfc4d4d4617b6ede29f53e751215510e681",
+    "corresponding_huggingface_commit": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+    "file_count": 420,
+    "total_bytes": 135253623632,
+    "matching_sha256": {
+      "README.md": "2b62aaf5b5d876732a2f4efb5f023ca31185ba324110fc9be27c8b088ee827a2",
+      "config.json": "e765305daba0951974308f4d32c075b52a6a45974730d273f2216718a994d624",
+      "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+      "model.safetensors.index.json": "da5ca9c3b65e48e151329e64e141c2fa700bf2f99aec53cc014e4b52a6ff7a84",
+      "model-bf16-00011.safetensors": "d18b0db2e27fa066b3f8f86913686f572ee29406d971c8f5b0ec2902e3419ad9",
+      "model-plefp8-00000.safetensors": "dc2e845b7edd35bda92834fba3626bf7d199e28d6aceac99fee654aade390cfd"
+    },
+    "conclusion": "Pinned ModelScope content matches the corresponding RadixArk Hugging Face revision for manifests and sampled large LFS shards."
+  },
+  "gates": [
+    {
+      "gate_id": "source-and-integrity",
+      "status": "Passed",
+      "evidence": [
+        "ModelScope API returned 420 files totaling 135,253,623,632 bytes.",
+        "git ls-remote resolved master to immutable commit a6cc3dfc4d4d4617b6ede29f53e751215510e681.",
+        "Configuration, generation settings, weight index and two sampled large weight shards matched the corresponding Hugging Face RadixArk revision by SHA256.",
+        "config.json declares Qwen4ExpForConditionalGeneration, ModelOpt NVFP4, FP8 E4M3 PLE, native 262144 context and a vision_config."
+      ]
+    },
+    {
+      "gate_id": "backend-and-upgrade-contract",
+      "status": "Passed",
+      "evidence": [
+        "71 focused Python tests passed in 1.506 seconds.",
+        "Tests cover the ModelScope hub and revision, direct weight-download environment, NVFP4/PLE/vision artifact validation, all indexed shards, 1-16 image bounds, real two-image requests, Docker daemon recovery guidance and upgrade packaging.",
+        "bash -n passed for llmctl.sh, install-llm-cluster.sh and upgrade-llmctl.sh.",
+        "Python compilation passed for model_deployment.py, model_profiles.py, model_verification.py and qwen38_deployment.py.",
+        "The online-upgrade archive tests include model_verification.py and remain compatible with the previous upgrader allowlist."
+      ]
+    },
+    {
+      "gate_id": "portal-contract-and-build",
+      "status": "Passed",
+      "evidence": [
+        "56 frontend tests passed across 9 files.",
+        "The production Vite build passed with 30 transformed modules.",
+        "Built portal index SHA256: d06ea9c64162ee899030d4c43c8b8ee196549596eba6e0bdd5128b47317ed376.",
+        "Built portal JavaScript SHA256: d60db5a216d22435ff47dc7949be1be172da22cc74c61e7f0deee7096f6dc50f.",
+        "Built portal CSS SHA256: a6cc717a3e16611f4997f80a8ad4117a3df7b1ab3950021aa24f8d3eba9c36ee."
+      ]
+    },
+    {
+      "gate_id": "visible-page-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "The authenticated built portal showed ModelScope, the bundled vision encoder, five responsive preset cards and the unchanged gdn-inside public ID.",
+        "Advanced settings and other deployment tools were closed by default.",
+        "After expanding advanced settings, the image-limit field showed value 4 with minimum 1 and maximum 16.",
+        "At the default viewport, innerWidth and document scrollWidth were both 1280.",
+        "At 390×844, innerWidth, body scrollWidth and document scrollWidth were all 390.",
+        "No browser console errors or warnings were reported."
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "status": "Passed",
+      "evidence": [
+        "285 Python tests passed in 56.657 seconds on the final source input.",
+        "Strict JSON parsing, git diff whitespace and the touched source 3000-line gate passed.",
+        "model_deployment.py has 2961 lines; llmctl.sh has 2950 lines; all touched first-party sources remain below 3000 lines."
+      ]
+    },
+    {
+      "gate_id": "target-host-acceptance",
+      "status": "Unverified",
+      "reason": "The target 8×RTX PRO 6000D host has not loaded this source revision or executed the 135GB ModelScope download and real image inference in this task.",
+      "required_actions": [
+        "Keep the SSH reverse tunnel active and pre-pull vllm/vllm-openai:qwen38-flash-next through the Docker daemon proxy.",
+        "Upgrade the server to LLMCtl 3.6.3 and refresh the Model Deployments page.",
+        "Verify the page shows ModelScope RadixArk, four TP2 groups, image limit 4 and no resource blockers.",
+        "Run the one-click deployment and require all four real image-and-text probes to pass before gdn-inside publication.",
+        "Run llmctl smoke --full after publication and retain the restore point until workload acceptance completes."
+      ]
+    }
+  ],
+  "attempts": [
+    {
+      "stage": "focused backend tests",
+      "classification": "stale test expectation",
+      "result": "One assertion still expected the previous generic progress text. The expectation was updated to the new explicit text-only wording and the original focused gate then passed."
+    },
+    {
+      "stage": "focused frontend test",
+      "classification": "command working directory error",
+      "result": "The first npm invocation ran from the repository root without package.json. It was rerun from portal-ui and passed."
+    },
+    {
+      "stage": "evidence hash collection",
+      "classification": "temporary shell variable error",
+      "result": "A zsh special variable name temporarily replaced PATH inside one completed subshell. No files or persistent environment changed; the command was rerun with a neutral variable name."
+    }
+  ],
+  "human_decisions": [
+    "The user requires the visual-capable checkpoint to be installed with the language model.",
+    "The user authorized committing and pushing the completed work to GitHub main."
+  ],
+  "traceability": [
+    {
+      "acceptance": "ModelScope fixed source with unchanged public model ID",
+      "gate": "source-and-integrity",
+      "change": "model_profiles.py and qwen38 request generation",
+      "product_result": "The one-click path downloads the pinned RadixArk checkpoint from ModelScope and continues publishing gdn-inside."
+    },
+    {
+      "acceptance": "The visual encoder is present and actually usable",
+      "gate": "backend-and-upgrade-contract",
+      "change": "qwen38 artifact verification and model_verification.py",
+      "product_result": "A missing vision tower, PLE shard or failed image request blocks publication and triggers the existing recovery path."
+    },
+    {
+      "acceptance": "Administrators can understand and control per-request image count",
+      "gate": "portal-contract-and-build and visible-page-acceptance",
+      "change": "Qwen one-click advanced settings and responsive preset cards",
+      "product_result": "The default 4-image limit is visible, adjustable from 1 to 16 and enforced by the Worker rather than only by the browser."
+    }
+  ],
+  "final_stage": "Implemented and locally verified; not installed or accepted on the target GPU host"
+}

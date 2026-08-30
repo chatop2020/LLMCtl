@@ -6,7 +6,7 @@ LLMCtl supports the dedicated Qwen3.8 preview runtime, TP2, PLE CPU offload, exp
 
 ## Recommended one-click deployment
 
-After upgrading to LLMCtl 3.6.2, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, then performs image/model checks, fixed-revision download, backup, deployment, per-instance inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
+After upgrading to LLMCtl 3.6.3, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, downloads the pinned checkpoint from ModelScope, then performs backup, deployment, per-instance image-and-text inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
 
 The commands below remain available for advanced manual control.
 
@@ -16,8 +16,8 @@ For 8×84GB RTX PRO 6000D, 512GB RAM, PCIe 4.0, and no NVLink, use four identica
 
 | Setting | Value |
 | --- | --- |
-| Model | `Inferact/Qwen3.8-Flash-Next-NVFP4` |
-| Revision | `103a7608316173ca6edd49929544244de7ffda70` |
+| Model | ModelScope `RadixArk/Qwen3.8-Flash-Next-NVFP4` |
+| Revision | `a6cc3dfc4d4d4617b6ede29f53e751215510e681` |
 | Runtime | `vllm/vllm-openai:qwen38-flash-next` |
 | Topology | 4×TP2 with expert parallelism |
 | Context | native `262144`, YaRN=`1` |
@@ -26,7 +26,8 @@ For 8×84GB RTX PRO 6000D, 512GB RAM, PCIe 4.0, and no NVLink, use four identica
 | KV cache | `auto` / BF16 |
 | MTP | `0` for the baseline; A/B test `2` later |
 | Prefix cache | disabled until the preview stability fixes are validated |
-| GPU utilization | `0.92` |
+| GPU utilization | `0.90` |
+| Vision input | built-in vision encoder; default `4` images/request, adjustable from `1` to `16` |
 | Batched tokens | `8192` |
 | Startup parallelism | `1` |
 
@@ -37,15 +38,15 @@ Inspect `nvidia-smi topo -m`, P2P read/write topology, and `numactl -H` before a
 ```bash
 sudo bash install-llm-cluster.sh \
   --yes \
-  --model-source huggingface \
-  --model-id Inferact/Qwen3.8-Flash-Next-NVFP4 \
-  --model-revision 103a7608316173ca6edd49929544244de7ffda70 \
+  --model-source modelscope \
+  --model-id RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --model-revision a6cc3dfc4d4d4617b6ede29f53e751215510e681 \
   --tp-size 2 \
   --max-model-len 262144 \
   --max-num-seqs 8 \
   --active-instances 1 \
   --startup-parallelism 1 \
-  --gpu-memory-utilization 0.92 \
+  --gpu-memory-utilization 0.90 \
   --max-num-batched-tokens 8192 \
   --ple-cpu-offload enabled \
   --expert-parallel enabled \
@@ -57,6 +58,8 @@ sudo bash install-llm-cluster.sh \
 ```
 
 On an existing cluster, open Model Deployments, apply the “Qwen3.8 NVFP4” preset, and first select only the best-topology GPU pair. After the canary passes, edit the same deployment, select all eight GPUs, and verify the four identical TP2 groups before confirming the read-only plan.
+
+The checkpoint already contains the vision encoder and visual weights; no second vision model is installed. vLLM enforces the item count with `--limit-mm-per-prompt`. Image resolution and count are converted into visual tokens, so the item cap does not replace the shared 262K context, memory, latency, and request-body limits. The one-click path sends a real embedded-image request to every replica before publication; `llmctl smoke --full` performs the configured multi-image check.
 
 ## Tune and roll back
 

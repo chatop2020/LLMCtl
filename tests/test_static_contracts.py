@@ -137,12 +137,18 @@ class StaticDeploymentContracts(unittest.TestCase):
             "开始自动部署并上线",
             "恢复到部署前状态",
             "高级设置（推荐保持默认）",
+            "每请求最大图片数",
+            "真实图文测试",
         ):
             self.assertIn(marker, portal_page)
         self.assertIn("qwen38-plan", ACCOUNT)
         self.assertIn("qwen38-submit", ACCOUNT)
         self.assertIn("lib/model_profiles.py", MANIFEST)
+        self.assertIn("lib/model_verification.py", MANIFEST)
         self.assertIn("lib/qwen38_deployment.py", MANIFEST)
+        self.assertIn("--limit-mm-per-prompt", MANAGER)
+        self.assertIn("单请求 ${probe_images} 张图片", MANAGER)
+        self.assertNotIn("six_images_json", MANAGER)
 
     def test_systemd_delegates_selected_gateway_to_manager(self):
         self.assertIn("ExecStart=/usr/local/sbin/llmctl _gateway-start", INSTALLER)

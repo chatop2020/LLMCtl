@@ -48,24 +48,31 @@ from model_upgrade import (
 )
 from model_profiles import (
     QWEN38_ARCHITECTURE,
+    QWEN38_DEFAULT_MAX_IMAGES,
     QWEN38_DEPLOYMENT_ID,
     QWEN38_DISPLAY_NAME,
     QWEN38_EDITABLE_FIELDS,
     QWEN38_IMAGE,
+    QWEN38_MODEL_HUB,
     QWEN38_MODEL_ID,
     QWEN38_MODEL_REVISION,
     QWEN38_PUBLIC_MODEL_ID,
     qwen38_capacity_requirements,
     qwen38_runtime_defaults,
 )
-from qwen38_deployment import host_resource_snapshot, qwen38_gpu_groups
+from model_verification import endpoint_inference_ready
+from qwen38_deployment import (
+    host_resource_snapshot,
+    qwen38_gpu_groups,
+    verify_qwen38_artifact,
+)
 from omniroute_maintenance import (
     OmniRouteMaintenanceManager,
     OmniRouteMaintenancePaths,
 )
 
 
-APP_VERSION = "3.6.2"
+APP_VERSION = "3.6.3"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -944,6 +951,13 @@ class DeploymentManager:
             if not isinstance(payload["enable_prefix_caching"], bool):
                 raise ValueError("前缀缓存开关必须是布尔值")
             runtime["enable_prefix_caching"] = payload["enable_prefix_caching"]
+        max_images = bounded_int(
+            payload.get("max_images_per_request", QWEN38_DEFAULT_MAX_IMAGES),
+            "每请求最大图片数",
+            1,
+            16,
+        )
+        runtime["mm_limit"] = f'{{"image":{max_images},"video":0}}'
         validate_runtime(runtime)
         validate_model_runtime(QWEN38_MODEL_ID, runtime)
         return runtime
@@ -981,7 +995,7 @@ class DeploymentManager:
         runtime = self._qwen38_runtime(payload)
         request = {
             "deployment_id": QWEN38_DEPLOYMENT_ID,
-            "hub": "huggingface",
+            "hub": QWEN38_MODEL_HUB,
             "model_id": QWEN38_MODEL_ID,
             "revision": QWEN38_MODEL_REVISION,
             "public_model_id": QWEN38_PUBLIC_MODEL_ID,
@@ -1086,10 +1100,12 @@ class DeploymentManager:
             "available": not blockers,
             "blockers": blockers,
             "warnings": warnings,
+            "hub": QWEN38_MODEL_HUB,
             "model_id": QWEN38_MODEL_ID,
             "revision": QWEN38_MODEL_REVISION,
             "public_model_id": QWEN38_PUBLIC_MODEL_ID,
             "display_name": QWEN38_DISPLAY_NAME,
+            "max_images_per_request": QWEN38_DEFAULT_MAX_IMAGES,
             "runtime": qwen38_runtime_defaults(),
             "gpu_groups": pairing,
             "resources": resources,
@@ -1129,7 +1145,7 @@ class DeploymentManager:
                 "下载固定模型版本",
                 "备份当前部署",
                 "创建四个 TP2 实例",
-                "逐实例真实生成验收",
+                "逐实例真实图文生成验收",
                 "上线 gdn-inside",
             ],
             "rollback": "失败自动恢复；成功后可一键恢复部署前状态",
@@ -1632,6 +1648,8 @@ class DeploymentManager:
                 self._download_artifact(artifact, request["deployment"]["runtime"], job)
             self._update_job(job, "verifying", 45, "验证模型目录、配置和权重文件")
             verify_artifact(pathlib.Path(artifact["path"]))
+            if artifact["model_id"] == QWEN38_MODEL_ID:
+                verify_qwen38_artifact(pathlib.Path(artifact["path"]))
             artifact["status"] = "ready"
             self._update_job(job, "backing_up", 52, "备份注册表和受影响 Worker 配置")
             current = self.registry.read()
@@ -1651,7 +1669,7 @@ class DeploymentManager:
                     job,
                     "testing",
                     84,
-                    "上线前逐实例执行真实文本生成；每个实例最多等待 60 秒",
+                    "上线前逐实例执行真实图文生成；每个实例最多等待 60 秒",
                 )
                 self._verify_instances(
                     candidate,
@@ -1741,6 +1759,18 @@ class DeploymentManager:
 
         if not is_qwen38_flash_next(model_id):
             return
+        image = str(runtime["image"])
+        inspect = self.runner.run(
+            ["docker", "image", "inspect", image], check=False, timeout=10
+        )
+        if inspect.returncode != 0:
+            try:
+                self.runner.run(["docker", "pull", image], timeout=2 * 60 * 60)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError(
+                    "专用 vLLM 镜像下载失败。模型权重尚未开始下载；请让 "
+                    "Docker daemon 使用可访问 Docker Hub 的代理，拉取成功后重试"
+                ) from error
         script = """
 import sys
 from vllm.model_executor.models import ModelRegistry
@@ -1766,7 +1796,7 @@ if cache_dtype not in {"auto", "bfloat16"}:
                 "--rm",
                 "--entrypoint",
                 "python3",
-                str(runtime["image"]),
+                image,
                 "-c",
                 script,
                 str(runtime.get("kv_cache_dtype", "auto")),
@@ -1960,6 +1990,16 @@ if cache_dtype not in {"auto", "bfloat16"}:
         runner = CommandRunner(logger)
         if hub == "modelscope":
             downloader = self._ensure_modelscope_downloader(runner, environment)
+            if model_id == QWEN38_MODEL_ID:
+                # 一键预设选择 ModelScope 是为了使用国内直连；保存的维护
+                # 代理只用来准备下载器，不应把 135GB 权重绕到国际代理。
+                environment = os.environ.copy()
+                for name in (
+                    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "no_proxy",
+                    "ALL_PROXY", "all_proxy",
+                ):
+                    environment.pop(name, None)
             command = [
                 str(downloader),
                 "download",
@@ -2156,7 +2196,7 @@ if cache_dtype not in {"auto", "bfloat16"}:
         inference: bool = False,
         job: dict[str, Any] | None = None,
     ) -> None:
-        """验证目标部署的健康端点，并按需执行真实文本生成。
+        """验证目标部署的健康端点，并按需执行真实文本或图文生成。
 
         参数：
             candidate: 已写入 Worker 配置的候选注册表。
@@ -2173,6 +2213,14 @@ if cache_dtype not in {"auto", "bfloat16"}:
             if instance.get("enabled", True)
         ]
         total = len(instances)
+        runtime = deployment.get("runtime", {})
+        try:
+            limits = json.loads(str(runtime.get("mm_limit", "{}")))
+            image_limit = int(limits.get("image", 0))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            image_limit = 0
+        probe_images = min(2, image_limit) if runtime.get("supports_image_input") else 0
+        api_key = parse_env_file(self.paths.secrets_env).get("BACKEND_API_KEY", "")
         inference_timeout = bounded_int(
             os.environ.get("LLM_MODEL_INFERENCE_PROBE_TIMEOUT", "60"),
             "真实生成探测超时",
@@ -2187,7 +2235,8 @@ if cache_dtype not in {"auto", "bfloat16"}:
                     job,
                     "testing",
                     progress,
-                    f"真实生成验收 {index}/{total}：{instance_id}（最多等待 {inference_timeout} 秒）",
+                    f"真实{'图文' if probe_images else '文本'}生成验收 "
+                    f"{index}/{total}：{instance_id}（最多等待 {inference_timeout} 秒）",
                 )
             origin = (
                 str(instance["base_url"]).removesuffix("/v1").rstrip("/")
@@ -2207,10 +2256,11 @@ if cache_dtype not in {"auto", "bfloat16"}:
                 continue
             if inference and not endpoint_inference_ready(
                 origin,
-                self.paths.secrets_env,
+                api_key,
                 str(deployment["served_model_name"]),
                 timeout=inference_timeout,
                 detail=(probe_detail := []),
+                image_count=probe_images,
             ):
                 reason = probe_detail[0] if probe_detail else "未知响应"
                 failures.append(f"{instance_id}:inference:{reason}")
@@ -2219,8 +2269,8 @@ if cache_dtype not in {"auto", "bfloat16"}:
                         job,
                         "testing",
                         84 + (index * 7 // max(total, 1)),
-                        f"真实生成验收 {index}/{total}：{instance_id} 失败（{reason}）",
-                        log=f"实例 {instance_id} 真实生成失败：{reason}",
+                        f"真实{'图文' if probe_images else '文本'}生成验收 {index}/{total}：{instance_id} 失败（{reason}）",
+                        log=f"实例 {instance_id} 真实{'图文' if probe_images else '文本'}生成失败：{reason}",
                     )
                 continue
             if inference and job:
@@ -2228,8 +2278,8 @@ if cache_dtype not in {"auto", "bfloat16"}:
                     job,
                     "testing",
                     84 + (index * 7 // max(total, 1)),
-                    f"真实生成验收 {index}/{total}：{instance_id} 已通过",
-                    log=f"实例 {instance_id} 真实生成通过",
+                    f"真实{'图文' if probe_images else '文本'}生成验收 {index}/{total}：{instance_id} 已通过",
+                    log=f"实例 {instance_id} 真实{'图文' if probe_images else '文本'}生成通过",
                 )
         if failures:
             raise RuntimeError(f"实例验收失败：{failures}")
@@ -2669,89 +2719,6 @@ def endpoint_healthy(origin: str, secrets_file: pathlib.Path) -> bool:
             return 200 <= response.status < 300
     except (OSError, urllib.error.URLError):
         return False
-
-
-def endpoint_inference_ready(
-    origin: str,
-    secrets_file: pathlib.Path,
-    served_model_name: str,
-    timeout: int = 60,
-    detail: list[str] | None = None,
-) -> bool:
-    """向单个 Worker 发送有界文本生成，验证真实模型执行路径。
-
-    参数：
-        origin: 不含 `/v1` 的 Worker 来源地址。
-        secrets_file: 保存内部 Worker API Key 的受保护环境文件。
-        served_model_name: 候选部署写入 vLLM 的服务模型名。
-        timeout: 单个真实生成请求的最大等待秒数。
-        detail: 可选的诊断输出列表；失败时追加一条脱敏、截断的原因。
-
-    返回：
-        HTTP 成功且响应包含至少一个有效 assistant 消息时返回真。
-    """
-
-    key = parse_env_file(secrets_file).get("BACKEND_API_KEY", "")
-    body = json.dumps(
-        {
-            "model": served_model_name,
-            "messages": [{"role": "user", "content": "只回复 OK"}],
-            "temperature": 0,
-            "max_tokens": 16,
-            "stream": False,
-        },
-        ensure_ascii=False,
-    ).encode()
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    request = urllib.request.Request(
-        f"{origin.rstrip('/')}/v1/chat/completions",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    def fail(reason: str) -> bool:
-        """记录不含密钥的单条失败摘要并返回假。"""
-
-        if detail is not None:
-            detail.append(" ".join(str(reason).split())[:800])
-        return False
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            if not 200 <= response.status < 300:
-                return fail(f"HTTP {response.status}")
-            payload = json.loads(response.read(2 << 20))
-    except urllib.error.HTTPError as error:
-        with contextlib.suppress(OSError):
-            body = error.read(4096).decode("utf-8", errors="replace")
-            return fail(f"HTTP {error.code}: {body}")
-        return fail(f"HTTP {error.code}")
-    except json.JSONDecodeError as error:
-        return fail(f"响应不是有效 JSON：{error.msg}")
-    except (OSError, urllib.error.URLError) as error:
-        return fail(f"请求失败或超时：{error}")
-    choices = payload.get("choices") if isinstance(payload, dict) else None
-    if not isinstance(choices, list) or not choices:
-        return fail("响应缺少 choices")
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    if not isinstance(message, dict):
-        return fail("响应缺少 assistant message")
-    has_text = any(
-        isinstance(message.get(field), str) and bool(message.get(field).strip())
-        for field in (
-            "content",
-            "reasoning_content",
-            "reasoning_text",
-            "reasoning",
-        )
-    )
-    if has_text or (
-        isinstance(message.get("tool_calls"), list) and bool(message["tool_calls"])
-    ):
-        return True
-    return fail("assistant message 没有文本、思考内容或工具调用")
 
 
 def gpu_inventory(runner: CommandRunner) -> list[dict[str, Any]]:

@@ -14,6 +14,7 @@ SPEC = importlib.util.spec_from_file_location(
 MODEL = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(MODEL)
+import model_verification as MODEL_VERIFICATION
 
 
 class ModelDeploymentTests(unittest.TestCase):
@@ -218,7 +219,7 @@ class ModelDeploymentTests(unittest.TestCase):
         request = self.request(
             deployment_id="qwen38",
             public_id="qwen3.8-flash-next",
-            model_id="Inferact/Qwen3.8-Flash-Next-NVFP4",
+            model_id="RadixArk/Qwen3.8-Flash-Next-NVFP4",
             artifact_path=artifact_path,
             gpu_ids=[0, 1],
         )
@@ -269,7 +270,7 @@ class ModelDeploymentTests(unittest.TestCase):
         runner = mock.Mock(spec=MODEL.CommandRunner)
         manager = MODEL.DeploymentManager(self.paths, runner=runner)
         manager._verify_runtime_image(
-            "Inferact/Qwen3.8-Flash-Next-NVFP4",
+            "RadixArk/Qwen3.8-Flash-Next-NVFP4",
             {
                 "image": "vllm/vllm-openai:qwen38-flash-next",
                 "kv_cache_dtype": "nvfp4",
@@ -279,6 +280,67 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertIn("architecture = sys.argv[2]", command[-3])
         self.assertEqual(command[-2], "nvfp4")
         self.assertEqual(command[-1], "Qwen4ExpForConditionalGeneration")
+
+    def test_qwen38_missing_image_reports_docker_daemon_proxy_action(self):
+        """镜像网络失败应说明修复 Docker daemon，而不是输出整段 daemon 异常。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.side_effect = [
+            subprocess.CompletedProcess([], 1),
+            RuntimeError("dial tcp registry-1.docker.io:443: i/o timeout"),
+        ]
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        with self.assertRaisesRegex(RuntimeError, "Docker daemon"):
+            manager._verify_runtime_image(
+                "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                {
+                    "image": "vllm/vllm-openai:qwen38-flash-next",
+                    "kv_cache_dtype": "auto",
+                },
+            )
+        self.assertEqual(
+            runner.run.call_args_list[1].args[0][:2], ["docker", "pull"]
+        )
+
+    def test_qwen38_artifact_requires_visual_ple_and_all_indexed_shards(self):
+        """固定制品必须真的包含视觉编码器和 PLE，不能只凭模型名称放行。"""
+
+        artifact = self.models / "qwen38-verified"
+        artifact.mkdir()
+        (artifact / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen4ExpForConditionalGeneration"],
+                    "language_model_only": False,
+                    "vision_config": {"depth": 27},
+                    "text_config": {
+                        "max_position_embeddings": 262144,
+                        "ple_embedding_dtype": "float8_e4m3fn",
+                    },
+                    "quantization_config": {
+                        "quant_method": "modelopt",
+                        "quant_algo": "NVFP4",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        weight_map = {
+            "model.visual.blocks.0.attn.qkv.weight": "visual.safetensors",
+            "model.language_model.layers.1.ple.key_proj.weight": "ple.safetensors",
+        }
+        (artifact / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+        for shard in set(weight_map.values()):
+            (artifact / shard).write_bytes(b"weight")
+        MODEL.verify_qwen38_artifact(artifact)
+        del weight_map["model.visual.blocks.0.attn.qkv.weight"]
+        (artifact / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "视觉编码器"):
+            MODEL.verify_qwen38_artifact(artifact)
 
     def test_qwen38_quick_plan_owns_public_id_and_builds_four_tp2_instances(self):
         """一键计划必须用全部八卡替换旧模型，并让 gdn-inside 成为真实公开 ID。"""
@@ -302,9 +364,20 @@ class ModelDeploymentTests(unittest.TestCase):
             plan = manager.plan_qwen38({})
 
         deployment = plan["normalized_request"]["deployment"]
+        artifact = plan["normalized_request"]["artifact"]
+        self.assertEqual(artifact["hub"], "modelscope")
+        self.assertEqual(artifact["model_id"], "RadixArk/Qwen3.8-Flash-Next-NVFP4")
+        self.assertEqual(
+            artifact["revision"], "a6cc3dfc4d4d4617b6ede29f53e751215510e681"
+        )
         self.assertEqual(deployment["public_model_ids"], ["gdn-inside"])
         self.assertEqual(deployment["served_model_name"], "gdn-inside")
         self.assertEqual(deployment["runtime"]["tensor_parallel_size"], 2)
+        self.assertTrue(deployment["runtime"]["supports_image_input"])
+        self.assertEqual(
+            json.loads(deployment["runtime"]["mm_limit"]),
+            {"image": 4, "video": 0},
+        )
         self.assertEqual(
             [item["gpu_devices"] for item in deployment["instances"]],
             pairing["groups"],
@@ -312,6 +385,28 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertEqual(plan["requested_gpu_ids"], list(range(8)))
         self.assertNotIn("gdn-inside", plan["legacy_aliases"])
         self.assertEqual(plan["source_registry_revision"], 0)
+
+    def test_qwen38_quick_visual_limit_is_server_owned_and_bounded(self):
+        """图片上限必须由后端写入 vLLM 参数，并拒绝资源风险过大的值。"""
+
+        manager = MODEL.DeploymentManager(self.paths, runner=mock.Mock())
+        with mock.patch.object(
+            MODEL,
+            "qwen38_gpu_groups",
+            return_value={
+                "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+                "links": [],
+                "source": "nvidia-smi",
+            },
+        ):
+            request, _pairing = manager._qwen38_request(
+                {"max_images_per_request": 6}, self.gpus
+            )
+            self.assertEqual(
+                json.loads(request["mm_limit"]), {"image": 6, "video": 0}
+            )
+            with self.assertRaisesRegex(ValueError, "每请求最大图片数"):
+                manager._qwen38_request({"max_images_per_request": 17}, self.gpus)
 
     def test_qwen38_quick_submit_rejects_stale_plan_and_persists_job_before_start(self):
         """一键按钮只能提交刚预检的状态，后台线程前必须保存回滚所需任务。"""
@@ -370,6 +465,7 @@ class ModelDeploymentTests(unittest.TestCase):
             candidate["revision"] = int(candidate.get("revision", 0)) + 1
 
         with mock.patch.object(manager, "_verify_runtime_image"), \
+             mock.patch.object(MODEL, "verify_qwen38_artifact"), \
              mock.patch.object(manager, "_backup_runtime", return_value=self.root / "backup"), \
              mock.patch.object(manager, "_apply_candidate", side_effect=apply_candidate), \
              mock.patch.object(manager, "_start_and_wait"), \
@@ -415,6 +511,32 @@ class ModelDeploymentTests(unittest.TestCase):
             {frozenset(group) for group in result["groups"]}, preferred
         )
         self.assertEqual(result["source"], "nvidia-smi")
+
+    def test_qwen38_instance_acceptance_uses_real_multi_image_request(self):
+        """Qwen 上线验收必须把图片送入视觉编码器，而不是只测文本端点。"""
+
+        manager = MODEL.DeploymentManager(self.paths, runner=mock.Mock())
+        with mock.patch.object(
+            MODEL,
+            "qwen38_gpu_groups",
+            return_value={
+                "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+                "links": [],
+                "source": "nvidia-smi",
+            },
+        ):
+            request, _pairing = manager._qwen38_request({}, self.gpus)
+        normalized = MODEL.normalize_request(request, self.paths)
+        candidate, _affected = MODEL.merge_deployment(
+            manager.registry.read(), normalized
+        )
+        with mock.patch.object(MODEL, "endpoint_healthy", return_value=True), \
+             mock.patch.object(MODEL, "endpoint_inference_ready", return_value=True) as probe:
+            manager._verify_instances(
+                candidate, "qwen38-flash-next", inference=True
+            )
+        self.assertEqual(probe.call_count, 4)
+        self.assertTrue(all(call.kwargs["image_count"] == 2 for call in probe.call_args_list))
 
     def test_qwen38_quick_page_blocks_unsafe_host_capacity(self):
         """主内存或模型盘不足时，一键页面必须禁用部署而不是让任务中途 OOM。"""
@@ -574,7 +696,7 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertIn("2/2", saved["message"])
         self.assertEqual(
             [entry["message"] for entry in saved["logs"]],
-            ["实例 worker-0 真实生成通过", "实例 worker-1 真实生成通过"],
+            ["实例 worker-0 真实文本生成通过", "实例 worker-1 真实文本生成通过"],
         )
         self.assertEqual(inference.call_count, 2)
         self.assertTrue(
@@ -753,6 +875,36 @@ class ModelDeploymentTests(unittest.TestCase):
         runner.run.assert_not_called()
         self.assertFalse(self.paths.proxy_env.exists())
 
+    def test_qwen38_modelscope_weights_bypass_saved_international_proxy(self):
+        """ModelScope 大权重应国内直连，维护代理只可用于准备下载器。"""
+
+        self.paths.proxy_env.write_text(
+            "MAINTENANCE_PROXY=http://127.0.0.1:1802\n",
+            encoding="utf-8",
+        )
+        manager = MODEL.DeploymentManager(self.paths)
+        command_runner = mock.Mock()
+        command_runner.run.return_value = subprocess.CompletedProcess([], 0)
+        artifact = {
+            "hub": "modelscope",
+            "model_id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+            "revision": "a6cc3dfc4d4d4617b6ede29f53e751215510e681",
+            "path": str(self.models / "qwen38-ms"),
+        }
+        with mock.patch.object(
+            manager,
+            "_ensure_modelscope_downloader",
+            return_value=Path("/usr/local/bin/ms"),
+        ), mock.patch.object(
+            MODEL, "CommandRunner", return_value=command_runner
+        ), mock.patch.object(MODEL, "verify_artifact"):
+            manager._download_artifact(artifact, {"image": "unused"}, {})
+        environment = command_runner.run.call_args.kwargs["env"]
+        self.assertNotIn("HTTPS_PROXY", environment)
+        self.assertNotIn("https_proxy", environment)
+        self.assertNotIn("ALL_PROXY", environment)
+        self.assertIn("--revision", command_runner.run.call_args.args[0])
+
     def test_upgrade_catalog_failure_surfaces_hub_error_instead_of_exit_code(self):
         """Hub 失败原因必须穿透到页面，不能只剩无法排障的退出码 2。"""
 
@@ -837,7 +989,7 @@ class ModelDeploymentTests(unittest.TestCase):
             "BACKEND_API_KEY=test-internal-key\n", encoding="utf-8"
         )
         with mock.patch.object(
-            MODEL.urllib.request,
+            MODEL_VERIFICATION.urllib.request,
             "urlopen",
             return_value=Response(
                 {"choices": [{"message": {"content": "OK"}}]}
@@ -846,12 +998,37 @@ class ModelDeploymentTests(unittest.TestCase):
             self.assertTrue(
                 MODEL.endpoint_inference_ready(
                     "http://127.0.0.1:8100",
-                    self.paths.secrets_env,
+                    "test-internal-key",
                     "ornith-1.5-35b-a3b-fp8",
                 )
             )
         with mock.patch.object(
-            MODEL.urllib.request,
+            MODEL_VERIFICATION.urllib.request,
+            "urlopen",
+            return_value=Response({"choices": [{"message": {"content": "OK"}}]}),
+        ) as urlopen:
+            self.assertTrue(
+                MODEL.endpoint_inference_ready(
+                    "http://127.0.0.1:8100",
+                    "test-internal-key",
+                    "gdn-inside",
+                    image_count=2,
+                )
+            )
+            request_body = json.loads(urlopen.call_args.args[0].data)
+            content = request_body["messages"][0]["content"]
+            self.assertEqual(
+                sum(item.get("type") == "image_url" for item in content), 2
+            )
+            self.assertTrue(
+                all(
+                    item["image_url"]["url"].startswith("data:image/png;base64,")
+                    for item in content
+                    if item.get("type") == "image_url"
+                )
+            )
+        with mock.patch.object(
+            MODEL_VERIFICATION.urllib.request,
             "urlopen",
             return_value=Response(
                 {"choices": [{"message": {"content": None, "reasoning": "OK"}}]}
@@ -860,34 +1037,34 @@ class ModelDeploymentTests(unittest.TestCase):
             self.assertTrue(
                 MODEL.endpoint_inference_ready(
                     "http://127.0.0.1:8100",
-                    self.paths.secrets_env,
+                    "test-internal-key",
                     "ornith-1.5-35b-a3b-fp8",
                 )
             )
         detail = []
         with mock.patch.object(
-            MODEL.urllib.request,
+            MODEL_VERIFICATION.urllib.request,
             "urlopen",
             return_value=Response({"error": "model not found"}, status=404),
         ):
             self.assertFalse(
                 MODEL.endpoint_inference_ready(
                     "http://127.0.0.1:8100",
-                    self.paths.secrets_env,
+                    "test-internal-key",
                     "ornith-1.5-35b-a3b-fp8",
                     detail=detail,
                 )
             )
         self.assertEqual(detail, ["HTTP 404"])
         with mock.patch.object(
-            MODEL.urllib.request,
+            MODEL_VERIFICATION.urllib.request,
             "urlopen",
             return_value=Response({"choices": []}),
         ):
             self.assertFalse(
                 MODEL.endpoint_inference_ready(
                     "http://127.0.0.1:8100",
-                    self.paths.secrets_env,
+                    "test-internal-key",
                     "ornith-1.5-35b-a3b-fp8",
                 )
             )

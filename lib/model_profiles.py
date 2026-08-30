@@ -9,11 +9,13 @@ from typing import Any
 GIB = 1024**3
 QWEN38_DEPLOYMENT_ID = "qwen38-flash-next"
 QWEN38_DISPLAY_NAME = "Qwen3.8 Flash Next NVFP4"
-QWEN38_MODEL_ID = "Inferact/Qwen3.8-Flash-Next-NVFP4"
-QWEN38_MODEL_REVISION = "103a7608316173ca6edd49929544244de7ffda70"
+QWEN38_MODEL_HUB = "modelscope"
+QWEN38_MODEL_ID = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
+QWEN38_MODEL_REVISION = "a6cc3dfc4d4d4617b6ede29f53e751215510e681"
 QWEN38_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
 QWEN38_IMAGE = "vllm/vllm-openai:qwen38-flash-next"
 QWEN38_PUBLIC_MODEL_ID = "gdn-inside"
+QWEN38_DEFAULT_MAX_IMAGES = 4
 QWEN38_EDITABLE_FIELDS = frozenset(
     {
         "max_model_len",
@@ -23,6 +25,7 @@ QWEN38_EDITABLE_FIELDS = frozenset(
         "mtp_speculative_tokens",
         "kv_cache_dtype",
         "enable_prefix_caching",
+        "max_images_per_request",
         "expected_registry_revision",
     }
 )
@@ -35,7 +38,7 @@ def qwen38_runtime_defaults() -> dict[str, Any]:
         "image": QWEN38_IMAGE,
         "tensor_parallel_size": 2,
         "max_model_len": 262_144,
-        "gpu_memory_utilization": 0.92,
+        "gpu_memory_utilization": 0.90,
         "max_num_seqs": 8,
         "max_num_batched_tokens": 8192,
         "ple_cpu_offload": True,
@@ -54,7 +57,7 @@ def qwen38_runtime_defaults() -> dict[str, Any]:
         "supports_thinking_toggle": True,
         "tool_call_parser": "qwen3_xml",
         "reasoning_parser": "qwen3",
-        "mm_limit": '{"image":4,"video":0}',
+        "mm_limit": f'{{"image":{QWEN38_DEFAULT_MAX_IMAGES},"video":0}}',
     }
 
 

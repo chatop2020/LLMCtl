@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.2"
+readonly CTL_VERSION="3.6.3"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -1612,7 +1612,7 @@ cmd_status() {
   printf '启动并行度: 每批最多 %s 个 Worker\n' "${STARTUP_PARALLELISM}"
   if (( SUPPORTS_IMAGE_INPUT == 1 )); then
     max_images=$(jq -r '.image // "unknown"' <<<"${MM_LIMIT}" 2>/dev/null || printf unknown)
-    printf '多模态: 支持；每请求最多 %s 张图片；完整测试覆盖单请求 6 图\n' "${max_images}"
+    printf '多模态: 支持；每请求最多 %s 张图片；完整测试按配置验证多图输入\n' "${max_images}"
   else
     printf '多模态: 当前模型不支持图片输入\n'
   fi
@@ -2452,9 +2452,9 @@ ocr_request_file() {
 
 smoke_endpoint() {
   local base_url="${1:?}" key="${2:?}" full="${3:-0}" tmp response content reasoning tool finish_reason
-  local tmp_dir ocr_json six_images_json reasoning_limit diagnostic
+  local tmp_dir ocr_json multi_images_json reasoning_limit diagnostic max_images probe_images data_url
   tmp=$(mktemp)
-  trap 'rm -f "${tmp:-}" "${ocr_json:-}" "${six_images_json:-}"; [[ -z "${tmp_dir:-}" ]] || rm -rf "${tmp_dir}"' RETURN
+  trap 'rm -f "${tmp:-}" "${ocr_json:-}" "${multi_images_json:-}"; [[ -z "${tmp_dir:-}" ]] || rm -rf "${tmp_dir}"' RETURN
 
   log "开始文本冒烟测试..."
   jq -n --arg model "${SERVED_MODEL_NAME}" --argjson toggle "${SUPPORTS_THINKING_TOGGLE}" '
@@ -2503,7 +2503,10 @@ smoke_endpoint() {
   fi
 
   if [[ "${full}" == 1 && "${SUPPORTS_IMAGE_INPUT}" == 1 ]]; then
-    log "开始图片/OCR 与单请求 6 图冒烟测试..."
+    max_images=$(jq -er '.image | select(type == "number" and . >= 1) | floor' <<<"${MM_LIMIT}") || \
+      die "MM_LIMIT 未声明有效的图片数量上限"
+    probe_images=$((max_images < 6 ? max_images : 6))
+    log "开始图片/OCR 与单请求 ${probe_images} 图冒烟测试..."
     tmp_dir=$(smoke_fixture_directory)
     make_ocr_fixture "${tmp_dir}"
     ocr_json=$(mktemp)
@@ -2517,24 +2520,24 @@ smoke_endpoint() {
       [[ -n "${content}" ]] || smoke_fail_response image "图片输入测试返回空内容" "${response}"
       log "图片输入：PASS（模型未标记为 OCR 优化，不强制识别准确率）"
     fi
-    local data_url
     data_url=$(jq -r '.messages[0].content[0].image_url.url' "${ocr_json}")
-    six_images_json=$(mktemp)
-    jq -n --arg model "${SERVED_MODEL_NAME}" --arg url "${data_url}" --argjson toggle "${SUPPORTS_THINKING_TOGGLE}" '
+    multi_images_json=$(mktemp)
+    jq -n --arg model "${SERVED_MODEL_NAME}" --arg url "${data_url}" \
+      --argjson count "${probe_images}" --argjson toggle "${SUPPORTS_THINKING_TOGGLE}" '
       {model:$model,max_tokens:64,temperature:0,stream:false,
        messages:[{role:"user",content:
-         ([range(0;6)|{type:"image_url",image_url:{url:$url}}] +
+         ([range(0;$count)|{type:"image_url",image_url:{url:$url}}] +
           [{type:"text",text:"这些图片中的编号相同。请简短回答。"}])}]} +
-       (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${six_images_json}"
-    response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${six_images_json}") || die "单请求 6 图测试失败"
+       (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${multi_images_json}"
+    response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${multi_images_json}") || die "单请求 ${probe_images} 图测试失败"
     content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
-    [[ -n "${content}" ]] || smoke_fail_response six-images "单请求 6 图返回空内容" "${response}"
-    log "单请求 6 张图片：PASS"
+    [[ -n "${content}" ]] || smoke_fail_response multi-images "单请求 ${probe_images} 图返回空内容" "${response}"
+    log "单请求 ${probe_images} 张图片：PASS（服务端上限 ${max_images} 张）"
   elif [[ "${full}" == 1 ]]; then
-    log "当前模型不支持图片输入，跳过 OCR/6 图测试。"
+    log "当前模型不支持图片输入，跳过视觉测试。"
   fi
   trap - RETURN
-  rm -f "${tmp}" "${ocr_json:-}" "${six_images_json:-}"
+  rm -f "${tmp}" "${ocr_json:-}" "${multi_images_json:-}"
   [[ -z "${tmp_dir:-}" ]] || rm -rf "${tmp_dir}"
 }
 

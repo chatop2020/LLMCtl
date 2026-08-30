@@ -1,0 +1,93 @@
+{
+  "plan_id": "qwen38-modelscope-vision",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L2",
+  "source": {
+    "baseline_commit": "c24a029c6e24d2215736319c8d672086ac60a005",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "将 Qwen3.8 Flash Next 一键部署切换为固定 revision 的 ModelScope RadixArk NVFP4 制品，并保证视觉编码器、图片请求上限和真实图文上线验收形成完整产品链路。",
+    "acceptance": [
+      "一键预设从 ModelScope 下载 RadixArk/Qwen3.8-Flash-Next-NVFP4 的固定 commit，公开 ID 继续是 gdn-inside。",
+      "下载完成后核验 NVFP4、FP8 PLE、原生 262K、视觉配置、视觉/PLE 权重映射和全部索引分片。",
+      "页面明确说明视觉编码器随 checkpoint 安装，并允许把每请求图片上限在 1 到 16 之间调整，默认值为 4。",
+      "vLLM Worker 以 --limit-mm-per-prompt 强制执行上限，四个 TP2 实例上线前分别完成真实 image_url 图文请求。",
+      "ModelScope 大权重使用国内直连，Docker 镜像下载失败给出 Docker daemon 代理恢复动作，既有自动回滚保持不变。",
+      "桌面和 390px 窄屏页面无横向溢出，高级设置默认折叠且图片上限可读可调。"
+    ]
+  },
+  "risk": {
+    "level": "L2",
+    "affected_components": [
+      "Qwen3.8 权威模型预设",
+      "ModelScope 权重下载",
+      "模型制品完整性验证",
+      "vLLM Worker 多模态参数",
+      "逐实例上线验收",
+      "管理门户与构建资源",
+      "安装和在线升级资产",
+      "运维文档与冒烟测试"
+    ],
+    "stop_conditions": [
+      "ModelScope revision 无法解析或关键文件哈希与对应 RadixArk 版本不一致",
+      "制品缺少视觉、PLE 或索引引用的权重分片",
+      "专用 vLLM 镜像不支持目标架构或 Docker daemon 无法下载镜像",
+      "任一实例的真实图文请求失败",
+      "任何 Required 本地门禁失败"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "source-and-integrity",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "ModelScope API and git ls-remote revision inspection",
+        "manifest/config/index and sampled large-shard SHA256 comparison"
+      ]
+    },
+    {
+      "gate_id": "backend-and-upgrade-contract",
+      "criticality": "Required",
+      "depends_on": ["source-and-integrity"],
+      "commands": [
+        "python3 -m unittest tests.test_model_deployment tests.test_source_structure tests.test_static_contracts tests.test_control_plane_upgrade",
+        "python3 -m py_compile and bash -n"
+      ]
+    },
+    {
+      "gate_id": "portal-contract-and-build",
+      "criticality": "Required",
+      "depends_on": ["backend-and-upgrade-contract"],
+      "commands": [
+        "npm test -- --run",
+        "npm run build"
+      ]
+    },
+    {
+      "gate_id": "visible-page-acceptance",
+      "criticality": "Required",
+      "depends_on": ["portal-contract-and-build"],
+      "commands": [
+        "Authenticated built-portal inspection at default and 390x844 viewports"
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "criticality": "Required",
+      "depends_on": ["backend-and-upgrade-contract", "portal-contract-and-build"],
+      "commands": [
+        "python3 -m unittest discover -s tests -v",
+        "git diff --check, strict JSON validation, source-size checks and upgrade archive tests"
+      ]
+    },
+    {
+      "gate_id": "target-host-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-regression", "visible-page-acceptance"],
+      "environment": "8×RTX PRO 6000D, 512GB RAM, PCIe 4.0, no NVLink",
+      "expected_status_without_target_host": "Unverified"
+    }
+  ]
+}
