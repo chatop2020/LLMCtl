@@ -73,7 +73,7 @@ from omniroute_maintenance import (
 )
 
 
-APP_VERSION = "3.6.6"
+APP_VERSION = "3.6.7"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -1050,15 +1050,9 @@ class DeploymentManager:
         if not gateway_capabilities(self.paths)["registry_publish"]:
             blockers.append("当前 AI 接入层不能原子上线 gdn-inside；请先使用 OmniRoute")
         total_memory = int(resources["memory_total_bytes"])
-        available_memory = int(resources["memory_available_bytes"])
         disk_free = int(resources["disk_free_bytes"])
         if total_memory and total_memory < requirements["minimum_host_memory_bytes"]:
             blockers.append("主内存不足 480GiB，不能安全运行四个同构实例")
-        if (
-            available_memory
-            and available_memory < requirements["recommended_available_memory_bytes"]
-        ):
-            warnings.append("当前可用主内存低于推荐的 420GiB；部署前应停止无关大内存任务")
         if not artifact_ready and disk_free and disk_free < requirements["download_disk_bytes"]:
             blockers.append("模型盘可用空间不足 250GiB，无法完成下载和临时校验")
         try:
@@ -2155,22 +2149,11 @@ if cache_dtype not in {"auto", "bfloat16"}:
         for worker_id in sorted(affected):
             if worker_id not in desired:
                 continue
+            if job and self.jobs.get(job["id"]).get("cancel_requested"):
+                raise InterruptedError("任务已由管理员取消")
             self.runner.run(["systemctl", "enable", f"llm-worker@{worker_id}.service"])
             self.runner.run(["systemctl", "start", f"llm-worker@{worker_id}.service"])
             pending.add(worker_id)
-            deployment, instance = desired[worker_id]
-            # PLE 主内存常驻量很大；一键部署逐实例加载，避免四份权重同时
-            # 进入主内存造成瞬时 OOM。普通部署继续保持原并行启动行为。
-            if is_qwen38_flash_next(str(deployment.get("model_id", ""))):
-                while worker_id in pending and time.monotonic() < deadline:
-                    if job and self.jobs.get(job["id"]).get("cancel_requested"):
-                        raise InterruptedError("任务已由管理员取消")
-                    if endpoint_healthy(f"http://127.0.0.1:{instance['port']}", self.paths.secrets_env):
-                        pending.remove(worker_id)
-                    else:
-                        time.sleep(3)
-                if worker_id in pending:
-                    raise RuntimeError(f"Worker 健康检查超时：[{worker_id}]")
         while pending and time.monotonic() < deadline:
             if job and self.jobs.get(job["id"]).get("cancel_requested"):
                 raise InterruptedError("任务已由管理员取消")

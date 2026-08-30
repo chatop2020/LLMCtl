@@ -68,6 +68,5 @@ def qwen38_capacity_requirements() -> dict[str, int]:
         "gpu_count": 8,
         "minimum_gpu_memory_mib": 80 * 1024,
         "minimum_host_memory_bytes": 480 * GIB,
-        "recommended_available_memory_bytes": 420 * GIB,
         "download_disk_bytes": 250 * GIB,
     }

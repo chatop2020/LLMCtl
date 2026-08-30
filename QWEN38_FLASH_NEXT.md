@@ -6,7 +6,7 @@
 
 ## 推荐的一键部署
 
-升级到 LLMCtl 3.6.6 后，进入管理后台“模型部署”，使用首屏的“Qwen3.8 Flash Next 一键部署”：
+升级到 LLMCtl 3.6.7 后，进入管理后台“模型部署”，使用首屏的“Qwen3.8 Flash Next 一键部署”：
 
 1. 页面自动读取八张 GPU 的实际拓扑并显示四个 TP2 分组。
 2. 推荐参数已经填好；“高级设置”默认折叠，一般无需修改。
@@ -35,7 +35,7 @@
 | 显存比例 | `0.90` | 在 84GB 卡上保留 CUDA Graph、GDN/QSA 与多模态工作区余量 |
 | 图片输入 | 每请求最多 `4` 张，可调 `1–16` | checkpoint 已包含视觉编码器；图片数、分辨率和文本共同占用 262K 上下文与处理预算 |
 | 批处理 Token | `8192` | 兼顾 chunked prefill、并发和 GDN 状态要求 |
-| 启动并行度 | `1` | 四个实例的 PLE 常驻主内存较大，串行加载避免主内存与模型盘瞬时压力 |
+| 启动并行度 | `4` | 四个 TP2 实例同时加载；允许 PLE 和 Linux 页缓存使用全部可用主内存，不预留固定空闲量 |
 
 四组 GPU 不应只按编号猜测。先运行：
 
@@ -62,7 +62,7 @@ sudo bash install-llm-cluster.sh \
   --max-model-len 262144 \
   --max-num-seqs 8 \
   --active-instances 1 \
-  --startup-parallelism 1 \
+  --startup-parallelism 4 \
   --gpu-memory-utilization 0.90 \
   --max-num-batched-tokens 8192 \
   --ple-cpu-offload enabled \
@@ -141,14 +141,14 @@ sudo llmctl model rollback DEPLOYMENT_JOB_ID
 | 现象 | 处理 |
 | --- | --- |
 | 镜像不注册 `Qwen4ExpForConditionalGeneration` | 使用专用 `qwen38-flash-next` 镜像，不下载权重 |
-| ModelScope 报 `/root/.modelscope` 只读 | 升级到 3.6.6；控制服务会把 SDK home、cache 和 `--cache-dir` 固定到模型盘私有目录 |
-| 下载结束后控制服务持续大量写盘 | 升级到 3.6.6；命令输出持久化已限制为最后 100 行，避免进度条日志写放大 |
-| PLE 启动时报缺少 `ngram_embedding.weight_scale` | 升级到 3.6.6；LLMCtl 会从当前基础镜像 ID 构建最小 FP8-PLE resolver 派生层，原镜像和权重保持不变 |
-| 在 `starting` 阶段点击安全取消后仍等待 | 升级到 3.6.6；逐 Worker 健康等待现在每 3 秒检查取消标志并立即进入回滚 |
+| ModelScope 报 `/root/.modelscope` 只读 | 升级到 3.6.7；控制服务会把 SDK home、cache 和 `--cache-dir` 固定到模型盘私有目录 |
+| 下载结束后控制服务持续大量写盘 | 升级到 3.6.7；命令输出持久化已限制为最后 100 行，避免进度条日志写放大 |
+| PLE 启动时报缺少 `ngram_embedding.weight_scale` | 升级到 3.6.7；LLMCtl 会从当前基础镜像 ID 构建最小 FP8-PLE resolver 派生层，原镜像和权重保持不变 |
+| 在 `starting` 阶段点击安全取消后仍等待 | 升级到 3.6.7；并行 Worker 健康等待现在每 3 秒检查取消标志并立即进入回滚 |
 | 图片请求被拒绝为数量超限 | 在一键页面调整“每请求最大图片数”；推荐保持 4，不要只修改客户端 |
 | NVFP4 QSA KV 能力校验失败 | 改回 `auto`；不要用普通 NVFP4 KV patch 冒充 QSA 支持 |
 | PLE 进程无法交接 CUDA 句柄 | 确认容器具有最小的 `SYS_PTRACE` capability；LLMCtl 只在 PLE 开启时添加 |
-| 主内存持续接近耗尽 | 保持启动并行度 1；先只运行一个 TP2 金丝雀，检查 PLE 实际 RSS 后再扩容 |
+| 四组并行加载时实际触发主内存 OOM | 任务会失败并回滚；若仍要降低峰值，再临时改回分组启动 |
 | 共享前缀长对话触发 GPU 异常 | 保持前缀缓存关闭，升级到修复后的专用镜像后重新验收 |
 | MTP 后吞吐没有提升或尾延迟变差 | 回到 MTP0；接受率不足时更多草稿只增加无效计算 |
 | 需要恢复旧模型 | 使用成功任务的回滚入口；不要删除旧权重或手工覆盖 Worker 环境 |

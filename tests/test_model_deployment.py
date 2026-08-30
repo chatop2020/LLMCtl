@@ -602,8 +602,30 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertTrue(any("主内存不足" in item for item in snapshot["blockers"]))
         self.assertTrue(any("模型盘" in item for item in snapshot["blockers"]))
 
-    def test_qwen38_workers_load_sequentially_to_bound_host_memory(self):
-        """四个 PLE 实例必须逐个健康后再启动下一个，避免并行加载耗尽主内存。"""
+    def test_qwen38_parallel_start_does_not_reserve_free_host_memory(self):
+        """目标 512GB 主机允许 PLE 和页缓存用满内存，不按 available 提前拒绝。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        resources = {
+            "memory_total_bytes": 512 * 1024**3,
+            "memory_available_bytes": 64 * 1024**3,
+            "disk_free_bytes": 600 * 1024**3,
+        }
+        pairing = {
+            "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+            "links": [],
+            "source": "nvidia-smi",
+        }
+        with mock.patch.object(MODEL, "host_resource_snapshot", return_value=resources), \
+             mock.patch.object(MODEL, "qwen38_gpu_groups", return_value=pairing):
+            snapshot = manager.qwen38_quick_snapshot(inventory=self.gpus)
+        self.assertTrue(snapshot["available"])
+        self.assertFalse(any("可用主内存" in item for item in snapshot["blockers"]))
+
+    def test_qwen38_workers_start_all_tp2_groups_before_health_wait(self):
+        """四个 TP2 实例必须先全部启动，让八张 GPU 同时加载权重。"""
 
         events = []
         runner = mock.Mock(spec=MODEL.CommandRunner)
@@ -634,10 +656,14 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("start", "llm-worker@0.service"), ("healthy", "http://127.0.0.1:8100"),
-                ("start", "llm-worker@1.service"), ("healthy", "http://127.0.0.1:8101"),
-                ("start", "llm-worker@2.service"), ("healthy", "http://127.0.0.1:8102"),
-                ("start", "llm-worker@3.service"), ("healthy", "http://127.0.0.1:8103"),
+                ("start", "llm-worker@0.service"),
+                ("start", "llm-worker@1.service"),
+                ("start", "llm-worker@2.service"),
+                ("start", "llm-worker@3.service"),
+                ("healthy", "http://127.0.0.1:8100"),
+                ("healthy", "http://127.0.0.1:8101"),
+                ("healthy", "http://127.0.0.1:8102"),
+                ("healthy", "http://127.0.0.1:8103"),
             ],
         )
 
@@ -670,7 +696,7 @@ class ModelDeploymentTests(unittest.TestCase):
             for call in runner.run.call_args_list
             if call.args[0][:2] == ["systemctl", "start"]
         ]
-        self.assertEqual(starts, [["systemctl", "start", "llm-worker@0.service"]])
+        self.assertEqual(starts, [])
 
     def test_local_artifact_must_stay_under_model_root(self):
         manager = MODEL.DeploymentManager(self.paths)
