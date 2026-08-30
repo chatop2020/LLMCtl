@@ -56,6 +56,14 @@ class StaticDeploymentContracts(unittest.TestCase):
             self.assertIn(secret, info)
         self.assertIn("--redact", info)
         self.assertIn("dump-config --show-secrets", info)
+        self.assertIn("activate_default_published_deployment", info)
+        self.assertIn("活动部署", info)
+        self.assertIn("active_model_dir", info)
+        self.assertIn("effective_routing_strategy", info)
+        self.assertIn("systemd_property_state", info)
+        self.assertIn("旧版 current 兼容链接", info)
+        self.assertIn("CpusetMems", info)
+        self.assertIn("CpusetCpus", info)
 
     def test_nginx_install_isolated_config_has_validation_rollback_and_restore(self):
         nginx = MANAGER.split("render_nginx_config() {", 1)[1].split("database_health() {", 1)[0]

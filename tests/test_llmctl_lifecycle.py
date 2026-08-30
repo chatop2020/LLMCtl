@@ -197,6 +197,13 @@ class LlmctlLifecycleTests(unittest.TestCase):
             workers = config / "workers"
             workers.mkdir(parents=True)
             registry = {
+                "artifacts": {
+                    "qwen": {
+                        "hub": "modelscope",
+                        "revision": "a" * 40,
+                        "path": "/data/models/qwen38",
+                    }
+                },
                 "deployments": {
                     "legacy": {
                         "enabled": False,
@@ -208,6 +215,8 @@ class LlmctlLifecycleTests(unittest.TestCase):
                     "qwen38-flash-next": {
                         "enabled": True,
                         "publish_requested": True,
+                        "artifact_id": "qwen",
+                        "model_id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
                         "served_model_name": "gdn-inside",
                         "public_model_ids": ["gdn-inside"],
                         "instances": [

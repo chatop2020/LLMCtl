@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.11"
+readonly CTL_VERSION="3.6.12"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -652,31 +652,6 @@ worker_devices() {
 
 worker_served_model() {
   worker_config_value "${1:?}" SERVED_MODEL_NAME "${SERVED_MODEL_NAME}"
-}
-
-# 让面向统一入口的诊断命令使用注册表中当前发布的模型及其真实运行能力。
-# 多模型环境默认选择第一个已启用且请求发布的部署；没有可用注册表时保留
-# 旧版全局配置，确保控制面升级本身不改变旧安装行为。
-activate_default_published_deployment() {
-  local registry="${CONFIG_DIR}/deployments.json" selected="" public_model="" worker_id="" worker_env=""
-  [[ -r "${registry}" ]] || return 0
-  selected=$(jq -r '
-    [.deployments | to_entries[]
-     | select(.value.enabled != false and .value.publish_requested != false)
-     | .value
-     | {model: ((.public_model_ids // [])[0] // .served_model_name // ""),
-        worker: ([.instances[]? | select(.kind == "local" and .enabled != false) | .worker_id][0] // "")}
-     | select(.model != "")][0] // {}
-    | [(.model // ""), ((.worker // "") | tostring)] | @tsv
-  ' "${registry}" 2>/dev/null || true)
-  IFS=$'\t' read -r public_model worker_id <<<"${selected}"
-  [[ "${public_model}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$ ]] || return 0
-  worker_env="${CONFIG_DIR}/workers/${worker_id}.env"
-  if [[ "${worker_id}" =~ ^[0-9]+$ && -r "${worker_env}" ]]; then
-    # shellcheck disable=SC1090
-    source "${worker_env}"
-  fi
-  SERVED_MODEL_NAME="${public_model}"
 }
 
 worker_supports_thinking_toggle() {
@@ -1693,6 +1668,11 @@ cmd_info() {
   local mysql_host="<未配置>" mysql_port="3306" mysql_database="<未配置>" mysql_username="<未配置>"
   local mysql_password="" mysql_tls="preferred" mysql_ca="<empty>"
   local migration_status="idle" migration_stage="未开始" migration_progress="0" migration_backup="<none>" migration_error="<none>"
+  local active_model_dir="" effective_routing_strategy="" workflow_base_models="" container_numa="" container_cpus=""
+  activate_default_published_deployment
+  active_model_dir="${MODEL_LOCAL_DIR:-${MODEL_ROOT}/current}"
+  effective_routing_strategy="${ROUTING_STRATEGY}"
+  [[ "${GATEWAY_KIND}" != omniroute ]] || effective_routing_strategy="round-robin（逐请求，关闭会话粘性）"
   case "${1:-}" in
     "") ;;
     --redact) redact=1 ;;
@@ -1800,8 +1780,8 @@ cmd_info() {
     "${API_BIND}" "${API_PORT}" "${ACCOUNT_PUBLISHED_ORIGIN:-<自动使用当前访问地址>}" \
     "${effective_public_origin}" "${effective_public_origin}"
   printf 'Nginx 状态: %s；开机自启: %s；配置: %s\n' \
-    "$(systemctl is-active nginx.service 2>/dev/null || printf unknown)" \
-    "$(systemctl is-enabled nginx.service 2>/dev/null || printf unknown)" "${NGINX_CONFIG}"
+    "$(systemd_property_state is-active nginx.service)" \
+    "$(systemd_property_state is-enabled nginx.service)" "${NGINX_CONFIG}"
   printf 'TLS: 未由 LLMCtl 自动配置；如由现有 Nginx 站点终止 TLS，请以站点配置为准\n'
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
     printf '企业门户: %s/ui/\n门户管理 API: %s/portal-api/\nOmniRoute 原生 UI: %s/base_ui/\n' \
@@ -1821,7 +1801,7 @@ cmd_info() {
   fi
 
   printf '\n[接入层与管理员 / Gateway and administrators]\n'
-  printf '网关: %s (%s)\n镜像: %s\n路由策略: %s\n' "$(gateway_display_name)" "${GATEWAY_KIND}" "${GATEWAY_IMAGE}" "${ROUTING_STRATEGY}"
+  printf '网关: %s (%s)\n镜像: %s\n路由策略: %s\n' "$(gateway_display_name)" "${GATEWAY_KIND}" "${GATEWAY_IMAGE}" "${effective_routing_strategy}"
   printf '网关镜像 ID: %s\n' "$(docker image inspect --format '{{.Id}}' "${GATEWAY_IMAGE}" 2>/dev/null || printf unavailable)"
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
     printf '原生 UI 管理员用户名: 不适用（OmniRoute 原生 UI 仅使用密码）\n原生 UI 管理员密码: %s\n' "$(secret_value "${UI_PASSWORD}")"
@@ -1874,8 +1854,9 @@ cmd_info() {
     "$(secret_value "${RUNTIME_HTTPS_PROXY:-}")" "${RUNTIME_NO_PROXY}" "${RUNTIME_PROXY_ENV}"
 
   printf '\n[模型与推理 / Model and inference]\n'
-  printf 'Hub/模型/revision: %s / %s @ %s\n本地目录: %s/current\n模型服务 ID: %s\n架构/精度/任务: %s / %s / %s\n' \
-    "${MODEL_HUB}" "${MODEL_ID}" "${MODEL_REVISION}" "${MODEL_ROOT}" "${SERVED_MODEL_NAME}" "${MODEL_ARCHITECTURE}" "${MODEL_PRECISION}" "${MODEL_TASK}"
+  printf '活动部署: %s\nHub/模型/revision: %s / %s @ %s\n本地目录: %s\n模型服务 ID: %s\n架构/精度/任务: %s / %s / %s\n' \
+    "${ACTIVE_DEPLOYMENT_ID:-legacy}" "${MODEL_HUB}" "${MODEL_ID}" "${MODEL_REVISION}" "${active_model_dir}" \
+    "${SERVED_MODEL_NAME}" "${MODEL_ARCHITECTURE}" "${MODEL_PRECISION}" "${MODEL_TASK}"
   printf 'GPU/TP/实例: %s / %s / %s；开机激活: %s；启动并行度: %s\n' \
     "${PHYSICAL_GPU_COUNT}" "${TP_SIZE}" "${INSTANCE_COUNT}" "${ACTIVE_WORKERS}" "${STARTUP_PARALLELISM}"
   printf 'Context/max-seqs/batched-tokens/GPU-memory: %s / %s / %s / %s\n' \
@@ -1886,59 +1867,73 @@ cmd_info() {
   printf '单请求最大输出 Token: %s（vLLM 服务端硬上限）\n' "${MAX_OUTPUT_TOKENS}"
   printf '图片/OCR/工具/思考/关闭思考: %s / %s / %s / %s / %s\n' \
     "${SUPPORTS_IMAGE_INPUT}" "${SUPPORTS_OCR}" "${SUPPORTS_TOOL_CALLING}" "${SUPPORTS_REASONING}" "${SUPPORTS_THINKING_TOGGLE}"
-  printf 'vLLM 镜像: %s (ID=%s)\nPostgreSQL 镜像: %s (ID=%s)\n' \
-    "${VLLM_IMAGE}" "$(docker image inspect --format '{{.Id}}' "${VLLM_IMAGE}" 2>/dev/null || printf unavailable)" \
-    "${POSTGRES_IMAGE}" "$(docker image inspect --format '{{.Id}}' "${POSTGRES_IMAGE}" 2>/dev/null || printf unavailable)"
+  printf 'vLLM 镜像: %s (ID=%s)\n' \
+    "${VLLM_IMAGE}" "$(docker image inspect --format '{{.Id}}' "${VLLM_IMAGE}" 2>/dev/null || printf unavailable)"
+  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
+    printf 'PostgreSQL: 当前 OmniRoute 模式不使用\n'
+  else
+    printf 'PostgreSQL 镜像: %s (ID=%s)\n' "${POSTGRES_IMAGE}" \
+      "$(docker image inspect --format '{{.Id}}' "${POSTGRES_IMAGE}" 2>/dev/null || printf unavailable)"
+  fi
 
   printf '\n[服务、自启与 Worker / Services and workers]\n'
   printf 'llm-cluster: %s；enabled=%s\nllm-router: %s\n' \
-    "$(systemctl is-active llm-cluster.service 2>/dev/null || printf unknown)" \
-    "$(systemctl is-enabled llm-cluster.service 2>/dev/null || printf unknown)" \
-    "$(systemctl is-active llm-router.service 2>/dev/null || printf unknown)"
+    "$(systemd_property_state is-active llm-cluster.service)" \
+    "$(systemd_property_state is-enabled llm-cluster.service)" \
+    "$(systemd_property_state is-active llm-router.service)"
   printf 'Worker 保活: enabled=%s；interval=%ss；timeout=%ss；timer=%s/%s\n最近保活: %s；状态文件: %s\n' \
     "${KEEPWARM_ENABLED}" "${KEEPWARM_INTERVAL_SECONDS}" "${KEEPWARM_TIMEOUT_SECONDS}" \
-    "$(systemctl is-active llm-keepwarm.timer 2>/dev/null || printf unknown)" \
-    "$(systemctl is-enabled llm-keepwarm.timer 2>/dev/null || printf unknown)" \
+    "$(systemd_property_state is-active llm-keepwarm.timer)" \
+    "$(systemd_property_state is-enabled llm-keepwarm.timer)" \
     "$([[ -r "${KEEPWARM_STATE_FILE}" ]] && jq -r '"\(.finished_at) requested=\(.summary.requested) succeeded=\(.summary.succeeded) failed=\(.summary.failed)"' "${KEEPWARM_STATE_FILE}" 2>/dev/null || printf never)" \
     "${KEEPWARM_STATE_FILE}"
   printf '可插拔工作流: configured=%s；enabled=%s；service=%s/%s\n配置: %s；密钥: %s；运行时: %s\n' \
     "$([[ -r "${WORKFLOW_CONFIG}" ]] && printf yes || printf no)" "${WORKFLOW_ENABLED}" \
-    "$(systemctl is-active llm-workflow.service 2>/dev/null || printf inactive)" \
-    "$(systemctl is-enabled llm-workflow.service 2>/dev/null || printf disabled)" \
+    "$(systemd_property_state is-active llm-workflow.service)" \
+    "$(systemd_property_state is-enabled llm-workflow.service)" \
     "${WORKFLOW_CONFIG}" "${WORKFLOW_ENV}" "${WORKFLOW_RUNTIME}"
   if [[ -r "${WORKFLOW_CONFIG}" ]]; then
-    printf '工作流监听/路由/资源池: %s / %s / %s\n' \
+    workflow_base_models=$(jq -r '[.models|to_entries[]|select(.value.enabled)|.value.base_model]|unique|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)
+    printf '工作流监听/路由→底层模型/资源池: %s / %s / %s\n' \
       "$(jq -r '.listen // "unknown"' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)" \
-      "$(jq -r '[.models|to_entries[]|select(.value.enabled)|.key]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)" \
+      "$(jq -r '[.models|to_entries[]|select(.value.enabled)|"\(.key)→\(.value.base_model)"]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)" \
       "$(jq -r '[.pools|to_entries[]|"\(.key)=\(.value.targets|length)"]|join(",")' "${WORKFLOW_CONFIG}" 2>/dev/null || printf invalid)"
+    if [[ -n "${workflow_base_models}" && ",${workflow_base_models}," != *",${SERVED_MODEL_NAME},"* ]]; then
+      printf '工作流提示: 独立工作流仍引用 %s，未随活动模型 %s 自动切换\n' "${workflow_base_models}" "${SERVED_MODEL_NAME}"
+    fi
   fi
   printf '多模型控制器: registry=%s；service=%s/%s；socket=%s\n运行时: %s；任务目录: %s；回滚目录: %s\n' \
     "$([[ -r "${CONFIG_DIR}/deployments.json" ]] && printf configured || printf legacy)" \
-    "$(systemctl is-active llm-model-control.service 2>/dev/null || printf inactive)" \
-    "$(systemctl is-enabled llm-model-control.service 2>/dev/null || printf disabled)" \
+    "$(systemd_property_state is-active llm-model-control.service)" \
+    "$(systemd_property_state is-enabled llm-model-control.service)" \
     "$([[ -S "${MODEL_CONTROL_SOCKET}" ]] && printf ready || printf unavailable)" \
     "${MODEL_CONTROL_RUNTIME}" "${STATE_DIR}/model-control/jobs" "${STATE_DIR}/model-control/backups"
   if [[ -S "${MODEL_CONTROL_SOCKET}" && -x "${MODEL_CONTROL_RUNTIME}" ]]; then
     printf '部署/GPU 分配: %s\n' \
-      "$("${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot 2>/dev/null | jq -c '{revision:.registry.revision,deployments:[.registry.deployments|to_entries[]|{id:.key,status:.value.status,public_ids:.value.public_model_ids,instances:[.value.instances[]|{id,kind,worker_id,gpu_devices,base_url,enabled}]}],active_jobs:[.jobs[]|select(.state|IN("waiting","running"))|{id,kind,state,phase,progress}]}' 2>/dev/null || printf unavailable)"
+      "$("${MODEL_CONTROL_RUNTIME}" --socket "${MODEL_CONTROL_SOCKET}" snapshot 2>/dev/null | jq -c '{revision:.registry.revision,deployments:[.registry.deployments|to_entries[]|{id:.key,enabled:.value.enabled,status:.value.status,public_ids:.value.public_model_ids,instances:[.value.instances[]|{id,kind,worker_id,gpu_devices,base_url,enabled}]}],active_jobs:[.jobs[]|select(.state|IN("waiting","running"))|{id,kind,state,phase,progress}]}' 2>/dev/null || printf unavailable)"
   fi
   if [[ "${GATEWAY_KIND}" == omniroute ]]; then
     printf 'OmniRoute 运维: 状态=%s；备份=%s；最近评估=%s\n' \
       "${OMNIROUTE_MAINTENANCE_STATE_DIR}" "${OMNIROUTE_MAINTENANCE_BACKUP_DIR}" \
       "${OMNIROUTE_MAINTENANCE_STATE_DIR}/last-assessment.json"
   fi
-  [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemctl is-active llm-account.service 2>/dev/null || printf unknown)"
-  [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemctl is-active llm-database.service 2>/dev/null || printf unknown)"
+  [[ "${GATEWAY_KIND}" == omniroute ]] && printf 'llm-account: %s\n' "$(systemd_property_state is-active llm-account.service)"
+  [[ "${GATEWAY_KIND}" != omniroute ]] && printf 'llm-database: %s\n' "$(systemd_property_state is-active llm-database.service)"
   for ((id = 0; id < INSTANCE_COUNT; id++)); do
-    state=$(systemctl is-active "$(worker_unit "${id}")" 2>/dev/null || printf unknown)
-    printf 'Worker %s: GPU=%s port=%s systemd=%s boot=%s\n' "${id}" "$(worker_devices "${id}")" "$(worker_port "${id}")" "${state}" "$(csv_has "${ACTIVE_WORKERS}" "${id}" && printf yes || printf no)"
+    state=$(systemd_property_state is-active "$(worker_unit "${id}")")
+    container_numa=$(docker inspect -f '{{.HostConfig.CpusetMems}}' "llm-worker-${id}" 2>/dev/null || true)
+    container_cpus=$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "llm-worker-${id}" 2>/dev/null || true)
+    printf 'Worker %s: GPU=%s port=%s systemd=%s boot=%s NUMA=%s CPUs=%s\n' "${id}" "$(worker_devices "${id}")" \
+      "$(worker_port "${id}")" "${state}" "$(csv_has "${ACTIVE_WORKERS}" "${id}" && printf yes || printf no)" \
+      "${container_numa:-系统默认}" "${container_cpus:-系统默认}"
   done
 
   printf '\n[文件、日志与维护 / Files, logs and maintenance]\n'
   printf '主配置: %s\n密钥配置: %s (mode=%s)\n状态目录: %s\n缓存目录: %s\n网关计划: %s\n' \
     "${CLUSTER_ENV}" "${SECRETS_ENV}" "$(stat -c %a "${SECRETS_ENV}" 2>/dev/null || printf unknown)" "${STATE_DIR}" "${CACHE_DIR}" "$(gateway_config_path)"
-  printf '模型当前链接: %s/current -> %s\n门户程序: %s\n门户静态资源: %s\nNginx 配置备份目录: %s\n' \
-    "${MODEL_ROOT}" "$(readlink -f "${MODEL_ROOT}/current" 2>/dev/null || printf missing)" "${ACCOUNT_HELPER}" "${ACCOUNT_STATIC_DIR:-/usr/local/lib/llm-cluster/account_portal_ui}" "${NGINX_STATE_DIR}"
+  printf '活动模型目录: %s\n旧版 current 兼容链接: %s/current -> %s\n门户程序: %s\n门户静态资源: %s\nNginx 配置备份目录: %s\n' \
+    "${active_model_dir}" "${MODEL_ROOT}" "$(readlink -f "${MODEL_ROOT}/current" 2>/dev/null || printf missing)" \
+    "${ACCOUNT_HELPER}" "${ACCOUNT_STATIC_DIR:-/usr/local/lib/llm-cluster/account_portal_ui}" "${NGINX_STATE_DIR}"
   printf 'systemd 单元: %s\nDocker 网络: %s\nDocker 数据卷: %s\n' \
     "$(find /etc/systemd/system -maxdepth 1 -type f \( -name 'llm-*.service' -o -name 'llm-*.timer' \) -printf '%f ' 2>/dev/null || printf unavailable)" \
     "${DOCKER_NETWORK}" "$(docker volume ls --format '{{.Name}}' 2>/dev/null | awk '/^llm-cluster-/{printf "%s ",$0}' || printf unavailable)"
@@ -2920,7 +2915,7 @@ load_llmctl_command_modules() {
   else
     module_dir="${LLMCTL_MODULE_DIR:-/usr/local/lib/llm-cluster/llmctl}"
   fi
-  for module in topology workflow_model optimizer maintenance offline_lifecycle omniroute; do
+  for module in topology registry_runtime workflow_model optimizer maintenance offline_lifecycle omniroute; do
     [[ -r "${module_dir}/${module}.sh" ]] || die "llmctl 命令模块缺失：${module_dir}/${module}.sh"
     # shellcheck disable=SC1090
     source "${module_dir}/${module}.sh"
