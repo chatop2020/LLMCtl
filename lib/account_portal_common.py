@@ -53,7 +53,7 @@ from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.6.5"
+APP_VERSION = "3.6.6"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024

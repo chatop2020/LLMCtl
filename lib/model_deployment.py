@@ -73,7 +73,7 @@ from omniroute_maintenance import (
 )
 
 
-APP_VERSION = "3.6.5"
+APP_VERSION = "3.6.6"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -1665,7 +1665,7 @@ class DeploymentManager:
             self._update_job(job, "deploying", 60, "写入每实例配置并仅停止受影响 Worker")
             self._apply_candidate(candidate, affected, request["deployment"]["id"])
             self._update_job(job, "starting", 72, "启动受影响 Worker 并等待健康")
-            self._start_and_wait(candidate, affected)
+            self._start_and_wait(candidate, affected, job)
             is_upgrade = job.get("kind") == "upgrade"
             is_qwen38_quick = job.get("kind") == "qwen38"
             requires_inference = is_upgrade or is_qwen38_quick
@@ -2142,7 +2142,9 @@ if cache_dtype not in {"auto", "bfloat16"}:
             {"ACTIVE_WORKERS": ",".join(str(item) for item in sorted(desired))},
         )
 
-    def _start_and_wait(self, candidate: dict[str, Any], affected: set[int]) -> None:
+    def _start_and_wait(
+        self, candidate: dict[str, Any], affected: set[int], job: dict[str, Any] | None = None
+    ) -> None:
         """启动候选配置中的受影响 Worker，并等待每个端点健康。"""
 
         desired = local_instances(candidate)
@@ -2161,6 +2163,8 @@ if cache_dtype not in {"auto", "bfloat16"}:
             # 进入主内存造成瞬时 OOM。普通部署继续保持原并行启动行为。
             if is_qwen38_flash_next(str(deployment.get("model_id", ""))):
                 while worker_id in pending and time.monotonic() < deadline:
+                    if job and self.jobs.get(job["id"]).get("cancel_requested"):
+                        raise InterruptedError("任务已由管理员取消")
                     if endpoint_healthy(f"http://127.0.0.1:{instance['port']}", self.paths.secrets_env):
                         pending.remove(worker_id)
                     else:
@@ -2168,6 +2172,8 @@ if cache_dtype not in {"auto", "bfloat16"}:
                 if worker_id in pending:
                     raise RuntimeError(f"Worker 健康检查超时：[{worker_id}]")
         while pending and time.monotonic() < deadline:
+            if job and self.jobs.get(job["id"]).get("cancel_requested"):
+                raise InterruptedError("任务已由管理员取消")
             for worker_id in list(pending):
                 _deployment, instance = desired[worker_id]
                 if endpoint_healthy(f"http://127.0.0.1:{instance['port']}", self.paths.secrets_env):

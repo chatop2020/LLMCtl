@@ -641,6 +641,37 @@ class ModelDeploymentTests(unittest.TestCase):
             ],
         )
 
+    def test_qwen38_start_wait_honors_safe_cancel_before_next_restart(self):
+        """管理员取消必须打断健康等待，交给外层恢复备份而非等待超时。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        with mock.patch.object(
+            MODEL,
+            "qwen38_gpu_groups",
+            return_value={
+                "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+                "links": [],
+                "source": "nvidia-smi",
+            },
+        ):
+            request, _pairing = manager._qwen38_request({}, self.gpus)
+        normalized = MODEL.normalize_request(request, self.paths)
+        candidate, affected = MODEL.merge_deployment(manager.registry.read(), normalized)
+        job = manager.jobs.create(normalized, kind="qwen38")
+        job["cancel_requested"] = True
+        manager.jobs.save(job)
+        with mock.patch.object(MODEL, "endpoint_healthy", return_value=False), \
+             self.assertRaisesRegex(InterruptedError, "管理员取消"):
+            manager._start_and_wait(candidate, affected, job)
+        starts = [
+            call.args[0]
+            for call in runner.run.call_args_list
+            if call.args[0][:2] == ["systemctl", "start"]
+        ]
+        self.assertEqual(starts, [["systemctl", "start", "llm-worker@0.service"]])
+
     def test_local_artifact_must_stay_under_model_root(self):
         manager = MODEL.DeploymentManager(self.paths)
         request = self.request(
