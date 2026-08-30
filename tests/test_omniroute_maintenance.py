@@ -345,6 +345,18 @@ class OmniRouteMaintenanceTests(unittest.TestCase):
         self.assertEqual(job["state"], "rolled_back")
         self.assertEqual(self.sample_value(), "original")
 
+    def test_compact_reports_restored_database_when_smoke_remains_unhealthy(self):
+        """两次冒烟均失败时也必须区分数据库已恢复与服务尚未通过验收。"""
+
+        self.runner.fail_smoke_count = 2
+
+        job = self.wait_job(self.submit("compact"))
+
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(self.sample_value(), "original")
+        self.assertIn("已恢复维护前数据库文件", job["message"])
+        self.assertIn("恢复后服务冒烟仍失败", job["message"])
+
     def test_router_stop_failure_restarts_account_portal_without_touching_database(self):
         """维护窗口无法建立时应恢复账户门户，并保持主库和 Router 配置不变。"""
 

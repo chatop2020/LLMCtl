@@ -1123,11 +1123,17 @@ class OmniRouteMaintenanceManager:
             try:
                 self._stop_router_stack()
                 self._restore_database(directory, metadata)
-                self._restart_and_smoke()
-            except Exception as rollback_error:
+            except Exception as restore_error:
                 raise RuntimeError(
-                    f"压缩失败：{error}；自动恢复失败：{rollback_error}"
-                ) from rollback_error
+                    f"压缩失败：{error}；自动恢复数据库失败：{restore_error}"
+                ) from restore_error
+            try:
+                self._restart_and_smoke()
+            except Exception as verification_error:
+                raise RuntimeError(
+                    f"压缩失败：{error}；已恢复维护前数据库文件，"
+                    f"但恢复后服务冒烟仍失败：{verification_error}"
+                ) from verification_error
             job.update(
                 {
                     "state": "rolled_back",

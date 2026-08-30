@@ -189,6 +189,88 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn("开机激活 Worker: 0,1,2,3", completed.stdout)
         self.assertNotIn("8104", completed.stdout)
 
+    def test_public_smoke_and_key_use_enabled_registry_deployment(self):
+        """维护冒烟和接入信息不得继续使用已停用模型的全局旧名称。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "config"
+            workers = config / "workers"
+            workers.mkdir(parents=True)
+            registry = {
+                "deployments": {
+                    "legacy": {
+                        "enabled": False,
+                        "publish_requested": True,
+                        "served_model_name": "ornith-old",
+                        "public_model_ids": ["ornith-old"],
+                        "instances": [],
+                    },
+                    "qwen38-flash-next": {
+                        "enabled": True,
+                        "publish_requested": True,
+                        "served_model_name": "gdn-inside",
+                        "public_model_ids": ["gdn-inside"],
+                        "instances": [
+                            {
+                                "kind": "local",
+                                "enabled": True,
+                                "worker_id": 0,
+                            }
+                        ],
+                    },
+                }
+            }
+            (config / "deployments.json").write_text(
+                json.dumps(registry), encoding="utf-8"
+            )
+            (workers / "0.env").write_text(
+                "\n".join(
+                    [
+                        "MODEL_ID=RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                        "SERVED_MODEL_NAME=gdn-inside",
+                        "SUPPORTS_THINKING_TOGGLE=0",
+                        "SUPPORTS_REASONING=0",
+                        "SUPPORTS_TOOL_CALLING=0",
+                        "SUPPORTS_IMAGE_INPUT=0",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                export LLM_CLUSTER_CONFIG_DIR={config!s}
+                source {MANAGER!s}
+                load_config() {{
+                  MODEL_ID=ornith-ai/Ornith-1.5-35B-A3B-FP8; SERVED_MODEL_NAME=ornith-old
+                  SUPPORTS_THINKING_TOGGLE=1; SUPPORTS_REASONING=1; SUPPORTS_TOOL_CALLING=1
+                  SUPPORTS_IMAGE_INPUT=1; SUPPORTS_OCR=1; MM_LIMIT='{{"image":8}}'
+                  API_BIND=127.0.0.1; API_PORT=8000; GATEWAY_KIND=litellm
+                  GATEWAY_API_KEY=test-key; BACKEND_API_KEY=backend-key
+                }}
+                require_root() {{ :; }}
+                gateway_display_name() {{ printf LiteLLM; }}
+                router_health() {{ return 0; }}
+                public_router_health() {{ return 0; }}
+                api_post() {{
+                  jq -e '.model == "gdn-inside"' "$3" >/dev/null
+                  printf '%s\n' '{{"choices":[{{"message":{{"content":"LLM_OK"}},"finish_reason":"stop"}}]}}'
+                }}
+                cmd_smoke
+                cmd_key show
+                """
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script], check=False, text=True, capture_output=True
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("文本生成：PASS", completed.stdout)
+        self.assertIn("OPENAI_MODEL=gdn-inside", completed.stdout)
+        self.assertNotIn("OPENAI_MODEL=ornith-old", completed.stdout)
+
     def test_model_upgrade_cli_reuses_plan_revision_and_submits_stale_guard(self):
         """CLI apply 必须把计划版本带回控制服务，且不要求管理员手写 JSON。"""
 
@@ -575,6 +657,43 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertTrue(summary["invalid_json"])
         self.assertEqual(summary["detected_format"], "sse")
         self.assertGreater(summary["body_chars"], 0)
+
+    def test_smoke_persists_http_error_body_for_actionable_diagnostics(self):
+        """HTTP 400 也必须保存网关响应，不能只留下 curl 退出码。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            script = textwrap.dedent(
+                f"""
+                set -Eeuo pipefail
+                export LLMCTL_SOURCE_ONLY=1
+                source {MANAGER!s}
+                SERVED_MODEL_NAME=retired-model
+                SUPPORTS_THINKING_TOGGLE=0
+                SUPPORTS_REASONING=0
+                SUPPORTS_TOOL_CALLING=0
+                SUPPORTS_IMAGE_INPUT=0
+                api_post() {{
+                  printf '%s\n' '{{"error":{{"message":"model retired-model not found"}}}}'
+                  return 22
+                }}
+                smoke_endpoint http://127.0.0.1:1 key 0
+                """
+            )
+            environment = os.environ.copy()
+            environment["LLM_CLUSTER_STATE_DIR"] = directory
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=False,
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            diagnostic = pathlib.Path(directory) / "diagnostics/smoke/latest-text.json"
+            payload = json.loads(diagnostic.resolve().read_text(encoding="utf-8"))
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("model retired-model not found", completed.stderr)
+        self.assertEqual(payload["error"]["message"], "model retired-model not found")
 
     def test_ocr_fixture_is_written_outside_systemd_private_tmp(self):
         """后台维护必须在宿主机共享目录生成并回读 OCR 图片。"""

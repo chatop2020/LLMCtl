@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.9"
+readonly CTL_VERSION="3.6.10"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -648,6 +648,31 @@ worker_devices() {
 
 worker_served_model() {
   worker_config_value "${1:?}" SERVED_MODEL_NAME "${SERVED_MODEL_NAME}"
+}
+
+# 让面向统一入口的诊断命令使用注册表中当前发布的模型及其真实运行能力。
+# 多模型环境默认选择第一个已启用且请求发布的部署；没有可用注册表时保留
+# 旧版全局配置，确保控制面升级本身不改变旧安装行为。
+activate_default_published_deployment() {
+  local registry="${CONFIG_DIR}/deployments.json" selected="" public_model="" worker_id="" worker_env=""
+  [[ -r "${registry}" ]] || return 0
+  selected=$(jq -r '
+    [.deployments | to_entries[]
+     | select(.value.enabled != false and .value.publish_requested != false)
+     | .value
+     | {model: ((.public_model_ids // [])[0] // .served_model_name // ""),
+        worker: ([.instances[]? | select(.kind == "local" and .enabled != false) | .worker_id][0] // "")}
+     | select(.model != "")][0] // {}
+    | [(.model // ""), ((.worker // "") | tostring)] | @tsv
+  ' "${registry}" 2>/dev/null || true)
+  IFS=$'\t' read -r public_model worker_id <<<"${selected}"
+  [[ "${public_model}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$ ]] || return 0
+  worker_env="${CONFIG_DIR}/workers/${worker_id}.env"
+  if [[ "${worker_id}" =~ ^[0-9]+$ && -r "${worker_env}" ]]; then
+    # shellcheck disable=SC1090
+    source "${worker_env}"
+  fi
+  SERVED_MODEL_NAME="${public_model}"
 }
 
 worker_supports_thinking_toggle() {
@@ -2345,7 +2370,7 @@ cmd_logs() {
 
 api_post() {
   local url="${1:?}" key="${2:?}" payload="${3:?}"
-  curl --noproxy '*' -fsS --max-time 600 \
+  curl --noproxy '*' --fail-with-body -sS --max-time 600 \
     -H "Authorization: Bearer ${key}" \
     -H 'Accept: application/json' \
     -H 'Content-Type: application/json' \
@@ -2460,7 +2485,9 @@ smoke_endpoint() {
   jq -n --arg model "${SERVED_MODEL_NAME}" --argjson toggle "${SUPPORTS_THINKING_TOGGLE}" '
     {model:$model,max_tokens:64,temperature:0,stream:false,messages:[{role:"user",content:"只输出 LLM_OK，不要输出其他内容。"}]} +
     (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${tmp}"
-  response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "文本冒烟测试请求失败"
+  if ! response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}"); then
+    smoke_fail_response text "文本冒烟测试请求失败" "${response}"
+  fi
   jq -e '.choices[0].message | type == "object"' <<<"${response}" >/dev/null 2>&1 || smoke_fail_response text "文本测试响应结构无效" "${response}"
   content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
   [[ "${content}" == *LLM_OK* ]] || smoke_fail_response text "文本语义测试失败，模型未返回 LLM_OK" "${response}"
@@ -2474,7 +2501,9 @@ smoke_endpoint() {
       jq -n --arg model "${SERVED_MODEL_NAME}" --argjson max_tokens "${reasoning_limit}" \
         '{model:$model,max_tokens:$max_tokens,temperature:0.6,top_p:0.95,top_k:20,stream:false,
           messages:[{role:"user",content:"请简短思考并计算 17×19，随后给出包含计算结果的最终答案。"}]}' >"${tmp}"
-      response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "思考测试请求失败"
+      if ! response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}"); then
+        smoke_fail_response reasoning "思考测试请求失败" "${response}"
+      fi
       jq -e '.choices[0].message | type == "object"' <<<"${response}" >/dev/null 2>&1 || smoke_fail_response reasoning "思考测试响应结构无效" "${response}"
       finish_reason=$(jq -r '.choices[0].finish_reason // ""' <<<"${response}")
       if [[ "${finish_reason}" != length ]]; then break; fi
@@ -2496,7 +2525,9 @@ smoke_endpoint() {
       reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false},
       messages:[{role:"user",content:"必须调用 get_weather 查询 Paris。"}],
       tools:[{type:"function",function:{name:"get_weather",description:"查询城市天气",parameters:{type:"object",properties:{city:{type:"string"}},required:["city"]}}}],tool_choice:"required"}' >"${tmp}"
-    response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}") || die "工具调用测试请求失败"
+    if ! response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${tmp}"); then
+      smoke_fail_response tool-calling "工具调用测试请求失败" "${response}"
+    fi
     tool=$(jq -r '.choices[0].message.tool_calls[0].function.name // ""' <<<"${response}")
     [[ "${tool}" == get_weather ]] || smoke_fail_response tool-calling "工具调用未解析为 get_weather" "${response}"
     log "OpenAI 工具调用：PASS"
@@ -2511,7 +2542,9 @@ smoke_endpoint() {
     make_ocr_fixture "${tmp_dir}"
     ocr_json=$(mktemp)
     ocr_request_file "${tmp_dir}/llm-ocr-test.png" "识别图片文字，只输出文字。" "${ocr_json}"
-    response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${ocr_json}") || die "图片输入测试请求失败"
+    if ! response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${ocr_json}"); then
+      smoke_fail_response image "图片输入测试请求失败" "${response}"
+    fi
     content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
     if (( SUPPORTS_OCR == 1 )); then
       [[ "${content}" == *7319* ]] || smoke_fail_response ocr "OCR 语义测试未识别出 7319" "${response}"
@@ -2529,7 +2562,9 @@ smoke_endpoint() {
          ([range(0;$count)|{type:"image_url",image_url:{url:$url}}] +
           [{type:"text",text:"这些图片中的编号相同。请简短回答。"}])}]} +
        (if $toggle == 1 then {reasoning_effort:"none",chat_template_kwargs:{enable_thinking:false}} else {} end)' >"${multi_images_json}"
-    response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${multi_images_json}") || die "单请求 ${probe_images} 图测试失败"
+    if ! response=$(api_post "${base_url}/v1/chat/completions" "${key}" "${multi_images_json}"); then
+      smoke_fail_response multi-images "单请求 ${probe_images} 图测试失败" "${response}"
+    fi
     content=$(jq -r '.choices[0].message.content // ""' <<<"${response}")
     [[ -n "${content}" ]] || smoke_fail_response multi-images "单请求 ${probe_images} 图返回空内容" "${response}"
     log "单请求 ${probe_images} 张图片：PASS（服务端上限 ${max_images} 张）"
@@ -2554,8 +2589,14 @@ cmd_smoke() {
   if [[ -n "${worker}" ]]; then
     csv_normalize "${worker}" >/dev/null
     worker_health "${worker}" || die "Worker ${worker} 未就绪"
+    local worker_env="${CONFIG_DIR}/workers/${worker}.env"
+    if [[ -r "${worker_env}" ]]; then
+      # shellcheck disable=SC1090
+      source "${worker_env}"
+    fi
     smoke_endpoint "http://127.0.0.1:$(worker_port "${worker}")" "${BACKEND_API_KEY}" "${full}"
   else
+    activate_default_published_deployment
     router_health || die "$(gateway_display_name) 内部 API 未就绪"
     public_router_health || die "Nginx 统一公开 API 未就绪"
     smoke_endpoint "$(public_local_base_url)" "${GATEWAY_API_KEY}" "${full}"
@@ -2564,6 +2605,7 @@ cmd_smoke() {
 
 cmd_ocr() {
   load_config
+  activate_default_published_deployment
   (( SUPPORTS_IMAGE_INPUT == 1 )) || die "当前模型 ${MODEL_ID} 不支持图片输入"
   local image_file="${1:?请提供图片文件}" prompt="${2:-请逐字识别图片中的全部文字，只输出识别结果。}" tmp response
   [[ -r "${image_file}" ]] || die "无法读取图片：${image_file}"
@@ -2579,6 +2621,7 @@ cmd_ocr() {
 
 cmd_bench() {
   load_config
+  activate_default_published_deployment
   local concurrency=25 requests=50 max_tokens=512
   while (($#)); do
     case "$1" in
@@ -2669,6 +2712,7 @@ if bad:
 
 cmd_key() {
   require_root; load_config
+  activate_default_published_deployment
   case "${1:-show}" in
     show)
       local api_host="${API_BIND}" api_origin=""
