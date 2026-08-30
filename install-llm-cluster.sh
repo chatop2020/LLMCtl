@@ -62,6 +62,14 @@ MAX_NUM_SEQS=7
 ESTIMATED_MAX_NUM_SEQS=7
 MAX_NUM_BATCHED_TOKENS=8192
 GPU_MEMORY_UTILIZATION="0.92"
+PLE_CPU_OFFLOAD=0
+ENABLE_EXPERT_PARALLEL=0
+ENABLE_PREFIX_CACHING=1
+ENABLE_FLASHINFER_AUTOTUNE=1
+DISABLE_CUSTOM_ALL_REDUCE=0
+MTP_SPECULATIVE_TOKENS=0
+KV_CACHE_DTYPE="auto"
+YARN_FACTOR=1
 MM_LIMIT='{"image":8,"video":0}'
 ROUTING_STRATEGY="least-busy"
 WORKER_BASE_PORT=8100
@@ -113,6 +121,15 @@ MAX_LEN_EXPLICIT=0
 MODEL_ROOT_EXPLICIT=0
 ACTIVE_COUNT_EXPLICIT=0
 STARTUP_PARALLELISM_EXPLICIT=0
+VLLM_IMAGE_EXPLICIT=0
+PLE_CPU_OFFLOAD_EXPLICIT=0
+EXPERT_PARALLEL_EXPLICIT=0
+PREFIX_CACHING_EXPLICIT=0
+FLASHINFER_AUTOTUNE_EXPLICIT=0
+CUSTOM_ALL_REDUCE_EXPLICIT=0
+MTP_EXPLICIT=0
+KV_CACHE_DTYPE_EXPLICIT=0
+YARN_FACTOR_EXPLICIT=0
 UI_USERNAME_EXPLICIT=0
 UI_PASSWORD_EXPLICIT=0
 INTERFACE_LANGUAGE="zh"
@@ -197,6 +214,14 @@ Common unattended options:
   --max-model-len N              Planned from native context and VRAM by default
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N     Default 8192
+  --ple-cpu-offload enabled|disabled
+  --expert-parallel enabled|disabled
+  --prefix-caching enabled|disabled
+  --flashinfer-autotune enabled|disabled
+  --disable-custom-all-reduce enabled|disabled
+  --mtp-speculative-tokens 0-8  Built-in MTP draft-token count; 0 disables it
+  --kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3|nvfp4
+  --yarn-factor 1|2|4           Static YaRN; only validated for Qwen3.8 Flash Next
   --api-bind IP                  Public Nginx bind; default 0.0.0.0
   --api-port PORT                Public Nginx port; default 8000
   --gateway-internal-port PORT   Loopback gateway port; default 18000
@@ -272,6 +297,14 @@ EOF
   --max-model-len N               默认按模型原生长度与显存规划
   --gpu-memory-utilization 0.70-0.96
   --max-num-batched-tokens N       默认 8192
+  --ple-cpu-offload enabled|disabled
+  --expert-parallel enabled|disabled
+  --prefix-caching enabled|disabled
+  --flashinfer-autotune enabled|disabled
+  --disable-custom-all-reduce enabled|disabled
+  --mtp-speculative-tokens 0-8     内置 MTP 草稿 Token 数；0 表示关闭
+  --kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3|nvfp4
+  --yarn-factor 1|2|4              静态 YaRN；当前仅核验 Qwen3.8 Flash Next
   --api-bind IP                   Nginx 公开监听地址，默认 0.0.0.0
   --api-port PORT                 Nginx 统一公开端口，默认 8000
   --gateway-internal-port PORT    接入层回环端口，默认 18000
@@ -366,6 +399,29 @@ parse_args() {
       --max-model-len) need_value "$@"; MAX_MODEL_LEN="$2"; MAX_LEN_EXPLICIT=1; shift 2 ;;
       --gpu-memory-utilization) need_value "$@"; GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
       --max-num-batched-tokens) need_value "$@"; MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
+      --ple-cpu-offload)
+        need_value "$@"; PLE_CPU_OFFLOAD_EXPLICIT=1
+        case "$2" in enabled) PLE_CPU_OFFLOAD=1 ;; disabled) PLE_CPU_OFFLOAD=0 ;; *) die "$(l10n '--ple-cpu-offload 只能是 enabled 或 disabled' '--ple-cpu-offload must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --expert-parallel)
+        need_value "$@"; EXPERT_PARALLEL_EXPLICIT=1
+        case "$2" in enabled) ENABLE_EXPERT_PARALLEL=1 ;; disabled) ENABLE_EXPERT_PARALLEL=0 ;; *) die "$(l10n '--expert-parallel 只能是 enabled 或 disabled' '--expert-parallel must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --prefix-caching)
+        need_value "$@"; PREFIX_CACHING_EXPLICIT=1
+        case "$2" in enabled) ENABLE_PREFIX_CACHING=1 ;; disabled) ENABLE_PREFIX_CACHING=0 ;; *) die "$(l10n '--prefix-caching 只能是 enabled 或 disabled' '--prefix-caching must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --flashinfer-autotune)
+        need_value "$@"; FLASHINFER_AUTOTUNE_EXPLICIT=1
+        case "$2" in enabled) ENABLE_FLASHINFER_AUTOTUNE=1 ;; disabled) ENABLE_FLASHINFER_AUTOTUNE=0 ;; *) die "$(l10n '--flashinfer-autotune 只能是 enabled 或 disabled' '--flashinfer-autotune must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --disable-custom-all-reduce)
+        need_value "$@"; CUSTOM_ALL_REDUCE_EXPLICIT=1
+        case "$2" in enabled) DISABLE_CUSTOM_ALL_REDUCE=1 ;; disabled) DISABLE_CUSTOM_ALL_REDUCE=0 ;; *) die "$(l10n '--disable-custom-all-reduce 只能是 enabled 或 disabled' '--disable-custom-all-reduce must be enabled or disabled')" ;; esac
+        shift 2 ;;
+      --mtp-speculative-tokens) need_value "$@"; MTP_SPECULATIVE_TOKENS="$2"; MTP_EXPLICIT=1; shift 2 ;;
+      --kv-cache-dtype) need_value "$@"; KV_CACHE_DTYPE="$2"; KV_CACHE_DTYPE_EXPLICIT=1; shift 2 ;;
+      --yarn-factor) need_value "$@"; YARN_FACTOR="$2"; YARN_FACTOR_EXPLICIT=1; shift 2 ;;
       --api-bind) need_value "$@"; API_BIND="$2"; shift 2 ;;
       --api-port) need_value "$@"; API_PORT="$2"; shift 2 ;;
       --gateway-internal-port) need_value "$@"; GATEWAY_INTERNAL_PORT="$2"; shift 2 ;;
@@ -401,7 +457,7 @@ parse_args() {
       --skip-download) SKIP_DOWNLOAD=1; shift ;;
       --skip-packages) SKIP_PACKAGES=1; shift ;;
       --force-reconfigure) FORCE_RECONFIGURE=1; shift ;;
-      --vllm-image) need_value "$@"; VLLM_IMAGE="$2"; shift 2 ;;
+      --vllm-image) need_value "$@"; VLLM_IMAGE="$2"; VLLM_IMAGE_EXPLICIT=1; shift 2 ;;
       --newapi-image) need_value "$@"; NEWAPI_IMAGE="$2"; shift 2 ;;
       --litellm-image) need_value "$@"; LITELLM_IMAGE="$2"; shift 2 ;;
       --bifrost-image) need_value "$@"; BIFROST_IMAGE="$2"; shift 2 ;;
@@ -780,7 +836,11 @@ search_catalog() {
 
 apply_catalog_assignments() {
   local assignments_file="${1:?}" saved_tp="${TP_SIZE}" saved_seqs="${MAX_NUM_SEQS}" saved_len="${MAX_MODEL_LEN}"
-  local saved_startup="${STARTUP_PARALLELISM}"
+  local saved_startup="${STARTUP_PARALLELISM}" saved_vllm_image="${VLLM_IMAGE}"
+  local saved_ple="${PLE_CPU_OFFLOAD}" saved_ep="${ENABLE_EXPERT_PARALLEL}"
+  local saved_prefix="${ENABLE_PREFIX_CACHING}" saved_autotune="${ENABLE_FLASHINFER_AUTOTUNE}"
+  local saved_custom_ar="${DISABLE_CUSTOM_ALL_REDUCE}" saved_mtp="${MTP_SPECULATIVE_TOKENS}"
+  local saved_kv_dtype="${KV_CACHE_DTYPE}" saved_yarn="${YARN_FACTOR}"
   # 赋值来自本机 root 所有的辅助程序，每个值在 eval 前均由 shlex.quote 转义。
   # shellcheck disable=SC1090
   eval "$(<"${assignments_file}")"
@@ -798,6 +858,15 @@ apply_catalog_assignments() {
   (( SEQS_EXPLICIT )) && MAX_NUM_SEQS="${saved_seqs}"
   (( MAX_LEN_EXPLICIT )) && MAX_MODEL_LEN="${saved_len}"
   (( STARTUP_PARALLELISM_EXPLICIT )) && STARTUP_PARALLELISM="${saved_startup}"
+  (( VLLM_IMAGE_EXPLICIT )) && VLLM_IMAGE="${saved_vllm_image}"
+  (( PLE_CPU_OFFLOAD_EXPLICIT )) && PLE_CPU_OFFLOAD="${saved_ple}"
+  (( EXPERT_PARALLEL_EXPLICIT )) && ENABLE_EXPERT_PARALLEL="${saved_ep}"
+  (( PREFIX_CACHING_EXPLICIT )) && ENABLE_PREFIX_CACHING="${saved_prefix}"
+  (( FLASHINFER_AUTOTUNE_EXPLICIT )) && ENABLE_FLASHINFER_AUTOTUNE="${saved_autotune}"
+  (( CUSTOM_ALL_REDUCE_EXPLICIT )) && DISABLE_CUSTOM_ALL_REDUCE="${saved_custom_ar}"
+  (( MTP_EXPLICIT )) && MTP_SPECULATIVE_TOKENS="${saved_mtp}"
+  (( KV_CACHE_DTYPE_EXPLICIT )) && KV_CACHE_DTYPE="${saved_kv_dtype}"
+  (( YARN_FACTOR_EXPLICIT )) && YARN_FACTOR="${saved_yarn}"
   MODEL_PLAN_APPLIED=1
 }
 
@@ -1005,11 +1074,30 @@ validate_scalar_config() {
   for capability in SUPPORTS_IMAGE_INPUT SUPPORTS_OCR SUPPORTS_TOOL_CALLING SUPPORTS_REASONING SUPPORTS_THINKING_TOGGLE TRUST_REMOTE_CODE; do
     [[ "${!capability}" =~ ^[01]$ ]] || die "$(l10n "${capability} 必须为 0 或 1" "${capability} must be 0 or 1")"
   done
+  for capability in PLE_CPU_OFFLOAD ENABLE_EXPERT_PARALLEL ENABLE_PREFIX_CACHING ENABLE_FLASHINFER_AUTOTUNE DISABLE_CUSTOM_ALL_REDUCE; do
+    [[ "${!capability}" =~ ^[01]$ ]] || die "$(l10n "${capability} 必须为 0 或 1" "${capability} must be 0 or 1")"
+  done
   [[ "${TP_SIZE}" =~ ^(1|2|4|8)$ ]] || die "$(l10n 'TP_SIZE 只能是 1、2、4 或 8' 'TP_SIZE must be 1, 2, 4, or 8')"
   [[ "${MAX_NUM_SEQS}" =~ ^[0-9]+$ ]] && (( MAX_NUM_SEQS >= 1 && MAX_NUM_SEQS <= 16 )) || die "$(l10n 'max-num-seqs 范围 1-16' 'max-num-seqs must be between 1 and 16')"
   [[ "${ESTIMATED_MAX_NUM_SEQS}" =~ ^[0-9]+$ ]] && (( ESTIMATED_MAX_NUM_SEQS >= 1 && ESTIMATED_MAX_NUM_SEQS <= 16 )) || die "$(l10n '目录返回的序列容量估算无效' 'The catalog returned an invalid sequence-capacity estimate')"
   (( MAX_NUM_SEQS <= ESTIMATED_MAX_NUM_SEQS )) || die "$(l10n "max-num-seqs=${MAX_NUM_SEQS} 超过当前模型/显存估算上限 ${ESTIMATED_MAX_NUM_SEQS}" "max-num-seqs=${MAX_NUM_SEQS} exceeds the model/VRAM estimate of ${ESTIMATED_MAX_NUM_SEQS}")"
-  [[ "${MAX_MODEL_LEN}" =~ ^[0-9]+$ ]] && (( MAX_MODEL_LEN >= 8192 && MAX_MODEL_LEN <= 262144 )) || die "$(l10n 'max-model-len 范围 8192-262144' 'max-model-len must be between 8192 and 262144')"
+  [[ "${MAX_MODEL_LEN}" =~ ^[0-9]+$ ]] && (( MAX_MODEL_LEN >= 8192 && MAX_MODEL_LEN <= 1048576 )) || die "$(l10n 'max-model-len 范围 8192-1048576' 'max-model-len must be between 8192 and 1048576')"
+  [[ "${MTP_SPECULATIVE_TOKENS}" =~ ^[0-8]$ ]] || die "$(l10n 'mtp-speculative-tokens 范围 0-8' 'mtp-speculative-tokens must be between 0 and 8')"
+  [[ "${KV_CACHE_DTYPE}" =~ ^(auto|bfloat16|fp8|fp8_e4m3|nvfp4)$ ]] || die "$(l10n 'kv-cache-dtype 无效' 'Invalid kv-cache-dtype')"
+  [[ "${YARN_FACTOR}" =~ ^(1|1\.0|2|2\.0|4|4\.0)$ ]] || die "$(l10n 'yarn-factor 只能是 1、2 或 4' 'yarn-factor must be 1, 2, or 4')"
+  if [[ "${MODEL_ARCHITECTURE}" == Qwen4ExpForConditionalGeneration ]]; then
+    (( TP_SIZE >= 2 )) || die "$(l10n 'Qwen3.8 Flash Next 至少需要 TP2' 'Qwen3.8 Flash Next requires at least TP2')"
+    (( PLE_CPU_OFFLOAD == 1 )) || die "$(l10n 'Qwen3.8 Flash Next 必须启用 PLE CPU offload' 'Qwen3.8 Flash Next requires PLE CPU offload')"
+    if (( MAX_MODEL_LEN <= 262144 )); then
+      [[ "${YARN_FACTOR}" == 1 || "${YARN_FACTOR}" == 1.0 ]] || die "$(l10n '原生 262K 范围不应启用 YaRN' 'YaRN must stay disabled within the native 262K range')"
+    else
+      awk -v len="${MAX_MODEL_LEN}" -v factor="${YARN_FACTOR}" 'BEGIN{exit !(factor==2 || factor==4) || !(len<=262144*factor)}' || \
+        die "$(l10n '超长上下文与 YaRN 比例不匹配' 'The long-context limit does not match the YaRN factor')"
+    fi
+  else
+    (( MAX_MODEL_LEN <= 262144 )) || die "$(l10n '当前模型尚未核验超过 262K 的上下文' 'This model is not validated beyond 262K context')"
+    [[ "${YARN_FACTOR}" == 1 || "${YARN_FACTOR}" == 1.0 ]] || die "$(l10n 'YaRN 当前仅支持 Qwen3.8 Flash Next' 'YaRN is currently supported only for Qwen3.8 Flash Next')"
+  fi
   [[ "${MAX_OUTPUT_TOKENS}" =~ ^[0-9]+$ ]] && (( MAX_OUTPUT_TOKENS >= 1 && MAX_OUTPUT_TOKENS <= 32768 )) || die "$(l10n 'max-output-tokens 范围 1-32768' 'max-output-tokens must be between 1 and 32768')"
   [[ "${MAX_NUM_BATCHED_TOKENS}" =~ ^[0-9]+$ ]] && (( MAX_NUM_BATCHED_TOKENS >= 1024 && MAX_NUM_BATCHED_TOKENS <= 65536 )) || die "$(l10n 'max-num-batched-tokens 范围 1024-65536' 'max-num-batched-tokens must be between 1024 and 65536')"
   if (( STARTUP_PARALLELISM_EXPLICIT )); then
@@ -1409,6 +1497,21 @@ print(arch)
     die "$(l10n "固定镜像 ${VLLM_IMAGE} 不支持 ${MODEL_ARCHITECTURE}；已在下载大权重前停止" "Pinned image ${VLLM_IMAGE} does not support ${MODEL_ARCHITECTURE}; stopped before downloading large weights")"
 }
 
+verify_qwen38_qsa_kv_in_image() {
+  [[ "${MODEL_ARCHITECTURE}" == Qwen4ExpForConditionalGeneration ]] || return 0
+  [[ "${KV_CACHE_DTYPE}" != auto && "${KV_CACHE_DTYPE}" != bfloat16 ]] || return 0
+  log "$(l10n "核验 Qwen3.8 QSA KV Cache 精度：${KV_CACHE_DTYPE}" "Verifying Qwen3.8 QSA KV-cache dtype: ${KV_CACHE_DTYPE}")"
+  docker run --rm --entrypoint python3 "${VLLM_IMAGE}" -c '
+import sys
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend as Backend
+dtype = sys.argv[1]
+supported = set(Backend.supported_kv_cache_dtypes)
+if dtype not in supported:
+    raise SystemExit(f"QSA KV dtype {dtype} is unsupported: {sorted(supported)}")
+' "${KV_CACHE_DTYPE}" >/dev/null || \
+    die "$(l10n "镜像 ${VLLM_IMAGE} 未声明支持 Qwen3.8 QSA ${KV_CACHE_DTYPE} KV Cache；已在下载权重前停止" "Image ${VLLM_IMAGE} does not declare Qwen3.8 QSA ${KV_CACHE_DTYPE} KV-cache support; stopped before downloading weights")"
+}
+
 ensure_modelscope_downloader() {
   local venv="/opt/llm-cluster/hub-venv" package_ok=0
   MODELSCOPE_DOWNLOADER="${venv}/bin/ms"
@@ -1603,6 +1706,14 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS}
 ESTIMATED_MAX_NUM_SEQS=${ESTIMATED_MAX_NUM_SEQS}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
+PLE_CPU_OFFLOAD=${PLE_CPU_OFFLOAD}
+ENABLE_EXPERT_PARALLEL=${ENABLE_EXPERT_PARALLEL}
+ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}
+ENABLE_FLASHINFER_AUTOTUNE=${ENABLE_FLASHINFER_AUTOTUNE}
+DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE}
+MTP_SPECULATIVE_TOKENS=${MTP_SPECULATIVE_TOKENS}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE}
+YARN_FACTOR=${YARN_FACTOR}
 MM_LIMIT='${MM_LIMIT}'
 ROUTING_STRATEGY=${ROUTING_STRATEGY}
 START_TIMEOUT=${START_TIMEOUT}
@@ -2184,6 +2295,7 @@ EOF
   pull_images
   verify_gpu_in_container
   verify_model_architecture_in_image
+  verify_qwen38_qsa_kv_in_image
   download_model
 
   # 推理运行时不得继承国际代理；保存的代理仅供明确的 llmctl 维护操作读取。

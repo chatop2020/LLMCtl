@@ -1,5 +1,7 @@
 # LLMCtl：通用 vLLM 多 GPU 集群部署器
 
+Qwen3.8 Flash Next NVFP4 在 8×RTX PRO 6000D 上的推荐拓扑、验收和回退步骤见 [QWEN38_FLASH_NEXT.md](QWEN38_FLASH_NEXT.md)。
+
 **语言：** 中文 | [English](README_EN.md)
 
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)

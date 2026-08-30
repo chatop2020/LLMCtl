@@ -497,6 +497,14 @@ def runtime_from_environment(values: dict[str, str]) -> dict[str, Any]:
         "gpu_memory_utilization": bounded_float(values.get("GPU_MEMORY_UTILIZATION", "0.9"), "GPU_MEMORY_UTILIZATION", 0.1, 1.0),
         "max_num_seqs": bounded_int(values.get("MAX_NUM_SEQS", "1"), "MAX_NUM_SEQS", 1, 65536),
         "max_num_batched_tokens": bounded_int(values.get("MAX_NUM_BATCHED_TOKENS", "8192"), "MAX_NUM_BATCHED_TOKENS", 256, 10_000_000),
+        "ple_cpu_offload": values.get("PLE_CPU_OFFLOAD", "0") == "1",
+        "enable_expert_parallel": values.get("ENABLE_EXPERT_PARALLEL", "0") == "1",
+        "enable_prefix_caching": values.get("ENABLE_PREFIX_CACHING", "1") == "1",
+        "enable_flashinfer_autotune": values.get("ENABLE_FLASHINFER_AUTOTUNE", "1") == "1",
+        "disable_custom_all_reduce": values.get("DISABLE_CUSTOM_ALL_REDUCE", "0") == "1",
+        "mtp_speculative_tokens": bounded_int(values.get("MTP_SPECULATIVE_TOKENS", "0"), "MTP 草稿 Token", 0, 8),
+        "kv_cache_dtype": values.get("KV_CACHE_DTYPE", "auto"),
+        "yarn_factor": bounded_float(values.get("YARN_FACTOR", "1"), "YaRN 比例", 1.0, 4.0),
         "trust_remote_code": values.get("TRUST_REMOTE_CODE", "0") == "1",
         "supports_image_input": values.get("SUPPORTS_IMAGE_INPUT", "0") == "1",
         "supports_ocr": values.get("SUPPORTS_OCR", "0") == "1",
@@ -519,10 +527,60 @@ def validate_runtime(runtime: dict[str, Any]) -> None:
     bounded_float(runtime.get("gpu_memory_utilization"), "显存利用率", 0.1, 1.0)
     bounded_int(runtime.get("max_num_seqs"), "最大并发序列", 1, 65536)
     bounded_int(runtime.get("max_num_batched_tokens"), "批处理 Token", 256, 10_000_000)
+    bounded_int(runtime.get("mtp_speculative_tokens", 0), "MTP 草稿 Token", 0, 8)
+    yarn_factor = bounded_float(runtime.get("yarn_factor", 1), "YaRN 比例", 1.0, 4.0)
+    if yarn_factor not in {1.0, 2.0, 4.0}:
+        raise ValueError("YaRN 比例只能是 1、2 或 4")
+    if str(runtime.get("kv_cache_dtype", "auto")) not in {
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "nvfp4",
+    }:
+        raise ValueError("KV Cache 精度只能是 auto、bfloat16、fp8、fp8_e4m3 或 nvfp4")
+    for name in (
+        "ple_cpu_offload",
+        "enable_expert_parallel",
+        "enable_prefix_caching",
+        "enable_flashinfer_autotune",
+        "disable_custom_all_reduce",
+    ):
+        if not isinstance(runtime.get(name, False), bool):
+            raise ValueError(f"{name} 必须是布尔值")
     for name in ("tool_call_parser", "reasoning_parser"):
         value = str(runtime.get(name, ""))
         if len(value) > 100 or any(character.isspace() for character in value):
             raise ValueError(f"{name} 非法")
+
+
+def is_qwen38_flash_next(model_id: str) -> bool:
+    """判断模型 ID 是否属于 Qwen3.8 Flash Next 系列。"""
+
+    normalized = re.sub(r"[^a-z0-9]+", "", str(model_id).lower())
+    return "qwen38flashnext" in normalized
+
+
+def validate_model_runtime(model_id: str, runtime: dict[str, Any]) -> None:
+    """校验模型身份与运行参数之间不能由通用字段表达的约束。"""
+
+    yarn_factor = float(runtime.get("yarn_factor", 1))
+    max_model_len = int(runtime.get("max_model_len", 32768))
+    if not is_qwen38_flash_next(model_id):
+        if yarn_factor != 1.0:
+            raise ValueError("当前仅为 Qwen3.8 Flash Next 提供受校验的 YaRN 配置")
+        return
+    if int(runtime.get("tensor_parallel_size", 1)) < 2:
+        raise ValueError("Qwen3.8 Flash Next 预览运行时至少需要 TP2")
+    if not runtime.get("ple_cpu_offload", False):
+        raise ValueError("Qwen3.8 Flash Next 必须启用 PLE CPU offload")
+    if max_model_len <= 262_144 and yarn_factor != 1.0:
+        raise ValueError("原生 262K 范围不应启用 YaRN")
+    if max_model_len > 262_144:
+        if yarn_factor not in {2.0, 4.0}:
+            raise ValueError("超过 262K 必须选择静态 YaRN 2× 或 4×")
+        if max_model_len > int(262_144 * yarn_factor):
+            raise ValueError("最大上下文超过当前 YaRN 比例可覆盖的范围")
 
 
 def validate_registry(payload: dict[str, Any], paths: Paths) -> None:
@@ -586,6 +644,7 @@ def validate_registry(payload: dict[str, Any], paths: Paths) -> None:
                     raise ValueError(f"公开模型 ID {public_id} 同时属于多个部署")
                 used_public_ids[str(public_id)] = str(deployment_id)
         validate_runtime(deployment.get("runtime", {}))
+        validate_model_runtime(str(deployment.get("model_id", "")), deployment["runtime"])
         instances = deployment.get("instances")
         if not isinstance(instances, list) or not instances:
             raise ValueError(f"部署至少需要一个实例：{deployment_id}")
@@ -1262,6 +1321,9 @@ class DeploymentManager:
             request = job["request"]
             self._update_job(job, "preflight", 5, "检查硬件、端口和当前部署")
             artifact = request["artifact"]
+            self._verify_runtime_image(
+                artifact["model_id"], request["deployment"]["runtime"]
+            )
             if not pathlib.Path(artifact["path"]).is_dir():
                 self._update_job(job, "downloading", 15, "下载模型权重；支持复用已完成目录")
                 self._download_artifact(artifact, request["deployment"]["runtime"], job)
@@ -1355,6 +1417,54 @@ class DeploymentManager:
             if acquired:
                 self._mutation_lock.release()
             self._threads.pop(job_id, None)
+
+    def _verify_runtime_image(
+        self, model_id: str, runtime: dict[str, Any]
+    ) -> None:
+        """在下载大权重前核验 Qwen3.8 架构和 QSA KV 精度能力。
+
+        参数：
+            model_id: 将由该镜像加载的模型 ID。
+            runtime: 已通过注册表字段校验的 vLLM 运行参数。
+
+        异常：
+            RuntimeError: 镜像缺少模型架构或所选 QSA KV 精度。
+        """
+
+        if not is_qwen38_flash_next(model_id):
+            return
+        script = """
+import sys
+from vllm.model_executor.models import ModelRegistry
+
+architecture = "Qwen4ExpForConditionalGeneration"
+if architecture not in set(ModelRegistry.get_supported_archs()):
+    raise SystemExit(f"镜像未注册架构：{architecture}")
+
+cache_dtype = sys.argv[1]
+if cache_dtype not in {"auto", "bfloat16"}:
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
+
+    supported = set(Qwen4ExpQSAFlashAttentionBackend.supported_kv_cache_dtypes)
+    if cache_dtype not in supported:
+        raise SystemExit(
+            f"QSA KV Cache 不支持 {cache_dtype}；镜像声明值：{sorted(supported)}"
+        )
+"""
+        self.runner.run(
+            [
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "python3",
+                str(runtime["image"]),
+                "-c",
+                script,
+                str(runtime.get("kv_cache_dtype", "auto")),
+            ],
+            timeout=30 * 60,
+        )
 
     def _run_rollback_job(self, job_id: str) -> None:
         """执行显式回滚，并在回滚失败时恢复回滚前的安全快照。"""
@@ -1922,6 +2032,14 @@ def normalize_request(request: dict[str, Any], paths: Paths) -> dict[str, Any]:
         "gpu_memory_utilization": bounded_float(request.get("gpu_memory_utilization", 0.9), "显存利用率", 0.1, 1.0),
         "max_num_seqs": bounded_int(request.get("max_num_seqs", 1), "最大并发序列", 1, 65536),
         "max_num_batched_tokens": bounded_int(request.get("max_num_batched_tokens", 8192), "批处理 Token", 256, 10_000_000),
+        "ple_cpu_offload": bool(request.get("ple_cpu_offload", False)),
+        "enable_expert_parallel": bool(request.get("enable_expert_parallel", False)),
+        "enable_prefix_caching": bool(request.get("enable_prefix_caching", True)),
+        "enable_flashinfer_autotune": bool(request.get("enable_flashinfer_autotune", True)),
+        "disable_custom_all_reduce": bool(request.get("disable_custom_all_reduce", False)),
+        "mtp_speculative_tokens": bounded_int(request.get("mtp_speculative_tokens", 0), "MTP 草稿 Token", 0, 8),
+        "kv_cache_dtype": str(request.get("kv_cache_dtype", "auto")),
+        "yarn_factor": bounded_float(request.get("yarn_factor", 1), "YaRN 比例", 1.0, 4.0),
         "trust_remote_code": bool(request.get("trust_remote_code", False)),
         "supports_image_input": bool(request.get("supports_image_input", False)),
         "supports_ocr": bool(request.get("supports_ocr", False)),
@@ -1933,6 +2051,7 @@ def normalize_request(request: dict[str, Any], paths: Paths) -> dict[str, Any]:
         "mm_limit": str(request.get("mm_limit", '{"image":4}')),
     }
     validate_runtime(runtime)
+    validate_model_runtime(model_id, runtime)
     if any(item["kind"] == "local" and len(item["gpu_devices"]) != runtime["tensor_parallel_size"] for item in instances):
         raise ValueError("每个本机实例的 GPU 数必须等于 TP_SIZE")
     stamp = utc_now()
@@ -2100,6 +2219,20 @@ def plan_warnings(
         warnings.append("需要下载模型权重；下载目录保留为可断点续传的 partial 目录")
     if current.get("migrated_from_legacy"):
         warnings.append("当前环境来自单模型配置；首次提交会进入多模型注册表管理")
+    deployment = request["deployment"]
+    runtime = deployment["runtime"]
+    if is_qwen38_flash_next(deployment["model_id"]):
+        warnings.append(
+            "Qwen3.8 Flash Next 使用专用预览镜像；建议先部署一个 TP2 金丝雀，真实生成通过后再扩到全部同构实例"
+        )
+        if int(runtime.get("mtp_speculative_tokens", 0)):
+            warnings.append("MTP 会增加 GDN 状态显存；必须与关闭 MTP 的同一业务负载做验收对比")
+        if runtime.get("enable_prefix_caching", True):
+            warnings.append("当前预览分支存在混合 GDN/QSA 前缀缓存稳定性报告；正式修复前不建议启用")
+        if str(runtime.get("kv_cache_dtype", "auto")) == "nvfp4":
+            warnings.append("NVFP4 QSA KV 属于镜像能力门禁；目标镜像未声明支持时会在下载权重前停止")
+        if float(runtime.get("yarn_factor", 1)) > 1:
+            warnings.append("Static YaRN 会同时作用于短请求；同一部署全部实例必须使用一致比例并重新做短上下文质量验收")
     return warnings
 
 
@@ -2138,6 +2271,14 @@ def worker_environment(
         "GPU_MEMORY_UTILIZATION": runtime["gpu_memory_utilization"],
         "MAX_NUM_SEQS": runtime["max_num_seqs"],
         "MAX_NUM_BATCHED_TOKENS": runtime["max_num_batched_tokens"],
+        "PLE_CPU_OFFLOAD": int(runtime.get("ple_cpu_offload", False)),
+        "ENABLE_EXPERT_PARALLEL": int(runtime.get("enable_expert_parallel", False)),
+        "ENABLE_PREFIX_CACHING": int(runtime.get("enable_prefix_caching", True)),
+        "ENABLE_FLASHINFER_AUTOTUNE": int(runtime.get("enable_flashinfer_autotune", True)),
+        "DISABLE_CUSTOM_ALL_REDUCE": int(runtime.get("disable_custom_all_reduce", False)),
+        "MTP_SPECULATIVE_TOKENS": int(runtime.get("mtp_speculative_tokens", 0)),
+        "KV_CACHE_DTYPE": runtime.get("kv_cache_dtype", "auto"),
+        "YARN_FACTOR": runtime.get("yarn_factor", 1),
         "TRUST_REMOTE_CODE": int(runtime["trust_remote_code"]),
         "SUPPORTS_IMAGE_INPUT": int(runtime["supports_image_input"]),
         "SUPPORTS_OCR": int(runtime["supports_ocr"]),

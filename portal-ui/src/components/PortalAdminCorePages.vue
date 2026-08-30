@@ -798,6 +798,7 @@ export default {
                     <div class="section-title-row">
                       <div><h2>1. 模型来源</h2><p>可以下载新权重、复用本机目录或接入远程推理实例。</p></div>
                       <div class="segmented-control">
+                        <button type="button" @click="applyQwen38FlashNextPreset">Qwen3.8 NVFP4 预设</button>
                         <button type="button" :class="{ active: modelDeploymentMode === 'local' }" @click="modelDeploymentMode = 'local'">本机 GPU</button>
                         <button type="button" :class="{ active: modelDeploymentMode === 'remote' }" @click="modelDeploymentMode = 'remote'">远程实例</button>
                       </div>
@@ -894,6 +895,23 @@ export default {
                       <label>显存利用率<input v-model.number="modelDeploymentForm.gpu_memory_utilization" type="number" min="0.1" max="0.99" step="0.01" /></label>
                       <label>最大并发序列<input v-model.number="modelDeploymentForm.max_num_seqs" type="number" min="1" /></label>
                       <label>批处理 Token 上限<input v-model.number="modelDeploymentForm.max_num_batched_tokens" type="number" min="256" /></label>
+                      <label>MTP 草稿 Token<input v-model.number="modelDeploymentForm.mtp_speculative_tokens" type="number" min="0" max="8" /></label>
+                      <label>KV Cache 精度
+                        <select v-model="modelDeploymentForm.kv_cache_dtype">
+                          <option value="auto">auto / BF16</option>
+                          <option value="bfloat16">bfloat16</option>
+                          <option value="fp8">fp8</option>
+                          <option value="fp8_e4m3">fp8_e4m3</option>
+                          <option value="nvfp4">nvfp4（需镜像能力）</option>
+                        </select>
+                      </label>
+                      <label>Static YaRN
+                        <select v-model.number="modelDeploymentForm.yarn_factor">
+                          <option :value="1">关闭（原生上下文）</option>
+                          <option :value="2">2×</option>
+                          <option :value="4">4×</option>
+                        </select>
+                      </label>
                       <label>工具解析器<input v-model.trim="modelDeploymentForm.tool_call_parser" placeholder="可留空" /></label>
                       <label>思考解析器<input v-model.trim="modelDeploymentForm.reasoning_parser" placeholder="可留空" /></label>
                       <label>多模态限制<input v-model.trim="modelDeploymentForm.mm_limit" placeholder='{"image":4}' /></label>
@@ -905,7 +923,13 @@ export default {
                       <label><input v-model="modelDeploymentForm.supports_tool_calling" type="checkbox" />工具调用</label>
                       <label><input v-model="modelDeploymentForm.supports_reasoning" type="checkbox" />思考</label>
                       <label><input v-model="modelDeploymentForm.supports_thinking_toggle" type="checkbox" />可关闭思考</label>
+                      <label><input v-model="modelDeploymentForm.ple_cpu_offload" type="checkbox" />PLE 放入主内存</label>
+                      <label><input v-model="modelDeploymentForm.enable_expert_parallel" type="checkbox" />专家并行（EP）</label>
+                      <label><input v-model="modelDeploymentForm.enable_prefix_caching" type="checkbox" />前缀缓存</label>
+                      <label><input v-model="modelDeploymentForm.enable_flashinfer_autotune" type="checkbox" />FlashInfer 自动调优</label>
+                      <label><input v-model="modelDeploymentForm.disable_custom_all_reduce" type="checkbox" />关闭 vLLM 自定义 AllReduce</label>
                     </div>
+                    <p class="deployment-gateway-note">Qwen3.8 当前建议：PLE+EP 开启，KV=auto/BF16，YaRN=1，MTP=0，前缀缓存关闭。MTP2 只在无 MTP 基线通过后 A/B；NVFP4 QSA KV 会先检查镜像能力。</p>
                   </details>
 
                   <section class="panel deployment-submit-panel">

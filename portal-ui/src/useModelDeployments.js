@@ -58,6 +58,14 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     gpu_memory_utilization: 0.9,
     max_num_seqs: 4,
     max_num_batched_tokens: 8192,
+    ple_cpu_offload: false,
+    enable_expert_parallel: false,
+    enable_prefix_caching: true,
+    enable_flashinfer_autotune: true,
+    disable_custom_all_reduce: false,
+    mtp_speculative_tokens: 0,
+    kv_cache_dtype: "auto",
+    yarn_factor: 1,
     trust_remote_code: false,
     supports_image_input: false,
     supports_ocr: false,
@@ -310,6 +318,14 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       gpu_memory_utilization: Number(runtime.gpu_memory_utilization || 0.9),
       max_num_seqs: Number(runtime.max_num_seqs || 4),
       max_num_batched_tokens: Number(runtime.max_num_batched_tokens || 8192),
+      ple_cpu_offload: Boolean(runtime.ple_cpu_offload),
+      enable_expert_parallel: Boolean(runtime.enable_expert_parallel),
+      enable_prefix_caching: runtime.enable_prefix_caching !== false,
+      enable_flashinfer_autotune: runtime.enable_flashinfer_autotune !== false,
+      disable_custom_all_reduce: Boolean(runtime.disable_custom_all_reduce),
+      mtp_speculative_tokens: Number(runtime.mtp_speculative_tokens || 0),
+      kv_cache_dtype: runtime.kv_cache_dtype || "auto",
+      yarn_factor: Number(runtime.yarn_factor || 1),
       trust_remote_code: Boolean(runtime.trust_remote_code),
       supports_image_input: Boolean(runtime.supports_image_input),
       supports_ocr: Boolean(runtime.supports_ocr),
@@ -340,6 +356,46 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
         ? "已载入旧版 Ornith 部署；建议先完成 Qwen 对后半组 GPU 的接管，再把这里改为前半组"
         : `已载入 ${deployment.display_name || deployment.id}，修改后请重新生成部署计划`,
     );
+  }
+
+  /**
+   * 应用已核对 revision 的 Qwen3.8 Flash Next NVFP4 原生 262K 预设。
+   * GPU 选择保持不变，管理员仍需按本机拓扑确认四个 TP2 分组。
+   */
+  function applyQwen38FlashNextPreset() {
+    Object.assign(modelDeploymentForm, {
+      deployment_id: "qwen38-flash-next",
+      hub: "huggingface",
+      model_id: "Inferact/Qwen3.8-Flash-Next-NVFP4",
+      revision: "103a7608316173ca6edd49929544244de7ffda70",
+      public_model_id: "qwen3.8-flash-next",
+      served_model_name: "qwen3.8-flash-next",
+      display_name: "Qwen3.8 Flash Next NVFP4",
+      image: "vllm/vllm-openai:qwen38-flash-next",
+      tensor_parallel_size: 2,
+      max_model_len: 262144,
+      gpu_memory_utilization: 0.92,
+      max_num_seqs: 8,
+      max_num_batched_tokens: 8192,
+      ple_cpu_offload: true,
+      enable_expert_parallel: true,
+      enable_prefix_caching: false,
+      enable_flashinfer_autotune: false,
+      disable_custom_all_reduce: false,
+      mtp_speculative_tokens: 0,
+      kv_cache_dtype: "auto",
+      yarn_factor: 1,
+      trust_remote_code: false,
+      supports_image_input: true,
+      supports_ocr: false,
+      supports_tool_calling: true,
+      supports_reasoning: true,
+      supports_thinking_toggle: true,
+      tool_call_parser: "qwen3_xml",
+      reasoning_parser: "qwen3",
+      mm_limit: '{"image":4,"video":0}',
+    });
+    notify("已应用 Qwen3.8 NVFP4 原生 262K 预设；请按 nvidia-smi topo -m 核对 TP2 配对");
   }
 
   function setDeploymentGpuSelection(mode) {
@@ -439,6 +495,14 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       gpu_memory_utilization: Number(modelDeploymentForm.gpu_memory_utilization),
       max_num_seqs: Number(modelDeploymentForm.max_num_seqs),
       max_num_batched_tokens: Number(modelDeploymentForm.max_num_batched_tokens),
+      ple_cpu_offload: Boolean(modelDeploymentForm.ple_cpu_offload),
+      enable_expert_parallel: Boolean(modelDeploymentForm.enable_expert_parallel),
+      enable_prefix_caching: Boolean(modelDeploymentForm.enable_prefix_caching),
+      enable_flashinfer_autotune: Boolean(modelDeploymentForm.enable_flashinfer_autotune),
+      disable_custom_all_reduce: Boolean(modelDeploymentForm.disable_custom_all_reduce),
+      mtp_speculative_tokens: Number(modelDeploymentForm.mtp_speculative_tokens),
+      kv_cache_dtype: String(modelDeploymentForm.kv_cache_dtype || "auto"),
+      yarn_factor: Number(modelDeploymentForm.yarn_factor),
       trust_remote_code: Boolean(modelDeploymentForm.trust_remote_code),
       supports_image_input: Boolean(modelDeploymentForm.supports_image_input),
       supports_ocr: Boolean(modelDeploymentForm.supports_ocr),
@@ -799,6 +863,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     submitModelDeployment,
     cancelModelDeployment,
     rollbackModelDeployment,
+    applyQwen38FlashNextPreset,
     retryModelDeploymentPublish,
     deploymentJobStateLabel,
     modelDownloadProxyPayload,

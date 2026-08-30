@@ -210,6 +210,75 @@ class ModelDeploymentTests(unittest.TestCase):
         )
         self.assertTrue(second_candidate["deployments"]["qwen"]["enabled"])
 
+    def test_qwen38_runtime_is_model_scoped_and_restorable(self):
+        """Qwen 专属参数必须进入 Worker 私有环境，不能污染 Ornith 全局值。"""
+
+        artifact_path = self.models / "qwen38"
+        artifact_path.mkdir()
+        request = self.request(
+            deployment_id="qwen38",
+            public_id="qwen3.8-flash-next",
+            model_id="Inferact/Qwen3.8-Flash-Next-NVFP4",
+            artifact_path=artifact_path,
+            gpu_ids=[0, 1],
+        )
+        request.update(
+            {
+                "image": "vllm/vllm-openai:qwen38-flash-next",
+                "tensor_parallel_size": 2,
+                "max_model_len": 262144,
+                "max_num_seqs": 8,
+                "ple_cpu_offload": True,
+                "enable_expert_parallel": True,
+                "enable_prefix_caching": False,
+                "enable_flashinfer_autotune": False,
+                "mtp_speculative_tokens": 0,
+                "kv_cache_dtype": "auto",
+                "yarn_factor": 1,
+                "instances": [
+                    {
+                        "kind": "local",
+                        "worker_id": 0,
+                        "gpu_devices": [0, 1],
+                        "port": 8100,
+                        "enabled": True,
+                    }
+                ],
+            }
+        )
+        normalized = MODEL.normalize_request(request, self.paths)
+        deployment = normalized["deployment"]
+        environment = MODEL.worker_environment(
+            deployment, deployment["instances"][0], normalized["artifact"]
+        )
+        self.assertEqual(environment["TP_SIZE"], 2)
+        self.assertEqual(environment["PLE_CPU_OFFLOAD"], 1)
+        self.assertEqual(environment["ENABLE_EXPERT_PARALLEL"], 1)
+        self.assertEqual(environment["ENABLE_PREFIX_CACHING"], 0)
+        self.assertEqual(environment["KV_CACHE_DTYPE"], "auto")
+        self.assertEqual(environment["YARN_FACTOR"], 1.0)
+
+        request["tensor_parallel_size"] = 1
+        request["instances"][0]["gpu_devices"] = [0]
+        with self.assertRaisesRegex(ValueError, "至少需要 TP2"):
+            MODEL.normalize_request(request, self.paths)
+
+    def test_qwen38_nvfp4_qsa_kv_is_gated_by_runtime_image(self):
+        """实验 KV 精度必须在下载权重前读取镜像实际支持列表。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        manager._verify_runtime_image(
+            "Inferact/Qwen3.8-Flash-Next-NVFP4",
+            {
+                "image": "vllm/vllm-openai:qwen38-flash-next",
+                "kv_cache_dtype": "nvfp4",
+            },
+        )
+        command = runner.run.call_args.args[0]
+        self.assertIn("Qwen4ExpForConditionalGeneration", command[-2])
+        self.assertEqual(command[-1], "nvfp4")
+
     def test_local_artifact_must_stay_under_model_root(self):
         manager = MODEL.DeploymentManager(self.paths)
         request = self.request(

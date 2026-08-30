@@ -265,4 +265,38 @@ describe("模型版本升级组合逻辑", () => {
       "working",
     );
   });
+
+  it("Qwen3.8 预设生成四个同构 TP2 原生 262K 实例", async () => {
+    const notify = vi.fn();
+    const state = useModelDeployments({
+      api: vi.fn(),
+      isAdmin: ref(true),
+      session: ref({ authenticated: true }),
+      notify,
+    });
+    state.modelDeploymentForm.selected_gpu_ids = [0, 1, 2, 3, 4, 5, 6, 7];
+    state.applyQwen38FlashNextPreset();
+    const payload = state.modelDeploymentPayload();
+
+    expect(payload.model_id).toBe("Inferact/Qwen3.8-Flash-Next-NVFP4");
+    expect(payload.revision).toBe("103a7608316173ca6edd49929544244de7ffda70");
+    expect(payload.image).toBe("vllm/vllm-openai:qwen38-flash-next");
+    expect(payload.tensor_parallel_size).toBe(2);
+    expect(payload.instances).toHaveLength(4);
+    expect(payload.instances.map((item) => item.gpu_devices)).toEqual([
+      [0, 1],
+      [2, 3],
+      [4, 5],
+      [6, 7],
+    ]);
+    expect(payload.max_model_len).toBe(262144);
+    expect(payload.max_num_seqs).toBe(8);
+    expect(payload.ple_cpu_offload).toBe(true);
+    expect(payload.enable_expert_parallel).toBe(true);
+    expect(payload.enable_prefix_caching).toBe(false);
+    expect(payload.mtp_speculative_tokens).toBe(0);
+    expect(payload.kv_cache_dtype).toBe("auto");
+    expect(payload.yarn_factor).toBe(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("TP2 配对"));
+  });
 });

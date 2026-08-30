@@ -120,6 +120,14 @@ load_config() {
   # 服务端安全上限；客户端仍可为普通请求选择更小的 max_tokens。
   MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-${MAX_OUTPUT_TOKENS_CEILING}}"
   ESTIMATED_MAX_NUM_SEQS="${ESTIMATED_MAX_NUM_SEQS:-${MAX_NUM_SEQS:-7}}"
+  PLE_CPU_OFFLOAD="${PLE_CPU_OFFLOAD:-0}"
+  ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}"
+  ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
+  ENABLE_FLASHINFER_AUTOTUNE="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
+  DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-0}"
+  MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-0}"
+  KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+  YARN_FACTOR="${YARN_FACTOR:-1}"
   TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
   REASONING_PARSER="${REASONING_PARSER:-qwen3}"
   SUPPORTS_IMAGE_INPUT="${SUPPORTS_IMAGE_INPUT:-1}"
@@ -218,6 +226,13 @@ load_config() {
   [[ "${WORKFLOW_ENABLED}" == 0 || "${WORKFLOW_ENABLED}" == 1 ]] || die "WORKFLOW_ENABLED 必须是 0 或 1"
   [[ "${MAX_OUTPUT_TOKENS}" =~ ^[0-9]+$ ]] && (( MAX_OUTPUT_TOKENS >= 1 && MAX_OUTPUT_TOKENS <= MAX_OUTPUT_TOKENS_CEILING )) || \
     die "MAX_OUTPUT_TOKENS 范围 1-${MAX_OUTPUT_TOKENS_CEILING}"
+  local runtime_switch
+  for runtime_switch in PLE_CPU_OFFLOAD ENABLE_EXPERT_PARALLEL ENABLE_PREFIX_CACHING ENABLE_FLASHINFER_AUTOTUNE DISABLE_CUSTOM_ALL_REDUCE; do
+    [[ "${!runtime_switch}" == 0 || "${!runtime_switch}" == 1 ]] || die "${runtime_switch} 必须是 0 或 1"
+  done
+  [[ "${MTP_SPECULATIVE_TOKENS}" =~ ^[0-8]$ ]] || die "MTP_SPECULATIVE_TOKENS 范围 0-8"
+  [[ "${KV_CACHE_DTYPE}" =~ ^(auto|bfloat16|fp8|fp8_e4m3|nvfp4)$ ]] || die "KV_CACHE_DTYPE 无效"
+  [[ "${YARN_FACTOR}" =~ ^(1|1\.0|2|2\.0|4|4\.0)$ ]] || die "YARN_FACTOR 只能是 1、2 或 4"
 }
 
 cmd_gateway_start() {
@@ -298,6 +313,25 @@ cmd_worker_start() {
   fi
   : "${GPU_DEVICES:?缺少 GPU_DEVICES}"
   : "${WORKER_PORT:?缺少 WORKER_PORT}"
+  local runtime_switch
+  for runtime_switch in PLE_CPU_OFFLOAD ENABLE_EXPERT_PARALLEL ENABLE_PREFIX_CACHING ENABLE_FLASHINFER_AUTOTUNE DISABLE_CUSTOM_ALL_REDUCE; do
+    [[ "${!runtime_switch}" == 0 || "${!runtime_switch}" == 1 ]] || die "Worker ${id} 的 ${runtime_switch} 必须是 0 或 1"
+  done
+  [[ "${MTP_SPECULATIVE_TOKENS}" =~ ^[0-8]$ ]] || die "Worker ${id} 的 MTP 草稿 Token 范围是 0-8"
+  [[ "${KV_CACHE_DTYPE}" =~ ^(auto|bfloat16|fp8|fp8_e4m3|nvfp4)$ ]] || die "Worker ${id} 的 KV Cache 精度无效"
+  [[ "${YARN_FACTOR}" =~ ^(1|1\.0|2|2\.0|4|4\.0)$ ]] || die "Worker ${id} 的 YaRN 比例无效"
+  local normalized_model_id="${MODEL_ID,,}"
+  normalized_model_id="${normalized_model_id//[^a-z0-9]/}"
+  if [[ "${normalized_model_id}" == *qwen38flashnext* ]]; then
+    (( TP_SIZE >= 2 )) || die "Worker ${id} 的 Qwen3.8 Flash Next 至少需要 TP2"
+    (( PLE_CPU_OFFLOAD == 1 )) || die "Worker ${id} 的 Qwen3.8 Flash Next 必须启用 PLE CPU offload"
+    if (( MAX_MODEL_LEN <= 262144 )); then
+      [[ "${YARN_FACTOR}" == 1 || "${YARN_FACTOR}" == 1.0 ]] || die "Worker ${id} 在原生 262K 范围不应启用 YaRN"
+    else
+      awk -v len="${MAX_MODEL_LEN}" -v factor="${YARN_FACTOR}" 'BEGIN{exit !(factor==2 || factor==4) || !(len<=262144*factor)}' || \
+        die "Worker ${id} 的超长上下文与 YaRN 比例不匹配"
+    fi
+  fi
   MODEL_LOCAL_DIR="${MODEL_LOCAL_DIR:-${MODEL_ROOT}/current}"
   MODEL_LOCAL_DIR=$(readlink -f "${MODEL_LOCAL_DIR}" 2>/dev/null || true)
   [[ -n "${MODEL_LOCAL_DIR}" && -d "${MODEL_LOCAL_DIR}" ]] || die "Worker ${id} 的模型目录不存在"
@@ -324,6 +358,14 @@ cmd_worker_start() {
     -e VLLM_NO_USAGE_STATS=1 -e VLLM_MEDIA_URL_ALLOW_REDIRECTS=0
     -v "${MODEL_LOCAL_DIR}:/model:ro"
     -v "${CACHE_DIR}/shared:/root/.cache"
+  )
+  if (( PLE_CPU_OFFLOAD == 1 )); then
+    docker_args+=(--cap-add SYS_PTRACE -e VLLM_PLE_CPU_OFFLOAD=1)
+  fi
+  if [[ "${YARN_FACTOR}" != 1 && "${YARN_FACTOR}" != 1.0 ]]; then
+    docker_args+=(-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1)
+  fi
+  docker_args+=(
     "${VLLM_IMAGE}" /model
     --served-model-name "${served_model_names[@]}"
     --host 0.0.0.0 --port "${WORKER_PORT}"
@@ -334,8 +376,23 @@ cmd_worker_start() {
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
     --max-num-seqs "${MAX_NUM_SEQS}"
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
-    --enable-chunked-prefill --enable-prefix-caching
+    --kv-cache-dtype "${KV_CACHE_DTYPE}"
+    --enable-chunked-prefill
   )
+  (( ENABLE_EXPERT_PARALLEL == 0 )) || docker_args+=(--enable-expert-parallel)
+  if (( ENABLE_PREFIX_CACHING == 1 )); then
+    docker_args+=(--enable-prefix-caching)
+  else
+    docker_args+=(--no-enable-prefix-caching)
+  fi
+  (( ENABLE_FLASHINFER_AUTOTUNE == 1 )) || docker_args+=(--no-enable-flashinfer-autotune)
+  (( DISABLE_CUSTOM_ALL_REDUCE == 0 )) || docker_args+=(--disable-custom-all-reduce)
+  if (( MTP_SPECULATIVE_TOKENS > 0 )); then
+    docker_args+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_SPECULATIVE_TOKENS}}")
+  fi
+  if [[ "${YARN_FACTOR}" != 1 && "${YARN_FACTOR}" != 1.0 ]]; then
+    docker_args+=(--hf-overrides "{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":${YARN_FACTOR},\"original_max_position_embeddings\":262144}}")
+  fi
   (( TRUST_REMOTE_CODE == 0 )) || docker_args+=(--trust-remote-code)
   if (( SUPPORTS_TOOL_CALLING == 1 )) && [[ -n "${TOOL_CALL_PARSER}" ]]; then
     docker_args+=(--enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER}")
@@ -346,7 +403,7 @@ cmd_worker_start() {
   if (( SUPPORTS_IMAGE_INPUT == 1 )); then
     docker_args+=(--limit-mm-per-prompt "${MM_LIMIT}" --allowed-media-domains llm.invalid)
   fi
-  log "Worker ${id} 启动：GPU=${GPU_DEVICES}，TP=${TP_SIZE}，ctx=${MAX_MODEL_LEN}，output<=${MAX_OUTPUT_TOKENS}，seq=${MAX_NUM_SEQS}，模型=${MODEL_ID}"
+  log "Worker ${id} 启动：GPU=${GPU_DEVICES}，TP=${TP_SIZE}，ctx=${MAX_MODEL_LEN}，output<=${MAX_OUTPUT_TOKENS}，seq=${MAX_NUM_SEQS}，KV=${KV_CACHE_DTYPE}，MTP=${MTP_SPECULATIVE_TOKENS}，PLE=${PLE_CPU_OFFLOAD}，模型=${MODEL_ID}"
   exec "${docker_args[@]}"
 }
 
@@ -1794,6 +1851,9 @@ cmd_info() {
     "${PHYSICAL_GPU_COUNT}" "${TP_SIZE}" "${INSTANCE_COUNT}" "${ACTIVE_WORKERS}" "${STARTUP_PARALLELISM}"
   printf 'Context/max-seqs/batched-tokens/GPU-memory: %s / %s / %s / %s\n' \
     "${MAX_MODEL_LEN}" "${MAX_NUM_SEQS}" "${MAX_NUM_BATCHED_TOKENS}" "${GPU_MEMORY_UTILIZATION}"
+  printf 'PLE/EP/prefix-cache/FlashInfer-autotune/custom-AR-off: %s / %s / %s / %s / %s\nMTP/KV/YaRN: %s / %s / %s\n' \
+    "${PLE_CPU_OFFLOAD}" "${ENABLE_EXPERT_PARALLEL}" "${ENABLE_PREFIX_CACHING}" "${ENABLE_FLASHINFER_AUTOTUNE}" "${DISABLE_CUSTOM_ALL_REDUCE}" \
+    "${MTP_SPECULATIVE_TOKENS}" "${KV_CACHE_DTYPE}" "${YARN_FACTOR}"
   printf '单请求最大输出 Token: %s（vLLM 服务端硬上限）\n' "${MAX_OUTPUT_TOKENS}"
   printf '图片/OCR/工具/思考/关闭思考: %s / %s / %s / %s / %s\n' \
     "${SUPPORTS_IMAGE_INPUT}" "${SUPPORTS_OCR}" "${SUPPORTS_TOOL_CALLING}" "${SUPPORTS_REASONING}" "${SUPPORTS_THINKING_TOGGLE}"

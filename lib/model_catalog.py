@@ -26,17 +26,19 @@ import urllib.request
 from typing import Any, Iterable
 
 
-CATALOG_VERSION = "2.2.1"
+CATALOG_VERSION = "2.3.0"
 VLLM_COMPAT_VERSION = "0.22.1"
+QWEN38_FLASH_NEXT_IMAGE = "vllm/vllm-openai:qwen38-flash-next"
+QWEN38_FLASH_NEXT_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
 GIB = 1024**3
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 MS_ENDPOINT = os.environ.get("MODELSCOPE_ENDPOINT", "https://modelscope.cn").rstrip("/")
 USER_AGENT = f"llm-cluster-deploy/{CATALOG_VERSION}"
 LANGUAGE = os.environ.get("LLMCTL_LANG", "zh").lower()
 
-# Generated from the official vLLM 0.22.1 supported-models page.  Runtime
-# installation performs a second check against ModelRegistry in the pinned
-# container image, so this list is only the discovery gate.
+# 主清单来自 vLLM 0.22.1 官方支持页；Qwen4Exp 是由专用预览镜像提供的
+# 显式例外。安装仍会在下载大权重前读取目标镜像的 ModelRegistry，因此这里
+# 只承担目录发现门禁，不替代真实运行时核验。
 SUPPORTED_ARCHITECTURES = frozenset(
     """
 AXK1ForCausalLM AfmoeForCausalLM ApertusForCausalLM AquilaForCausalLM
@@ -112,7 +114,8 @@ Qwen2_5_VLForConditionalGeneration Qwen3ASRForConditionalGeneration
 Qwen3ForCausalLM Qwen3MoeForCausalLM Qwen3NextForCausalLM
 Qwen3OmniMoeThinkerForConditionalGeneration Qwen3VLForConditionalGeneration
 Qwen3VLMoeForConditionalGeneration Qwen3_5ForConditionalGeneration
-Qwen3_5MoeForConditionalGeneration QwenVLForConditionalGeneration
+Qwen3_5MoeForConditionalGeneration Qwen4ExpForConditionalGeneration
+QwenVLForConditionalGeneration
 RWForCausalLM Rnj1ForCausalLM SarvamMLAForCausalLM SarvamMoEForCausalLM
 SeedOssForCausalLM SkyworkR1VChatModel SmolLM3ForCausalLM
 SmolVLMForConditionalGeneration SolarForCausalLM StableLMEpochForCausalLM
@@ -478,9 +481,21 @@ def native_context(config: dict[str, Any]) -> int:
 
 
 def kv_bytes_per_token(config: dict[str, Any]) -> int | None:
+    """估算单个 Token 的全量 KV Cache 字节数。
+
+    混合 GDN/全注意力模型只让 ``full_attention`` 层按上下文长度增长；
+    线性注意力状态按请求固定分配，由运行时预留承担，不能按全部层重复计算。
+    """
+
     cfg = nested_config(config)
     try:
-        layers = int(cfg.get("num_hidden_layers") or cfg.get("n_layer"))
+        layer_types = cfg.get("layer_types")
+        if isinstance(layer_types, list) and layer_types:
+            layers = sum(str(item) == "full_attention" for item in layer_types)
+            if layers <= 0:
+                return None
+        else:
+            layers = int(cfg.get("num_hidden_layers") or cfg.get("n_layer"))
         kv_heads = int(
             cfg.get("num_key_value_heads")
             or cfg.get("multi_query_group_num")
@@ -500,9 +515,14 @@ def kv_bytes_per_token(config: dict[str, Any]) -> int | None:
 
 
 def normalize_precision(config: dict[str, Any], model_id: str, tags: Iterable[str]) -> str:
+    """把不同量化配置规范为管理员可识别的精度名称。"""
+
     qcfg = config.get("quantization_config")
     if isinstance(qcfg, dict):
         method = str(qcfg.get("quant_method") or qcfg.get("quantization_method") or "").lower()
+        algorithm = str(qcfg.get("quant_algo") or "").lower()
+        if "nvfp4" in algorithm or "nvfp4" in method:
+            return "nvfp4"
         if method:
             bits = qcfg.get("bits")
             return f"{method}{bits or ''}"
@@ -580,6 +600,91 @@ def architectures(config: dict[str, Any]) -> list[str]:
     if not values:
         values = nested_config(config).get("architectures")
     return [str(x) for x in (values or []) if isinstance(x, str)]
+
+
+def qwen38_ple_weight_bytes(config: dict[str, Any]) -> int:
+    """返回 Qwen3.8 Flash Next 可放到主内存的 PLE 表大小。
+
+    参数：
+        config: Hugging Face 模型配置。
+
+    返回：
+        按检查点声明精度计算的 PLE 字节数；缺少必要字段时返回 0。
+    """
+
+    cfg = nested_config(config)
+    try:
+        base_rows = int(cfg.get("ngram_vocab_size_base"))
+        embedding_dim = int(cfg.get("ple_embed_dim"))
+        layer_count = max(1, len(cfg.get("ple_layer_ids") or []))
+    except (TypeError, ValueError):
+        return 0
+    dtype = str(cfg.get("ple_embedding_dtype") or cfg.get("dtype") or "").lower()
+    bytes_per_value = 1 if "float8" in dtype or dtype in {"fp8", "f8_e4m3"} else 2
+    return base_rows * embedding_dim * layer_count * bytes_per_value
+
+
+def model_runtime_profile(
+    model_id: str, config: dict[str, Any], precision: str
+) -> dict[str, Any]:
+    """为目录结果生成可由安装器和多模型控制器共同消费的运行时建议。"""
+
+    archs = architectures(config)
+    if QWEN38_FLASH_NEXT_ARCHITECTURE in archs:
+        return {
+            "kind": "qwen38-flash-next-preview",
+            "image": QWEN38_FLASH_NEXT_IMAGE,
+            "minimum_tp": 2,
+            "max_num_seqs": 8,
+            "runtime_extra_bytes_per_gpu": 4 * GIB,
+            "ple_cpu_offload": True,
+            "ple_offload_bytes": qwen38_ple_weight_bytes(config),
+            "enable_expert_parallel": True,
+            "enable_prefix_caching": False,
+            "enable_flashinfer_autotune": False,
+            "disable_custom_all_reduce": False,
+            "mtp_speculative_tokens": 0,
+            "kv_cache_dtype": "auto",
+            "startup_parallelism_cap": 1,
+            "preview": True,
+            "precision": precision,
+            "model_id": model_id,
+        }
+    return {
+        "kind": "standard",
+        "image": f"vllm/vllm-openai:v{VLLM_COMPAT_VERSION}",
+        "minimum_tp": 1,
+        "max_num_seqs": 7,
+        "runtime_extra_bytes_per_gpu": 0,
+        "ple_cpu_offload": False,
+        "ple_offload_bytes": 0,
+        "enable_expert_parallel": False,
+        "enable_prefix_caching": True,
+        "enable_flashinfer_autotune": True,
+        "disable_custom_all_reduce": False,
+        "mtp_speculative_tokens": 0,
+        "kv_cache_dtype": "auto",
+        "startup_parallelism_cap": 8,
+        "preview": False,
+        "precision": precision,
+        "model_id": model_id,
+    }
+
+
+def yarn_factor_for_context(native_limit: int, requested_limit: int) -> float:
+    """为 Qwen3.8 Flash Next 选择受支持的静态 YaRN 档位。
+
+    原生范围返回 1；超过原生范围后只使用官方说明中的 2× 或 4× 档位。
+    超过 4× 原生范围会失败，避免把未经支持的外推比例写入 Worker。
+    """
+
+    if requested_limit <= native_limit:
+        return 1.0
+    if requested_limit <= native_limit * 2:
+        return 2.0
+    if requested_limit <= native_limit * 4:
+        return 4.0
+    raise ValueError("Qwen3.8 Flash Next 最多支持静态 YaRN 4× 上下文")
 
 
 def is_mlx_weight_repository(model: dict[str, Any]) -> bool:
@@ -816,6 +921,8 @@ def inspect_ms(model_id: str, revision: str | None, token: str | None) -> dict[s
 
 
 def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requested_context: int) -> dict[str, Any]:
+    """核验模型元数据并为当前硬件生成保守部署计划。"""
+
     config = model.get("config") or {}
     archs = architectures(config)
     supported = [arch for arch in archs if arch in SUPPORTED_ARCHITECTURES]
@@ -823,6 +930,10 @@ def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requ
     model["architectures"] = archs
     model["supported_architectures"] = supported
     model["precision"] = normalize_precision(config, model["id"], tags)
+    runtime_profile = model_runtime_profile(
+        model["id"], config, model["precision"]
+    )
+    model["runtime_profile"] = runtime_profile
     model["native_context"] = native_context(config)
     model["capabilities"] = capability_profile(model["id"], model["task"], config, model.get("tokenizer") or {})
     model["trust_remote_code"] = bool(config.get("auto_map"))
@@ -857,25 +968,56 @@ def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requ
         reasons.append(tr("仓库体积显著小于参数量，可能是适配器或非完整权重", "Repository size is too small for its parameter count and may contain an adapter or incomplete weights"))
     if not hardware.count:
         reasons.append(tr("未检测到 NVIDIA GPU", "No NVIDIA GPU was detected"))
+    if runtime_profile["kind"] == "qwen38-flash-next-preview" and model["precision"] == "nvfp4":
+        known_compute_capabilities = []
+        for gpu in hardware.gpus:
+            try:
+                known_compute_capabilities.append(int(str(gpu.compute_capability).split(".", 1)[0]))
+            except ValueError:
+                continue
+        if known_compute_capabilities and min(known_compute_capabilities) < 10:
+            reasons.append(
+                tr(
+                    "NVFP4 检查点需要 NVIDIA Blackwell GPU；当前检测到较早的计算能力",
+                    "The NVFP4 checkpoint requires NVIDIA Blackwell GPUs; an older compute capability was detected",
+                )
+            )
 
-    # Preserve the model's useful long-context ceiling (capped at 256K) when a
-    # single request fits. Scheduler slots are estimated separately at a 32K
-    # reference length: max_num_seqs=7 means seven typical shorter requests,
-    # not seven simultaneous max-length requests.
-    desired = requested_context or min(model["native_context"], 262144)
-    desired = max(8192, min(desired, model["native_context"], 262144))
+    # 默认保留模型原生长上下文。Qwen3.8 Flash Next 只有在用户明确请求超过
+    # 262K 时才启用静态 YaRN，避免短上下文也承受位置外推的质量代价。
+    native_limit = int(model["native_context"])
+    if runtime_profile["kind"] == "qwen38-flash-next-preview":
+        desired = requested_context or native_limit
+        desired = max(8192, min(desired, native_limit * 4))
+        yarn_factor = yarn_factor_for_context(native_limit, desired)
+    else:
+        desired = requested_context or min(native_limit, 262144)
+        desired = max(8192, min(desired, native_limit, 262144))
+        yarn_factor = 1.0
     kv_bpt = kv_bytes_per_token(config)
     if kv_bpt is None:
         desired = min(desired, 32768)
     plan: dict[str, Any] | None = None
     if not reasons:
         min_mem = hardware.min_memory_bytes
+        minimum_tp = int(runtime_profile["minimum_tp"])
+        host_memory_rejected = False
         for tp in (1, 2, 4, 8):
+            if tp < minimum_tp:
+                continue
             if tp > hardware.count or hardware.count % tp:
                 continue
             usable = min_mem * utilization
-            weight_per_gpu = weight_bytes * 1.08 / tp
-            runtime = max(4 * GIB, min_mem * 0.06)
+            ple_offload_bytes = (
+                int(runtime_profile["ple_offload_bytes"])
+                if runtime_profile["ple_cpu_offload"]
+                else 0
+            )
+            resident_weight_bytes = max(0, weight_bytes - ple_offload_bytes)
+            weight_per_gpu = resident_weight_bytes * 1.08 / tp
+            runtime = max(4 * GIB, min_mem * 0.06) + int(
+                runtime_profile["runtime_extra_bytes_per_gpu"]
+            )
             if model["capabilities"]["image_input"]:
                 runtime += 3 * GIB
             context = desired
@@ -888,26 +1030,46 @@ def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requ
                     estimated_seq_capacity = (
                         max(1, min(16, int(free_for_kv // kv_reference))) if kv_bpt else 1
                     )
-                    # The project-wide operational default is seven scheduler
-                    # slots per replica.  Higher theoretical KV capacity is
-                    # useful evidence, but should not silently increase the
-                    # live concurrency limit chosen by the user.
-                    seqs = min(7, estimated_seq_capacity)
+                    full_context_capacity = (
+                        max(1, int(free_for_kv // kv_one)) if kv_bpt else 1
+                    )
+                    # 调度序列数按典型 32K 请求估算，不代表每个序列都能同时占满
+                    # 最大窗口；完整窗口容量单独显示，避免把 8 个槽误读成 8×1M。
+                    seqs = min(
+                        int(runtime_profile["max_num_seqs"]),
+                        estimated_seq_capacity,
+                    )
+                    replicas = hardware.count // tp
+                    host_reserve = max(16 * GIB, int(hardware.memory_total_bytes * 0.05))
+                    host_offload_per_instance = int(ple_offload_bytes * 1.10)
+                    host_running_required = host_reserve + replicas * host_offload_per_instance
+                    if (
+                        hardware.memory_total_bytes
+                        and host_running_required > hardware.memory_total_bytes
+                    ):
+                        host_memory_rejected = True
+                        break
                     plan = {
                         "tp": tp,
-                        "replicas": hardware.count // tp,
+                        "replicas": replicas,
                         "max_model_len": context,
                         "max_num_seqs": seqs,
                         "estimated_seq_capacity": estimated_seq_capacity,
+                        "estimated_full_context_sequences": full_context_capacity,
                         "sequence_reference_context": reference_context,
                         "estimated_weight_per_gpu": int(weight_per_gpu),
+                        "estimated_gpu_resident_weight_total": resident_weight_bytes,
                         "estimated_runtime_reserve_per_gpu": int(runtime),
                         "estimated_kv_bytes_per_token_total": kv_bpt or 0,
                         "usable_per_gpu": int(usable),
+                        "yarn_factor": yarn_factor,
+                        "ple_cpu_offload": bool(runtime_profile["ple_cpu_offload"]),
+                        "ple_offload_bytes_per_instance": ple_offload_bytes,
+                        "host_memory_per_running_instance": host_offload_per_instance,
+                        "host_memory_running_required": host_running_required,
                     }
                     tp_paths = topology_paths_for_tp(hardware.topology_matrix, hardware.count, tp)
                     tp_worst_path = worst_topology_path(tp_paths)
-                    host_reserve = max(16 * GIB, int(hardware.memory_total_bytes * 0.05))
                     memory_per_start = int(weight_bytes * 1.15 + 4 * GIB)
                     if hardware.memory_available_bytes:
                         memory_budget = max(0, hardware.memory_available_bytes - host_reserve)
@@ -921,7 +1083,12 @@ def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requ
                     )
                     startup_parallelism = max(
                         1,
-                        min(plan["replicas"], memory_parallelism, cpu_parallelism, 8),
+                        min(
+                            plan["replicas"],
+                            memory_parallelism,
+                            cpu_parallelism,
+                            int(runtime_profile["startup_parallelism_cap"]),
+                        ),
                     )
                     disk_required = weight_bytes + weight_bytes // 3 + 10 * GIB
                     warnings: list[str] = []
@@ -953,6 +1120,20 @@ def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requ
                                 f"The default model disk has {human_size(hardware.disk_free_bytes)} free, below the {human_size(disk_required)} download and temporary-space budget; choose another directory or reuse local weights",
                             )
                         )
+                    if runtime_profile["kind"] == "qwen38-flash-next-preview":
+                        warnings.append(
+                            tr(
+                                "Qwen3.8 Flash Next 仍使用专用预览镜像；默认关闭 MTP 和前缀缓存，先完成单个 TP2 金丝雀验收",
+                                "Qwen3.8 Flash Next still uses a dedicated preview image; MTP and prefix caching stay disabled until a single TP2 canary passes",
+                            )
+                        )
+                        if yarn_factor > 1:
+                            warnings.append(
+                                tr(
+                                    f"当前部署启用静态 YaRN {yarn_factor:g}×；短上下文质量也会受该缩放影响，全部实例必须保持一致并重新做质量验收",
+                                    f"This deployment uses static YaRN {yarn_factor:g}x; short-context quality is affected too, so every replica must remain aligned and pass a new quality acceptance",
+                                )
+                            )
                     plan.update(
                         {
                             "startup_parallelism": startup_parallelism,
@@ -972,7 +1153,15 @@ def evaluate(model: dict[str, Any], hardware: Hardware, utilization: float, requ
             if plan:
                 break
         if not plan:
-            reasons.append(tr("在当前 GPU 数量/显存及至少 8K 上下文下无法保守部署", "The model cannot be conservatively deployed on the available GPUs/VRAM with at least an 8K context"))
+            if host_memory_rejected:
+                reasons.append(
+                    tr(
+                        "系统内存不足以同时保留全部实例的 PLE offload 与操作系统余量",
+                        "System memory cannot hold PLE offload for all replicas plus operating-system headroom",
+                    )
+                )
+            else:
+                reasons.append(tr("在当前 GPU 数量/显存及至少 8K 上下文下无法保守部署", "The model cannot be conservatively deployed on the available GPUs/VRAM with at least an 8K context"))
 
     model["plan"] = plan
     model["installable"] = not reasons and plan is not None
@@ -1145,6 +1334,13 @@ def render_selection_summary(model: dict[str, Any]) -> None:
     print(f"{tr('每卡可用预算', 'Usable budget per GPU')}: {human_size(int(plan['usable_per_gpu']))}")
     print(f"{tr('每卡权重估算', 'Estimated weights per GPU')}: {human_size(int(plan['estimated_weight_per_gpu']))}")
     print(f"{tr('每卡运行时预留', 'Runtime reserve per GPU')}: {human_size(int(plan['estimated_runtime_reserve_per_gpu']))}")
+    print(f"{tr('完整最大窗口容量估算', 'Estimated full-window capacity')}: {plan.get('estimated_full_context_sequences', 1)} {tr('路/实例', 'sequence(s) per replica')}")
+    if plan.get("ple_cpu_offload"):
+        print(f"PLE CPU offload: {human_size(int(plan.get('ple_offload_bytes_per_instance') or 0))} / {tr('实例', 'replica')}")
+        print(f"{tr('全池主内存常驻预算', 'Whole-pool resident host-memory budget')}: {human_size(int(plan.get('host_memory_running_required') or 0))}")
+    if float(plan.get("yarn_factor") or 1) > 1:
+        print(f"Static YaRN: {float(plan['yarn_factor']):g}x")
+    print(f"vLLM: {model.get('runtime_profile', {}).get('image', '?')}")
     print(f"{tr('每卡剩余 KV 预算', 'Remaining KV budget per GPU')}: {human_size(kv_budget)}")
     print(f"{tr('推荐启动并行度', 'Recommended startup parallelism')}: {plan.get('startup_parallelism', 1)}")
     print(f"{tr('单实例主机内存加载预算', 'Host-memory loading budget per replica')}: {human_size(int(plan.get('host_memory_per_starting_instance') or 0))}")
@@ -1152,11 +1348,28 @@ def render_selection_summary(model: dict[str, Any]) -> None:
     print(f"{tr('推荐分', 'Recommendation score')}: {score}")
     print()
     print(tr("推荐原因：", "Why this is recommended:"))
+    runtime_kind = model.get("runtime_profile", {}).get("kind")
+    runtime_reason = (
+        tr(
+            f"架构 {arch} 由 Qwen3.8 Flash Next 专用 vLLM 预览镜像提供。",
+            f"Architecture {arch} is provided by the dedicated Qwen3.8 Flash Next vLLM preview image.",
+        )
+        if runtime_kind == "qwen38-flash-next-preview"
+        else tr(f"架构 {arch} 位于 vLLM {VLLM_COMPAT_VERSION} 保守兼容清单中。", f"Architecture {arch} is in the conservative vLLM {VLLM_COMPAT_VERSION} compatibility list.")
+    )
+    context_reason = (
+        tr(
+            f"计划上下文 {plan['max_model_len']} 使用静态 YaRN {float(plan['yarn_factor']):g}×，并通过当前显存估算。",
+            f"The planned {plan['max_model_len']}-token context uses static YaRN {float(plan['yarn_factor']):g}x and passes the current VRAM estimate.",
+        )
+        if float(plan.get("yarn_factor") or 1) > 1
+        else tr(f"计划上下文 {plan['max_model_len']} 不超过模型原生上限，并通过当前显存估算。", f"The planned {plan['max_model_len']}-token context does not exceed the model-native limit and passes the current VRAM estimate.")
+    )
     reasons = [
-        tr(f"架构 {arch} 位于 vLLM {VLLM_COMPAT_VERSION} 保守兼容清单中。", f"Architecture {arch} is in the conservative vLLM {VLLM_COMPAT_VERSION} compatibility list."),
+        runtime_reason,
         tr(f"仓库提供约 {human_size(int(model.get('weight_bytes') or 0))} 完整权重，且未命中 MLX 等平台专用格式。", f"The repository provides about {human_size(int(model.get('weight_bytes') or 0))} of complete weights and is not tagged as a platform-specific format such as MLX."),
         tr(f"TP{plan['tp']} 可在每卡保留运行时与 KV Cache 余量，并形成 {plan['replicas']} 个独立服务实例。", f"TP{plan['tp']} leaves runtime and KV-cache headroom per GPU while forming {plan['replicas']} independent serving replicas."),
-        tr(f"计划上下文 {plan['max_model_len']} 不超过模型原生上限，并通过当前显存估算。", f"The planned {plan['max_model_len']}-token context does not exceed the model-native limit and passes the current VRAM estimate."),
+        context_reason,
         tr(f"排名信号：downloads={model.get('downloads', 0)}、likes={model.get('likes', 0)}、能力={capability_text(model)}、副本数={plan['replicas']}、TP 成本={plan['tp']}。", f"Ranking signals: downloads={model.get('downloads', 0)}, likes={model.get('likes', 0)}, capabilities={capability_text(model)}, replicas={plan['replicas']}, TP cost={plan['tp']}.")
     ]
     for number, reason in enumerate(reasons, 1):
@@ -1175,10 +1388,13 @@ def render_selection_summary(model: dict[str, Any]) -> None:
 
 
 def shell_assignments(model: dict[str, Any]) -> str:
+    """把已通过门禁的目录结果输出为安全转义的 Shell 赋值。"""
+
     if not model.get("installable") or not model.get("plan"):
         raise CatalogError(tr("所选模型未通过兼容/硬件门禁", "The selected model did not pass compatibility or hardware gates"))
     plan = model["plan"]
     caps = model["capabilities"]
+    runtime = model.get("runtime_profile") or {}
     served = re.sub(r"[^A-Za-z0-9._-]+", "-", model["id"].split("/")[-1]).lower()
     values = {
         "MODEL_HUB": model["source"],
@@ -1191,11 +1407,22 @@ def shell_assignments(model: dict[str, Any]) -> str:
         "MODEL_PARAMS": int(model.get("params") or 0),
         "MODEL_NATIVE_CONTEXT": model["native_context"],
         "SERVED_MODEL_NAME": served,
+        "VLLM_IMAGE": runtime.get(
+            "image", f"vllm/vllm-openai:v{VLLM_COMPAT_VERSION}"
+        ),
         "TP_SIZE": plan["tp"],
         "MAX_MODEL_LEN": plan["max_model_len"],
         "MAX_NUM_SEQS": plan["max_num_seqs"],
         "ESTIMATED_MAX_NUM_SEQS": plan["estimated_seq_capacity"],
         "STARTUP_PARALLELISM": plan.get("startup_parallelism", 1),
+        "PLE_CPU_OFFLOAD": int(bool(runtime.get("ple_cpu_offload"))),
+        "ENABLE_EXPERT_PARALLEL": int(bool(runtime.get("enable_expert_parallel"))),
+        "ENABLE_PREFIX_CACHING": int(bool(runtime.get("enable_prefix_caching", True))),
+        "ENABLE_FLASHINFER_AUTOTUNE": int(bool(runtime.get("enable_flashinfer_autotune", True))),
+        "DISABLE_CUSTOM_ALL_REDUCE": int(bool(runtime.get("disable_custom_all_reduce"))),
+        "MTP_SPECULATIVE_TOKENS": int(runtime.get("mtp_speculative_tokens") or 0),
+        "KV_CACHE_DTYPE": runtime.get("kv_cache_dtype", "auto"),
+        "YARN_FACTOR": plan.get("yarn_factor", 1),
         "TOOL_CALL_PARSER": caps["tool_parser"],
         "REASONING_PARSER": caps["reasoning_parser"],
         "SUPPORTS_IMAGE_INPUT": int(caps["image_input"]),

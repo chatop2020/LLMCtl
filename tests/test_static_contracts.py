@@ -109,6 +109,27 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertNotIn("--tool-call-parser qwen3_xml", unit)
         self.assertNotIn("--reasoning-parser qwen3", unit)
 
+    def test_qwen38_runtime_flags_are_model_scoped_and_docker_options_precede_image(self):
+        """PLE capability 必须是 Docker 参数，其余优化必须是 Worker 私有 vLLM 参数。"""
+
+        worker = MANAGER.split("cmd_worker_start() {", 1)[1].split(
+            "\nimage_supports_architecture()", 1
+        )[0]
+        self.assertLess(worker.index("--cap-add SYS_PTRACE"), worker.index('"${VLLM_IMAGE}" /model'))
+        for marker in (
+            "VLLM_PLE_CPU_OFFLOAD=1",
+            "--enable-expert-parallel",
+            "--no-enable-prefix-caching",
+            "--no-enable-flashinfer-autotune",
+            "--speculative-config",
+            "--kv-cache-dtype",
+            "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1",
+            "--hf-overrides",
+        ):
+            self.assertIn(marker, worker)
+        self.assertIn("QWEN38_FLASH_NEXT.md", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("QWEN38_FLASH_NEXT_EN.md", (ROOT / "README_EN.md").read_text(encoding="utf-8"))
+
     def test_systemd_delegates_selected_gateway_to_manager(self):
         self.assertIn("ExecStart=/usr/local/sbin/llmctl _gateway-start", INSTALLER)
         self.assertIn('newapi) GATEWAY_IMAGE="${GATEWAY_IMAGE:-${NEWAPI_IMAGE}}"', MANAGER)

@@ -1,0 +1,95 @@
+{
+  "plan_id": "qwen38-flash-next",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L2",
+  "source": {
+    "baseline_commit": "42aaaf5",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "让 LLMCtl 能为 Qwen3.8-Flash-Next NVFP4 生成适配 8 张 RTX PRO 6000D 的同构 TP2 部署计划，并安全传递 PLE、EP、MTP、缓存和可选 YaRN 参数。",
+    "acceptance": [
+      "目录识别 Qwen4ExpForConditionalGeneration 与 ModelOpt NVFP4，并为 8×84GB Blackwell 生成 TP2×4、262144 上下文和 8 个调度序列的计划。",
+      "计划把 FP8 PLE 从 GPU 权重预算中分离，并显示单实例与整机的主内存常驻预算。",
+      "安装器、多模型注册表、Worker 环境和门户对 PLE CPU offload、专家并行、MTP、前缀缓存及 FlashInfer 自动调优使用同一字段契约。",
+      "请求 262144 以内上下文时不启用 YaRN；显式请求更长窗口时按上限选择静态 YaRN 2× 或 4×，同一部署的全部 Worker 使用一致配置。",
+      "Qwen3.8 专用运行时默认关闭 MTP 与前缀缓存，管理员可在基线通过后显式启用 MTP2。",
+      "现有模型保持原运行参数和默认行为，旧注册表缺少新增字段时可无损读取。",
+      "成功部署可回滚到部署前注册表和 Worker 环境；重新部署 Ornith 1.5 时不会继承 Qwen 专属参数，TP 可恢复为该部署自己的值。"
+    ]
+  },
+  "risk": {
+    "level": "L2",
+    "affected_components": [
+      "模型目录与硬件规划",
+      "安装期 cluster.env",
+      "多模型部署注册表与 Worker 环境",
+      "vLLM Docker 启动参数",
+      "静态 YaRN 上下文扩展",
+      "管理员模型部署表单",
+      "中英文运维文档"
+    ],
+    "stop_conditions": [
+      "Qwen3.8 模型身份或固定 revision 无法核验",
+      "专用 vLLM 镜像不注册 Qwen4ExpForConditionalGeneration",
+      "主机内存不足以保留 PLE 与系统余量",
+      "真实 GPU 加载、文本/视觉/工具调用或长上下文冒烟失败"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "static-contract",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "python3 -m py_compile lib/*.py tests/*.py",
+        "bash -n install-llm-cluster.sh llmctl.sh upgrade-llmctl.sh",
+        "git diff --check",
+        "touched first-party source line-count check"
+      ]
+    },
+    {
+      "gate_id": "focused-tests",
+      "criticality": "Required",
+      "depends_on": ["static-contract"],
+      "commands": [
+        "python3 -m unittest tests.test_model_catalog tests.test_model_deployment tests.test_static_contracts -v",
+        "npm test -- --run src/useModelDeployments.test.js"
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "criticality": "Required",
+      "depends_on": ["focused-tests"],
+      "commands": [
+        "python3 -m unittest discover -s tests -v",
+        "npm test",
+        "npm run build"
+      ]
+    },
+    {
+      "gate_id": "live-metadata",
+      "criticality": "Required",
+      "depends_on": ["focused-tests"],
+      "commands": [
+        "model_catalog inspect against the immutable Hugging Face revision with an 8×84GB hardware fixture"
+      ]
+    },
+    {
+      "gate_id": "gpu-field-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-regression", "live-metadata"],
+      "environment": "Ubuntu 24.04 target host with 8×RTX PRO 6000D, 512GB RAM and the dedicated vLLM image",
+      "commands": [
+        "verify topology and NUMA pairing",
+        "load one TP2 canary with MTP and prefix caching disabled",
+        "run text, vision, tool-call, 256K bounded and C1/C2/C4/C8 benchmarks",
+        "enable MTP2 only after the baseline and repeat the same workload",
+        "roll out the remaining native 262K TP2 instances only after canary acceptance",
+        "roll back to the pre-deployment Ornith snapshot and verify its original TP and runtime flags"
+      ],
+      "expected_status_without_target_host": "Unverified",
+      "unverified_optional_capability": "Static YaRN 2×/4× remains disabled for this production target; a future all-pool 1M rollout requires a separate quality and capacity acceptance."
+    }
+  ]
+}

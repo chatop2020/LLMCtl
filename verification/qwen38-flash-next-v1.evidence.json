@@ -1,0 +1,106 @@
+{
+  "plan_id": "qwen38-flash-next",
+  "plan_version": 1,
+  "generated_at": "2026-08-30T07:02:53Z",
+  "source": {
+    "baseline_commit": "42aaaf5a6f0457bc19f9305d20adeab60e6ed0fb",
+    "worktree": "dirty",
+    "tracked_diff_sha256": "addbe65ed85bbd79ad62db70de67d9599969eaeb094b6e8bc0199ce1075ee9d2",
+    "untracked_artifacts": {
+      "QWEN38_FLASH_NEXT.md": "15b8faf95795d018120d18b4a1bb4066d5927282580a0ba97f6fd0ff601c5724",
+      "QWEN38_FLASH_NEXT_EN.md": "c9ec44a87574b7c8a919ba02599d0646315b8b95bc414ae6edc0600148e67690",
+      "verification/qwen38-flash-next-v1.json": "c939149e88995266fd1ca6bbc9ad6d5ff285852458e0958069a823d6fdb45308"
+    },
+    "digest_scope": "Tracked binary diff plus separately hashed untracked task artifacts; this evidence file is excluded."
+  },
+  "environment": {
+    "host": "macOS local development environment without NVIDIA GPUs",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "target": "Ubuntu 24.04, 8×RTX PRO 6000D 84GB, 512GB RAM, PCIe 4.0, no NVLink"
+  },
+  "gates": [
+    {
+      "gate_id": "static-contract",
+      "status": "Passed",
+      "evidence": [
+        "bash -n passed for install-llm-cluster.sh, llmctl.sh, and upgrade-llmctl.sh.",
+        "python3 -m py_compile passed for lib/*.py and tests/*.py.",
+        "git diff --check passed.",
+        "Every touched first-party source file is below 3000 physical lines; App.vue is the largest at 2981 lines."
+      ]
+    },
+    {
+      "gate_id": "focused-tests",
+      "status": "Passed",
+      "evidence": [
+        "60 focused Python catalog, deployment, and static-contract tests passed.",
+        "5 useModelDeployments tests passed, including the four-replica TP2 preset.",
+        "A first focused Python attempt used portal-ui as cwd and failed to import the top-level tests package; the command was corrected without changing product code or acceptance criteria."
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "status": "Passed",
+      "evidence": [
+        "274 Python tests passed in 56.341 seconds.",
+        "55 frontend tests passed across 9 files.",
+        "The Vite production build passed with 30 transformed modules.",
+        "The first full Python run found a missing output-limit field in the Worker startup log; the hard limit was still present. The log field was restored, its original failing test passed, and the full suite then passed.",
+        "Built portal index SHA256: 731e51ddb39d0c8b5c87b675790fd95e526ffe683dfb6ac98f38f292f2088bcb.",
+        "Built portal JavaScript SHA256: 8f3881e4aa1a7b9f1cb8ea375129086353f45db34edd7522ec23955b378d3c8f."
+      ]
+    },
+    {
+      "gate_id": "live-metadata",
+      "status": "Passed",
+      "evidence": [
+        "Hugging Face resolved Inferact/Qwen3.8-Flash-Next-NVFP4 to immutable revision 103a7608316173ca6edd49929544244de7ffda70.",
+        "Live metadata reported 182779284200 bytes of safetensors and architecture Qwen4ExpForConditionalGeneration.",
+        "The 8×86016MiB/512GiB fixture produced TP2, four replicas, native 262144 context, max_num_seqs 8, PLE CPU offload, EP, KV auto, MTP0, and startup parallelism 1.",
+        "The plan estimated 478047790694 bytes of whole-pool host-memory requirement including PLE overhead and reserve; this is planning evidence, not a target-host RSS measurement."
+      ]
+    },
+    {
+      "gate_id": "local-portal-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "The final Vite artifact loaded at /ui/ through the Vite preview server.",
+        "The login page rendered its header, controls, and status feedback with no browser console warnings or errors.",
+        "The administrator-only Qwen form could not be visually opened without a live authenticated portal backend; field binding and preset behavior are covered by component and composable tests."
+      ]
+    },
+    {
+      "gate_id": "gpu-field-acceptance",
+      "status": "Unverified",
+      "reason": "The local environment has no RTX PRO 6000D host and did not pull the preview image or 182GB checkpoint.",
+      "required_actions": [
+        "Capture nvidia-smi topology, P2P, NUMA, driver, free RAM, and disk before assigning TP2 pairs.",
+        "Deploy one TP2 canary with native 262K, KV auto, MTP0, and prefix cache disabled.",
+        "Verify actual image architecture and QSA KV capability before downloading weights.",
+        "Run text, vision, tool-call, bounded 256K retrieval, C1/C2/C4/C8, GPU/PCIe, KV, and host-RSS acceptance.",
+        "A/B only MTP2, then expand to four identical TP2 replicas if the canary passes.",
+        "Exercise explicit rollback and verify Ornith returns with its original TP and runtime parameters."
+      ]
+    }
+  ],
+  "traceability": [
+    {
+      "evidence": "Live Hugging Face metadata plus the hardware planner",
+      "finding": "The dedicated NVFP4 checkpoint fits as four TP2 replicas only when PLE host memory and hybrid-attention KV accounting are modeled separately.",
+      "path": "model_catalog runtime profile -> installer or portal preset -> Worker-private environment -> dedicated vLLM image"
+    },
+    {
+      "evidence": "Current Qwen4Exp QSA backend capability inspection",
+      "finding": "Stock QSA currently accepts auto/bfloat16, so NVFP4 KV must be capability-gated rather than enabled by configuration alone.",
+      "path": "KV selection -> image preflight -> QSA supported_kv_cache_dtypes -> download or fail closed"
+    },
+    {
+      "evidence": "Existing deployment snapshot and rollback tests plus new model-scoped runtime tests",
+      "finding": "Qwen-specific PLE, EP, MTP, KV, and YaRN values do not become Ornith defaults and are restored with the deployment snapshot.",
+      "path": "registry backup -> affected Worker environments -> health wait -> gateway republish"
+    }
+  ],
+  "final_stage": "Implemented and locally verified; target GPU deployment and operator acceptance remain unverified"
+}

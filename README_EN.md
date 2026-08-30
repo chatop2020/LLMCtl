@@ -1,5 +1,7 @@
 # LLMCtl: General-Purpose Multi-GPU vLLM Cluster Deployer
 
+For the recommended Qwen3.8 Flash Next NVFP4 topology, acceptance, and rollback flow on 8×RTX PRO 6000D, see [QWEN38_FLASH_NEXT_EN.md](QWEN38_FLASH_NEXT_EN.md).
+
 **Language:** [中文](README.md) | English
 
 [![CI](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml/badge.svg)](https://github.com/chatop2020/LLMCtl/actions/workflows/ci.yml)

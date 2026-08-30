@@ -202,6 +202,114 @@ class CatalogPlanningTests(unittest.TestCase):
         self.assertIn("MODEL_ID=example/Test-Instruct", assignments)
         self.assertNotIn("$(``,", assignments)
 
+    def qwen38_flash_next(self):
+        """返回覆盖 NVFP4、FP8 PLE、混合注意力和多模态的目录夹具。"""
+
+        model = self.model(
+            "Qwen4ExpForConditionalGeneration", 126 * catalog.GIB
+        )
+        model.update(
+            {
+                "id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                "task": "image-text-to-text",
+                "params": 118_000_000_000,
+                "tags": ["modelopt", "nvfp4"],
+            }
+        )
+        model["config"] = {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+            },
+            "text_config": {
+                "max_position_embeddings": 262144,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "layer_types": [
+                    item
+                    for _ in range(12)
+                    for item in (
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    )
+                ],
+                "ngram_vocab_size_base": 20_000_000,
+                "ple_embed_dim": 2560,
+                "ple_layer_ids": [2],
+                "ple_embedding_dtype": "float8_e4m3fn",
+            },
+        }
+        model["tokenizer"] = {"chat_template": "tools tool_call enable_thinking"}
+        return model
+
+    def test_qwen38_nvfp4_uses_tp2_ple_offload_and_preview_runtime(self):
+        """8×84GB Blackwell 必须得到四个同构 TP2 原生 262K 实例。"""
+
+        hardware = self.hardware(
+            8,
+            86016,
+            memory_total_bytes=512 * catalog.GIB,
+            memory_available_bytes=480 * catalog.GIB,
+            cpu_threads=192,
+            topology_worst_path="PHB",
+            pcie_max_width_min=16,
+        )
+        for gpu in hardware.gpus:
+            gpu.compute_capability = "12.0"
+        result = catalog.evaluate(
+            self.qwen38_flash_next(), hardware, 0.92, 262144
+        )
+        self.assertTrue(result["installable"])
+        self.assertEqual(result["precision"], "nvfp4")
+        self.assertEqual(result["plan"]["tp"], 2)
+        self.assertEqual(result["plan"]["replicas"], 4)
+        self.assertEqual(result["plan"]["max_model_len"], 262144)
+        self.assertEqual(result["plan"]["max_num_seqs"], 8)
+        self.assertEqual(result["plan"]["yarn_factor"], 1.0)
+        self.assertEqual(
+            result["plan"]["estimated_kv_bytes_per_token_total"], 24576
+        )
+        self.assertEqual(
+            result["runtime_profile"]["image"],
+            "vllm/vllm-openai:qwen38-flash-next",
+        )
+        self.assertTrue(result["runtime_profile"]["ple_cpu_offload"])
+        self.assertTrue(result["runtime_profile"]["enable_expert_parallel"])
+        self.assertFalse(result["runtime_profile"]["enable_prefix_caching"])
+        self.assertEqual(result["runtime_profile"]["mtp_speculative_tokens"], 0)
+        assignments = catalog.shell_assignments(result)
+        self.assertIn("TP_SIZE=2", assignments)
+        self.assertIn("PLE_CPU_OFFLOAD=1", assignments)
+        self.assertIn("KV_CACHE_DTYPE=auto", assignments)
+
+    def test_qwen38_one_million_is_explicit_static_yarn_not_default(self):
+        """1M 只在显式请求时生成全池一致的 YaRN 4× 配置。"""
+
+        hardware = self.hardware(
+            8,
+            86016,
+            memory_total_bytes=512 * catalog.GIB,
+            memory_available_bytes=480 * catalog.GIB,
+            cpu_threads=192,
+        )
+        for gpu in hardware.gpus:
+            gpu.compute_capability = "12.0"
+        native = catalog.evaluate(self.qwen38_flash_next(), hardware, 0.92, 0)
+        extended = catalog.evaluate(
+            self.qwen38_flash_next(), hardware, 0.92, 1_000_000
+        )
+        self.assertEqual(native["plan"]["max_model_len"], 262144)
+        self.assertEqual(native["plan"]["yarn_factor"], 1.0)
+        self.assertEqual(extended["plan"]["max_model_len"], 1_000_000)
+        self.assertEqual(extended["plan"]["yarn_factor"], 4.0)
+        self.assertEqual(extended["plan"]["estimated_full_context_sequences"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
