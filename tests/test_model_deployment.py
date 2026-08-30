@@ -269,14 +269,21 @@ class ModelDeploymentTests(unittest.TestCase):
 
         runner = mock.Mock(spec=MODEL.CommandRunner)
         manager = MODEL.DeploymentManager(self.paths, runner=runner)
-        manager._verify_runtime_image(
-            "RadixArk/Qwen3.8-Flash-Next-NVFP4",
-            {
-                "image": "vllm/vllm-openai:qwen38-flash-next",
-                "kv_cache_dtype": "nvfp4",
-            },
-        )
+        with mock.patch.object(
+            MODEL,
+            "ensure_radixark_ple_runtime_image",
+            return_value="llmctl/qwen38-flash-next:patched",
+        ):
+            selected = manager._verify_runtime_image(
+                "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                {
+                    "image": "vllm/vllm-openai:qwen38-flash-next",
+                    "kv_cache_dtype": "nvfp4",
+                },
+            )
         command = runner.run.call_args.args[0]
+        self.assertEqual(selected, "llmctl/qwen38-flash-next:patched")
+        self.assertEqual(command[5], "llmctl/qwen38-flash-next:patched")
         self.assertIn("architecture = sys.argv[2]", command[-3])
         self.assertEqual(command[-2], "nvfp4")
         self.assertEqual(command[-1], "Qwen4ExpForConditionalGeneration")
@@ -301,6 +308,36 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertEqual(
             runner.run.call_args_list[1].args[0][:2], ["docker", "pull"]
         )
+
+    def test_radixark_runtime_image_is_derived_from_exact_local_base(self):
+        """PLE 兼容层必须锚定基础镜像 ID，并在补丁漂移时由构建失败关闭。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.side_effect = [
+            subprocess.CompletedProcess([], 0, stdout="sha256:" + "a" * 64),
+            subprocess.CompletedProcess([], 1, stdout=""),
+            subprocess.CompletedProcess([], 0, stdout="built"),
+            subprocess.CompletedProcess([], 0, stdout="verified"),
+        ]
+        selected = MODEL.ensure_radixark_ple_runtime_image(
+            runner,
+            "vllm/vllm-openai:qwen38-flash-next",
+            self.state,
+        )
+        self.assertEqual(
+            selected,
+            "llmctl/qwen38-flash-next:radixark-ple-aaaaaaaaaaaa",
+        )
+        build = runner.run.call_args_list[2].args[0]
+        self.assertEqual(build[:2], ["docker", "build"])
+        self.assertIn("BASE_IMAGE=vllm/vllm-openai:qwen38-flash-next", build)
+        context = self.state / "runtime-overrides/qwen38-radixark-ple"
+        patch_source = (context / "patch_ple.py").read_text(encoding="utf-8")
+        dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("PLE_FORCE_FP8", patch_source)
+        self.assertIn("source.count(needle) != 1", patch_source)
+        self.assertIn("ENV PLE_FORCE_FP8=1", dockerfile)
+        self.assertEqual((context / "patch_ple.py").stat().st_mode & 0o777, 0o600)
 
     def test_qwen38_artifact_requires_visual_ple_and_all_indexed_shards(self):
         """固定制品必须真的包含视觉编码器和 PLE，不能只凭模型名称放行。"""
@@ -464,7 +501,11 @@ class ModelDeploymentTests(unittest.TestCase):
         def apply_candidate(candidate, _affected, _deployment_id):
             candidate["revision"] = int(candidate.get("revision", 0)) + 1
 
-        with mock.patch.object(manager, "_verify_runtime_image"), \
+        with mock.patch.object(
+                 manager,
+                 "_verify_runtime_image",
+                 return_value="vllm/vllm-openai:qwen38-flash-next",
+             ), \
              mock.patch.object(MODEL, "verify_qwen38_artifact"), \
              mock.patch.object(manager, "_backup_runtime", return_value=self.root / "backup"), \
              mock.patch.object(manager, "_apply_candidate", side_effect=apply_candidate), \
@@ -959,6 +1000,22 @@ class ModelDeploymentTests(unittest.TestCase):
                 RuntimeError, "gdn-inside ownership conflict"
             ):
                 MODEL.CommandRunner().run(["gateway-helper"])
+
+    def test_command_runner_bounds_buffered_progress_log_replay(self):
+        """下载器退出后不得逐条持久化海量进度行并放大磁盘写入。"""
+
+        messages = []
+        completed = subprocess.CompletedProcess(
+            args=["ms", "download"],
+            returncode=0,
+            stdout="\n".join(f"progress-{index}" for index in range(10_000)),
+        )
+        with mock.patch.object(MODEL.subprocess, "run", return_value=completed):
+            MODEL.CommandRunner(messages.append).run(["ms", "download"])
+        self.assertEqual(len(messages), MODEL.COMMAND_LOG_LINE_LIMIT + 1)
+        self.assertEqual(messages[0], "已省略前 9900 条重复或进度输出")
+        self.assertEqual(messages[1], "progress-9900")
+        self.assertEqual(messages[-1], "progress-9999")
 
     def test_gateway_reconcile_derives_local_url_for_systemd_controller(self):
         """后台服务没有临时 Shell 变量时必须从 cluster.env 构造 OmniRoute 地址。"""

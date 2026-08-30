@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import shutil
+import tempfile
 from typing import Any
 
 from model_profiles import QWEN38_ARCHITECTURE
+
+
+QWEN38_PLE_MODULE = "vllm.models.qwen3_8_flash_next.nvidia.ple_layer"
 
 
 def host_resource_snapshot(model_root: pathlib.Path) -> dict[str, int]:
@@ -94,6 +99,95 @@ def verify_qwen38_artifact(directory: pathlib.Path) -> None:
     )
     if missing:
         raise ValueError(f"Qwen3.8 权重分片不完整：{missing[:3]}")
+
+
+def _atomic_private_write(path: pathlib.Path, content: str) -> None:
+    """在受控状态目录原子写入只允许 root 修改的构建输入。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_radixark_ple_runtime_image(
+    runner: Any, base_image: str, state_dir: pathlib.Path
+) -> str:
+    """从本地专用镜像构建带 FP8-PLE resolver 门禁的可追溯派生镜像。
+
+    RadixArk checkpoint 的主体使用 ModelOpt NVFP4，PLE 表却是带全局 scale
+    的 FP8 分片。目标 vLLM 已包含对应 loader，但只按外层 ``Fp8Config``
+    选择它。本函数在构建时验证唯一补丁锚点，生成以基础镜像 ID 命名的小
+    派生层；不修改原镜像、模型权重或宿主 Python 环境。
+    """
+
+    inspected = runner.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", base_image],
+        timeout=30,
+    )
+    image_id = str(inspected.stdout or "").strip()
+    match = re.fullmatch(r"sha256:([0-9a-f]{12,64})", image_id)
+    if not match:
+        raise RuntimeError("无法读取 Qwen3.8 基础镜像 ID，拒绝构建 PLE 兼容层")
+    derived_image = f"llmctl/qwen38-flash-next:radixark-ple-{match.group(1)[:12]}"
+    existing = runner.run(
+        ["docker", "image", "inspect", derived_image], check=False, timeout=10
+    )
+    if existing.returncode == 0:
+        return derived_image
+
+    context = state_dir / "runtime-overrides" / "qwen38-radixark-ple"
+    patch_script = f'''from importlib import import_module
+from pathlib import Path
+
+module = import_module("{QWEN38_PLE_MODULE}")
+target = Path(module.__file__).resolve()
+source = target.read_text(encoding="utf-8")
+needle = "    if not isinstance(quant_config, Fp8Config):\\n"
+replacement = (
+    "    import os\\n"
+    "    if os.environ.get(\\\"PLE_FORCE_FP8\\\") == \\\"1\\\":\\n"
+    "        return Qwen3_8FlashNextPLEFp8EmbeddingMethod()\\n"
+    + needle
+)
+if source.count(needle) != 1:
+    raise SystemExit("Qwen3.8 PLE resolver patch anchor is missing or ambiguous")
+patched = source.replace(needle, replacement, 1)
+compile(patched, str(target), "exec")
+target.write_text(patched, encoding="utf-8")
+print(target)
+'''
+    dockerfile = '''ARG BASE_IMAGE
+FROM ${{BASE_IMAGE}}
+COPY patch_ple.py /tmp/llmctl-patch-ple.py
+RUN python3 /tmp/llmctl-patch-ple.py && rm -f /tmp/llmctl-patch-ple.py
+ENV PLE_FORCE_FP8=1
+LABEL org.llmctl.runtime="qwen38-radixark-fp8-ple-v1"
+'''
+    _atomic_private_write(context / "patch_ple.py", patch_script)
+    _atomic_private_write(context / "Dockerfile", dockerfile)
+    runner.run(
+        [
+            "docker", "build", "--pull=false",
+            "--build-arg", f"BASE_IMAGE={base_image}",
+            "--tag", derived_image, str(context),
+        ],
+        timeout=30 * 60,
+    )
+    runner.run(
+        ["docker", "image", "inspect", derived_image], timeout=30
+    )
+    return derived_image
 
 
 def _topology_link_cost(value: str) -> int:

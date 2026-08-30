@@ -62,6 +62,7 @@ from model_profiles import (
 )
 from model_verification import endpoint_inference_ready
 from qwen38_deployment import (
+    ensure_radixark_ple_runtime_image,
     host_resource_snapshot,
     qwen38_gpu_groups,
     verify_qwen38_artifact,
@@ -72,7 +73,7 @@ from omniroute_maintenance import (
 )
 
 
-APP_VERSION = "3.6.4"
+APP_VERSION = "3.6.5"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -83,6 +84,7 @@ SAFE_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled", "rolled_back"}
 DEFAULT_MAINTENANCE_NO_PROXY = "127.0.0.1,localhost,::1"
 MODELSCOPE_DOWNLOADER_VERSION = "0.1.8"
+COMMAND_LOG_LINE_LIMIT = 100
 
 
 def utc_now() -> str:
@@ -727,11 +729,14 @@ class CommandRunner:
             timeout=timeout,
             env=env,
         )
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                self.logger(line[:2000])
+        output_lines = (result.stdout or "").splitlines()
+        omitted = max(0, len(output_lines) - COMMAND_LOG_LINE_LIMIT)
+        if omitted:
+            self.logger(f"已省略前 {omitted} 条重复或进度输出")
+        for line in output_lines[-COMMAND_LOG_LINE_LIMIT:]:
+            self.logger(line[:2000])
         if check and result.returncode:
-            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            lines = [line.strip() for line in output_lines if line.strip()]
             detail = "；".join(lines[-3:])[-2000:]
             raise RuntimeError(
                 f"命令执行失败，退出码 {result.returncode}"
@@ -1640,9 +1645,11 @@ class DeploymentManager:
             request = job["request"]
             self._update_job(job, "preflight", 5, "检查硬件、端口和当前部署")
             artifact = request["artifact"]
-            self._verify_runtime_image(
+            verified_image = self._verify_runtime_image(
                 artifact["model_id"], request["deployment"]["runtime"]
             )
+            if verified_image:
+                request["deployment"]["runtime"]["image"] = verified_image
             if not pathlib.Path(artifact["path"]).is_dir():
                 self._update_job(job, "downloading", 15, "下载模型权重；支持复用已完成目录")
                 self._download_artifact(artifact, request["deployment"]["runtime"], job)
@@ -1746,7 +1753,7 @@ class DeploymentManager:
 
     def _verify_runtime_image(
         self, model_id: str, runtime: dict[str, Any]
-    ) -> None:
+    ) -> str:
         """在下载大权重前核验 Qwen3.8 架构和 QSA KV 精度能力。
 
         参数：
@@ -1758,7 +1765,7 @@ class DeploymentManager:
         """
 
         if not is_qwen38_flash_next(model_id):
-            return
+            return str(runtime["image"])
         image = str(runtime["image"])
         inspect = self.runner.run(
             ["docker", "image", "inspect", image], check=False, timeout=10
@@ -1771,6 +1778,10 @@ class DeploymentManager:
                     "专用 vLLM 镜像下载失败。模型权重尚未开始下载；请让 "
                     "Docker daemon 使用可访问 Docker Hub 的代理，拉取成功后重试"
                 ) from error
+        if model_id == QWEN38_MODEL_ID:
+            image = ensure_radixark_ple_runtime_image(
+                self.runner, image, self.paths.state_dir
+            )
         script = """
 import sys
 from vllm.model_executor.models import ModelRegistry
@@ -1804,6 +1815,7 @@ if cache_dtype not in {"auto", "bfloat16"}:
             ],
             timeout=30 * 60,
         )
+        return image
 
     def _run_rollback_job(self, job_id: str) -> None:
         """执行显式回滚，并在回滚失败时恢复回滚前的安全快照。"""

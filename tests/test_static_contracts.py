@@ -149,6 +149,7 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("--limit-mm-per-prompt", MANAGER)
         self.assertIn("单请求 ${probe_images} 张图片", MANAGER)
         self.assertNotIn("six_images_json", MANAGER)
+        self.assertIn("PLE_FORCE_FP8", (ROOT / "lib/qwen38_deployment.py").read_text(encoding="utf-8"))
 
     def test_systemd_delegates_selected_gateway_to_manager(self):
         self.assertIn("ExecStart=/usr/local/sbin/llmctl _gateway-start", INSTALLER)

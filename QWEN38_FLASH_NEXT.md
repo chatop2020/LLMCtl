@@ -6,7 +6,7 @@
 
 ## 推荐的一键部署
 
-升级到 LLMCtl 3.6.4 后，进入管理后台“模型部署”，使用首屏的“Qwen3.8 Flash Next 一键部署”：
+升级到 LLMCtl 3.6.5 后，进入管理后台“模型部署”，使用首屏的“Qwen3.8 Flash Next 一键部署”：
 
 1. 页面自动读取八张 GPU 的实际拓扑并显示四个 TP2 分组。
 2. 推荐参数已经填好；“高级设置”默认折叠，一般无需修改。
@@ -141,7 +141,9 @@ sudo llmctl model rollback DEPLOYMENT_JOB_ID
 | 现象 | 处理 |
 | --- | --- |
 | 镜像不注册 `Qwen4ExpForConditionalGeneration` | 使用专用 `qwen38-flash-next` 镜像，不下载权重 |
-| ModelScope 报 `/root/.modelscope` 只读 | 升级到 3.6.4；控制服务会把 SDK home、cache 和 `--cache-dir` 固定到模型盘私有目录 |
+| ModelScope 报 `/root/.modelscope` 只读 | 升级到 3.6.5；控制服务会把 SDK home、cache 和 `--cache-dir` 固定到模型盘私有目录 |
+| 下载结束后控制服务持续大量写盘 | 升级到 3.6.5；命令输出持久化已限制为最后 100 行，避免进度条日志写放大 |
+| PLE 启动时报缺少 `ngram_embedding.weight_scale` | 升级到 3.6.5；LLMCtl 会从当前基础镜像 ID 构建最小 FP8-PLE resolver 派生层，原镜像和权重保持不变 |
 | 图片请求被拒绝为数量超限 | 在一键页面调整“每请求最大图片数”；推荐保持 4，不要只修改客户端 |
 | NVFP4 QSA KV 能力校验失败 | 改回 `auto`；不要用普通 NVFP4 KV patch 冒充 QSA 支持 |
 | PLE 进程无法交接 CUDA 句柄 | 确认容器具有最小的 `SYS_PTRACE` capability；LLMCtl 只在 PLE 开启时添加 |
