@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="3.5.0"
+readonly INSTALLER_VERSION="3.6.2"
 readonly CONFIG_DIR="/etc/llm-cluster"
 readonly LEGACY_CONFIG_DIR="/etc/ornith"
 readonly STATE_DIR="/var/lib/llm-cluster"
@@ -143,6 +143,8 @@ CATALOG_SOURCE="${SCRIPT_DIR}/lib/model_catalog.py"
 OPTIMIZER_SOURCE="${SCRIPT_DIR}/lib/runtime_optimizer.py"
 GATEWAY_SOURCE="${SCRIPT_DIR}/lib/gateway_config.py"
 MODEL_DEPLOYMENT_SOURCE="${SCRIPT_DIR}/lib/model_deployment.py"
+MODEL_PROFILES_SOURCE="${SCRIPT_DIR}/lib/model_profiles.py"
+QWEN38_DEPLOYMENT_SOURCE="${SCRIPT_DIR}/lib/qwen38_deployment.py"
 MODEL_UPGRADE_SOURCE="${SCRIPT_DIR}/lib/model_upgrade.py"
 OMNIROUTE_MAINTENANCE_SOURCE="${SCRIPT_DIR}/lib/omniroute_maintenance.py"
 ACCOUNT_SOURCE="${SCRIPT_DIR}/lib/account_portal.py"
@@ -1175,6 +1177,8 @@ check_discovery_host() {
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
+  [[ -r "${MODEL_PROFILES_SOURCE}" ]] || die "$(l10n '缺少模型预设 lib/model_profiles.py' 'The model profiles lib/model_profiles.py are missing')"
+  [[ -r "${QWEN38_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少 Qwen3.8 部署模块 lib/qwen38_deployment.py' 'The Qwen3.8 deployment module lib/qwen38_deployment.py is missing')"
   [[ -r "${MODEL_UPGRADE_SOURCE}" ]] || die "$(l10n '缺少模型版本升级规则 lib/model_upgrade.py' 'The model upgrade rules lib/model_upgrade.py are missing')"
   [[ -r "${OMNIROUTE_MAINTENANCE_SOURCE}" ]] || die "$(l10n '缺少 OmniRoute 生命周期维护模块' 'The OmniRoute lifecycle maintenance module is missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
@@ -1215,6 +1219,8 @@ check_host() {
   [[ -r "${OPTIMIZER_SOURCE}" ]] || die "$(l10n 'lib/runtime_optimizer.py 必须与安装脚本放在同一目录' 'lib/runtime_optimizer.py must be in the same directory as the installer')"
   [[ -r "${GATEWAY_SOURCE}" ]] || die "$(l10n 'lib/gateway_config.py 必须与安装脚本放在同一目录' 'lib/gateway_config.py must be in the same directory as the installer')"
   [[ -r "${MODEL_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少模型部署控制器 lib/model_deployment.py' 'The model deployment controller lib/model_deployment.py is missing')"
+  [[ -r "${MODEL_PROFILES_SOURCE}" ]] || die "$(l10n '缺少模型预设 lib/model_profiles.py' 'The model profiles lib/model_profiles.py are missing')"
+  [[ -r "${QWEN38_DEPLOYMENT_SOURCE}" ]] || die "$(l10n '缺少 Qwen3.8 部署模块 lib/qwen38_deployment.py' 'The Qwen3.8 deployment module lib/qwen38_deployment.py is missing')"
   [[ -r "${MODEL_UPGRADE_SOURCE}" ]] || die "$(l10n '缺少模型版本升级规则 lib/model_upgrade.py' 'The model upgrade rules lib/model_upgrade.py are missing')"
   [[ -r "${OMNIROUTE_MAINTENANCE_SOURCE}" ]] || die "$(l10n '缺少 OmniRoute 生命周期维护模块' 'The OmniRoute lifecycle maintenance module is missing')"
   [[ -r "${ACCOUNT_SOURCE}" ]] || die "$(l10n 'lib/account_portal.py 必须与安装脚本放在同一目录' 'lib/account_portal.py must be in the same directory as the installer')"
@@ -1845,6 +1851,8 @@ install_manager() {
   install -m 755 "${OPTIMIZER_SOURCE}" /usr/local/lib/llm-cluster/runtime_optimizer.py
   install -m 755 "${GATEWAY_SOURCE}" /usr/local/lib/llm-cluster/gateway_config.py
   install -m 755 "${MODEL_DEPLOYMENT_SOURCE}" /usr/local/lib/llm-cluster/model_deployment.py
+  install -m 644 "${MODEL_PROFILES_SOURCE}" /usr/local/lib/llm-cluster/model_profiles.py
+  install -m 644 "${QWEN38_DEPLOYMENT_SOURCE}" /usr/local/lib/llm-cluster/qwen38_deployment.py
   install -m 644 "${MODEL_UPGRADE_SOURCE}" /usr/local/lib/llm-cluster/model_upgrade.py
   install -m 644 "${OMNIROUTE_MAINTENANCE_SOURCE}" /usr/local/lib/llm-cluster/omniroute_maintenance.py
   install -m 755 "${ACCOUNT_SOURCE}" /usr/local/lib/llm-cluster/account_portal.py

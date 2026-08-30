@@ -129,6 +129,20 @@ class StaticDeploymentContracts(unittest.TestCase):
             self.assertIn(marker, worker)
         self.assertIn("QWEN38_FLASH_NEXT.md", (ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertIn("QWEN38_FLASH_NEXT_EN.md", (ROOT / "README_EN.md").read_text(encoding="utf-8"))
+        portal_page = (ROOT / "portal-ui/src/components/PortalAdminCorePages.vue").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "Qwen3.8 Flash Next 一键部署",
+            "开始自动部署并上线",
+            "恢复到部署前状态",
+            "高级设置（推荐保持默认）",
+        ):
+            self.assertIn(marker, portal_page)
+        self.assertIn("qwen38-plan", ACCOUNT)
+        self.assertIn("qwen38-submit", ACCOUNT)
+        self.assertIn("lib/model_profiles.py", MANIFEST)
+        self.assertIn("lib/qwen38_deployment.py", MANIFEST)
 
     def test_systemd_delegates_selected_gateway_to_manager(self):
         self.assertIn("ExecStart=/usr/local/sbin/llmctl _gateway-start", INSTALLER)

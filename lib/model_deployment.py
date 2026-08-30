@@ -46,13 +46,26 @@ from model_upgrade import (
     select_source_deployment,
     upgrade_profiles,
 )
+from model_profiles import (
+    QWEN38_ARCHITECTURE,
+    QWEN38_DEPLOYMENT_ID,
+    QWEN38_DISPLAY_NAME,
+    QWEN38_EDITABLE_FIELDS,
+    QWEN38_IMAGE,
+    QWEN38_MODEL_ID,
+    QWEN38_MODEL_REVISION,
+    QWEN38_PUBLIC_MODEL_ID,
+    qwen38_capacity_requirements,
+    qwen38_runtime_defaults,
+)
+from qwen38_deployment import host_resource_snapshot, qwen38_gpu_groups
 from omniroute_maintenance import (
     OmniRouteMaintenanceManager,
     OmniRouteMaintenancePaths,
 )
 
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.2"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -856,17 +869,307 @@ class DeploymentManager:
     def snapshot(self) -> dict[str, Any]:
         """返回注册表、任务和只读 GPU 清单，供 CLI 与管理后台展示。"""
 
+        registry = self.registry.read()
+        jobs = self.jobs.list()
+        inventory = gpu_inventory(self.runner)
         return {
             "version": APP_VERSION,
             "available": True,
-            "registry": self.registry.read(),
-            "jobs": self.jobs.list(),
-            "gpus": gpu_inventory(self.runner),
+            "registry": registry,
+            "jobs": jobs,
+            "gpus": inventory,
             "gateway": gateway_capabilities(self.paths),
             "upgrade_profiles": upgrade_profiles(),
             "download_environment": self.download_environment(),
+            "qwen38_quick": self.qwen38_quick_snapshot(
+                registry, jobs, inventory
+            ),
             "socket": str(self.paths.socket),
         }
+
+    def _qwen38_runtime(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """把少量高级覆盖合并到 Qwen 权威预设，并拒绝未知或高风险字段。"""
+
+        if not isinstance(payload, dict):
+            raise ValueError("Qwen3.8 高级参数必须是 JSON 对象")
+        unknown = set(payload) - QWEN38_EDITABLE_FIELDS
+        if unknown:
+            raise ValueError(f"Qwen3.8 一键部署不接受字段：{sorted(unknown)}")
+        runtime = qwen38_runtime_defaults()
+        max_model_len = bounded_int(
+            payload.get("max_model_len", runtime["max_model_len"]),
+            "最大上下文",
+            262_144,
+            1_000_000,
+        )
+        runtime["max_model_len"] = max_model_len
+        runtime["yarn_factor"] = (
+            1.0 if max_model_len <= 262_144 else 2.0 if max_model_len <= 524_288 else 4.0
+        )
+        runtime["gpu_memory_utilization"] = bounded_float(
+            payload.get(
+                "gpu_memory_utilization", runtime["gpu_memory_utilization"]
+            ),
+            "显存利用率",
+            0.70,
+            0.96,
+        )
+        runtime["max_num_seqs"] = bounded_int(
+            payload.get("max_num_seqs", runtime["max_num_seqs"]),
+            "最大并发序列",
+            1,
+            16,
+        )
+        runtime["max_num_batched_tokens"] = bounded_int(
+            payload.get(
+                "max_num_batched_tokens", runtime["max_num_batched_tokens"]
+            ),
+            "批处理 Token",
+            1024,
+            65536,
+        )
+        runtime["mtp_speculative_tokens"] = bounded_int(
+            payload.get(
+                "mtp_speculative_tokens", runtime["mtp_speculative_tokens"]
+            ),
+            "MTP 草稿 Token",
+            0,
+            3,
+        )
+        cache_dtype = str(payload.get("kv_cache_dtype", runtime["kv_cache_dtype"]))
+        if cache_dtype not in {"auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"}:
+            raise ValueError("KV Cache 精度无效")
+        runtime["kv_cache_dtype"] = cache_dtype
+        if "enable_prefix_caching" in payload:
+            if not isinstance(payload["enable_prefix_caching"], bool):
+                raise ValueError("前缀缓存开关必须是布尔值")
+            runtime["enable_prefix_caching"] = payload["enable_prefix_caching"]
+        validate_runtime(runtime)
+        validate_model_runtime(QWEN38_MODEL_ID, runtime)
+        return runtime
+
+    def _qwen38_request(
+        self, payload: dict[str, Any], inventory: list[dict[str, Any]] | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """使用全部八张 GPU 和最短可见链路生成同构 TP2 部署请求。"""
+
+        inventory = inventory if inventory is not None else gpu_inventory(self.runner)
+        requirements = qwen38_capacity_requirements()
+        if len(inventory) != requirements["gpu_count"]:
+            raise ValueError(
+                f"一键部署要求恰好 {requirements['gpu_count']} 张 GPU；当前检测到 {len(inventory)} 张"
+            )
+        low_memory = [
+            int(item["id"])
+            for item in inventory
+            if int(item.get("memory_mib", 0))
+            < requirements["minimum_gpu_memory_mib"]
+        ]
+        if low_memory:
+            raise ValueError(f"以下 GPU 显存不足 80GiB：{low_memory}")
+        pairing = qwen38_gpu_groups(self.runner, inventory)
+        groups = pairing["groups"]
+        if len(groups) != 4 or any(len(group) != 2 for group in groups):
+            raise ValueError("无法为八张 GPU 生成四个 TP2 实例")
+        cluster = parse_env_file(self.paths.cluster_env)
+        worker_base_port = bounded_int(
+            cluster.get("WORKER_BASE_PORT", "8100"),
+            "Worker 基础端口",
+            1024,
+            65000,
+        )
+        runtime = self._qwen38_runtime(payload)
+        request = {
+            "deployment_id": QWEN38_DEPLOYMENT_ID,
+            "hub": "huggingface",
+            "model_id": QWEN38_MODEL_ID,
+            "revision": QWEN38_MODEL_REVISION,
+            "public_model_id": QWEN38_PUBLIC_MODEL_ID,
+            "served_model_name": QWEN38_PUBLIC_MODEL_ID,
+            "display_name": QWEN38_DISPLAY_NAME,
+            "additional_public_ids": [],
+            "publish_requested": True,
+            "preserve_legacy_alias": False,
+            "instances": [
+                {
+                    "id": f"qwen38-worker-{worker_id}",
+                    "kind": "local",
+                    "worker_id": worker_id,
+                    "gpu_devices": group,
+                    "port": worker_base_port + worker_id,
+                    "enabled": True,
+                }
+                for worker_id, group in enumerate(groups)
+            ],
+            **runtime,
+        }
+        return request, pairing
+
+    def qwen38_quick_snapshot(
+        self,
+        registry: dict[str, Any] | None = None,
+        jobs: list[dict[str, Any]] | None = None,
+        inventory: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """返回一键页面需要的推荐参数、资源准备度、当前状态和回滚入口。"""
+
+        registry = registry if registry is not None else self.registry.read()
+        jobs = jobs if jobs is not None else self.jobs.list()
+        inventory = inventory if inventory is not None else gpu_inventory(self.runner)
+        resources = host_resource_snapshot(self.paths.model_root)
+        requirements = qwen38_capacity_requirements()
+        blockers: list[str] = []
+        warnings: list[str] = []
+        pairing: dict[str, Any] = {"groups": [], "links": [], "source": "unavailable"}
+        try:
+            request, pairing = self._qwen38_request({}, inventory)
+            normalized = normalize_request(request, self.paths)
+            artifact_ready = pathlib.Path(normalized["artifact"]["path"]).is_dir()
+        except ValueError as error:
+            blockers.append(str(error))
+            artifact_ready = False
+        if not gateway_capabilities(self.paths)["registry_publish"]:
+            blockers.append("当前 AI 接入层不能原子上线 gdn-inside；请先使用 OmniRoute")
+        total_memory = int(resources["memory_total_bytes"])
+        available_memory = int(resources["memory_available_bytes"])
+        disk_free = int(resources["disk_free_bytes"])
+        if total_memory and total_memory < requirements["minimum_host_memory_bytes"]:
+            blockers.append("主内存不足 480GiB，不能安全运行四个同构实例")
+        if (
+            available_memory
+            and available_memory < requirements["recommended_available_memory_bytes"]
+        ):
+            warnings.append("当前可用主内存低于推荐的 420GiB；部署前应停止无关大内存任务")
+        if not artifact_ready and disk_free and disk_free < requirements["download_disk_bytes"]:
+            blockers.append("模型盘可用空间不足 250GiB，无法完成下载和临时校验")
+        try:
+            image_check = self.runner.run(
+                ["docker", "image", "inspect", QWEN38_IMAGE],
+                check=False,
+                timeout=10,
+            )
+            image_ready = image_check.returncode == 0
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            image_ready = False
+        if not image_ready:
+            warnings.append("专用 vLLM 镜像尚未就绪；自动任务会先尝试拉取，失败时不会修改当前部署")
+        active = bool(
+            registry.get("deployments", {})
+            .get(QWEN38_DEPLOYMENT_ID, {})
+            .get("enabled", False)
+        )
+        quick_jobs = [job for job in jobs if job.get("kind") == "qwen38"]
+        latest_job = quick_jobs[0] if quick_jobs else None
+        rollback_job = next(
+            (
+                job
+                for job in quick_jobs
+                if active
+                and job.get("state") == "succeeded"
+                and job.get("backup")
+                and int(job.get("result_registry_revision", -1))
+                == int(registry.get("revision", 0))
+            ),
+            None,
+        )
+        current_owner = next(
+            (
+                deployment
+                for deployment in registry.get("deployments", {}).values()
+                if deployment.get("enabled", True)
+                and QWEN38_PUBLIC_MODEL_ID
+                in deployment.get("public_model_ids", [])
+            ),
+            None,
+        )
+        return {
+            "available": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+            "model_id": QWEN38_MODEL_ID,
+            "revision": QWEN38_MODEL_REVISION,
+            "public_model_id": QWEN38_PUBLIC_MODEL_ID,
+            "display_name": QWEN38_DISPLAY_NAME,
+            "runtime": qwen38_runtime_defaults(),
+            "gpu_groups": pairing,
+            "resources": resources,
+            "requirements": requirements,
+            "artifact_ready": artifact_ready,
+            "image_ready": image_ready,
+            "active": active,
+            "current_model": (
+                {
+                    "display_name": current_owner.get("display_name"),
+                    "model_id": current_owner.get("model_id"),
+                }
+                if current_owner
+                else None
+            ),
+            "latest_job_id": latest_job.get("id") if latest_job else "",
+            "rollback_job_id": rollback_job.get("id") if rollback_job else "",
+        }
+
+    def plan_qwen38(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """只读生成 Qwen3.8 全八卡替换计划，并绑定当前注册表版本。"""
+
+        snapshot = self.qwen38_quick_snapshot()
+        if snapshot["blockers"]:
+            raise ValueError("；".join(snapshot["blockers"]))
+        request, pairing = self._qwen38_request(payload)
+        plan = self.plan(request)
+        plan["source_registry_revision"] = int(
+            self.registry.read().get("revision", 0)
+        )
+        plan["qwen38"] = {
+            "display_name": QWEN38_DISPLAY_NAME,
+            "public_model_id": QWEN38_PUBLIC_MODEL_ID,
+            "gpu_groups": pairing,
+            "automatic_steps": [
+                "检查镜像与硬件",
+                "下载固定模型版本",
+                "备份当前部署",
+                "创建四个 TP2 实例",
+                "逐实例真实生成验收",
+                "上线 gdn-inside",
+            ],
+            "rollback": "失败自动恢复；成功后可一键恢复部署前状态",
+        }
+        plan["warnings"] = [
+            "该操作会使用全部八张 GPU，并在新模型验收通过后把 gdn-inside 切换到 Qwen3.8。",
+            *snapshot["warnings"],
+            *plan.get("warnings", []),
+        ]
+        return plan
+
+    def submit_qwen38(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """提交已由一键页面确认且注册表未变化的 Qwen3.8 自动部署任务。"""
+
+        with self._submission_lock:
+            self._reject_omniroute_conflict()
+            if any(
+                item.get("state") not in TERMINAL_JOB_STATES
+                for item in self.jobs.list(limit=200)
+            ):
+                raise RuntimeError("已有模型部署或回滚任务正在运行")
+            try:
+                expected_revision = int(payload.get("expected_registry_revision"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("一键部署缺少刚刚预检的注册表版本") from error
+            if expected_revision != int(self.registry.read().get("revision", 0)):
+                raise ValueError("当前部署已变化，请刷新页面后重新开始")
+            plan = self.plan_qwen38(payload)
+            if int(plan["source_registry_revision"]) != expected_revision:
+                raise ValueError("预检期间当前部署发生变化，请重新开始")
+            job = self.jobs.create(plan["normalized_request"], kind="qwen38")
+            job["source_registry_revision"] = expected_revision
+            job["qwen38"] = plan["qwen38"]
+            self.jobs.save(job)
+            thread = threading.Thread(
+                target=self._run_job, args=(job["id"],), daemon=True
+            )
+            self._threads[job["id"]] = thread
+            thread.start()
+        return job
 
     def download_environment(self) -> dict[str, Any]:
         """返回维护代理和 ModelScope 下载器的只读准备状态。
@@ -1339,14 +1642,16 @@ class DeploymentManager:
             self._update_job(job, "starting", 72, "启动受影响 Worker 并等待健康")
             self._start_and_wait(candidate, affected)
             is_upgrade = job.get("kind") == "upgrade"
-            if is_upgrade:
+            is_qwen38_quick = job.get("kind") == "qwen38"
+            requires_inference = is_upgrade or is_qwen38_quick
+            if requires_inference:
                 # 公开别名切换前必须让每个目标实例完成一次真实生成；仅有健康
                 # 端点不能证明量化内核、模板和推理路径可用。
                 self._update_job(
                     job,
                     "testing",
                     84,
-                    "公开切换前逐实例执行真实文本生成；每个实例最多等待 60 秒",
+                    "上线前逐实例执行真实文本生成；每个实例最多等待 60 秒",
                 )
                 self._verify_instances(
                     candidate,
@@ -1365,7 +1670,7 @@ class DeploymentManager:
                     88,
                     f"当前 AI 接入层 {gateway['kind']} 不支持注册表同步；已按计划跳过发布",
                 )
-            if not is_upgrade:
+            if not requires_inference:
                 self._update_job(job, "testing", 95, "逐实例执行模型列表和健康检查")
                 self._verify_instances(candidate, request["deployment"]["id"])
             job.update(
@@ -1376,9 +1681,12 @@ class DeploymentManager:
                     "message": (
                         "升级完成；旧模型权重和升级前回退点均已保留"
                         if is_upgrade
+                        else "Qwen3.8 已通过四实例真实生成验收并上线为 gdn-inside；部署前状态可一键恢复"
+                        if is_qwen38_quick
                         else "部署完成；公开模型可在门户中配置定价和授权"
                     ),
                     "backup": str(backup),
+                    "result_registry_revision": int(candidate.get("revision", 0)),
                 }
             )
             self.jobs.save(job)
@@ -1437,7 +1745,7 @@ class DeploymentManager:
 import sys
 from vllm.model_executor.models import ModelRegistry
 
-architecture = "Qwen4ExpForConditionalGeneration"
+architecture = sys.argv[2]
 if architecture not in set(ModelRegistry.get_supported_archs()):
     raise SystemExit(f"镜像未注册架构：{architecture}")
 
@@ -1462,6 +1770,7 @@ if cache_dtype not in {"auto", "bfloat16"}:
                 "-c",
                 script,
                 str(runtime.get("kv_cache_dtype", "auto")),
+                QWEN38_ARCHITECTURE,
             ],
             timeout=30 * 60,
         )
@@ -1773,15 +2082,27 @@ if cache_dtype not in {"auto", "bfloat16"}:
         """启动候选配置中的受影响 Worker，并等待每个端点健康。"""
 
         desired = local_instances(candidate)
+        deadline = time.monotonic() + bounded_int(
+            os.environ.get("LLM_MODEL_START_TIMEOUT", "1800"), "启动超时", 30, 7200
+        )
+        pending: set[int] = set()
         for worker_id in sorted(affected):
             if worker_id not in desired:
                 continue
             self.runner.run(["systemctl", "enable", f"llm-worker@{worker_id}.service"])
             self.runner.run(["systemctl", "start", f"llm-worker@{worker_id}.service"])
-        deadline = time.monotonic() + bounded_int(
-            os.environ.get("LLM_MODEL_START_TIMEOUT", "1800"), "启动超时", 30, 7200
-        )
-        pending = {worker_id for worker_id in affected if worker_id in desired}
+            pending.add(worker_id)
+            deployment, instance = desired[worker_id]
+            # PLE 主内存常驻量很大；一键部署逐实例加载，避免四份权重同时
+            # 进入主内存造成瞬时 OOM。普通部署继续保持原并行启动行为。
+            if is_qwen38_flash_next(str(deployment.get("model_id", ""))):
+                while worker_id in pending and time.monotonic() < deadline:
+                    if endpoint_healthy(f"http://127.0.0.1:{instance['port']}", self.paths.secrets_env):
+                        pending.remove(worker_id)
+                    else:
+                        time.sleep(3)
+                if worker_id in pending:
+                    raise RuntimeError(f"Worker 健康检查超时：[{worker_id}]")
         while pending and time.monotonic() < deadline:
             for worker_id in list(pending):
                 _deployment, instance = desired[worker_id]
@@ -2172,6 +2493,10 @@ def merge_deployment(
             existing["updated_at"] = utc_now()
     candidate["artifacts"][request["artifact"]["id"]] = request["artifact"]
     candidate["deployments"][deployment["id"]] = deployment
+    # 公开 ID 直接成为真实部署名时，删除同名历史别名，避免网关继续把它
+    # 重写到已经停用的旧模型或形成自引用。
+    for public_id in deployment.get("public_model_ids", []):
+        candidate.get("legacy_aliases", {}).pop(str(public_id), None)
     if request.get("preserve_legacy_alias"):
         candidate["legacy_aliases"]["gdn-inside"] = deployment["public_model_ids"][0]
     candidate["updated_at"] = utc_now()
@@ -2535,6 +2860,10 @@ class ControlServer(socketserver.ThreadingUnixStreamServer):
             return self.manager.plan(payload)
         if operation == "submit":
             return self.manager.submit(payload)
+        if operation == "qwen38-plan":
+            return self.manager.plan_qwen38(payload)
+        if operation == "qwen38-submit":
+            return self.manager.submit_qwen38(payload)
         if operation == "upgrade-plan":
             return self.manager.plan_upgrade(payload)
         if operation == "upgrade-submit":

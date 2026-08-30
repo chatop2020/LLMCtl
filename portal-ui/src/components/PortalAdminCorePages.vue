@@ -557,6 +557,120 @@ export default {
                 </p>
               </section>
 
+              <section class="panel qwen38-quick-card">
+                <div class="qwen38-quick-head">
+                  <div>
+                    <span class="eyebrow">RECOMMENDED FOR THIS SERVER</span>
+                    <h2>Qwen3.8 Flash Next 一键部署</h2>
+                    <p>点击一次，自动下载固定模型、备份当前状态、部署四个 TP2 实例、逐实例测试并上线为 <code>gdn-inside</code>。</p>
+                  </div>
+                  <span class="status" :class="qwen38Quick.profile?.active ? 'ok' : qwen38Quick.profile?.available ? 'warn' : 'bad'">
+                    {{ qwen38Quick.profile?.active ? "已上线" : qwen38Quick.profile?.available ? "可以部署" : "需要处理" }}
+                  </span>
+                </div>
+
+                <div class="qwen38-transition">
+                  <article>
+                    <small>当前 gdn-inside</small>
+                    <strong>{{ qwen38Quick.profile?.current_model?.display_name || "未识别" }}</strong>
+                    <span>{{ qwen38Quick.profile?.current_model?.model_id || "尚无公开模型" }}</span>
+                  </article>
+                  <b aria-hidden="true">→</b>
+                  <article class="target">
+                    <small>自动部署目标</small>
+                    <strong>Qwen3.8 Flash Next NVFP4</strong>
+                    <span>公开调用仍使用 <code>gdn-inside</code></span>
+                  </article>
+                </div>
+
+                <div class="qwen38-preset-grid">
+                  <article><strong>8 张 GPU</strong><span>自动分为 4 个 TP2 实例</span></article>
+                  <article><strong>262K 上下文</strong><span>原生窗口，不启用 YaRN</span></article>
+                  <article><strong>NVFP4 + BF16 KV</strong><span>PLE 放入主内存，开启 EP</span></article>
+                  <article><strong>自动保护</strong><span>失败自动恢复，成功可一键回滚</span></article>
+                </div>
+
+                <div v-if="qwen38Quick.profile?.gpu_groups?.groups?.length" class="qwen38-groups">
+                  <span
+                    v-for="(group, index) in qwen38Quick.profile.gpu_groups.groups"
+                    :key="group.join('-')"
+                  >实例 {{ index + 1 }}：GPU {{ group.join(' + ') }}</span>
+                  <small>配对来源：{{ qwen38Quick.profile.gpu_groups.source === 'nvidia-smi' ? 'GPU 实际拓扑' : '按编号回退分组' }}</small>
+                </div>
+
+                <ul v-if="qwen38Quick.profile?.blockers?.length" class="deployment-warnings qwen38-blockers">
+                  <li v-for="item in qwen38Quick.profile.blockers" :key="item">{{ item }}</li>
+                </ul>
+                <ul v-else-if="qwen38Quick.profile?.warnings?.length" class="deployment-warnings">
+                  <li v-for="item in qwen38Quick.profile.warnings" :key="item">{{ item }}</li>
+                </ul>
+
+                <details class="qwen38-advanced">
+                  <summary>高级设置（推荐保持默认）</summary>
+                  <div class="form-grid qwen38-advanced-grid">
+                    <label>最大上下文
+                      <input v-model.number="qwen38Quick.form.max_model_len" type="number" min="262144" max="1000000" />
+                      <small>推荐 262144；更大窗口会降低余量并启用 Static YaRN。</small>
+                    </label>
+                    <label>每实例并发序列
+                      <input v-model.number="qwen38Quick.form.max_num_seqs" type="number" min="1" max="16" />
+                      <small>推荐 8；不是 8 路请求都能同时占满 262K。</small>
+                    </label>
+                    <label>显存利用率
+                      <input v-model.number="qwen38Quick.form.gpu_memory_utilization" type="number" min="0.7" max="0.96" step="0.01" />
+                      <small>推荐 0.92，为图、状态和多模态工作区留余量。</small>
+                    </label>
+                    <label>MTP 草稿 Token
+                      <select v-model.number="qwen38Quick.form.mtp_speculative_tokens">
+                        <option :value="0">0（推荐，先稳定运行）</option>
+                        <option :value="1">1</option>
+                        <option :value="2">2（验收后可尝试）</option>
+                        <option :value="3">3</option>
+                      </select>
+                    </label>
+                    <label>KV Cache 精度
+                      <select v-model="qwen38Quick.form.kv_cache_dtype">
+                        <option value="auto">auto / BF16（推荐）</option>
+                        <option value="bfloat16">bfloat16</option>
+                        <option value="fp8">fp8（需镜像支持）</option>
+                        <option value="fp8_e4m3">fp8_e4m3（需镜像支持）</option>
+                        <option value="nvfp4">nvfp4（实验，需镜像支持）</option>
+                      </select>
+                    </label>
+                    <label class="qwen38-toggle">
+                      <input v-model="qwen38Quick.form.enable_prefix_caching" type="checkbox" />
+                      启用前缀缓存
+                      <small>当前预览版默认关闭，避免已知混合缓存风险。</small>
+                    </label>
+                  </div>
+                </details>
+
+                <div v-if="qwen38Quick.job" class="qwen38-last-result">
+                  <span class="status" :class="['failed', 'rolled_back'].includes(qwen38Quick.job.state) ? 'bad' : qwen38Quick.job.state === 'succeeded' ? 'ok' : 'warn'">
+                    {{ deploymentJobStateLabel(qwen38Quick.job.state) }}
+                  </span>
+                  <strong>{{ qwen38Quick.job.message }}</strong>
+                </div>
+
+                <div class="qwen38-actions">
+                  <button
+                    v-if="!qwen38Quick.profile?.active"
+                    type="button"
+                    class="primary qwen38-deploy-button"
+                    :disabled="qwen38Quick.busy || Boolean(activeModelDeploymentJob) || !qwen38Quick.profile?.available"
+                    @click="qwen38Quick.deploy"
+                  >{{ qwen38Quick.busy ? "正在检查并提交…" : "开始自动部署并上线" }}</button>
+                  <button
+                    v-if="qwen38Quick.rollbackJob"
+                    type="button"
+                    class="danger qwen38-rollback-button"
+                    :disabled="Boolean(activeModelDeploymentJob)"
+                    @click="qwen38Quick.rollback"
+                  >恢复到部署前状态</button>
+                  <small>开始后无需停留在本页。下载和部署在服务器后台继续，失败会自动恢复。</small>
+                </div>
+              </section>
+
               <section
                 v-if="displayedModelUpgradeJob"
                 id="model-deployment-active-job"
@@ -596,6 +710,9 @@ export default {
                 >仅重试 AI 接入层发布（不重启 Worker）</button>
               </section>
 
+              <details class="panel qwen38-other-tools">
+                <summary>其他模型与高级部署工具</summary>
+                <div class="qwen38-other-tools-body">
               <section class="panel deployment-form-section">
                 <div class="section-title-row">
                   <div>
@@ -996,6 +1113,8 @@ export default {
                   </section>
                 </aside>
               </div>
+                </div>
+              </details>
             </template>
           </section>
 

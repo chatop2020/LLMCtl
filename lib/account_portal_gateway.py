@@ -823,6 +823,8 @@ class ModelDeploymentClient:
             "snapshot",
             "plan",
             "submit",
+            "qwen38-plan",
+            "qwen38-submit",
             "upgrade-plan",
             "upgrade-submit",
             "publish",

@@ -267,14 +267,69 @@ describe("模型版本升级组合逻辑", () => {
   });
 
   it("Qwen3.8 预设生成四个同构 TP2 原生 262K 实例", async () => {
+    const quick = {
+      available: true,
+      blockers: [],
+      warnings: [],
+      model_id: "Inferact/Qwen3.8-Flash-Next-NVFP4",
+      revision: "103a7608316173ca6edd49929544244de7ffda70",
+      public_model_id: "gdn-inside",
+      display_name: "Qwen3.8 Flash Next NVFP4",
+      gpu_groups: { groups: [[0, 1], [2, 3], [4, 5], [6, 7]], source: "nvidia-smi" },
+      runtime: {
+        image: "vllm/vllm-openai:qwen38-flash-next",
+        tensor_parallel_size: 2,
+        max_model_len: 262144,
+        gpu_memory_utilization: 0.92,
+        max_num_seqs: 8,
+        max_num_batched_tokens: 8192,
+        ple_cpu_offload: true,
+        enable_expert_parallel: true,
+        enable_prefix_caching: false,
+        enable_flashinfer_autotune: false,
+        disable_custom_all_reduce: false,
+        mtp_speculative_tokens: 0,
+        kv_cache_dtype: "auto",
+        yarn_factor: 1,
+        trust_remote_code: false,
+        supports_image_input: true,
+        supports_ocr: false,
+        supports_tool_calling: true,
+        supports_reasoning: true,
+        supports_thinking_toggle: true,
+        tool_call_parser: "qwen3_xml",
+        reasoning_parser: "qwen3",
+        mm_limit: '{"image":4,"video":0}',
+      },
+    };
     const notify = vi.fn();
+    const calls = [];
+    const api = vi.fn(async (path, options = {}) => {
+      calls.push({ path, body: options.body ? JSON.parse(options.body) : null });
+      if (path === "admin/model-deployments") {
+        return {
+          available: true,
+          gateway: { registry_publish: true },
+          gpus: Array.from({ length: 8 }, (_, id) => ({ id })),
+          jobs: [],
+          registry: { deployments: {}, artifacts: {} },
+          upgrade_profiles: [],
+          qwen38_quick: quick,
+        };
+      }
+      if (path === "admin/qwen38/plan") return { source_registry_revision: 9 };
+      if (path === "admin/qwen38/deploy") {
+        return { id: "qwen-job", kind: "qwen38", state: "waiting" };
+      }
+      throw new Error(`未处理的测试路径：${path}`);
+    });
     const state = useModelDeployments({
-      api: vi.fn(),
+      api,
       isAdmin: ref(true),
       session: ref({ authenticated: true }),
       notify,
     });
-    state.modelDeploymentForm.selected_gpu_ids = [0, 1, 2, 3, 4, 5, 6, 7];
+    await state.loadModelDeployments();
     state.applyQwen38FlashNextPreset();
     const payload = state.modelDeploymentPayload();
 
@@ -283,6 +338,7 @@ describe("模型版本升级组合逻辑", () => {
     expect(payload.image).toBe("vllm/vllm-openai:qwen38-flash-next");
     expect(payload.tensor_parallel_size).toBe(2);
     expect(payload.instances).toHaveLength(4);
+    expect(payload.public_model_id).toBe("gdn-inside");
     expect(payload.instances.map((item) => item.gpu_devices)).toEqual([
       [0, 1],
       [2, 3],
@@ -297,6 +353,76 @@ describe("模型版本升级组合逻辑", () => {
     expect(payload.mtp_speculative_tokens).toBe(0);
     expect(payload.kv_cache_dtype).toBe("auto");
     expect(payload.yarn_factor).toBe(1);
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining("TP2 配对"));
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("后端核验"));
+
+    await state.qwen38Quick.deploy();
+    expect(calls.at(-1)).toMatchObject({
+      path: "admin/model-deployments",
+    });
+    const submitted = calls.find((item) => item.path === "admin/qwen38/deploy");
+    expect(submitted.body).toMatchObject({
+      expected_registry_revision: 9,
+      max_model_len: 262144,
+      max_num_seqs: 8,
+      mtp_speculative_tokens: 0,
+    });
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("失败会自动恢复"),
+      "working",
+    );
+  });
+
+  it("Qwen3.8 成功后可从专用入口恢复部署前状态", async () => {
+    const sourceJob = {
+      id: "qwen-source-job",
+      kind: "qwen38",
+      state: "succeeded",
+      backup: "/backup/qwen-source-job",
+    };
+    const calls = [];
+    const api = vi.fn(async (path, options = {}) => {
+      calls.push({ path, body: options.body ? JSON.parse(options.body) : null });
+      if (path === "admin/model-deployments") {
+        return {
+          available: true,
+          gateway: { registry_publish: true },
+          gpus: [],
+          jobs: [sourceJob],
+          registry: { deployments: {}, artifacts: {} },
+          upgrade_profiles: [],
+          qwen38_quick: {
+            active: true,
+            available: true,
+            blockers: [],
+            warnings: [],
+            rollback_job_id: sourceJob.id,
+            runtime: {},
+            gpu_groups: { groups: [] },
+          },
+        };
+      }
+      if (path === "admin/model-deployments/rollback") {
+        return { id: "rollback-job", kind: "rollback", state: "waiting" };
+      }
+      throw new Error(`未处理的测试路径：${path}`);
+    });
+    const originalWindow = globalThis.window;
+    globalThis.window = { confirm: vi.fn(() => true) };
+    try {
+      const state = useModelDeployments({
+        api,
+        isAdmin: ref(true),
+        session: ref({ authenticated: true }),
+        notify: vi.fn(),
+      });
+      await state.loadModelDeployments();
+      expect(state.qwen38Quick.rollbackJob?.id).toBe(sourceJob.id);
+      await state.qwen38Quick.rollback();
+      expect(
+        calls.find((item) => item.path === "admin/model-deployments/rollback")?.body,
+      ).toEqual({ id: sourceJob.id });
+    } finally {
+      globalThis.window = originalWindow;
+    }
   });
 });

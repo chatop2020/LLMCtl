@@ -32,6 +32,8 @@ class ControlPlaneUpgradeTests(unittest.TestCase):
             "lib/runtime_optimizer.py",
             "lib/gateway_config.py",
             "lib/model_deployment.py",
+            "lib/model_profiles.py",
+            "lib/qwen38_deployment.py",
             "lib/model_upgrade.py",
             "lib/omniroute_maintenance.py",
             "lib/account_portal.py",

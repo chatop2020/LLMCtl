@@ -2,7 +2,13 @@
 
 LLMCtl supports the dedicated Qwen3.8 preview runtime, TP2, PLE CPU offload, expert parallelism, MTP, selectable KV-cache dtype, and guarded static YaRN.
 
-> Qwen3.8 Flash Next and its vLLM integration are still preview software. Start with one TP2 canary. Expand to four identical replicas only after model load, text, vision, tool calling, long-context, and representative workload checks pass. Deployment snapshots support automatic and explicit rollback.
+> Qwen3.8 Flash Next and its vLLM integration are still preview software. The one-click path deploys four identical TP2 replicas but publishes them only after per-instance inference acceptance. Failures restore the previous runtime automatically, and successful deployments retain an explicit restore point. The generic form remains available for a staged canary rollout.
+
+## Recommended one-click deployment
+
+After upgrading to LLMCtl 3.6.2, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, then performs image/model checks, fixed-revision download, backup, deployment, per-instance inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
+
+The commands below remain available for advanced manual control.
 
 ## Recommended production profile
 

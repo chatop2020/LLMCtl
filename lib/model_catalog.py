@@ -26,10 +26,19 @@ import urllib.request
 from typing import Any, Iterable
 
 
+_CATALOG_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+if _CATALOG_DIRECTORY not in sys.path:
+    sys.path.insert(0, _CATALOG_DIRECTORY)
+
+from model_profiles import (
+    QWEN38_ARCHITECTURE,
+    QWEN38_IMAGE,
+    qwen38_runtime_defaults,
+)
+
+
 CATALOG_VERSION = "2.3.0"
 VLLM_COMPAT_VERSION = "0.22.1"
-QWEN38_FLASH_NEXT_IMAGE = "vllm/vllm-openai:qwen38-flash-next"
-QWEN38_FLASH_NEXT_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
 GIB = 1024**3
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 MS_ENDPOINT = os.environ.get("MODELSCOPE_ENDPOINT", "https://modelscope.cn").rstrip("/")
@@ -630,21 +639,22 @@ def model_runtime_profile(
     """为目录结果生成可由安装器和多模型控制器共同消费的运行时建议。"""
 
     archs = architectures(config)
-    if QWEN38_FLASH_NEXT_ARCHITECTURE in archs:
+    if QWEN38_ARCHITECTURE in archs:
+        defaults = qwen38_runtime_defaults()
         return {
             "kind": "qwen38-flash-next-preview",
-            "image": QWEN38_FLASH_NEXT_IMAGE,
+            "image": QWEN38_IMAGE,
             "minimum_tp": 2,
-            "max_num_seqs": 8,
+            "max_num_seqs": defaults["max_num_seqs"],
             "runtime_extra_bytes_per_gpu": 4 * GIB,
-            "ple_cpu_offload": True,
+            "ple_cpu_offload": defaults["ple_cpu_offload"],
             "ple_offload_bytes": qwen38_ple_weight_bytes(config),
-            "enable_expert_parallel": True,
-            "enable_prefix_caching": False,
-            "enable_flashinfer_autotune": False,
-            "disable_custom_all_reduce": False,
-            "mtp_speculative_tokens": 0,
-            "kv_cache_dtype": "auto",
+            "enable_expert_parallel": defaults["enable_expert_parallel"],
+            "enable_prefix_caching": defaults["enable_prefix_caching"],
+            "enable_flashinfer_autotune": defaults["enable_flashinfer_autotune"],
+            "disable_custom_all_reduce": defaults["disable_custom_all_reduce"],
+            "mtp_speculative_tokens": defaults["mtp_speculative_tokens"],
+            "kv_cache_dtype": defaults["kv_cache_dtype"],
             "startup_parallelism_cap": 1,
             "preview": True,
             "precision": precision,

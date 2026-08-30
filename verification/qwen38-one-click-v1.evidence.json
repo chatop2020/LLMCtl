@@ -1,0 +1,96 @@
+{
+  "plan_id": "qwen38-one-click",
+  "plan_version": 1,
+  "generated_at": "2026-08-30T12:31:19Z",
+  "source": {
+    "baseline_commit": "324f128b6ccbd513589d322f0b5719a0c536fffe",
+    "worktree": "dirty",
+    "tracked_diff_sha256": "edb83da5b578d089c08994eb8994324e0f35dd72311ab4acd0eff8b4921d8e42",
+    "untracked": {
+      "lib/model_profiles.py": "6b81dd79b410b97b498ab103bfbd8ae37fcca745e0e391a47983207b108aebf8",
+      "lib/qwen38_deployment.py": "a6f6f659e67925e26c341369a4032e5c07b9b0da846f6d3538dd7d5c0ea1cfae",
+      "verification/qwen38-one-click-v1.json": "413d904961fce06270a46d0e01b5e03721b3d0c39bdbb9feea1cc89c33ce6751"
+    },
+    "digest_scope": "Tracked binary diff plus separately hashed untracked task files; this evidence file is excluded."
+  },
+  "environment": {
+    "host": "macOS local development environment without NVIDIA GPUs",
+    "python": "3.9.6",
+    "node": "26.7.0",
+    "portal_build_tool": "Vite 7.3.6",
+    "target": "Upgraded OmniRoute host with 8×RTX PRO 6000D"
+  },
+  "gates": [
+    {
+      "gate_id": "backend-contract",
+      "status": "Passed",
+      "evidence": [
+        "The backend owns the immutable model ID, revision, public gdn-inside ID and runtime defaults.",
+        "Topology tests select non-adjacent PIX pairs when they are better than adjacent GPU numbers.",
+        "Plan tests produce four TP2 instances over all eight GPUs, disable the conflicting old deployment and remove the stale gdn-inside alias.",
+        "Unsafe host RAM and model-disk fixtures disable one-click deployment before any task starts.",
+        "Stale registry submissions fail closed and Qwen jobs persist before their background thread starts.",
+        "Qwen jobs start PLE workers sequentially, require per-instance real inference before publication and retain the pre-deployment backup for explicit rollback."
+      ]
+    },
+    {
+      "gate_id": "portal-contract",
+      "status": "Passed",
+      "evidence": [
+        "Admin-only HTTP routes map qwen38 plan and deploy requests to the model-control allowlist.",
+        "Six composable tests cover server-owned preset loading, one-click plan and submit, and the dedicated rollback action.",
+        "56 frontend tests passed across 9 files.",
+        "The Vite production build passed with 30 transformed modules."
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "status": "Passed",
+      "evidence": [
+        "280 Python tests passed in 55.660 seconds.",
+        "Shell syntax, Python compilation, strict JSON, git diff whitespace and source-size gates passed.",
+        "The online-upgrade ZIP initially failed because its test fixture omitted the two new runtime modules. The fixture was updated, and both original failed archive gates then passed.",
+        "model_deployment.py remains below the 3000-line limit; topology and resource logic is split into qwen38_deployment.py.",
+        "Built portal index SHA256: 50b7b5d3bea0fa3ffc6d205b6eb472c9c0c8a9b279eebdc9d60a30f6c5ca5d8c.",
+        "Built portal JavaScript SHA256: a1b8c26cff494dc43f38fe3d418ac94b45da8538246f75df507fefdeffde27a9.",
+        "Built portal CSS SHA256: 80f5595b7e69aa32375eb93cc92c3d1ca3bb7de216030a3a70704f8b3f787e77."
+      ]
+    },
+    {
+      "gate_id": "visible-page-acceptance",
+      "status": "Passed",
+      "evidence": [
+        "An authenticated local administrator fixture rendered the one-click card above every generic deployment tool.",
+        "The default state showed Ornith 1.5 to Qwen3.8, gdn-inside retention, four TP2 groups, recommended parameter summaries and one enabled start button.",
+        "Advanced settings and all generic deployment tools were closed by default.",
+        "At a 390×844 viewport, innerWidth and document scrollWidth were both 390 with no horizontal overflow.",
+        "A successful deployment fixture hid the start button, displayed the Qwen online state and exposed the restore-to-pre-deployment button.",
+        "No browser console errors or warnings were reported."
+      ]
+    },
+    {
+      "gate_id": "target-host-acceptance",
+      "status": "Unverified",
+      "reason": "The implementation was not installed on or executed against the user's 8×RTX PRO 6000D server in this task.",
+      "required_actions": [
+        "Upgrade the server to LLMCtl 3.6.2 while the maintenance tunnel is active.",
+        "Open Model Deployments and verify the page reports no blockers.",
+        "Click Start automatic deployment and observe download, sequential loading, inference acceptance and publication.",
+        "After success, verify gdn-inside and exercise the dedicated restore button during an approved maintenance window."
+      ]
+    }
+  ],
+  "traceability": [
+    {
+      "evidence": "Server-owned preset and topology tests",
+      "finding": "Administrators no longer need to understand deployment IDs, Hub revisions, Worker IDs, GPU groups or routing aliases.",
+      "path": "one-click page -> qwen38-plan -> qwen38-submit -> fixed normalized request"
+    },
+    {
+      "evidence": "Sequential load, inference-before-publish and rollback tests",
+      "finding": "The simplified action does not weaken safety or make a submitted task look like a successful deployment.",
+      "path": "download -> backup -> sequential TP2 start -> real inference -> gateway publish -> retained restore point"
+    }
+  ],
+  "final_stage": "Implemented and locally verified; not installed or accepted on the target GPU host"
+}

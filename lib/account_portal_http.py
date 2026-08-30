@@ -719,6 +719,10 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
                 result = self.app.models.request("plan", payload)
             elif path == "/portal-api/admin/model-deployments/submit":
                 result = self.app.models.request("submit", payload)
+            elif path == "/portal-api/admin/qwen38/plan":
+                result = self.app.models.request("qwen38-plan", payload)
+            elif path == "/portal-api/admin/qwen38/deploy":
+                result = self.app.models.request("qwen38-submit", payload)
             elif path == "/portal-api/admin/model-upgrades/plan":
                 result = self.app.models.request("upgrade-plan", payload)
             elif path == "/portal-api/admin/model-upgrades/submit":

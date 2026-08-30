@@ -276,8 +276,207 @@ class ModelDeploymentTests(unittest.TestCase):
             },
         )
         command = runner.run.call_args.args[0]
-        self.assertIn("Qwen4ExpForConditionalGeneration", command[-2])
-        self.assertEqual(command[-1], "nvfp4")
+        self.assertIn("architecture = sys.argv[2]", command[-3])
+        self.assertEqual(command[-2], "nvfp4")
+        self.assertEqual(command[-1], "Qwen4ExpForConditionalGeneration")
+
+    def test_qwen38_quick_plan_owns_public_id_and_builds_four_tp2_instances(self):
+        """一键计划必须用全部八卡替换旧模型，并让 gdn-inside 成为真实公开 ID。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        resources = {
+            "memory_total_bytes": 512 * 1024**3,
+            "memory_available_bytes": 470 * 1024**3,
+            "disk_free_bytes": 600 * 1024**3,
+        }
+        pairing = {
+            "groups": [[0, 2], [1, 3], [4, 6], [5, 7]],
+            "links": [],
+            "source": "nvidia-smi",
+        }
+        with mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus), \
+             mock.patch.object(MODEL, "host_resource_snapshot", return_value=resources), \
+             mock.patch.object(MODEL, "qwen38_gpu_groups", return_value=pairing):
+            plan = manager.plan_qwen38({})
+
+        deployment = plan["normalized_request"]["deployment"]
+        self.assertEqual(deployment["public_model_ids"], ["gdn-inside"])
+        self.assertEqual(deployment["served_model_name"], "gdn-inside")
+        self.assertEqual(deployment["runtime"]["tensor_parallel_size"], 2)
+        self.assertEqual(
+            [item["gpu_devices"] for item in deployment["instances"]],
+            pairing["groups"],
+        )
+        self.assertEqual(plan["requested_gpu_ids"], list(range(8)))
+        self.assertNotIn("gdn-inside", plan["legacy_aliases"])
+        self.assertEqual(plan["source_registry_revision"], 0)
+
+    def test_qwen38_quick_submit_rejects_stale_plan_and_persists_job_before_start(self):
+        """一键按钮只能提交刚预检的状态，后台线程前必须保存回滚所需任务。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        resources = {
+            "memory_total_bytes": 512 * 1024**3,
+            "memory_available_bytes": 470 * 1024**3,
+            "disk_free_bytes": 600 * 1024**3,
+        }
+        pairing = {
+            "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+            "links": [],
+            "source": "nvidia-smi",
+        }
+        patches = (
+            mock.patch.object(MODEL, "gpu_inventory", return_value=self.gpus),
+            mock.patch.object(MODEL, "host_resource_snapshot", return_value=resources),
+            mock.patch.object(MODEL, "qwen38_gpu_groups", return_value=pairing),
+        )
+        with patches[0], patches[1], patches[2]:
+            with self.assertRaisesRegex(ValueError, "当前部署已变化"):
+                manager.submit_qwen38({"expected_registry_revision": 99})
+            with mock.patch.object(MODEL.threading, "Thread") as thread:
+                job = manager.submit_qwen38({"expected_registry_revision": 0})
+        stored = manager.jobs.get(job["id"])
+        self.assertEqual(stored["kind"], "qwen38")
+        self.assertEqual(stored["source_registry_revision"], 0)
+        self.assertEqual(stored["request"]["deployment"]["served_model_name"], "gdn-inside")
+        thread.return_value.start.assert_called_once()
+
+    def test_qwen38_quick_job_runs_real_inference_before_publication(self):
+        """一键任务必须在 gdn-inside 上线前让四个实例完成真实生成。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        pairing = {
+            "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+            "links": [],
+            "source": "nvidia-smi",
+        }
+        with mock.patch.object(MODEL, "qwen38_gpu_groups", return_value=pairing):
+            request, _pairing = manager._qwen38_request({}, self.gpus)
+        normalized = MODEL.normalize_request(request, self.paths)
+        artifact = Path(normalized["artifact"]["path"])
+        artifact.mkdir(parents=True)
+        (artifact / "config.json").write_text("{}\n", encoding="utf-8")
+        (artifact / "model.safetensors").write_bytes(b"weight")
+        job = manager.jobs.create(normalized, kind="qwen38")
+        order = []
+
+        def apply_candidate(candidate, _affected, _deployment_id):
+            candidate["revision"] = int(candidate.get("revision", 0)) + 1
+
+        with mock.patch.object(manager, "_verify_runtime_image"), \
+             mock.patch.object(manager, "_backup_runtime", return_value=self.root / "backup"), \
+             mock.patch.object(manager, "_apply_candidate", side_effect=apply_candidate), \
+             mock.patch.object(manager, "_start_and_wait"), \
+             mock.patch.object(
+                 manager,
+                 "_verify_instances",
+                 side_effect=lambda *_args, **kwargs: order.append(
+                     ("verify", kwargs.get("inference"))
+                 ),
+             ), \
+             mock.patch.object(
+                 manager, "_reconcile_gateway", side_effect=lambda: order.append(("publish", None))
+             ):
+            manager._run_job(job["id"])
+
+        stored = manager.jobs.get(job["id"])
+        self.assertEqual(order, [("verify", True), ("publish", None)])
+        self.assertEqual(stored["state"], "succeeded")
+        self.assertEqual(stored["result_registry_revision"], 1)
+        self.assertIn("一键恢复", stored["message"])
+
+    def test_qwen38_topology_pairing_prefers_shorter_nonadjacent_links(self):
+        """GPU 编号相邻不是最短链路时，应按 nvidia-smi 的 PIX 关系配对。"""
+
+        preferred = {frozenset(pair) for pair in ((0, 2), (1, 3), (4, 6), (5, 7))}
+        lines = []
+        for left in range(8):
+            values = []
+            for right in range(8):
+                if left == right:
+                    values.append("X")
+                elif frozenset((left, right)) in preferred:
+                    values.append("PIX")
+                else:
+                    values.append("SYS")
+            lines.append(f"GPU{left} " + " ".join(values))
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, stdout="\n".join(lines), stderr=""
+        )
+        result = MODEL.qwen38_gpu_groups(runner, self.gpus)
+        self.assertEqual(
+            {frozenset(group) for group in result["groups"]}, preferred
+        )
+        self.assertEqual(result["source"], "nvidia-smi")
+
+    def test_qwen38_quick_page_blocks_unsafe_host_capacity(self):
+        """主内存或模型盘不足时，一键页面必须禁用部署而不是让任务中途 OOM。"""
+
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+        runner.run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        resources = {
+            "memory_total_bytes": 256 * 1024**3,
+            "memory_available_bytes": 200 * 1024**3,
+            "disk_free_bytes": 100 * 1024**3,
+        }
+        pairing = {
+            "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+            "links": [],
+            "source": "nvidia-smi",
+        }
+        with mock.patch.object(MODEL, "host_resource_snapshot", return_value=resources), \
+             mock.patch.object(MODEL, "qwen38_gpu_groups", return_value=pairing):
+            snapshot = manager.qwen38_quick_snapshot(inventory=self.gpus)
+        self.assertFalse(snapshot["available"])
+        self.assertTrue(any("主内存不足" in item for item in snapshot["blockers"]))
+        self.assertTrue(any("模型盘" in item for item in snapshot["blockers"]))
+
+    def test_qwen38_workers_load_sequentially_to_bound_host_memory(self):
+        """四个 PLE 实例必须逐个健康后再启动下一个，避免并行加载耗尽主内存。"""
+
+        events = []
+        runner = mock.Mock(spec=MODEL.CommandRunner)
+
+        def run(command, **_kwargs):
+            if command[:2] == ["systemctl", "start"]:
+                events.append(("start", command[2]))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        runner.run.side_effect = run
+        manager = MODEL.DeploymentManager(self.paths, runner=runner)
+        pairing = {
+            "groups": [[0, 1], [2, 3], [4, 5], [6, 7]],
+            "links": [],
+            "source": "nvidia-smi",
+        }
+        with mock.patch.object(MODEL, "qwen38_gpu_groups", return_value=pairing):
+            request, _pairing = manager._qwen38_request({}, self.gpus)
+        normalized = MODEL.normalize_request(request, self.paths)
+        candidate, affected = MODEL.merge_deployment(manager.registry.read(), normalized)
+
+        def healthy(origin, _secrets):
+            events.append(("healthy", origin))
+            return True
+
+        with mock.patch.object(MODEL, "endpoint_healthy", side_effect=healthy):
+            manager._start_and_wait(candidate, affected)
+        self.assertEqual(
+            events,
+            [
+                ("start", "llm-worker@0.service"), ("healthy", "http://127.0.0.1:8100"),
+                ("start", "llm-worker@1.service"), ("healthy", "http://127.0.0.1:8101"),
+                ("start", "llm-worker@2.service"), ("healthy", "http://127.0.0.1:8102"),
+                ("start", "llm-worker@3.service"), ("healthy", "http://127.0.0.1:8103"),
+            ],
+        )
 
     def test_local_artifact_must_stay_under_model_root(self):
         manager = MODEL.DeploymentManager(self.paths)

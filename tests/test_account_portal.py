@@ -1507,12 +1507,16 @@ class PortalIntegrationTests(unittest.TestCase):
 
             def request(self, operation, payload=None):
                 self.calls.append((operation, payload or {}))
-                if operation == "upgrade-plan":
+                if operation in {"upgrade-plan", "qwen38-plan"}:
                     return {
                         "source_registry_revision": 7,
                         "upgrade": {"target_revision": "0" * 40},
                     }
-                return {"id": "upgrade-job", "kind": "upgrade", "state": "waiting"}
+                return {
+                    "id": "qwen-job" if operation == "qwen38-submit" else "upgrade-job",
+                    "kind": "qwen38" if operation == "qwen38-submit" else "upgrade",
+                    "state": "waiting",
+                }
 
         models = FakeModels()
         self.server.models = models
@@ -1536,6 +1540,19 @@ class PortalIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(job["kind"], "upgrade")
+        status, quick_plan, _ = self.json_post(
+            client, jar, "/portal-api/admin/qwen38/plan", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(quick_plan["source_registry_revision"], 7)
+        status, quick_job, _ = self.json_post(
+            client,
+            jar,
+            "/portal-api/admin/qwen38/deploy",
+            {"expected_registry_revision": 7},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(quick_job["kind"], "qwen38")
         for suffix in ("test", "save", "clear"):
             status, _result, _ = self.json_post(
                 client,
@@ -1559,6 +1576,8 @@ class PortalIntegrationTests(unittest.TestCase):
             [
                 "upgrade-plan",
                 "upgrade-submit",
+                "qwen38-plan",
+                "qwen38-submit",
                 "download-proxy-test",
                 "download-proxy-save",
                 "download-proxy-clear",

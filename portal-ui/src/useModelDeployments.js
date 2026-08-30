@@ -17,6 +17,17 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
   const modelDeploymentSubmitting = ref(false);
   const modelDeploymentPlan = ref(null);
   const modelDeploymentConfirmed = ref(false);
+  const qwen38QuickBusy = ref(false);
+  const qwen38QuickPlan = ref(null);
+  const qwen38QuickForm = reactive({
+    max_model_len: 262144,
+    gpu_memory_utilization: 0.92,
+    max_num_seqs: 8,
+    max_num_batched_tokens: 8192,
+    mtp_speculative_tokens: 0,
+    kv_cache_dtype: "auto",
+    enable_prefix_caching: false,
+  });
   const modelUpgradePlanning = ref(false);
   const modelUpgradeSubmitting = ref(false);
   const modelUpgradePlan = ref(null);
@@ -98,6 +109,17 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     ),
   );
   const modelDeploymentJobs = computed(() => modelDeployments.value?.jobs || []);
+  const qwen38QuickProfile = computed(
+    () => modelDeployments.value?.qwen38_quick || null,
+  );
+  const qwen38QuickJob = computed(
+    () =>
+      modelDeploymentJobs.value.find((job) => job.kind === "qwen38") || null,
+  );
+  const qwen38QuickRollbackJob = computed(() => {
+    const id = qwen38QuickProfile.value?.rollback_job_id;
+    return id ? modelDeploymentJobs.value.find((job) => job.id === id) || null : null;
+  });
   const modelUpgradeProfiles = computed(
     () => modelDeployments.value?.upgrade_profiles || [],
   );
@@ -178,6 +200,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
 
   let upgradeSourceDefaultsId = "";
   let downloadProxyDefaultsLoaded = false;
+  let qwen38DefaultsLoaded = false;
 
   function applyUpgradeProfile(profileId) {
     const profile = modelUpgradeProfiles.value.find((item) => item.id === profileId);
@@ -257,6 +280,13 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
       }
       if (!result.gateway?.registry_publish)
         modelDeploymentForm.publish_requested = false;
+      if (!qwen38DefaultsLoaded && result.qwen38_quick?.runtime) {
+        const runtime = result.qwen38_quick.runtime;
+        for (const key of Object.keys(qwen38QuickForm)) {
+          if (Object.hasOwn(runtime, key)) qwen38QuickForm[key] = runtime[key];
+        }
+        qwen38DefaultsLoaded = true;
+      }
       const sources = Object.values(result.registry?.deployments || {}).filter(
         (deployment) =>
           deployment.enabled !== false &&
@@ -363,39 +393,87 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
    * GPU 选择保持不变，管理员仍需按本机拓扑确认四个 TP2 分组。
    */
   function applyQwen38FlashNextPreset() {
+    const profile = qwen38QuickProfile.value;
+    if (!profile) {
+      notify("Qwen3.8 一键预设尚未加载，请先刷新模型部署状态", "bad");
+      return;
+    }
+    const runtime = profile.runtime || {};
     Object.assign(modelDeploymentForm, {
       deployment_id: "qwen38-flash-next",
       hub: "huggingface",
-      model_id: "Inferact/Qwen3.8-Flash-Next-NVFP4",
-      revision: "103a7608316173ca6edd49929544244de7ffda70",
-      public_model_id: "qwen3.8-flash-next",
-      served_model_name: "qwen3.8-flash-next",
-      display_name: "Qwen3.8 Flash Next NVFP4",
-      image: "vllm/vllm-openai:qwen38-flash-next",
-      tensor_parallel_size: 2,
-      max_model_len: 262144,
-      gpu_memory_utilization: 0.92,
-      max_num_seqs: 8,
-      max_num_batched_tokens: 8192,
-      ple_cpu_offload: true,
-      enable_expert_parallel: true,
-      enable_prefix_caching: false,
-      enable_flashinfer_autotune: false,
-      disable_custom_all_reduce: false,
-      mtp_speculative_tokens: 0,
-      kv_cache_dtype: "auto",
-      yarn_factor: 1,
-      trust_remote_code: false,
-      supports_image_input: true,
-      supports_ocr: false,
-      supports_tool_calling: true,
-      supports_reasoning: true,
-      supports_thinking_toggle: true,
-      tool_call_parser: "qwen3_xml",
-      reasoning_parser: "qwen3",
-      mm_limit: '{"image":4,"video":0}',
+      model_id: profile.model_id,
+      revision: profile.revision,
+      public_model_id: profile.public_model_id,
+      served_model_name: profile.public_model_id,
+      display_name: profile.display_name,
+      selected_gpu_ids: (profile.gpu_groups?.groups || []).flat(),
+      worker_start_id: 0,
+      ...runtime,
     });
-    notify("已应用 Qwen3.8 NVFP4 原生 262K 预设；请按 nvidia-smi topo -m 核对 TP2 配对");
+    notify("已载入后端核验的 Qwen3.8 全八卡预设");
+  }
+
+  /** 返回专用页面允许调整的少量高级参数。 */
+  function qwen38QuickPayload() {
+    return {
+      max_model_len: Number(qwen38QuickForm.max_model_len),
+      gpu_memory_utilization: Number(qwen38QuickForm.gpu_memory_utilization),
+      max_num_seqs: Number(qwen38QuickForm.max_num_seqs),
+      max_num_batched_tokens: Number(qwen38QuickForm.max_num_batched_tokens),
+      mtp_speculative_tokens: Number(qwen38QuickForm.mtp_speculative_tokens),
+      kv_cache_dtype: String(qwen38QuickForm.kv_cache_dtype || "auto"),
+      enable_prefix_caching: Boolean(qwen38QuickForm.enable_prefix_caching),
+    };
+  }
+
+  /** 一次点击完成后端预检，并在同一注册表版本上提交自动部署。 */
+  async function deployQwen38Quick() {
+    if (qwen38QuickBusy.value || activeModelDeploymentJob.value) return;
+    qwen38QuickBusy.value = true;
+    qwen38QuickPlan.value = null;
+    try {
+      const payload = qwen38QuickPayload();
+      const plan = await api("admin/qwen38/plan", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      qwen38QuickPlan.value = plan;
+      const job = await api("admin/qwen38/deploy", {
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
+          expected_registry_revision: plan.source_registry_revision,
+        }),
+      });
+      recordModelDeploymentJob(job);
+      notify("Qwen3.8 自动部署已开始；失败会自动恢复当前状态", "working");
+      await loadModelDeployments({ silent: true });
+      await focusActiveModelDeploymentJob();
+    } catch (error) {
+      notify(`Qwen3.8 自动部署未启动：${error.message}`, "bad");
+    } finally {
+      qwen38QuickBusy.value = false;
+    }
+  }
+
+  /** 把成功的一键部署恢复到它执行前保存的完整运行快照。 */
+  async function rollbackQwen38Quick() {
+    const job = qwen38QuickRollbackJob.value;
+    if (!job || activeModelDeploymentJob.value) return;
+    if (!window.confirm("确认恢复到部署 Qwen3.8 之前的模型、Worker 和路由状态？")) return;
+    try {
+      const rollback = await api("admin/model-deployments/rollback", {
+        method: "POST",
+        body: JSON.stringify({ id: job.id }),
+      });
+      recordModelDeploymentJob(rollback);
+      notify("恢复任务已开始；完成前不会提前切换公开路由", "working");
+      await loadModelDeployments({ silent: true });
+      await focusActiveModelDeploymentJob();
+    } catch (error) {
+      notify(`恢复任务未启动：${error.message}`, "bad");
+    }
   }
 
   function setDeploymentGpuSelection(mode) {
@@ -821,6 +899,17 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     }
   }
 
+  const qwen38Quick = reactive({
+    busy: qwen38QuickBusy,
+    plan: qwen38QuickPlan,
+    form: qwen38QuickForm,
+    profile: qwen38QuickProfile,
+    job: qwen38QuickJob,
+    rollbackJob: qwen38QuickRollbackJob,
+    deploy: deployQwen38Quick,
+    rollback: rollbackQwen38Quick,
+  });
+
   return {
     modelDeployments,
     modelDeploymentsLoading,
@@ -828,6 +917,7 @@ export function useModelDeployments({ api, isAdmin, session, notify }) {
     modelDeploymentSubmitting,
     modelDeploymentPlan,
     modelDeploymentConfirmed,
+    qwen38Quick,
     modelUpgradePlanning,
     modelUpgradeSubmitting,
     modelUpgradePlan,

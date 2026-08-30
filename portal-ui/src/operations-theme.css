@@ -1612,6 +1612,187 @@ td {
   font-size: 12px;
   line-height: 1.55;
 }
+.qwen38-quick-card {
+  display: grid;
+  gap: 18px;
+  padding: 22px;
+  border-color: #9fd5e8;
+  background: linear-gradient(145deg, #f7fcfe 0%, #eef8fc 52%, #f8fbff 100%);
+  box-shadow: 0 14px 38px #1b709014;
+}
+.qwen38-quick-head,
+.qwen38-actions,
+.qwen38-last-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.qwen38-quick-head h2 {
+  margin: 3px 0 5px;
+  color: #174e68;
+  font-size: clamp(22px, 2.2vw, 31px);
+}
+.qwen38-quick-head p {
+  max-width: 850px;
+  margin: 0;
+  color: #577888;
+  line-height: 1.6;
+}
+.qwen38-quick-head code,
+.qwen38-transition code {
+  color: #087dad;
+  font-weight: 750;
+}
+.qwen38-transition {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: 12px;
+}
+.qwen38-transition article {
+  display: grid;
+  gap: 5px;
+  padding: 15px 16px;
+  border: 1px solid #cadfe8;
+  border-radius: 12px;
+  background: #ffffffc7;
+}
+.qwen38-transition article.target {
+  border-color: #72c1df;
+  background: #e9f8fe;
+}
+.qwen38-transition b {
+  display: grid;
+  place-items: center;
+  color: #1687bd;
+  font-size: 24px;
+}
+.qwen38-transition small,
+.qwen38-transition span,
+.qwen38-preset-grid span,
+.qwen38-actions small {
+  color: #698898;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.qwen38-transition strong {
+  color: #315d73;
+}
+.qwen38-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.qwen38-preset-grid article {
+  display: grid;
+  gap: 4px;
+  padding: 13px;
+  border: 1px solid #d4e6ed;
+  border-radius: 10px;
+  background: #fff;
+}
+.qwen38-preset-grid strong {
+  color: #176f96;
+  font-size: 15px;
+}
+.qwen38-groups {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+.qwen38-groups span {
+  padding: 6px 9px;
+  color: #315d73;
+  border: 1px solid #c9e0e9;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 11px;
+  font-weight: 650;
+}
+.qwen38-groups small {
+  margin-left: auto;
+  color: #7893a2;
+}
+.qwen38-blockers {
+  color: #9d303d;
+  border-color: #edb8bf;
+  background: #fff7f8;
+}
+.qwen38-advanced {
+  padding: 13px 15px;
+  border: 1px solid #d3e4eb;
+  border-radius: 10px;
+  background: #ffffffa8;
+}
+.qwen38-advanced summary {
+  cursor: pointer;
+  color: #456b7e;
+  font-size: 12px;
+  font-weight: 700;
+}
+.qwen38-advanced[open] summary {
+  margin-bottom: 14px;
+}
+.qwen38-advanced-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.qwen38-advanced-grid label small {
+  display: block;
+  margin-top: 5px;
+  color: #7893a2;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+.qwen38-toggle {
+  align-content: center;
+}
+.qwen38-toggle input {
+  width: 16px;
+  height: 16px;
+  margin-right: 7px;
+  accent-color: #1687bd;
+}
+.qwen38-last-result {
+  justify-content: flex-start;
+  padding: 11px 13px;
+  border-radius: 9px;
+  background: #fff;
+}
+.qwen38-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+.qwen38-actions small {
+  flex: 1 1 320px;
+}
+.qwen38-deploy-button,
+.qwen38-rollback-button {
+  min-height: 46px;
+  padding-inline: 22px;
+  font-size: 14px;
+  font-weight: 750;
+}
+.qwen38-other-tools {
+  padding: 15px 17px;
+  border-style: dashed;
+  background: #fbfdfe;
+}
+.qwen38-other-tools > summary {
+  cursor: pointer;
+  color: #607f92;
+  font-size: 13px;
+  font-weight: 700;
+}
+.qwen38-other-tools[open] > summary {
+  margin-bottom: 16px;
+}
+.qwen38-other-tools-body {
+  display: grid;
+  gap: 16px;
+}
 .deployment-migration-note {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -2062,6 +2243,9 @@ td {
     flex-direction: column;
   }
   .deployment-safety-note,
+  .qwen38-transition,
+  .qwen38-preset-grid,
+  .qwen38-advanced-grid,
   .deployment-source-grid,
   .deployment-runtime-grid,
   .remote-target-row {
@@ -2070,6 +2254,14 @@ td {
   .section-title-row,
   .deployment-submit-panel,
   .deployment-job-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .qwen38-transition b {
+    transform: rotate(90deg);
+  }
+  .qwen38-quick-head,
+  .qwen38-actions {
     align-items: stretch;
     flex-direction: column;
   }

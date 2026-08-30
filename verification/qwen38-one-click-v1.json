@@ -1,0 +1,84 @@
+{
+  "plan_id": "qwen38-one-click",
+  "version": 1,
+  "quality_profile": "develop-product-grade-software/L2",
+  "source": {
+    "baseline_commit": "324f128b6ccbd513589d322f0b5719a0c536fffe",
+    "baseline_worktree": "clean"
+  },
+  "task": {
+    "objective": "提供面向非专业管理员的 Qwen3.8 Flash Next 一键部署界面，自动完成下载、备份、部署、真实生成验收、上线和可恢复回滚。",
+    "acceptance": [
+      "页面首屏直接展示 gdn-inside、4×TP2、原生 262K 和推荐运行参数，不要求管理员理解通用部署字段。",
+      "管理员点击一次开始按钮后，后端从同一权威预设生成全部八卡实例、备份当前状态、下载固定 revision、逐实例真实生成验收并在通过后发布路由。",
+      "部署失败且已修改运行配置时自动恢复；成功后页面提供醒目的一键恢复部署前状态按钮。",
+      "高级参数默认折叠，仅允许修改有明确边界的上下文、并发、显存比例、MTP、KV 精度和前缀缓存。",
+      "现有通用模型部署与 Ornith 升级入口保持可用。"
+    ]
+  },
+  "risk": {
+    "level": "L2",
+    "affected_components": [
+      "模型控制 Unix Socket API",
+      "Qwen3.8 权威运行预设",
+      "GPU 拓扑分组",
+      "门户管理 API",
+      "模型部署页面与构建资源",
+      "部署任务真实生成与回滚状态"
+    ],
+    "stop_conditions": [
+      "不是八张满足容量要求的 NVIDIA GPU",
+      "当前接入层不能原子发布多模型注册表",
+      "主内存、模型盘、维护代理或专用镜像不满足预检",
+      "注册表在计划与提交之间变化",
+      "任一目标实例真实生成或路由发布失败"
+    ]
+  },
+  "gate_dag": [
+    {
+      "gate_id": "backend-contract",
+      "criticality": "Required",
+      "depends_on": [],
+      "commands": [
+        "Qwen preset, topology grouping, plan, stale submit, inference-before-publish, automatic rollback, and explicit rollback tests"
+      ]
+    },
+    {
+      "gate_id": "portal-contract",
+      "criticality": "Required",
+      "depends_on": ["backend-contract"],
+      "commands": [
+        "portal route authorization tests",
+        "one-click composable and visible state tests",
+        "Vite production build"
+      ]
+    },
+    {
+      "gate_id": "repository-regression",
+      "criticality": "Required",
+      "depends_on": ["portal-contract"],
+      "commands": [
+        "python3 -m unittest discover -s tests -v",
+        "npm test",
+        "bash -n and python3 -m py_compile",
+        "git diff --check and touched source line-count check"
+      ]
+    },
+    {
+      "gate_id": "visible-page-acceptance",
+      "criticality": "Required",
+      "depends_on": ["portal-contract"],
+      "commands": [
+        "open final /ui artifact with representative authenticated snapshot",
+        "verify desktop and narrow viewport hierarchy, advanced collapse, action state, progress, failure, success, and rollback"
+      ]
+    },
+    {
+      "gate_id": "target-host-acceptance",
+      "criticality": "Required",
+      "depends_on": ["repository-regression", "visible-page-acceptance"],
+      "environment": "Upgraded 8×RTX PRO 6000D host",
+      "expected_status_without_target_host": "Unverified"
+    }
+  ]
+}
