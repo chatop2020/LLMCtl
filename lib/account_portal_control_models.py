@@ -426,52 +426,127 @@ class PortalModelControlMixin:
             return "failed", "; ".join(errors)[:2000]
         return "synced", ""
 
-    def seed_managed_model(self) -> None:
-        model_name = os.environ.get("SERVED_MODEL_NAME", "").strip()
-        if not model_name:
-            return
-        combos = self.omni.combos()
-        combo = next((item for item in combos if str(item.get("name", "")) == model_name), None)
-        if not combo:
-            return
-        capabilities = ["chat"]
-        if env_bool("SUPPORTS_IMAGE_INPUT"):
-            capabilities.append("vision")
-        if env_bool("SUPPORTS_OCR"):
-            capabilities.append("ocr")
-        if env_bool("SUPPORTS_TOOL_CALLING"):
-            capabilities.append("tools")
-        if env_bool("SUPPORTS_REASONING"):
-            capabilities.append("reasoning")
-        stamp = now()
-        with self.db.connect() as connection:
-            existing = connection.execute(
-                "SELECT id FROM published_models WHERE public_model_id=?", (model_name,)
-            ).fetchone()
-            if existing:
-                connection.execute(
-                    "UPDATE published_models SET source_kind='combo',source_ref=?,source_model=?,capabilities_json=?,health_status='healthy',health_failures=0,updated_at=? WHERE id=?",
-                    (str(combo.get("id", "")), model_name, json.dumps(capabilities), stamp, existing["id"]),
-                )
-                model_id = existing["id"]
-            else:
-                model_id = str(uuid.uuid4())
-                connection.execute(
-                    "INSERT INTO published_models(id,public_model_id,display_name,description,source_kind,source_ref,source_model,capabilities_json,status,health_status,last_health_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        model_id, model_name, model_name, "LLMCtl local vLLM cluster", "combo",
-                        str(combo.get("id", "")), model_name, json.dumps(capabilities), "published",
-                        "healthy", stamp, stamp, stamp,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO model_price_versions(model_id,effective_at,input_price_micros,output_price_micros,cached_price_micros,reasoning_price_micros,actor) VALUES(?,?,?,?,?,?,?)",
-                    (model_id, stamp, 0, 0, 0, 0, "system"),
-                )
-            connection.execute(
-                "INSERT OR IGNORE INTO model_access(model_id,subject_type,subject_id,created_at) VALUES(?, 'all', '', ?)",
-                (model_id, stamp),
+    @staticmethod
+    def _registry_managed_models() -> list[tuple[str, list[str]]]:
+        """读取已启用部署的公开模型及真实能力；旧安装返回空列表。"""
+
+        registry_path = pathlib.Path(
+            os.environ.get(
+                "LLM_DEPLOYMENT_REGISTRY", "/etc/llm-cluster/deployments.json"
             )
+        )
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        deployments = registry.get("deployments", {})
+        if not isinstance(deployments, dict):
+            return []
+        result: list[tuple[str, list[str]]] = []
+        for deployment in deployments.values():
+            if (
+                not isinstance(deployment, dict)
+                or not deployment.get("enabled", True)
+                or not deployment.get("publish_requested", True)
+            ):
+                continue
+            runtime = deployment.get("runtime", {})
+            if not isinstance(runtime, dict):
+                runtime = {}
+            capabilities = ["chat"]
+            for enabled, capability in (
+                (runtime.get("supports_image_input"), "vision"),
+                (runtime.get("supports_ocr"), "ocr"),
+                (runtime.get("supports_tool_calling"), "tools"),
+                (runtime.get("supports_reasoning"), "reasoning"),
+            ):
+                if enabled:
+                    capabilities.append(capability)
+            public_ids = deployment.get("public_model_ids", [])
+            if not isinstance(public_ids, list) or not public_ids:
+                public_ids = [deployment.get("served_model_name", "")]
+            for public_id in public_ids:
+                model_name = str(public_id).strip()
+                if model_name and (model_name, capabilities) not in result:
+                    result.append((model_name, capabilities))
+        return result
+
+    def seed_managed_model(self) -> None:
+        """把部署注册表当前公开模型投影到门户，并停用已退役的自动种子。"""
+
+        managed_models = self._registry_managed_models()
+        registry_owned = bool(managed_models)
+        if not managed_models:
+            model_name = os.environ.get("SERVED_MODEL_NAME", "").strip()
+            if not model_name:
+                return
+            capabilities = ["chat"]
+            if env_bool("SUPPORTS_IMAGE_INPUT"):
+                capabilities.append("vision")
+            if env_bool("SUPPORTS_OCR"):
+                capabilities.append("ocr")
+            if env_bool("SUPPORTS_TOOL_CALLING"):
+                capabilities.append("tools")
+            if env_bool("SUPPORTS_REASONING"):
+                capabilities.append("reasoning")
+            managed_models = [(model_name, capabilities)]
+        combos = self.omni.combos()
+        combos_by_name = {str(item.get("name", "")): item for item in combos}
+        stamp = now()
+        seeded_names: set[str] = set()
+        with self.db.connect() as connection:
+            for model_name, capabilities in managed_models:
+                combo = combos_by_name.get(model_name)
+                if not combo or not str(combo.get("id", "")):
+                    continue
+                existing = connection.execute(
+                    "SELECT id FROM published_models WHERE public_model_id=?",
+                    (model_name,),
+                ).fetchone()
+                if existing:
+                    connection.execute(
+                        "UPDATE published_models SET source_kind='combo',source_ref=?,"
+                        "source_model=?,capabilities_json=?,health_status='healthy',"
+                        "health_failures=0,updated_at=? WHERE id=?",
+                        (
+                            str(combo["id"]),
+                            model_name,
+                            json.dumps(capabilities),
+                            stamp,
+                            existing["id"],
+                        ),
+                    )
+                    model_id = existing["id"]
+                else:
+                    model_id = str(uuid.uuid4())
+                    connection.execute(
+                        "INSERT INTO published_models(id,public_model_id,display_name,description,source_kind,source_ref,source_model,capabilities_json,status,health_status,last_health_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            model_id, model_name, model_name,
+                            AUTO_SEEDED_MODEL_DESCRIPTION, "combo", str(combo["id"]),
+                            model_name, json.dumps(capabilities), "published", "healthy",
+                            stamp, stamp, stamp,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO model_price_versions(model_id,effective_at,input_price_micros,output_price_micros,cached_price_micros,reasoning_price_micros,actor) VALUES(?,?,?,?,?,?,?)",
+                        (model_id, stamp, 0, 0, 0, 0, "system"),
+                    )
+                connection.execute(
+                    "INSERT OR IGNORE INTO model_access(model_id,subject_type,subject_id,created_at) VALUES(?, 'all', '', ?)",
+                    (model_id, stamp),
+                )
+                seeded_names.add(model_name)
+            if registry_owned and seeded_names:
+                placeholders = ",".join("?" for _ in seeded_names)
+                connection.execute(
+                    "UPDATE published_models SET health_status='failed',"
+                    "health_failures=MAX(health_failures,3),updated_at=? "
+                    "WHERE description=? AND public_model_id NOT IN ("
+                    + placeholders
+                    + ")",
+                    (stamp, AUTO_SEEDED_MODEL_DESCRIPTION, *sorted(seeded_names)),
+                )
 
     @staticmethod
     def _source_combo(
@@ -642,6 +717,7 @@ class PortalModelControlMixin:
         with self.db.connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM published_models WHERE source_kind='combo' "
+                "AND health_status!='failed' "
                 "ORDER BY created_at,id"
             ).fetchall()
         migrated = unchanged = failed = 0

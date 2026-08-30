@@ -53,7 +53,7 @@ from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.6.8"
+APP_VERSION = "3.6.14"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
 MAX_FORM_BYTES = 64 * 1024
@@ -68,6 +68,7 @@ WORKFLOW_GATEWAY_NODE_NAME = "LLMCtl workflow data plane"
 WORKFLOW_GATEWAY_CONNECTION_NAME = "LLMCtl workflow"
 WORKFLOW_GATEWAY_PREFIX = "llmctl-workflow"
 WORKFLOW_GATEWAY_MANAGED_DESCRIPTION = "Managed by LLMCtl workflow data plane"
+AUTO_SEEDED_MODEL_DESCRIPTION = "LLMCtl local vLLM cluster"
 PUBLIC_COMBO_MANAGED_DESCRIPTION = "Managed by LLMCtl account portal public model"
 MODEL_REGISTRY_COMBO_MANAGED_DESCRIPTION = (
     "Managed by LLMCtl. Do not edit worker targets manually."
