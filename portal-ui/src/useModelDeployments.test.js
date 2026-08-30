@@ -429,4 +429,60 @@ describe("模型版本升级组合逻辑", () => {
       globalThis.window = originalWindow;
     }
   });
+
+  it("Qwen3.8 已上线后仍可提交修改后的运行参数", async () => {
+    const calls = [];
+    const api = vi.fn(async (path, options = {}) => {
+      calls.push({ path, body: options.body ? JSON.parse(options.body) : null });
+      if (path === "admin/model-deployments") {
+        return {
+          available: true,
+          gateway: { registry_publish: true },
+          gpus: [],
+          jobs: [],
+          registry: { revision: 12, deployments: {}, artifacts: {} },
+          upgrade_profiles: [],
+          qwen38_quick: {
+            active: true,
+            available: true,
+            blockers: [],
+            warnings: [],
+            runtime: {
+              max_model_len: 262144,
+              gpu_memory_utilization: 0.9,
+              max_num_seqs: 8,
+              max_num_batched_tokens: 8192,
+              mtp_speculative_tokens: 0,
+              kv_cache_dtype: "auto",
+              enable_prefix_caching: false,
+            },
+            max_images_per_request: 4,
+            gpu_groups: { groups: [[0, 1], [2, 3], [4, 5], [6, 7]] },
+          },
+        };
+      }
+      if (path === "admin/qwen38/plan") return { source_registry_revision: 12 };
+      if (path === "admin/qwen38/deploy") {
+        return { id: "qwen-redeploy", kind: "qwen38", state: "waiting" };
+      }
+      throw new Error(`未处理的测试路径：${path}`);
+    });
+    const state = useModelDeployments({
+      api,
+      isAdmin: ref(true),
+      session: ref({ authenticated: true }),
+      notify: vi.fn(),
+    });
+    await state.loadModelDeployments();
+    state.qwen38Quick.form.mtp_speculative_tokens = 3;
+    state.qwen38Quick.form.enable_prefix_caching = true;
+
+    await state.qwen38Quick.deploy();
+
+    expect(calls.find((item) => item.path === "admin/qwen38/deploy")?.body).toMatchObject({
+      expected_registry_revision: 12,
+      mtp_speculative_tokens: 3,
+      enable_prefix_caching: true,
+    });
+  });
 });

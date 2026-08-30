@@ -143,12 +143,14 @@ class StaticDeploymentContracts(unittest.TestCase):
         for marker in (
             "Qwen3.8 Flash Next 一键部署",
             "开始自动部署并上线",
+            "应用新参数并重新部署",
             "恢复到部署前状态",
             "高级设置（推荐保持默认）",
             "每请求最大图片数",
             "真实图文测试",
         ):
             self.assertIn(marker, portal_page)
+        self.assertNotIn('v-if="!qwen38Quick.profile?.active"', portal_page)
         self.assertIn("qwen38-plan", ACCOUNT)
         self.assertIn("qwen38-submit", ACCOUNT)
         self.assertIn("lib/model_profiles.py", MANIFEST)

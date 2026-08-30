@@ -659,12 +659,11 @@ export default {
 
                 <div class="qwen38-actions">
                   <button
-                    v-if="!qwen38Quick.profile?.active"
                     type="button"
                     class="primary qwen38-deploy-button"
                     :disabled="qwen38Quick.busy || Boolean(activeModelDeploymentJob) || !qwen38Quick.profile?.available"
                     @click="qwen38Quick.deploy"
-                  >{{ qwen38Quick.busy ? "正在检查并提交…" : "开始自动部署并上线" }}</button>
+                  >{{ qwen38Quick.busy ? "正在检查并提交…" : qwen38Quick.profile?.active ? "应用新参数并重新部署" : "开始自动部署并上线" }}</button>
                   <button
                     v-if="qwen38Quick.rollbackJob"
                     type="button"
@@ -672,7 +671,7 @@ export default {
                     :disabled="Boolean(activeModelDeploymentJob)"
                     @click="qwen38Quick.rollback"
                   >恢复到部署前状态</button>
-                  <small>开始后无需停留在本页。下载和部署在服务器后台继续，失败会自动恢复。</small>
+                  <small>{{ qwen38Quick.profile?.active ? "重新部署会复用现有权重和镜像，重新加载四个 Worker；失败自动恢复当前运行状态。" : "开始后无需停留在本页。下载和部署在服务器后台继续，失败会自动恢复。" }}</small>
                 </div>
               </section>
 
