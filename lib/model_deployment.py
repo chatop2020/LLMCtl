@@ -73,7 +73,7 @@ from omniroute_maintenance import (
 )
 
 
-APP_VERSION = "3.6.7"
+APP_VERSION = "3.6.8"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")

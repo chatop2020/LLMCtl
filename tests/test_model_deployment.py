@@ -336,6 +336,8 @@ class ModelDeploymentTests(unittest.TestCase):
         dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("PLE_FORCE_FP8", patch_source)
         self.assertIn("source.count(needle) != 1", patch_source)
+        self.assertIn("FROM ${BASE_IMAGE}", dockerfile)
+        self.assertNotIn("${{BASE_IMAGE}}", dockerfile)
         self.assertIn("ENV PLE_FORCE_FP8=1", dockerfile)
         self.assertEqual((context / "patch_ple.py").stat().st_mode & 0o777, 0o600)
 

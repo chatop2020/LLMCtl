@@ -168,7 +168,7 @@ target.write_text(patched, encoding="utf-8")
 print(target)
 '''
     dockerfile = '''ARG BASE_IMAGE
-FROM ${{BASE_IMAGE}}
+FROM ${BASE_IMAGE}
 COPY patch_ple.py /tmp/llmctl-patch-ple.py
 RUN python3 /tmp/llmctl-patch-ple.py && rm -f /tmp/llmctl-patch-ple.py
 ENV PLE_FORCE_FP8=1

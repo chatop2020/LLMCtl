@@ -6,7 +6,7 @@ LLMCtl supports the dedicated Qwen3.8 preview runtime, TP2, PLE CPU offload, exp
 
 ## Recommended one-click deployment
 
-After upgrading to LLMCtl 3.6.7, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, downloads the pinned checkpoint from ModelScope, then performs backup, deployment, per-instance image-and-text inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
+After upgrading to LLMCtl 3.6.8, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, downloads the pinned checkpoint from ModelScope, then performs backup, deployment, per-instance image-and-text inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
 
 The commands below remain available for advanced manual control.
 
@@ -79,6 +79,6 @@ sudo llmctl model rollback DEPLOYMENT_JOB_ID
 
 Ornith deployments keep their own TP and runtime fields. Rolling back or redeploying Ornith 1.5 does not inherit Qwen-specific PLE, EP, MTP, KV-cache, or YaRN settings.
 
-If ModelScope reports that `/root/.modelscope` is read-only, upgrade to LLMCtl 3.6.7. The hardened model-control service places `MODELSCOPE_HOME`, `MODELSCOPE_CACHE`, and the CLI `--cache-dir` under private writable directories on the model disk. Version 3.6.7 also limits persisted command output to the final 100 lines so completed progress bars cannot cause prolonged job-file write amplification.
+If ModelScope reports that `/root/.modelscope` is read-only, upgrade to LLMCtl 3.6.8. The hardened model-control service places `MODELSCOPE_HOME`, `MODELSCOPE_CACHE`, and the CLI `--cache-dir` under private writable directories on the model disk. Version 3.6.8 also limits persisted command output to the final 100 lines so completed progress bars cannot cause prolonged job-file write amplification.
 
-For the RadixArk mixed checkpoint, version 3.6.7 derives a small local image layer from the exact installed base-image ID. The layer enables vLLM's existing FP8-PLE loader under the ModelOpt NVFP4 parent configuration and prevents the `ngram_embedding.weight_scale` startup failure. The base image and downloaded weights remain unchanged and available for rollback. All four TP2 Workers start together, may consume all available host memory, and share a health loop that checks safe cancellation every three seconds.
+For the RadixArk mixed checkpoint, version 3.6.8 derives a small local image layer from the exact installed base-image ID. The layer enables vLLM's existing FP8-PLE loader under the ModelOpt NVFP4 parent configuration and prevents the `ngram_embedding.weight_scale` startup failure. The base image and downloaded weights remain unchanged and available for rollback. All four TP2 Workers start together, may consume all available host memory, and share a health loop that checks safe cancellation every three seconds.
