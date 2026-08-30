@@ -875,11 +875,11 @@ class ModelDeploymentTests(unittest.TestCase):
         runner.run.assert_not_called()
         self.assertFalse(self.paths.proxy_env.exists())
 
-    def test_qwen38_modelscope_weights_bypass_saved_international_proxy(self):
-        """ModelScope 大权重应国内直连，维护代理只可用于准备下载器。"""
+    def test_qwen38_modelscope_uses_writable_private_sdk_directories(self):
+        """强化服务必须把 SDK home/cache 放在模型盘并让大权重国内直连。"""
 
         self.paths.proxy_env.write_text(
-            "MAINTENANCE_PROXY=http://127.0.0.1:1802\n",
+            "MAINTENANCE_PROXY=http://127.0.0.1:1082\n",
             encoding="utf-8",
         )
         manager = MODEL.DeploymentManager(self.paths)
@@ -903,7 +903,26 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertNotIn("HTTPS_PROXY", environment)
         self.assertNotIn("https_proxy", environment)
         self.assertNotIn("ALL_PROXY", environment)
-        self.assertIn("--revision", command_runner.run.call_args.args[0])
+        self.assertEqual(
+            environment["MODELSCOPE_HOME"],
+            str(self.models / ".hub-config/modelscope"),
+        )
+        self.assertEqual(
+            environment["MODELSCOPE_CACHE"],
+            str(self.models / ".hub-cache/modelscope"),
+        )
+        for directory in (
+            self.models / ".hub-config/modelscope",
+            self.models / ".hub-cache/modelscope",
+        ):
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        command = command_runner.run.call_args.args[0]
+        self.assertIn("--revision", command)
+        self.assertEqual(
+            command[command.index("--cache-dir") + 1],
+            str(self.models / ".hub-cache/modelscope"),
+        )
 
     def test_upgrade_catalog_failure_surfaces_hub_error_instead_of_exit_code(self):
         """Hub 失败原因必须穿透到页面，不能只剩无法排障的退出码 2。"""

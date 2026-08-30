@@ -6,7 +6,7 @@ LLMCtl supports the dedicated Qwen3.8 preview runtime, TP2, PLE CPU offload, exp
 
 ## Recommended one-click deployment
 
-After upgrading to LLMCtl 3.6.3, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, downloads the pinned checkpoint from ModelScope, then performs backup, deployment, per-instance image-and-text inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
+After upgrading to LLMCtl 3.6.4, open Model Deployments and use the Qwen3.8 Flash Next one-click panel at the top of the page. It reads the eight-GPU topology, shows four TP2 groups and the recommended preset, downloads the pinned checkpoint from ModelScope, then performs backup, deployment, per-instance image-and-text inference acceptance, and `gdn-inside` publication from one button. Failures after runtime changes restore the backup automatically; a successful run exposes a prominent restore button.
 
 The commands below remain available for advanced manual control.
 
@@ -78,3 +78,5 @@ sudo llmctl model rollback DEPLOYMENT_JOB_ID
 ```
 
 Ornith deployments keep their own TP and runtime fields. Rolling back or redeploying Ornith 1.5 does not inherit Qwen-specific PLE, EP, MTP, KV-cache, or YaRN settings.
+
+If ModelScope reports that `/root/.modelscope` is read-only, upgrade to LLMCtl 3.6.4. The hardened model-control service now places `MODELSCOPE_HOME`, `MODELSCOPE_CACHE`, and the CLI `--cache-dir` under private writable directories on the model disk.

@@ -72,7 +72,7 @@ from omniroute_maintenance import (
 )
 
 
-APP_VERSION = "3.6.3"
+APP_VERSION = "3.6.4"
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -1990,6 +1990,11 @@ if cache_dtype not in {"auto", "bfloat16"}:
         runner = CommandRunner(logger)
         if hub == "modelscope":
             downloader = self._ensure_modelscope_downloader(runner, environment)
+            modelscope_home = self.paths.model_root / ".hub-config" / "modelscope"
+            modelscope_cache = self.paths.model_root / ".hub-cache" / "modelscope"
+            for directory in (modelscope_home, modelscope_cache):
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                directory.chmod(0o700)
             if model_id == QWEN38_MODEL_ID:
                 # 一键预设选择 ModelScope 是为了使用国内直连；保存的维护
                 # 代理只用来准备下载器，不应把 135GB 权重绕到国际代理。
@@ -2000,12 +2005,19 @@ if cache_dtype not in {"auto", "bfloat16"}:
                     "ALL_PROXY", "all_proxy",
                 ):
                     environment.pop(name, None)
+            # model-control.service 使用 ProtectHome；即使指定 local-dir，SDK
+            # 仍会初始化配置目录，因此 home、cache 和 CLI 参数都必须落在
+            # 模型盘的可写私有目录，不能回退到只读的 /root。
+            environment["MODELSCOPE_HOME"] = str(modelscope_home)
+            environment["MODELSCOPE_CACHE"] = str(modelscope_cache)
             command = [
                 str(downloader),
                 "download",
                 model_id,
                 "--revision",
                 revision,
+                "--cache-dir",
+                str(modelscope_cache),
                 "--local-dir",
                 str(partial),
                 "--max-workers",
