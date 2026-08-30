@@ -94,7 +94,13 @@ class LlmctlLifecycleTests(unittest.TestCase):
                         "model_id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
                         "revision": "b" * 40,
                         "path": "/data/models/ornith-1.5",
-                    }
+                    },
+                    "artifact-old": {
+                        "hub": "huggingface",
+                        "model_id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+                        "revision": "a" * 40,
+                        "path": "/data/models/ornith-1.5-old",
+                    },
                 },
                 "deployments": {
                     "legacy": {
@@ -115,7 +121,26 @@ class LlmctlLifecycleTests(unittest.TestCase):
                             }
                             for index in range(4)
                         ],
-                    }
+                    },
+                    "legacy-disabled": {
+                        "enabled": False,
+                        "artifact_id": "artifact-old",
+                        "model_id": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+                        "served_model_name": "ornith-1.0-35b-fp8",
+                        "served_model_aliases": [],
+                        "runtime": {
+                            "tensor_parallel_size": 1,
+                            "max_num_seqs": 7,
+                        },
+                        "instances": [
+                            {
+                                "kind": "local",
+                                "enabled": True,
+                                "worker_id": index,
+                            }
+                            for index in range(4, 8)
+                        ],
+                    },
                 },
             }
             (config / "deployments.json").write_text(
@@ -161,6 +186,8 @@ class LlmctlLifecycleTests(unittest.TestCase):
         self.assertIn("拓扑: TP=2", completed.stdout)
         self.assertIn("兼容别名: ornith-1.0-35b-fp8", completed.stdout)
         self.assertIn("ornith-1.5-35b-a3b-fp8", completed.stdout)
+        self.assertIn("开机激活 Worker: 0,1,2,3", completed.stdout)
+        self.assertNotIn("8104", completed.stdout)
 
     def test_model_upgrade_cli_reuses_plan_revision_and_submits_stale_guard(self):
         """CLI apply 必须把计划版本带回控制服务，且不要求管理员手写 JSON。"""

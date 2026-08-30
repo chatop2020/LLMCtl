@@ -101,6 +101,7 @@ class FakeOmniRouteClient:
             "name": "local-model",
             "description": gateway.OMNIROUTE_DESCRIPTION,
         }
+        self.combos = [self.combo]
 
     def login(self):
         self.calls.append(("LOGIN", "", None))
@@ -138,10 +139,20 @@ class FakeOmniRouteClient:
         if method in {"POST", "PUT"} and path == "/api/provider-models":
             return {"model": payload}
         if (method, path) == ("GET", "/api/combos?limit=1000"):
-            return {"combos": [dict(self.combo)]}
-        if (method, path) == ("PUT", "/api/combos/combo-1"):
-            self.combo.update(payload)
-            return dict(self.combo)
+            return {"combos": [dict(item) for item in self.combos]}
+        if method == "PUT" and path.startswith("/api/combos/"):
+            combo_id = path.rsplit("/", 1)[1]
+            combo = next(item for item in self.combos if item["id"] == combo_id)
+            combo.update(payload)
+            return dict(combo)
+        if (method, path) == ("POST", "/api/combos"):
+            combo = {"id": f"combo-{len(self.combos) + 1}", **payload}
+            self.combos.append(combo)
+            return dict(combo)
+        if method == "DELETE" and path.startswith("/api/combos/"):
+            combo_id = path.rsplit("/", 1)[1]
+            self.combos = [item for item in self.combos if item["id"] != combo_id]
+            return {"success": True}
         if method == "DELETE" and path.startswith("/api/providers/"):
             connection_id = path.rsplit("/", 1)[1]
             self.connections = [item for item in self.connections if item["id"] != connection_id]
@@ -307,6 +318,114 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertFalse(
             any(call[0:2] == ("PATCH", "/api/settings") for call in client.calls)
         )
+
+    def test_registry_reconcile_excludes_and_removes_disabled_deployment_routes(self):
+        """停用部署不得留在公开 Combo，相关连接和节点也必须被清理。"""
+
+        client = FakeOmniRouteClient()
+        client.nodes = [
+            {"id": "node-qwen", "name": "LLMCtl qwen38-flash-next worker 0"},
+            {"id": "node-ornith", "name": "LLMCtl legacy worker 4"},
+        ]
+        client.connections = [
+            {"id": "conn-qwen", "provider": "node-qwen"},
+            {"id": "conn-ornith", "provider": "node-ornith"},
+        ]
+        client.models = {
+            "node-qwen": [{"id": "gdn-inside"}],
+            "node-ornith": [{"id": "ornith-1.0-35b-fp8"}],
+        }
+        client.combo = {
+            "id": "combo-qwen",
+            "name": "gdn-inside",
+            "description": gateway.OMNIROUTE_DESCRIPTION,
+        }
+        client.combos = [
+            client.combo,
+            {
+                "id": "combo-ornith",
+                "name": "ornith-1.0-35b-fp8",
+                "description": gateway.OMNIROUTE_DESCRIPTION,
+            },
+        ]
+        registry = {
+            "schema_version": 1,
+            "legacy_aliases": {},
+            "deployments": {
+                "qwen38-flash-next": {
+                    "enabled": True,
+                    "publish_requested": True,
+                    "served_model_name": "gdn-inside",
+                    "public_model_ids": ["gdn-inside"],
+                    "runtime": {
+                        "max_model_len": 262144,
+                        "supports_image_input": True,
+                    },
+                    "instances": [
+                        {
+                            "id": "qwen-worker-0",
+                            "kind": "local",
+                            "worker_id": 0,
+                            "port": 8100,
+                            "enabled": True,
+                        }
+                    ],
+                },
+                "legacy": {
+                    "enabled": False,
+                    "publish_requested": True,
+                    "served_model_name": "ornith-1.0-35b-fp8",
+                    "public_model_ids": ["ornith-1.0-35b-fp8"],
+                    "runtime": {
+                        "max_model_len": 262144,
+                        "supports_image_input": True,
+                    },
+                    "instances": [
+                        {
+                            "id": "ornith-worker-4",
+                            "kind": "local",
+                            "worker_id": 4,
+                            "port": 8104,
+                            "enabled": True,
+                        }
+                    ],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry_file = root / "deployments.json"
+            secrets = root / "secrets.env"
+            registry_file.write_text(json.dumps(registry), encoding="utf-8")
+            secrets.write_text("GATEWAY_API_KEY=sk-bf-public-secret\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+                specs = gateway.registry_omniroute_specs(registry_file)
+                gateway.reconcile_omniroute_registry(client, registry_file, secrets)
+
+        self.assertEqual([item["deployment_id"] for item in specs], ["qwen38-flash-next"])
+        self.assertEqual({item["id"] for item in client.nodes}, {"node-qwen"})
+        self.assertEqual({item["id"] for item in client.connections}, {"conn-qwen"})
+        self.assertEqual({item["id"] for item in client.combos}, {"combo-qwen"})
+        self.assertEqual(
+            {item["provider"] for item in client.combo["models"]}, {"node-qwen"}
+        )
+        combo_update = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[0:2] == ("PUT", "/api/combos/combo-qwen")
+        )
+        connection_delete = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[0:2] == ("DELETE", "/api/providers/conn-ornith")
+        )
+        node_delete = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[0:2] == ("DELETE", "/api/provider-nodes/node-ornith")
+        )
+        self.assertLess(combo_update, connection_delete)
+        self.assertLess(connection_delete, node_delete)
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

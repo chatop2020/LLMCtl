@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.8"
+readonly CTL_VERSION="3.6.9"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -1582,7 +1582,7 @@ cmd_status() {
     ' "${registry}" 2>/dev/null || true)
     if [[ -n "${registry_line}" ]]; then
       IFS=$'\x1f' read -r status_hub status_model_id status_revision status_path status_served status_aliases status_tp status_instances status_max_seqs <<<"${registry_line}"
-      registry_active_workers=$(jq -r '[.deployments[].instances[]? | select(.kind == "local" and .enabled != false) | .worker_id] | unique | sort | join(",")' "${registry}")
+      registry_active_workers=$(jq -r '[.deployments[] | select(.enabled != false) | .instances[]? | select(.kind == "local" and .enabled != false) | .worker_id] | unique | sort | join(",")' "${registry}")
       status_slot_limit=$(jq -r '[.deployments[] | select(.enabled != false) as $d | ([ $d.instances[]? | select(.kind == "local" and .enabled != false) ]|length) * ($d.runtime.max_num_seqs // 0)] | add // 0' "${registry}")
     fi
   fi

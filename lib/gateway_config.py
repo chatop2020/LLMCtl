@@ -956,8 +956,21 @@ def reconcile_omniroute_registry(
                 client.request("POST", "/api/combos", combo_payload)
 
     # 先创建完整新路由，最后再清理旧资源，任何中途失败都保留上次可用链路。
-    for connection_id in sorted(stale_connection_ids):
-        client.request("DELETE", f"/api/providers/{urllib.parse.quote(connection_id, safe='')}")
+    # 停用部署的连接不再属于任何期望 Combo；显式删除它们，避免只依赖
+    # OmniRoute 删除 Provider Node 时是否级联清理的版本相关行为。
+    stale_node_ids = {
+        str(node.get("id", ""))
+        for node in nodes
+        if str(node.get("name", "")).startswith("LLMCtl ")
+        and str(node.get("id", ""))
+        and str(node.get("id", "")) not in desired_node_ids
+    }
+    stale_connection_ids.update(
+        str(connection.get("id", ""))
+        for connection in connections
+        if str(connection.get("provider", "")) in stale_node_ids
+        and str(connection.get("id", ""))
+    )
     for combo in combos:
         combo_id = str(combo.get("id", ""))
         if (
@@ -966,6 +979,8 @@ def reconcile_omniroute_registry(
             and combo_id
         ):
             client.request("DELETE", f"/api/combos/{urllib.parse.quote(combo_id, safe='')}")
+    for connection_id in sorted(stale_connection_ids):
+        client.request("DELETE", f"/api/providers/{urllib.parse.quote(connection_id, safe='')}")
     for node in nodes:
         node_id = str(node.get("id", ""))
         if (
