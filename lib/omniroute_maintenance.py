@@ -830,14 +830,25 @@ class OmniRouteMaintenanceManager:
             )
             raise
 
-    def _restart_and_smoke(self) -> None:
-        """启动 Router/账户门户并执行 LLMCtl 完整真实模型冒烟。"""
+    def _restart_and_smoke(self, allow_legacy_gateway: bool = False) -> None:
+        """启动 Router/账户门户并执行 LLMCtl 完整真实模型冒烟。
+
+        参数：
+            allow_legacy_gateway: 仅用于恢复或 SQLite 维护路径。为真时允许旧
+                OmniRoute 跳过新推理规则 API，保证原版本可以恢复服务；目标
+                镜像的正式升级验收始终为假，不能借此绕过能力门禁。
+        """
+
+        environment = os.environ.copy()
+        if allow_legacy_gateway:
+            environment["LLMCTL_ALLOW_LEGACY_OMNIROUTE"] = "1"
 
         self.runner.run(
             [str(self.paths.llmctl), "router", "restart"],
             timeout=240,
             check=True,
             capture_output=True,
+            env=environment,
         )
         self.runner.run(
             [str(self.paths.llmctl), "smoke", "--full"],
@@ -1120,7 +1131,7 @@ class OmniRouteMaintenanceManager:
                 "恢复 Router 并执行完整模型冒烟",
                 cancellable=False,
             )
-            self._restart_and_smoke()
+            self._restart_and_smoke(allow_legacy_gateway=True)
             self.assess(deep=False)
             self._complete(job, "SQLite 压缩完成，Router 已恢复并通过完整冒烟")
         except Exception as error:
@@ -1132,7 +1143,7 @@ class OmniRouteMaintenanceManager:
                     f"压缩失败：{error}；自动恢复数据库失败：{restore_error}"
                 ) from restore_error
             try:
-                self._restart_and_smoke()
+                self._restart_and_smoke(allow_legacy_gateway=True)
             except Exception as verification_error:
                 raise RuntimeError(
                     f"压缩失败：{error}；已恢复维护前数据库文件，"
@@ -1305,7 +1316,7 @@ class OmniRouteMaintenanceManager:
                 self._stop_router_stack()
                 self._restore_database(directory, metadata)
                 self._restore_backup_image(metadata)
-                self._restart_and_smoke()
+                self._restart_and_smoke(allow_legacy_gateway=True)
             except Exception as rollback_error:
                 raise RuntimeError(
                     f"升级失败：{error}；自动回滚失败：{rollback_error}"
@@ -1361,7 +1372,7 @@ class OmniRouteMaintenanceManager:
                 self.jobs.save(job)
             except Exception as incident_error:
                 try:
-                    self._restart_and_smoke()
+                    self._restart_and_smoke(allow_legacy_gateway=True)
                 except Exception as restart_error:
                     raise RuntimeError(
                         f"无法保存损坏数据库的事故副本：{incident_error}；"
@@ -1387,7 +1398,7 @@ class OmniRouteMaintenanceManager:
                 "启动回滚版本并执行完整冒烟",
                 cancellable=False,
             )
-            self._restart_and_smoke()
+            self._restart_and_smoke(allow_legacy_gateway=True)
             self.assess(deep=False)
             self._complete(
                 job,
@@ -1404,7 +1415,7 @@ class OmniRouteMaintenanceManager:
                 self._stop_router_stack()
                 self._restore_database(current_directory, current_metadata)
                 self._restore_backup_image(current_metadata)
-                self._restart_and_smoke()
+                self._restart_and_smoke(allow_legacy_gateway=True)
             except Exception as compensation_error:
                 raise RuntimeError(
                     f"人工回滚失败：{error}；恢复回滚前状态失败：{compensation_error}"

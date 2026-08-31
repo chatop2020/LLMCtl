@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import shlex
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -43,10 +44,15 @@ LLMCTL_MANAGED_COMBO_DESCRIPTIONS = frozenset(
 OMNIROUTE_INFLIGHT_PER_WORKER = 20
 OMNIROUTE_QUEUE_TIMEOUT_MS = 1000
 MAX_OUTPUT_TOKENS_CEILING = 32768
+OMNIROUTE_PAGE_LIMIT = 200
 OMNIROUTE_REASONING_EFFORTS = frozenset(
     {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
 )
 QWEN38_REASONING_EFFORT_ALIASES = {"high": "xhigh"}
+
+
+class OmniRouteFeatureUnavailable(RuntimeError):
+    """表示运行镜像缺少 LLMCtl 当前操作所需的可选 OmniRoute API。"""
 
 
 def is_llmctl_managed_combo(combo: dict[str, Any] | None) -> bool:
@@ -536,7 +542,9 @@ def ensure_omniroute_management_key(
     current = os.environ.get("GATEWAY_API_KEY", "")
     if not rotate and client.management_key_works(current):
         return current
-    existing = response_list(client.request("GET", "/api/keys?limit=1000"), "keys")
+    existing = response_list(
+        client.request("GET", f"/api/keys?limit={OMNIROUTE_PAGE_LIMIT}"), "keys"
+    )
     created = client.request(
         "POST", "/api/keys", {"name": OMNIROUTE_MANAGED_KEY, "scopes": ["manage"]}
     )
@@ -589,8 +597,14 @@ def reconcile_omniroute(
                 "OmniRoute did not persist visionBridgeEnabled=false for the native-vision cluster"
             )
 
-    nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
-    connections = response_list(client.request("GET", "/api/providers?limit=1000"), "connections")
+    nodes = response_list(
+        client.request("GET", f"/api/provider-nodes?limit={OMNIROUTE_PAGE_LIMIT}"),
+        "nodes",
+    )
+    connections = response_list(
+        client.request("GET", f"/api/providers?limit={OMNIROUTE_PAGE_LIMIT}"),
+        "connections",
+    )
     desired_node_ids: set[str] = set()
     stale_connection_ids: set[str] = set()
     combo_models: list[dict[str, Any]] = []
@@ -720,7 +734,9 @@ def reconcile_omniroute(
             }
         )
 
-    combos = response_list(client.request("GET", "/api/combos?limit=1000"), "combos")
+    combos = response_list(
+        client.request("GET", f"/api/combos?limit={OMNIROUTE_PAGE_LIMIT}"), "combos"
+    )
     existing_combo = next((item for item in combos if item.get("name") == model), None)
     combo_payload: dict[str, Any] = {
         "name": model,
@@ -918,7 +934,7 @@ def omniroute_reasoning_rules(client: OmniRouteClient) -> list[dict[str, Any]]:
         detail = str(error)
         if f"GET {path} returned HTTP 404" not in detail:
             raise
-        raise RuntimeError(
+        raise OmniRouteFeatureUnavailable(
             "当前实际运行的 OmniRoute 缺少推理路由规则 API，无法安装 "
             "Qwen3.8 的 high→xhigh 兼容规则；尚未修改 Worker、Combo 或路由。"
             "请先运行 `llmctl omniroute status`：若 running_image 与 "
@@ -1004,17 +1020,36 @@ def reconcile_omniroute_registry(
     ensure_omniroute_management_key(client, secrets_file)
     # 在修改 Vision Bridge、节点和 Combo 之前验证运行镜像能力。旧镜像缺少规则
     # API 时失败关闭，避免路由已局部同步后才暴露版本不一致。
-    existing_reasoning_rules = omniroute_reasoning_rules(client)
+    reasoning_rules_available = True
+    try:
+        existing_reasoning_rules = omniroute_reasoning_rules(client)
+    except OmniRouteFeatureUnavailable:
+        if os.environ.get("LLMCTL_ALLOW_LEGACY_OMNIROUTE") != "1":
+            raise
+        reasoning_rules_available = False
+        existing_reasoning_rules = []
+        print(
+            "[gateway-config] WARNING: 恢复流程正在兼容旧 OmniRoute；"
+            "跳过 Qwen 推理等级规则，不影响现有模型路由。",
+            file=sys.stderr,
+        )
     if any(spec["supports_vision"] for spec in specs):
         settings = client.request("PATCH", "/api/settings", {"visionBridgeEnabled": False})
         if settings.get("visionBridgeEnabled") is not False:
             raise RuntimeError("OmniRoute 未能关闭会造成多模态请求延迟的 Vision Bridge")
 
-    nodes = response_list(client.request("GET", "/api/provider-nodes?limit=1000"), "nodes")
-    connections = response_list(
-        client.request("GET", "/api/providers?limit=1000"), "connections"
+    nodes = response_list(
+        client.request("GET", f"/api/provider-nodes?limit={OMNIROUTE_PAGE_LIMIT}"),
+        "nodes",
     )
-    combos = response_list(client.request("GET", "/api/combos?limit=1000"), "combos")
+    connections = response_list(
+        client.request("GET", f"/api/providers?limit={OMNIROUTE_PAGE_LIMIT}"),
+        "connections",
+    )
+    combos = response_list(
+        client.request("GET", f"/api/combos?limit={OMNIROUTE_PAGE_LIMIT}"),
+        "combos",
+    )
     desired_node_ids: set[str] = set()
     desired_combo_names: set[str] = set()
     stale_connection_ids: set[str] = set()
@@ -1166,7 +1201,8 @@ def reconcile_omniroute_registry(
 
     # 推理兼容规则依赖公开模型已存在；先提交全部新 Combo，再对账规则，最后才
     # 清理退役路由。这样 Qwen 与 Ornith 切换中途失败时仍保留上一条可用链路。
-    reconcile_omniroute_reasoning_rules(client, specs, existing_reasoning_rules)
+    if reasoning_rules_available:
+        reconcile_omniroute_reasoning_rules(client, specs, existing_reasoning_rules)
 
     # 先创建完整新路由，最后再清理旧资源，任何中途失败都保留上次可用链路。
     # 停用部署的连接不再属于任何期望 Combo；显式删除它们，避免只依赖

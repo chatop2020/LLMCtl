@@ -114,11 +114,11 @@ class FakeOmniRouteClient:
 
     def request(self, method, path, payload=None, bearer=""):
         self.calls.append((method, path, payload))
-        if (method, path) == ("GET", "/api/provider-nodes?limit=1000"):
+        if (method, path) == ("GET", "/api/provider-nodes?limit=200"):
             return {"nodes": list(self.nodes)}
         if (method, path) == ("PATCH", "/api/settings"):
             return {"visionBridgeEnabled": payload["visionBridgeEnabled"]}
-        if (method, path) == ("GET", "/api/providers?limit=1000"):
+        if (method, path) == ("GET", "/api/providers?limit=200"):
             return {"connections": list(self.connections)}
         if method == "PUT" and path.startswith("/api/provider-nodes/"):
             node_id = path.rsplit("/", 1)[1]
@@ -141,7 +141,7 @@ class FakeOmniRouteClient:
             return {"models": list(self.models.get(provider, []))}
         if method in {"POST", "PUT"} and path == "/api/provider-models":
             return {"model": payload}
-        if (method, path) == ("GET", "/api/combos?limit=1000"):
+        if (method, path) == ("GET", "/api/combos?limit=200"):
             return {"combos": [dict(item) for item in self.combos]}
         if (method, path) == (
             "GET",
@@ -556,6 +556,34 @@ class GatewayConfigTests(unittest.TestCase):
             call for call in client.calls if call[0] in {"POST", "PUT", "PATCH", "DELETE"}
         ]
         self.assertEqual(mutating_calls, [])
+
+        recovery_client = FakeOmniRouteClient()
+        recovery_client.reasoning_rules_api_available = False
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry_file = root / "deployments.json"
+            secrets = root / "secrets.env"
+            registry_file.write_text(json.dumps(registry), encoding="utf-8")
+            secrets.write_text(
+                "GATEWAY_API_KEY=sk-bf-public-secret\n", encoding="utf-8"
+            )
+            environment = {
+                **BASE_ENV,
+                "LLMCTL_ALLOW_LEGACY_OMNIROUTE": "1",
+            }
+            with mock.patch.dict(os.environ, environment, clear=True):
+                gateway.reconcile_omniroute_registry(
+                    recovery_client, registry_file, secrets
+                )
+
+        self.assertTrue(
+            any(
+                call[0:2] == ("POST", "/api/combos")
+                and call[2].get("name") == "gdn-inside"
+                for call in recovery_client.calls
+            )
+        )
+        self.assertEqual(recovery_client.reasoning_rules, [])
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

@@ -162,7 +162,7 @@ class OmniRouteClient:
         return []
 
     def combos(self) -> list[dict[str, Any]]:
-        return self.items(self.request("GET", "/api/combos?limit=1000"), "combos")
+        return self.items(self.request("GET", "/api/combos?limit=200"), "combos")
 
     def upsert_combo(
         self, combo_id: str, payload: dict[str, Any], active: bool = True
@@ -265,7 +265,7 @@ class OmniRouteClient:
                 )
 
         nodes = self.items(
-            self.request("GET", "/api/provider-nodes?limit=1000"), "nodes"
+            self.request("GET", "/api/provider-nodes?limit=200"), "nodes"
         )
         matches = [item for item in nodes if item.get("name") == WORKFLOW_GATEWAY_NODE_NAME]
         node_payload = {
@@ -293,7 +293,7 @@ class OmniRouteClient:
             raise RuntimeError("OmniRoute 未返回工作流 Provider Node ID")
 
         connections = self.items(
-            self.request("GET", "/api/providers?limit=1000"), "connections"
+            self.request("GET", "/api/providers?limit=200"), "connections"
         )
         connection_matches = [item for item in connections if item.get("provider") == node_id]
         first_model = sorted(routes)[0]

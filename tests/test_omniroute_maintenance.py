@@ -25,6 +25,7 @@ class FakeRunner:
         self.cluster_env = cluster_env
         self.database = database
         self.commands: list[list[str]] = []
+        self.command_environments: list[dict[str, str]] = []
         self.running_image = "diegosouzapw/omniroute:3.8.48"
         self.running_image_id = "sha256:old-image"
         self.fail_smoke_count = 0
@@ -47,6 +48,7 @@ class FakeRunner:
 
         rendered = [str(value) for value in command]
         self.commands.append(rendered)
+        self.command_environments.append(dict(env or {}))
         stdout = ""
         returncode = 0
         if rendered[:3] == ["docker", "inspect", "--format"]:
@@ -355,6 +357,18 @@ class OmniRouteMaintenanceTests(unittest.TestCase):
             cluster["OMNIROUTE_IMAGE"], "diegosouzapw/omniroute:3.8.48"
         )
         self.assertEqual(self.runner.running_image, "diegosouzapw/omniroute:3.8.48")
+        recovery_restarts = [
+            environment
+            for command, environment in zip(
+                self.runner.commands, self.runner.command_environments
+            )
+            if command[-2:] == ["router", "restart"]
+        ]
+        self.assertEqual(len(recovery_restarts), 2)
+        self.assertNotIn("LLMCTL_ALLOW_LEGACY_OMNIROUTE", recovery_restarts[0])
+        self.assertEqual(
+            recovery_restarts[1].get("LLMCTL_ALLOW_LEGACY_OMNIROUTE"), "1"
+        )
 
     def test_update_image_id_mismatch_triggers_database_and_image_rollback(self):
         """标签相同但实际镜像 ID 不符时也必须视为供应链验收失败。"""
