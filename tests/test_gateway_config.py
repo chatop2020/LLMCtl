@@ -104,6 +104,7 @@ class FakeOmniRouteClient:
         self.combos = [self.combo]
         self.reasoning_rules = []
         self.next_reasoning_rule = 1
+        self.reasoning_rules_api_available = True
 
     def login(self):
         self.calls.append(("LOGIN", "", None))
@@ -146,6 +147,11 @@ class FakeOmniRouteClient:
             "GET",
             "/api/settings/reasoning-routing-rules",
         ):
+            if not self.reasoning_rules_api_available:
+                raise RuntimeError(
+                    "OmniRoute GET /api/settings/reasoning-routing-rules returned "
+                    "HTTP 404: unknown_route"
+                )
             return {"rules": [dict(item) for item in self.reasoning_rules]}
         if (method, path) == (
             "POST",
@@ -498,6 +504,58 @@ class GatewayConfigTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "目标推理等级"):
             gateway.deployment_reasoning_effort_aliases("custom", deployment)
+
+    def test_old_omniroute_fails_before_mutating_routes_with_upgrade_guidance(self):
+        """旧运行镜像缺少规则 API 时必须在任何路由写入前失败关闭。"""
+
+        client = FakeOmniRouteClient()
+        client.reasoning_rules_api_available = False
+        registry = {
+            "schema_version": 1,
+            "legacy_aliases": {},
+            "deployments": {
+                "qwen38-flash-next": {
+                    "enabled": True,
+                    "publish_requested": True,
+                    "model_id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                    "served_model_name": "gdn-inside",
+                    "public_model_ids": ["gdn-inside"],
+                    "runtime": {
+                        "max_model_len": 262144,
+                        "supports_image_input": True,
+                    },
+                    "instances": [
+                        {
+                            "id": "qwen-worker-0",
+                            "kind": "local",
+                            "worker_id": 0,
+                            "port": 8100,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            registry_file = root / "deployments.json"
+            secrets = root / "secrets.env"
+            registry_file.write_text(json.dumps(registry), encoding="utf-8")
+            secrets.write_text(
+                "GATEWAY_API_KEY=sk-bf-public-secret\n", encoding="utf-8"
+            )
+            with mock.patch.dict(os.environ, BASE_ENV, clear=True):
+                with self.assertRaisesRegex(
+                    RuntimeError, "llmctl omniroute status"
+                ):
+                    gateway.reconcile_omniroute_registry(
+                        client, registry_file, secrets
+                    )
+
+        mutating_calls = [
+            call for call in client.calls if call[0] in {"POST", "PUT", "PATCH", "DELETE"}
+        ]
+        self.assertEqual(mutating_calls, [])
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

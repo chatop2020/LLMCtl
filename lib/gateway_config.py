@@ -897,8 +897,41 @@ def reasoning_rule_payloads(specs: list[dict[str, Any]]) -> list[dict[str, Any]]
     return payloads
 
 
+def omniroute_reasoning_rules(client: OmniRouteClient) -> list[dict[str, Any]]:
+    """读取 OmniRoute 推理路由规则，并把旧运行版本转成可操作错误。
+
+    参数：
+        client: 已登录且具有管理权限的 OmniRoute 客户端。
+
+    返回：
+        当前全部推理路由规则；不存在规则时返回空列表。
+
+    异常：
+        RuntimeError: 当前运行镜像缺少规则 API 时给出版本核对与恢复入口；
+            其他网络、鉴权或服务端错误保持原始错误。
+    """
+
+    path = "/api/settings/reasoning-routing-rules"
+    try:
+        return response_list(client.request("GET", path), "rules")
+    except RuntimeError as error:
+        detail = str(error)
+        if f"GET {path} returned HTTP 404" not in detail:
+            raise
+        raise RuntimeError(
+            "当前实际运行的 OmniRoute 缺少推理路由规则 API，无法安装 "
+            "Qwen3.8 的 high→xhigh 兼容规则；尚未修改 Worker、Combo 或路由。"
+            "请先运行 `llmctl omniroute status`：若 running_image 与 "
+            "configured_image 不一致，执行 `llmctl router restart`；若两者一致但 "
+            "不是推荐镜像，执行 `llmctl omniroute update "
+            "diegosouzapw/omniroute:3.8.49 --yes`。"
+        ) from error
+
+
 def reconcile_omniroute_reasoning_rules(
-    client: OmniRouteClient, specs: list[dict[str, Any]]
+    client: OmniRouteClient,
+    specs: list[dict[str, Any]],
+    existing_rules: list[dict[str, Any]] | None = None,
 ) -> None:
     """原子对账 LLMCtl 管理的模型级推理等级兼容规则。
 
@@ -908,14 +941,17 @@ def reconcile_omniroute_reasoning_rules(
     参数：
         client: 已登录且具有管理权限的 OmniRoute 客户端。
         specs: 当前部署注册表生成的活动公开部署清单。
+        existing_rules: 可选的同步前规则快照；提供后不再重复调用读取 API。
 
     异常：
         RuntimeError: OmniRoute API 返回缺失 ID、拒绝规则或网络调用失败。
     """
 
     desired = reasoning_rule_payloads(specs)
-    existing = response_list(
-        client.request("GET", "/api/settings/reasoning-routing-rules"), "rules"
+    existing = (
+        list(existing_rules)
+        if existing_rules is not None
+        else omniroute_reasoning_rules(client)
     )
     managed = [
         rule
@@ -966,6 +1002,9 @@ def reconcile_omniroute_registry(
     specs = registry_omniroute_specs(registry_file)
     client.login()
     ensure_omniroute_management_key(client, secrets_file)
+    # 在修改 Vision Bridge、节点和 Combo 之前验证运行镜像能力。旧镜像缺少规则
+    # API 时失败关闭，避免路由已局部同步后才暴露版本不一致。
+    existing_reasoning_rules = omniroute_reasoning_rules(client)
     if any(spec["supports_vision"] for spec in specs):
         settings = client.request("PATCH", "/api/settings", {"visionBridgeEnabled": False})
         if settings.get("visionBridgeEnabled") is not False:
@@ -1127,7 +1166,7 @@ def reconcile_omniroute_registry(
 
     # 推理兼容规则依赖公开模型已存在；先提交全部新 Combo，再对账规则，最后才
     # 清理退役路由。这样 Qwen 与 Ornith 切换中途失败时仍保留上一条可用链路。
-    reconcile_omniroute_reasoning_rules(client, specs)
+    reconcile_omniroute_reasoning_rules(client, specs, existing_reasoning_rules)
 
     # 先创建完整新路由，最后再清理旧资源，任何中途失败都保留上次可用链路。
     # 停用部署的连接不再属于任何期望 Combo；显式删除它们，避免只依赖
