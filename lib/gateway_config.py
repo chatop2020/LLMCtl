@@ -27,6 +27,9 @@ MANAGED_TAG = "llmctl-managed"
 MANAGED_TOKEN = "llmctl-default"
 OMNIROUTE_MANAGED_KEY = "llmctl-management"
 OMNIROUTE_DESCRIPTION = "Managed by LLMCtl. Do not edit worker targets manually."
+OMNIROUTE_REASONING_RULE_DESCRIPTION = (
+    "Managed by LLMCtl reasoning effort compatibility. Do not edit manually."
+)
 PORTAL_PUBLIC_COMBO_DESCRIPTION = "Managed by LLMCtl account portal public model"
 LLMCTL_MANAGED_COMBO_DESCRIPTIONS = frozenset(
     {OMNIROUTE_DESCRIPTION, PORTAL_PUBLIC_COMBO_DESCRIPTION}
@@ -40,12 +43,69 @@ LLMCTL_MANAGED_COMBO_DESCRIPTIONS = frozenset(
 OMNIROUTE_INFLIGHT_PER_WORKER = 20
 OMNIROUTE_QUEUE_TIMEOUT_MS = 1000
 MAX_OUTPUT_TOKENS_CEILING = 32768
+OMNIROUTE_REASONING_EFFORTS = frozenset(
+    {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
+QWEN38_REASONING_EFFORT_ALIASES = {"high": "xhigh"}
 
 
 def is_llmctl_managed_combo(combo: dict[str, Any] | None) -> bool:
     """判断 Combo 是否由模型注册表或账户门户任一 LLMCtl 控制面管理。"""
 
     return str((combo or {}).get("description", "")) in LLMCTL_MANAGED_COMBO_DESCRIPTIONS
+
+
+def deployment_reasoning_effort_aliases(
+    deployment_id: str, deployment: dict[str, Any]
+) -> dict[str, str]:
+    """返回单个部署需要由 OmniRoute 执行的推理等级兼容映射。
+
+    注册表可以显式提供 `reasoning_effort_aliases`。既有 Qwen3.8 部署在升级前
+    尚无该字段，因此还会根据稳定的部署 ID、模型 ID 和服务名补齐
+    `high -> xhigh`。映射只作用于该部署的公开模型，不会改变 Ornith 或其他
+    模型对 `high` 的原生含义。
+
+    参数：
+        deployment_id: 部署注册表中的稳定部署 ID。
+        deployment: 包含模型身份、运行参数和公开 ID 的部署记录。
+
+    返回：
+        已校验且去除恒等项的来源等级到目标等级映射。
+
+    异常：
+        RuntimeError: 显式映射不是对象，或包含 OmniRoute 不支持的等级。
+    """
+
+    runtime = deployment.get("runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+    raw_aliases = runtime.get("reasoning_effort_aliases")
+    if raw_aliases is None:
+        identifiers = (
+            deployment_id,
+            str(deployment.get("model_id", "")),
+            str(deployment.get("served_model_name", "")),
+        )
+        is_qwen38 = any(
+            "qwen38flashnext"
+            in "".join(character for character in value.lower() if character.isalnum())
+            for value in identifiers
+        )
+        raw_aliases = QWEN38_REASONING_EFFORT_ALIASES if is_qwen38 else {}
+    if not isinstance(raw_aliases, dict):
+        raise RuntimeError("reasoning_effort_aliases 必须是对象")
+
+    aliases: dict[str, str] = {}
+    for raw_source, raw_target in raw_aliases.items():
+        source = str(raw_source).strip().lower()
+        target = str(raw_target).strip().lower()
+        if source not in OMNIROUTE_REASONING_EFFORTS:
+            raise RuntimeError(f"OmniRoute 不支持来源推理等级：{source or '<empty>'}")
+        if target not in OMNIROUTE_REASONING_EFFORTS:
+            raise RuntimeError(f"OmniRoute 不支持目标推理等级：{target or '<empty>'}")
+        if source != target:
+            aliases[source] = target
+    return aliases
 
 
 def worker_origin(worker_id: int) -> str:
@@ -780,12 +840,122 @@ def registry_omniroute_specs(registry_file: pathlib.Path) -> list[dict[str, Any]
                     "public_model_ids": list(dict.fromkeys(public_ids)),
                     "max_model_len": int(runtime.get("max_model_len", 32768)),
                     "supports_vision": bool(runtime.get("supports_image_input", False)),
+                    "reasoning_effort_aliases": deployment_reasoning_effort_aliases(
+                        str(deployment_id), deployment
+                    ),
                     "targets": targets,
                 }
             )
     if not specs:
         raise RuntimeError("部署注册表中没有可发布的模型实例")
     return specs
+
+
+def reasoning_rule_payloads(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把活动部署的推理等级别名转换为 OmniRoute 模型级规则。
+
+    参数：
+        specs: `registry_omniroute_specs` 生成的活动公开部署清单。
+
+    返回：
+        可直接提交到 OmniRoute 推理规则 API 的确定性、去重规则列表。
+        未配置兼容别名的模型不会产生规则。
+    """
+
+    payloads: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for spec in specs:
+        aliases = spec.get("reasoning_effort_aliases", {})
+        if not isinstance(aliases, dict):
+            raise RuntimeError("OmniRoute 部署清单中的推理等级映射无效")
+        for public_model_id in spec.get("public_model_ids", []):
+            model = str(public_model_id).strip()
+            if not model:
+                continue
+            for source, target in sorted(aliases.items()):
+                identity = (model, str(source), str(target))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                payloads.append(
+                    {
+                        "name": f"LLMCtl {model} reasoning {source} to {target}"[:200],
+                        "description": OMNIROUTE_REASONING_RULE_DESCRIPTION,
+                        "scope": "model",
+                        "modelPattern": model,
+                        "sourceEffort": source,
+                        "requestTags": [],
+                        "tagMatchMode": "any",
+                        "effortMode": "force",
+                        "targetEffort": target,
+                        "targetKind": "keep",
+                        "budgetAction": "preserve",
+                        "priority": 900_000,
+                        "enabled": True,
+                    }
+                )
+    return payloads
+
+
+def reconcile_omniroute_reasoning_rules(
+    client: OmniRouteClient, specs: list[dict[str, Any]]
+) -> None:
+    """原子对账 LLMCtl 管理的模型级推理等级兼容规则。
+
+    先创建或更新活动模型规则，再删除重复项和已退役模型规则。任何写入失败都会
+    保留此前已知可用的规则；函数只识别专用描述，不修改管理员手工规则。
+
+    参数：
+        client: 已登录且具有管理权限的 OmniRoute 客户端。
+        specs: 当前部署注册表生成的活动公开部署清单。
+
+    异常：
+        RuntimeError: OmniRoute API 返回缺失 ID、拒绝规则或网络调用失败。
+    """
+
+    desired = reasoning_rule_payloads(specs)
+    existing = response_list(
+        client.request("GET", "/api/settings/reasoning-routing-rules"), "rules"
+    )
+    managed = [
+        rule
+        for rule in existing
+        if rule.get("description") == OMNIROUTE_REASONING_RULE_DESCRIPTION
+    ]
+    managed_by_name: dict[str, list[dict[str, Any]]] = {}
+    for rule in managed:
+        managed_by_name.setdefault(str(rule.get("name", "")), []).append(rule)
+
+    retained_ids: set[str] = set()
+    for payload in desired:
+        matches = managed_by_name.get(str(payload["name"]), [])
+        current = matches.pop(0) if matches else None
+        if current:
+            rule_id = str(current.get("id", ""))
+            if not rule_id:
+                raise RuntimeError("OmniRoute 返回了缺少 ID 的 LLMCtl 推理规则")
+            client.request(
+                "PATCH",
+                "/api/settings/reasoning-routing-rules/"
+                + urllib.parse.quote(rule_id, safe=""),
+                payload,
+            )
+            retained_ids.add(rule_id)
+        else:
+            created = client.request(
+                "POST", "/api/settings/reasoning-routing-rules", payload
+            ).get("rule", {})
+            if not isinstance(created, dict) or not str(created.get("id", "")):
+                raise RuntimeError("OmniRoute 未返回新建推理兼容规则的 ID")
+
+    for rule in managed:
+        rule_id = str(rule.get("id", ""))
+        if rule_id and rule_id not in retained_ids:
+            client.request(
+                "DELETE",
+                "/api/settings/reasoning-routing-rules/"
+                + urllib.parse.quote(rule_id, safe=""),
+            )
 
 
 def reconcile_omniroute_registry(
@@ -954,6 +1124,10 @@ def reconcile_omniroute_registry(
                 )
             else:
                 client.request("POST", "/api/combos", combo_payload)
+
+    # 推理兼容规则依赖公开模型已存在；先提交全部新 Combo，再对账规则，最后才
+    # 清理退役路由。这样 Qwen 与 Ornith 切换中途失败时仍保留上一条可用链路。
+    reconcile_omniroute_reasoning_rules(client, specs)
 
     # 先创建完整新路由，最后再清理旧资源，任何中途失败都保留上次可用链路。
     # 停用部署的连接不再属于任何期望 Combo；显式删除它们，避免只依赖

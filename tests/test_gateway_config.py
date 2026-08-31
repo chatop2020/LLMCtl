@@ -102,6 +102,8 @@ class FakeOmniRouteClient:
             "description": gateway.OMNIROUTE_DESCRIPTION,
         }
         self.combos = [self.combo]
+        self.reasoning_rules = []
+        self.next_reasoning_rule = 1
 
     def login(self):
         self.calls.append(("LOGIN", "", None))
@@ -140,6 +142,34 @@ class FakeOmniRouteClient:
             return {"model": payload}
         if (method, path) == ("GET", "/api/combos?limit=1000"):
             return {"combos": [dict(item) for item in self.combos]}
+        if (method, path) == (
+            "GET",
+            "/api/settings/reasoning-routing-rules",
+        ):
+            return {"rules": [dict(item) for item in self.reasoning_rules]}
+        if (method, path) == (
+            "POST",
+            "/api/settings/reasoning-routing-rules",
+        ):
+            rule = {"id": f"reasoning-{self.next_reasoning_rule}", **payload}
+            self.next_reasoning_rule += 1
+            self.reasoning_rules.append(rule)
+            return {"rule": dict(rule)}
+        if method == "PATCH" and path.startswith(
+            "/api/settings/reasoning-routing-rules/"
+        ):
+            rule_id = path.rsplit("/", 1)[1]
+            rule = next(item for item in self.reasoning_rules if item["id"] == rule_id)
+            rule.update(payload)
+            return {"rule": dict(rule)}
+        if method == "DELETE" and path.startswith(
+            "/api/settings/reasoning-routing-rules/"
+        ):
+            rule_id = path.rsplit("/", 1)[1]
+            self.reasoning_rules = [
+                item for item in self.reasoning_rules if item["id"] != rule_id
+            ]
+            return {"success": True}
         if method == "PUT" and path.startswith("/api/combos/"):
             combo_id = path.rsplit("/", 1)[1]
             combo = next(item for item in self.combos if item["id"] == combo_id)
@@ -355,6 +385,7 @@ class GatewayConfigTests(unittest.TestCase):
                 "qwen38-flash-next": {
                     "enabled": True,
                     "publish_requested": True,
+                    "model_id": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
                     "served_model_name": "gdn-inside",
                     "public_model_ids": ["gdn-inside"],
                     "runtime": {
@@ -426,6 +457,47 @@ class GatewayConfigTests(unittest.TestCase):
         )
         self.assertLess(combo_update, connection_delete)
         self.assertLess(connection_delete, node_delete)
+
+        self.assertEqual(len(client.reasoning_rules), 1)
+        qwen_rule = client.reasoning_rules[0]
+        self.assertEqual(qwen_rule["scope"], "model")
+        self.assertEqual(qwen_rule["modelPattern"], "gdn-inside")
+        self.assertEqual(qwen_rule["sourceEffort"], "high")
+        self.assertEqual(qwen_rule["effortMode"], "force")
+        self.assertEqual(qwen_rule["targetEffort"], "xhigh")
+        self.assertEqual(qwen_rule["targetKind"], "keep")
+
+        # 重复同步必须更新同一条规则；切回其他模型时只清理 LLMCtl 自动规则。
+        gateway.reconcile_omniroute_reasoning_rules(client, specs)
+        self.assertEqual(len(client.reasoning_rules), 1)
+        client.reasoning_rules.append(
+            {
+                "id": "manual-rule",
+                "name": "管理员规则",
+                "description": "user managed",
+            }
+        )
+        gateway.reconcile_omniroute_reasoning_rules(
+            client,
+            [
+                {
+                    "public_model_ids": ["ornith-1.5-35b-a3b-fp8"],
+                    "reasoning_effort_aliases": {},
+                }
+            ],
+        )
+        self.assertEqual(
+            [item["id"] for item in client.reasoning_rules], ["manual-rule"]
+        )
+
+    def test_reasoning_effort_aliases_reject_unknown_omniroute_values(self):
+        """非法等级必须在写入 OmniRoute 前失败，不能留下半有效规则。"""
+
+        deployment = {
+            "runtime": {"reasoning_effort_aliases": {"high": "extreme"}}
+        }
+        with self.assertRaisesRegex(RuntimeError, "目标推理等级"):
+            gateway.deployment_reasoning_effort_aliases("custom", deployment)
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()
