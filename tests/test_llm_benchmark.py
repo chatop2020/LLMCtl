@@ -54,10 +54,27 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_prompt_is_meaningful_and_close_to_target(self):
         prompt = benchmark.meaningful_prompt(300, "stable-seed")
-        self.assertIn("Case 1:", prompt)
-        self.assertIn("latency throughput cost reliability", prompt)
-        self.assertGreaterEqual(len(prompt.split()), 280)
-        self.assertLessEqual(len(prompt.split()), 330)
+        self.assertIn("案例1：", prompt)
+        self.assertIn("延迟、吞吐、成本、可靠性", prompt)
+        self.assertEqual(len(prompt), 300)
+
+    def test_largest_prompt_stays_below_omniroute_heavy_admission_thresholds(self):
+        """30K 文字压测必须测到 Worker，不能被 Router 当成大文件拦截。"""
+
+        prompt = benchmark.meaningful_prompt(30_000, "largest-plan")
+        payload = json.dumps(
+            {
+                "model": "gdn-inside",
+                "stream": True,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            ensure_ascii=False,
+        ).encode()
+        admission_estimate = sum(0.25 if ord(character) < 128 else 1 for character in prompt)
+
+        self.assertEqual(len(prompt), 30_000)
+        self.assertLess(len(payload), 256 * 1024)
+        self.assertLess(admission_estimate, 32_000)
 
     def test_backend_runner_streams_and_writes_professional_metrics(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StreamingHandler)

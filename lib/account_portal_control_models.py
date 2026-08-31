@@ -712,8 +712,17 @@ class PortalModelControlMixin:
             self.omni.delete_model_alias(public_id)
 
     def reconcile_public_combo_routes(self) -> dict[str, int]:
-        """在不中断流量的前提下幂等迁移旧 Combo 映射。"""
+        """重新投影活动部署后，在不中断流量的前提下迁移旧 Combo 映射。
+
+        账户门户可能在 Router 完成 Combo 初始化前启动。首次种子同步没有找到
+        当前 Combo 时不能退役旧模型，因此维护循环在真正迁移前必须再次执行
+        幂等同步；这样当前模型会绑定实时 Combo，退役部署也不会永久进入重试。
+
+        返回：
+            本轮已迁移、无需修改和失败的公开 Combo 数量。
+        """
         self.prepare_public_combo_migration_backup()
+        self.seed_managed_model()
         with self.db.connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM published_models WHERE source_kind='combo' "

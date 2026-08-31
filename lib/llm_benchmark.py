@@ -39,23 +39,23 @@ _WRITE_LOCK = threading.Lock()
 ROUTE_DECISION_PART = re.compile(r"^\s*([^=;]+)=([^;]*)\s*$")
 
 TOPICS = (
-    "distributed inference capacity planning",
-    "incident response for a regional payment service",
-    "database migration with zero customer downtime",
-    "energy-efficient scheduling for a GPU cluster",
-    "quality assurance for an enterprise document workflow",
-    "privacy review for an internal knowledge assistant",
-    "supply-chain forecasting under uncertain demand",
-    "observability design for a high-volume API platform",
+    "分布式推理容量规划",
+    "区域支付服务故障处置",
+    "客户无感数据库迁移",
+    "图形处理器集群节能调度",
+    "企业文档流程质量保障",
+    "内部知识助手隐私审查",
+    "不确定需求下供应链预测",
+    "高流量接口可观测性设计",
 )
-VERBS = ("analyze", "compare", "validate", "explain", "prioritize", "estimate", "review")
+VERBS = ("分析", "比较", "验证", "解释", "排序", "估算", "复核")
 QUALIFIERS = (
-    "using explicit assumptions",
-    "with measurable acceptance criteria",
-    "while identifying operational risks",
-    "and separate facts from recommendations",
-    "with a concise executive summary",
-    "including failure modes and mitigations",
+    "列出明确假设",
+    "给出可测验收条件",
+    "识别运行风险",
+    "区分事实与建议",
+    "提供简短管理摘要",
+    "包含故障模式与缓解措施",
 )
 
 
@@ -234,32 +234,39 @@ def percentile(values: list[float], value: float) -> float | None:
 
 
 def meaningful_prompt(target_tokens: int, seed: str) -> str:
-    """Produce varied prose close to the requested tokenizer-independent target.
+    """生成长度接近目标且不会误触 Router 大请求门禁的可复现业务文本。
 
-    Common English words are used because they are approximately one token for
-    the model families LLMCtl targets.  The gateway's returned usage remains the
-    source of truth and is reported separately from this requested target.
+    当前受管 Qwen 系模型通常把一个中文字符编码为约一个 Token。使用紧凑中文
+    可以让 30K 档位保持在 OmniRoute 的 256 KiB 原始请求体门槛以内，同时仍让
+    Worker 承担约 30K Token 的真实预填充负载。最终统计继续以网关返回的
+    ``usage`` 为准，不把字符数当作实际 Token 数。
+
+    参数：
+        target_tokens: 页面选择的目标输入 Token 档位。
+        seed: 为每个请求生成稳定但不同内容的种子。
+
+    返回：
+        字符数等于目标档位的紧凑中文企业场景提示词。
     """
     generator = random.Random(seed)
-    words: list[str] = []
-    word_budget = max(1, target_tokens - 24)
+    prefix = "请阅读企业运行记录，分析最后一项。\n"
+    suffix = "\n只输出简短编号建议，并说明证据、风险与下一步。"
+    content_budget = max(0, target_tokens - len(prefix) - len(suffix))
+    fragments: list[str] = []
+    content_length = 0
     case_number = 1
-    while len(words) < word_budget:
+    while content_length < content_budget:
         topic = generator.choice(TOPICS)
-        sentence = (
-            f"Case {case_number}: {generator.choice(VERBS)} {topic} "
-            f"{generator.choice(QUALIFIERS)}. Consider latency throughput cost "
-            "reliability security maintainability and user impact. State the evidence "
-            "needed, the tradeoffs, and a practical next action."
+        fragment = (
+            f"案例{case_number}：{generator.choice(VERBS)}{topic}，"
+            f"{generator.choice(QUALIFIERS)}；评估延迟、吞吐、成本、可靠性、安全性、"
+            "可维护性和用户影响，说明所需证据、主要权衡与可执行动作。"
         )
-        words.extend(sentence.split())
+        fragments.append(fragment)
+        content_length += len(fragment)
         case_number += 1
-    words = words[:word_budget]
-    return (
-        "You are evaluating realistic enterprise scenarios. Read every case, then "
-        "answer only the final case with a short numbered recommendation.\n\n"
-        + " ".join(words)
-    )
+    content = "".join(fragments)[:content_budget]
+    return (prefix + content + suffix)[:target_tokens]
 
 
 def error_kind(error: BaseException) -> str:
