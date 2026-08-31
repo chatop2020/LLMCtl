@@ -105,6 +105,7 @@ class FakeOmniRouteClient:
         self.reasoning_rules = []
         self.next_reasoning_rule = 1
         self.reasoning_rules_api_available = True
+        self.model_aliases = {"admin-alias": "admin-model"}
 
     def login(self):
         self.calls.append(("LOGIN", "", None))
@@ -153,6 +154,14 @@ class FakeOmniRouteClient:
                     "HTTP 404: unknown_route"
                 )
             return {"rules": [dict(item) for item in self.reasoning_rules]}
+        if (method, path) == ("GET", "/api/settings/model-aliases"):
+            return {"custom": dict(self.model_aliases)}
+        if (method, path) == ("POST", "/api/settings/model-aliases"):
+            self.model_aliases[str(payload["from"])] = str(payload["to"])
+            return {"success": True, "custom": dict(self.model_aliases)}
+        if (method, path) == ("DELETE", "/api/settings/model-aliases"):
+            self.model_aliases.pop(str(payload["from"]), None)
+            return {"success": True, "custom": dict(self.model_aliases)}
         if (method, path) == (
             "POST",
             "/api/settings/reasoning-routing-rules",
@@ -446,6 +455,15 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertEqual(
             {item["provider"] for item in client.combo["models"]}, {"node-qwen"}
         )
+        self.assertEqual(
+            {item["model"] for item in client.combo["models"]},
+            {"llmctl-native-vision-qwen38-flash-next"},
+        )
+        self.assertEqual(
+            client.model_aliases["llmctl-native-vision-qwen38-flash-next"],
+            "gdn-inside",
+        )
+        self.assertEqual(client.model_aliases["admin-alias"], "admin-model")
         combo_update = next(
             index
             for index, call in enumerate(client.calls)
@@ -495,6 +513,8 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in client.reasoning_rules], ["manual-rule"]
         )
+        gateway.reconcile_omniroute_model_aliases(client, {})
+        self.assertEqual(client.model_aliases, {"admin-alias": "admin-model"})
 
     def test_reasoning_effort_aliases_reject_unknown_omniroute_values(self):
         """非法等级必须在写入 OmniRoute 前失败，不能留下半有效规则。"""
@@ -584,6 +604,12 @@ class GatewayConfigTests(unittest.TestCase):
             )
         )
         self.assertEqual(recovery_client.reasoning_rules, [])
+        recovery_combo = next(
+            item for item in recovery_client.combos if item["name"] == "gdn-inside"
+        )
+        self.assertEqual(
+            {item["model"] for item in recovery_combo["models"]}, {"gdn-inside"}
+        )
 
     def test_newapi_reconcile_creates_replacements_before_deleting_old_routes(self):
         client = FakeNewAPIClient()

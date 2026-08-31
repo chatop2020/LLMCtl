@@ -49,10 +49,28 @@ OMNIROUTE_REASONING_EFFORTS = frozenset(
     {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
 )
 QWEN38_REASONING_EFFORT_ALIASES = {"high": "xhigh"}
+OMNIROUTE_VISION_ALIAS_PREFIX = "llmctl-native-vision-"
 
 
 class OmniRouteFeatureUnavailable(RuntimeError):
     """表示运行镜像缺少 LLMCtl 当前操作所需的可选 OmniRoute API。"""
+
+
+def managed_vision_alias(deployment_id: str) -> str:
+    """返回 OmniRoute 3.8.49 可保守识别的内部视觉模型别名。
+
+    OmniRoute 的 Combo 能力过滤不会读取自定义 Provider Model 的
+    `supportsVision`，但会保守识别包含 `-vision` 标识的模型 ID。别名只用于
+    Combo 内部能力判定；OmniRoute 在上游执行前会把它映射回 vLLM 实际服务名。
+
+    参数：
+        deployment_id: LLMCtl 部署注册表中已校验的稳定部署 ID。
+
+    返回：
+        带 LLMCtl 原生视觉保留前缀的内部模型名。
+    """
+
+    return f"{OMNIROUTE_VISION_ALIAS_PREFIX}{deployment_id}"
 
 
 def is_llmctl_managed_combo(combo: dict[str, Any] | None) -> bool:
@@ -581,6 +599,11 @@ def reconcile_omniroute(
     backend_key = required_env("BACKEND_API_KEY")
     supports_vision = os.environ.get("SUPPORTS_IMAGE_INPUT", "0") == "1"
     concurrency_per_worker = OMNIROUTE_INFLIGHT_PER_WORKER
+    routing_model = managed_vision_alias("legacy") if supports_vision else model
+
+    reconcile_omniroute_model_aliases(
+        client, {routing_model: model} if supports_vision else {}
+    )
 
     if supports_vision:
         # 下方自定义模型会持久化 supportsVision=true，但 OmniRoute 的
@@ -728,7 +751,7 @@ def reconcile_omniroute(
             {
                 "kind": "model",
                 "provider": node_id,
-                "model": model,
+                "model": routing_model,
                 "connectionId": connection_id,
                 "label": name,
             }
@@ -856,6 +879,11 @@ def registry_omniroute_specs(registry_file: pathlib.Path) -> list[dict[str, Any]
                     "public_model_ids": list(dict.fromkeys(public_ids)),
                     "max_model_len": int(runtime.get("max_model_len", 32768)),
                     "supports_vision": bool(runtime.get("supports_image_input", False)),
+                    "routing_model_name": (
+                        managed_vision_alias(str(deployment_id))
+                        if runtime.get("supports_image_input", False)
+                        else served_model
+                    ),
                     "reasoning_effort_aliases": deployment_reasoning_effort_aliases(
                         str(deployment_id), deployment
                     ),
@@ -944,6 +972,67 @@ def omniroute_reasoning_rules(client: OmniRouteClient) -> list[dict[str, Any]]:
         ) from error
 
 
+def omniroute_model_aliases(client: OmniRouteClient) -> dict[str, str]:
+    """读取 OmniRoute 自定义模型别名，旧运行版本缺少 API 时明确失败。"""
+
+    path = "/api/settings/model-aliases"
+    try:
+        response = client.request("GET", path)
+    except RuntimeError as error:
+        if f"GET {path} returned HTTP 404" not in str(error):
+            raise
+        raise OmniRouteFeatureUnavailable(
+            "当前实际运行的 OmniRoute 缺少模型别名 API，无法发布原生视觉模型路由"
+        ) from error
+    aliases = response.get("custom", {})
+    if not isinstance(aliases, dict):
+        raise RuntimeError("OmniRoute 返回的自定义模型别名结构无效")
+    return {
+        str(alias): str(target)
+        for alias, target in aliases.items()
+        if str(alias) and str(target)
+    }
+
+
+def reconcile_omniroute_model_aliases(
+    client: OmniRouteClient,
+    desired_aliases: dict[str, str],
+    existing_aliases: dict[str, str] | None = None,
+) -> None:
+    """对账 LLMCtl 原生视觉内部别名，并保留管理员自定义别名。
+
+    参数：
+        client: 已登录且具有管理权限的 OmniRoute 客户端。
+        desired_aliases: 内部视觉别名到 vLLM 实际服务名的映射。
+        existing_aliases: 可选的同步前快照；提供后不再重复读取 API。
+
+    只管理 `llmctl-native-vision-*` 保留命名空间。先创建或更新期望别名，再删除退役
+    部署别名；任一步失败都不会修改管理员使用其他名称维护的映射。
+    """
+
+    existing = (
+        dict(existing_aliases)
+        if existing_aliases is not None
+        else omniroute_model_aliases(client)
+    )
+    for alias, target in sorted(desired_aliases.items()):
+        if existing.get(alias) == target:
+            continue
+        client.request(
+            "POST",
+            "/api/settings/model-aliases",
+            {"from": alias, "to": target},
+        )
+    for alias in sorted(existing):
+        if (
+            alias.startswith(OMNIROUTE_VISION_ALIAS_PREFIX)
+            and alias not in desired_aliases
+        ):
+            client.request(
+                "DELETE", "/api/settings/model-aliases", {"from": alias}
+            )
+
+
 def reconcile_omniroute_reasoning_rules(
     client: OmniRouteClient,
     specs: list[dict[str, Any]],
@@ -1021,13 +1110,17 @@ def reconcile_omniroute_registry(
     # 在修改 Vision Bridge、节点和 Combo 之前验证运行镜像能力。旧镜像缺少规则
     # API 时失败关闭，避免路由已局部同步后才暴露版本不一致。
     reasoning_rules_available = True
+    model_aliases_available = True
     try:
         existing_reasoning_rules = omniroute_reasoning_rules(client)
+        existing_model_aliases = omniroute_model_aliases(client)
     except OmniRouteFeatureUnavailable:
         if os.environ.get("LLMCTL_ALLOW_LEGACY_OMNIROUTE") != "1":
             raise
         reasoning_rules_available = False
+        model_aliases_available = False
         existing_reasoning_rules = []
+        existing_model_aliases = {}
         print(
             "[gateway-config] WARNING: 恢复流程正在兼容旧 OmniRoute；"
             "跳过 Qwen 推理等级规则，不影响现有模型路由。",
@@ -1053,6 +1146,15 @@ def reconcile_omniroute_registry(
     desired_node_ids: set[str] = set()
     desired_combo_names: set[str] = set()
     stale_connection_ids: set[str] = set()
+    desired_model_aliases = {
+        str(spec["routing_model_name"]): str(spec["served_model_name"])
+        for spec in specs
+        if spec["supports_vision"]
+    }
+    if model_aliases_available:
+        reconcile_omniroute_model_aliases(
+            client, desired_model_aliases, existing_model_aliases
+        )
 
     for spec in specs:
         combo_targets: list[dict[str, Any]] = []
@@ -1158,7 +1260,13 @@ def reconcile_omniroute_registry(
                 {
                     "kind": "model",
                     "provider": node_id,
-                    "model": spec["served_model_name"],
+                    # 旧版恢复路径没有模型别名 API，必须继续使用 vLLM 实际名；
+                    # 正式 3.8.49 验收才使用可确认视觉能力的内部别名。
+                    "model": (
+                        spec["routing_model_name"]
+                        if model_aliases_available
+                        else spec["served_model_name"]
+                    ),
                     "connectionId": connection_id,
                     "label": node_name,
                 }
