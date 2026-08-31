@@ -163,6 +163,25 @@ class RegistryRuntimeTests(unittest.TestCase):
 
         self.assertEqual(completed.stdout.strip(), "legacy-model|legacy-served|8")
 
+    def test_heavy_request_capacity_tracks_enabled_workers_with_safety_cap(self):
+        """图片与超长请求槽必须按启用 Worker 数生成，并保留有限上界。"""
+
+        script = textwrap.dedent(
+            f"""
+            set -Eeuo pipefail
+            source {shlex.quote(str(RUNTIME))}
+            printf '%s|%s|%s\n' \
+              "$(active_worker_count 0,1,2,3)" \
+              "$(active_worker_count 0,1,2,3,4,5,6,7)" \
+              "$(active_worker_count 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)"
+            """
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script], check=True, text=True, capture_output=True
+        )
+
+        self.assertEqual(completed.stdout.strip(), "4|8|16")
+
     def test_inactive_systemd_state_is_not_duplicated_with_unknown(self):
         """systemctl 的有效非零状态必须原样显示且只能出现一次。"""
 

@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # 把多模型部署注册表投影为 CLI 诊断命令需要的当前运行配置。
 
+# 返回当前受管 Router 应允许的重请求并发数。该值按启用 Worker 数量生成，
+# 让每个后端实例最多同时承接一个图片、PDF 或超长上下文请求；保留 16 的
+# 保护上限，避免损坏配置把 Node.js 入口内存保护意外放大为无限并发。
+active_worker_count() {
+  local workers="${1:-${ACTIVE_WORKERS:-}}" count
+  [[ "${workers}" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  local -a worker_ids=()
+  IFS=',' read -r -a worker_ids <<<"${workers}"
+  count=${#worker_ids[@]}
+  (( count >= 1 )) || count=1
+  (( count <= 16 )) || count=16
+  printf '%s\n' "${count}"
+}
+
 # 让面向统一入口的命令使用首个已启用且请求发布的部署及其 Worker 能力。
 # 成功时覆盖当前 Shell 的模型、制品、拓扑和能力变量；没有有效注册表时
 # 保留旧版全局配置，保证控制面升级不会改变旧安装的行为。

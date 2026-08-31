@@ -172,6 +172,8 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("wait_gateway_process", MANAGER)
         self.assertIn("GATEWAY_API_KEY", MANAGER)
         self.assertIn("-e ALLOW_API_KEY_REVEAL=true", MANAGER)
+        self.assertIn("active_worker_count \"${ACTIVE_WORKERS}\"", MANAGER)
+        self.assertIn("OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT", MANAGER)
 
     def test_router_can_reconcile_live_without_restarting_workers(self):
         router = MANAGER.split("cmd_router() {", 1)[1].split("cmd_database() {", 1)[0]
