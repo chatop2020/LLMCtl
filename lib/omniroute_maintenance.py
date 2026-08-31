@@ -941,6 +941,10 @@ class OmniRouteMaintenanceManager:
             request["image"] = validate_fixed_image(
                 str(payload.get("image") or RECOMMENDED_OMNIROUTE_IMAGE)
             )
+            local_image = payload.get("local_image", False)
+            if not isinstance(local_image, bool):
+                raise ValueError("local_image 必须是布尔值")
+            request["local_image"] = local_image
         if action == "rollback":
             backup_id = str(payload.get("backup_id", "")).strip()
             self._validated_backup(backup_id)
@@ -1145,8 +1149,67 @@ class OmniRouteMaintenanceManager:
             )
             self.jobs.save(job)
 
+    @staticmethod
+    def _docker_architecture(value: str) -> str:
+        """把 Docker daemon 和镜像可能使用的架构别名归一化。"""
+
+        normalized = value.strip().lower()
+        return {
+            "x86_64": "amd64",
+            "aarch64": "arm64",
+        }.get(normalized, normalized)
+
+    def _inspect_local_image(self, image: str) -> str:
+        """校验本地镜像存在、平台匹配，并返回不可变镜像 ID。
+
+        参数：
+            image: 已通过固定标签或 digest 校验的 OmniRoute 镜像引用。
+
+        返回：
+            Docker daemon 中该引用当前解析到的 `sha256:` 镜像 ID。
+
+        异常：
+            RuntimeError: 镜像不存在、元数据无效，或 OS/架构与 daemon 不同。
+        """
+
+        daemon = self.runner.run(
+            ["docker", "version", "--format", "{{.Server.Os}}|{{.Server.Arch}}"],
+            timeout=30,
+            check=True,
+            capture_output=True,
+        )
+        daemon_parts = str(getattr(daemon, "stdout", "")).strip().split("|")
+        if len(daemon_parts) != 2 or not all(daemon_parts):
+            raise RuntimeError("Docker 未返回 daemon 的 OS/架构")
+        result = self.runner.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}|{{.Os}}|{{.Architecture}}",
+                image,
+            ],
+            timeout=30,
+            check=True,
+            capture_output=True,
+        )
+        image_parts = str(getattr(result, "stdout", "")).strip().split("|")
+        if len(image_parts) != 3 or not image_parts[0].startswith("sha256:"):
+            raise RuntimeError("Docker 未返回本地目标镜像的完整元数据")
+        daemon_os, daemon_arch = daemon_parts
+        image_id, image_os, image_arch = image_parts
+        if image_os.strip().lower() != daemon_os.strip().lower() or self._docker_architecture(
+            image_arch
+        ) != self._docker_architecture(daemon_arch):
+            raise RuntimeError(
+                "本地 OmniRoute 镜像平台不匹配："
+                f"镜像={image_os}/{image_arch}，Docker={daemon_os}/{daemon_arch}"
+            )
+        return image_id
+
     def _pull_image(self, image: str) -> str:
-        """拉取固定镜像并返回 Docker 的不可变镜像 ID。"""
+        """拉取固定镜像，校验 daemon 平台并返回不可变镜像 ID。"""
 
         self.runner.run(
             ["docker", "pull", image],
@@ -1154,16 +1217,7 @@ class OmniRouteMaintenanceManager:
             check=True,
             capture_output=True,
         )
-        result = self.runner.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-            timeout=30,
-            check=True,
-            capture_output=True,
-        )
-        image_id = str(getattr(result, "stdout", "")).strip()
-        if not image_id.startswith("sha256:"):
-            raise RuntimeError("Docker 未返回目标镜像的不可变 ID")
-        return image_id
+        return self._inspect_local_image(image)
 
     def _run_update(self, job: dict[str, Any]) -> None:
         """升级 OmniRoute；失败时同时恢复原镜像和升级前数据库。"""
@@ -1189,9 +1243,20 @@ class OmniRouteMaintenanceManager:
         assessment = self.assess(deep=True)
         if assessment["health"] == "critical":
             raise RuntimeError("SQLite 评估为严重异常，拒绝升级")
-        self._set_job(job, "pulling", 15, f"拉取固定 OmniRoute 镜像 {target}")
-        target_image_id = self._pull_image(target)
+        local_image = bool(job["request"].get("local_image", False))
+        if local_image:
+            self._set_job(
+                job,
+                "validating_local_image",
+                15,
+                f"校验已离线导入的 OmniRoute 镜像 {target}",
+            )
+            target_image_id = self._inspect_local_image(target)
+        else:
+            self._set_job(job, "pulling", 15, f"拉取固定 OmniRoute 镜像 {target}")
+            target_image_id = self._pull_image(target)
         job["target_image_id"] = target_image_id
+        job["image_source"] = "local" if local_image else "registry"
         self._set_job(job, "backing_up", 35, "切换前创建 SQLite 一致性备份")
         backup = self._create_backup(
             "upgrade", target_image=target, job_id=str(job["id"])

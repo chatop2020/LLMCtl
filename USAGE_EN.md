@@ -203,6 +203,7 @@ sudo llmctl omniroute backup
 sudo llmctl omniroute sqlite maintain online
 sudo llmctl omniroute sqlite maintain compact
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 --local-image
 sudo llmctl omniroute backups
 sudo llmctl omniroute rollback <backup-id>
 sudo llmctl omniroute job <job-id>
@@ -215,7 +216,7 @@ sudo llmctl omniroute cancel <job-id>
 
 - `maintain online` runs `PRAGMA optimize` and a `PASSIVE wal_checkpoint` while the Router is live. It does not stop the Router, account portal, or GPU Workers.
 - `maintain compact` requires enough disk space for roughly two database copies, backs up, stops the account portal and Router, runs a `TRUNCATE checkpoint`, `VACUUM`, `PRAGMA optimize`, and integrity verification, then restarts the Router and runs `llmctl smoke --full`. Failure restores the pre-maintenance database automatically.
-- `update` rejects mutable tags such as `latest`, `main`, and `next`; it pulls only a fixed version or digest. It writes the image configuration and restarts only after deep assessment and backup pass. If the actual container image, route reconciliation, full model smoke, or post-upgrade database check fails, LLMCtl stops the Router, restores both the prior image and pre-upgrade SQLite, then starts and validates the rollback. GPU Workers are never restarted.
+- `update` rejects mutable tags such as `latest`, `main`, and `next` and accepts only a fixed version or digest. It pulls from the registry by default. With `--local-image`, the operator must first import the same image reference with `docker load`; LLMCtl validates its immutable ID and OS/architecture against the Docker daemon without contacting the registry. It writes the image configuration and restarts only after deep assessment and backup pass. If the actual container image, route reconciliation, full model smoke, or post-upgrade database check fails, LLMCtl stops the Router, restores both the prior image and pre-upgrade SQLite, then starts and validates the rollback. GPU Workers are never restarted.
 - `rollback` accepts only an ID from the managed backup inventory and creates a `pre-rollback` snapshot first. It refuses size, SHA256, or quick_check mismatches. With the Router stopped, it atomically replaces the main database, removes stale WAL/SHM companions, restores the image entries captured by the backup, and runs full acceptance.
 
 The administration console exposes the same assessment, task progress, backup inventory, and rollback workflow under **OmniRoute Maintenance**. Online maintenance requires `MAINTAIN ONLINE`, compaction requires `COMPACT SQLITE`, update requires `UPDATE OMNIROUTE`, and rollback requires the full phrase containing the selected backup ID. Managed backups are never auto-deleted; monitor `/var/backups` capacity and copy important recovery points off-host.

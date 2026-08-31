@@ -83,7 +83,7 @@ cmd_omniroute() {
   load_config
   [[ "${GATEWAY_KIND}" == omniroute ]] || die "当前 AI 接入层不是 OmniRoute"
   local action="${1:-status}" subaction="" image="" backup_id="" job_id=""
-  local assume_yes=0 detach=0 deep=0 payload="" confirmation=""
+  local assume_yes=0 detach=0 deep=0 local_image=0 payload="" confirmation=""
   shift || true
   case "${action}" in
     status)
@@ -110,14 +110,17 @@ cmd_omniroute() {
         case "$1" in
           --yes) assume_yes=1; shift ;;
           --detach) detach=1; shift ;;
+          --local-image) local_image=1; shift ;;
           *) die "未知 omniroute update 参数：$1" ;;
         esac
       done
+      local source_hint="从 Docker Hub 拉取"
+      (( local_image == 0 )) || source_hint="仅使用已离线导入的本地镜像"
       omniroute_confirm \
-        "确认先评估并备份 SQLite，再升级到 ${image}；失败时自动恢复原镜像和数据库？" \
+        "确认先评估并备份 SQLite，再${source_hint}升级到 ${image}；失败时自动恢复原镜像和数据库？" \
         "${assume_yes}" || { log "已取消；未修改镜像、Router 或数据库。"; return; }
-      payload=$(jq -cn --arg image "${image}" \
-        '{action:"update",image:$image,confirmation:"UPDATE OMNIROUTE"}')
+      payload=$(jq -cn --arg image "${image}" --argjson local_image "${local_image}" \
+        '{action:"update",image:$image,local_image:($local_image == 1),confirmation:"UPDATE OMNIROUTE"}')
       omniroute_submit "${payload}" "${detach}"
       ;;
     rollback)

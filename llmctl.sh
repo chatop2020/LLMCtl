@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.16"
+readonly CTL_VERSION="3.6.17"
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -469,7 +469,7 @@ usage() {
   llmctl responses repair                      备份数据并修复 Responses API 原生 Combo 与用户权限
   llmctl router <start|stop|restart|reconcile|status> 管理或在线同步所选接入层
   llmctl omniroute status|backup|backups           查看状态或管理可校验 SQLite 备份
-  llmctl omniroute update [固定镜像] [--yes]       备份后升级；失败自动恢复镜像和数据库
+  llmctl omniroute update [固定镜像] [--local-image] [--yes] 本地/在线升级并自动恢复
   llmctl omniroute rollback <备份ID> [--yes]       回滚前再备份，并恢复镜像与 SQLite
   llmctl omniroute sqlite assess [--deep]          评估完整性、WAL、空间和备份准备度
   llmctl omniroute sqlite maintain online|compact  在线优化或维护窗 VACUUM

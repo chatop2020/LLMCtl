@@ -305,11 +305,12 @@ sudo llmctl omniroute backup
 sudo llmctl omniroute sqlite maintain online
 sudo llmctl omniroute sqlite maintain compact
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 --local-image
 sudo llmctl omniroute backups
 sudo llmctl omniroute rollback <backup-id>
 ```
 
-Assessment covers quick/integrity checks, foreign keys, WAL, free-page ratio, disk headroom, backup age, configured image, and the image actually running. Every write operation first creates a consistent snapshot with SQLite's online backup API and records SHA256, size, quick_check, source image, and file ownership/mode. Online maintenance runs only `PRAGMA optimize` and a `PASSIVE checkpoint` without stopping the Router. `compact` briefly stops the Router in a maintenance window for WAL truncation, `VACUUM`, and integrity verification. Upgrades accept only a fixed version or digest; a failed new image, route reconciliation, or full model smoke test restores both the previous image and pre-upgrade database. Manual rollback also snapshots the current state first. GPU Workers are never restarted by these operations.
+Assessment covers quick/integrity checks, foreign keys, WAL, free-page ratio, disk headroom, backup age, configured image, and the image actually running. Every write operation first creates a consistent snapshot with SQLite's online backup API and records SHA256, size, quick_check, source image, and file ownership/mode. Online maintenance runs only `PRAGMA optimize` and a `PASSIVE checkpoint` without stopping the Router. `compact` briefly stops the Router in a maintenance window for WAL truncation, `VACUUM`, and integrity verification. Upgrades accept only a fixed version or digest; `--local-image` skips registry access after an offline `docker load` while verifying the local platform and immutable image ID. A failed new image, route reconciliation, or full model smoke test restores both the previous image and pre-upgrade database. Manual rollback also snapshots the current state first. GPU Workers are never restarted by these operations.
 
 The WebUI exposes the same workflow, live phases, and backup inventory under “OmniRoute Maintenance”. Risky operations require the exact confirmation phrase shown on screen. Managed snapshots are stored under `/var/backups/llmctl/omniroute/` and are not deleted automatically; include them in disk-capacity and off-host backup planning.
 The legacy `llmctl update --omniroute-image ...` entry point delegates to this safe upgrade workflow and cannot bypass the SQLite backup and rollback contract.

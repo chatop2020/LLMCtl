@@ -434,6 +434,7 @@ class StaticDeploymentContracts(unittest.TestCase):
             "COMPACT SQLITE",
             "UPDATE OMNIROUTE",
             "ROLLBACK ${backup_id}",
+            "--local-image",
             "正在转交安全升级状态机",
         ):
             self.assertIn(marker, MANAGER)
@@ -444,6 +445,7 @@ class StaticDeploymentContracts(unittest.TestCase):
             "VACUUM",
             "_restore_database",
             "_restart_and_smoke",
+            "_inspect_local_image",
             "MUTABLE_IMAGE_TAGS",
         ):
             self.assertIn(marker, maintenance)

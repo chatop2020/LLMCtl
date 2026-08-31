@@ -305,11 +305,12 @@ sudo llmctl omniroute backup
 sudo llmctl omniroute sqlite maintain online
 sudo llmctl omniroute sqlite maintain compact
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 --local-image
 sudo llmctl omniroute backups
 sudo llmctl omniroute rollback <备份ID>
 ```
 
-评估会检查 quick/integrity check、外键、WAL、页空闲率、磁盘余量、备份年龄、配置镜像和实际运行镜像。所有写操作都先用 SQLite 在线备份 API 创建一致性快照，并记录 SHA256、大小、quick_check、原镜像和文件权限。在线维护只执行 `PRAGMA optimize` 与 `PASSIVE checkpoint`，不停止 Router；`compact` 会在维护窗口短暂停止 Router，执行 WAL 截断、`VACUUM` 和完整性检查。升级只接受固定版本或 digest，新版本、路由同步或完整模型冒烟失败时会同时恢复原镜像和升级前数据库。回滚前也会先保存当前状态。以上操作均不重启 GPU Worker。
+评估会检查 quick/integrity check、外键、WAL、页空闲率、磁盘余量、备份年龄、配置镜像和实际运行镜像。所有写操作都先用 SQLite 在线备份 API 创建一致性快照，并记录 SHA256、大小、quick_check、原镜像和文件权限。在线维护只执行 `PRAGMA optimize` 与 `PASSIVE checkpoint`，不停止 Router；`compact` 会在维护窗口短暂停止 Router，执行 WAL 截断、`VACUUM` 和完整性检查。升级只接受固定版本或 digest；`--local-image` 可在离线 `docker load` 后跳过仓库拉取，并验证本地镜像平台与不可变 ID。新版本、路由同步或完整模型冒烟失败时会同时恢复原镜像和升级前数据库。回滚前也会先保存当前状态。以上操作均不重启 GPU Worker。
 
 管理端左侧“OmniRoute 维护”提供相同能力、实时阶段与备份列表。高风险操作必须输入页面给出的完整确认短语。备份保存在 `/var/backups/llmctl/omniroute/`，不会自动删除；请纳入磁盘容量与异机备份策略。
 旧命令 `llmctl update --omniroute-image ...` 会自动转交上述安全升级流程，不能绕过 SQLite 备份和回滚。

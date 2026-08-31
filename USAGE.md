@@ -203,6 +203,7 @@ sudo llmctl omniroute backup
 sudo llmctl omniroute sqlite maintain online
 sudo llmctl omniroute sqlite maintain compact
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
+sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 --local-image
 sudo llmctl omniroute backups
 sudo llmctl omniroute rollback <备份ID>
 sudo llmctl omniroute job <任务ID>
@@ -215,7 +216,7 @@ sudo llmctl omniroute cancel <任务ID>
 
 - `maintain online`：Router 运行期间执行 `PRAGMA optimize` 与 `PASSIVE wal_checkpoint`，不停止 Router、账户门户或 GPU Worker。
 - `maintain compact`：检查至少可容纳约两份数据库的磁盘余量，备份后停止账户门户和 Router，执行 `TRUNCATE checkpoint`、`VACUUM`、`PRAGMA optimize` 与完整性检查，再启动 Router 并运行 `llmctl smoke --full`；失败时自动恢复维护前数据库。
-- `update`：拒绝 `latest`、`main`、`next` 等可变标签，只拉取固定版本或 digest；深度评估和备份通过后才写入镜像配置并重启 Router。实际容器镜像、路由同步、完整模型冒烟或升级后数据库检查任一步失败，都会停止 Router，恢复原镜像与升级前 SQLite，再次启动和冒烟。GPU Worker 始终不重启。
+- `update`：拒绝 `latest`、`main`、`next` 等可变标签，只使用固定版本或 digest；默认从镜像仓库拉取，`--local-image` 则要求管理员已通过 `docker load` 离线导入同名镜像，并只校验本地不可变 ID 与 Docker daemon 的 OS/架构，全程不访问镜像仓库。深度评估和备份通过后才写入镜像配置并重启 Router。实际容器镜像、路由同步、完整模型冒烟或升级后数据库检查任一步失败，都会停止 Router，恢复原镜像与升级前 SQLite，再次启动和冒烟。GPU Worker 始终不重启。
 - `rollback`：只接受备份列表中的 ID，恢复前先为当前状态创建 `pre-rollback` 备份；目标大小、SHA256 或 quick_check 不匹配时拒绝。恢复数据库时 Router 已停止，主文件原子替换并移除旧 WAL/SHM，再恢复备份记录的镜像配置并完整验收。
 
 管理端左侧“OmniRoute 维护”提供相同评估、任务进度、备份列表和回滚入口。在线维护要求输入 `MAINTAIN ONLINE`，压缩要求 `COMPACT SQLITE`，升级要求 `UPDATE OMNIROUTE`，回滚要求包含目标备份 ID 的完整短语。受管备份不会自动删除；运维应监控 `/var/backups` 容量，并把关键恢复点复制到异机介质。

@@ -31,6 +31,8 @@ class FakeRunner:
         self.mutate_on_next_restart = False
         self.forced_image_id = ""
         self.fail_router_stop_count = 0
+        self.local_image_os = "linux"
+        self.local_image_architecture = "amd64"
 
     def run(
         self,
@@ -49,8 +51,13 @@ class FakeRunner:
         returncode = 0
         if rendered[:3] == ["docker", "inspect", "--format"]:
             stdout = f"{self.running_image}|{self.running_image_id}\n"
+        elif rendered[:3] == ["docker", "version", "--format"]:
+            stdout = "linux|amd64\n"
         elif rendered[:3] == ["docker", "image", "inspect"]:
-            stdout = "sha256:new-image\n"
+            stdout = (
+                "sha256:new-image|"
+                f"{self.local_image_os}|{self.local_image_architecture}\n"
+            )
         elif rendered[:2] == ["docker", "pull"]:
             stdout = "pulled\n"
         elif (
@@ -289,6 +296,49 @@ class OmniRouteMaintenanceTests(unittest.TestCase):
             next(index for index, item in enumerate(commands) if "docker pull" in item),
             next(index for index, item in enumerate(commands) if "router restart" in item),
         )
+
+    def test_local_image_update_skips_registry_and_keeps_full_rollback_contract(self):
+        """离线镜像升级不得访问远端，仍必须备份、重启和完整验收。"""
+
+        job = self.wait_job(
+            self.submit(
+                "update",
+                image="diegosouzapw/omniroute:3.8.49",
+                local_image=True,
+            )
+        )
+
+        self.assertEqual(job["state"], "succeeded")
+        self.assertEqual(job["image_source"], "local")
+        self.assertTrue(job["backup_id"].startswith("upgrade-"))
+        commands = [" ".join(command) for command in self.runner.commands]
+        self.assertFalse(any("docker pull" in item for item in commands))
+        inspect_position = next(
+            index for index, item in enumerate(commands) if "docker image inspect" in item
+        )
+        restart_position = next(
+            index for index, item in enumerate(commands) if "router restart" in item
+        )
+        self.assertLess(inspect_position, restart_position)
+
+    def test_local_image_update_rejects_wrong_architecture_before_backup(self):
+        """误导入 ARM 镜像时不得写配置、备份数据库或重启 Router。"""
+
+        self.runner.local_image_architecture = "arm64"
+        job = self.wait_job(
+            self.submit(
+                "update",
+                image="diegosouzapw/omniroute:3.8.49",
+                local_image=True,
+            )
+        )
+
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("平台不匹配", job["message"])
+        self.assertFalse(self.manager.list_backups())
+        commands = [" ".join(command) for command in self.runner.commands]
+        self.assertFalse(any("docker pull" in item for item in commands))
+        self.assertFalse(any("router restart" in item for item in commands))
 
     def test_failed_update_restores_original_database_and_image(self):
         self.runner.mutate_on_next_restart = True
