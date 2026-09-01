@@ -16,6 +16,7 @@ const source = [
   appSource,
   readFileSync(new URL("./auditDisplay.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useAdminApiKeys.js", import.meta.url), "utf8"),
+  readFileSync(new URL("./useAdminUserPasswordReset.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useModelDeployments.js", import.meta.url), "utf8"),
   readFileSync(new URL("./useOmniRouteMaintenance.js", import.meta.url), "utf8"),
   readFileSync(new URL("./usePendingUserActions.js", import.meta.url), "utf8"),
@@ -321,6 +322,18 @@ describe("LLMCtl portal contracts", () => {
       expect(source).toContain(marker);
     expect(style).toContain(".bulk-policy-dialog");
     expect(style).toContain(".selection-column");
+  });
+
+  it("allows administrators to reset a user password without exposing credentials", () => {
+    for (const marker of [
+      "admin/users/password/reset",
+      "改密码",
+      "重置密码并退出现有会话",
+      "门户登录会话会立即失效",
+      "API Key、余额和模型权限保持不变",
+    ])
+      expect(source).toContain(marker);
+    expect(source).toContain('type="password"');
   });
 
   it("offers an admin-only read-only system monitor without continuous background polling", () => {

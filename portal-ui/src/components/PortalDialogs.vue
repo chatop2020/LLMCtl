@@ -173,6 +173,50 @@ export default {
         </button>
       </div>
     </dialog>
+    <dialog id="user-password-reset">
+      <form method="dialog" class="dialog-head">
+        <div>
+          <h2>重置用户密码</h2>
+          <p>为指定用户设置新的门户登录密码。</p>
+        </div>
+        <button class="icon-button" aria-label="关闭">×</button>
+      </form>
+      <div class="form-stack">
+        <div class="warning">
+          保存后，该用户当前所有门户登录会话会立即失效；API Key、余额和模型权限保持不变。
+        </div>
+        <p>目标邮箱：<strong>{{ userPasswordReset.email }}</strong></p>
+        <label>
+          新密码
+          <input
+            v-model="userPasswordReset.password"
+            type="password"
+            minlength="8"
+            maxlength="200"
+            autocomplete="new-password"
+          />
+        </label>
+        <label>
+          确认新密码
+          <input
+            v-model="userPasswordReset.confirm"
+            type="password"
+            minlength="8"
+            maxlength="200"
+            autocomplete="new-password"
+          />
+        </label>
+        <p class="muted">密码必须为 8-200 个字符，且不能全部由数字组成。</p>
+        <button
+          type="button"
+          class="danger"
+          :disabled="busy"
+          @click="resetUserPassword"
+        >
+          {{ operation === "user-password-reset" ? "重置中…" : "重置密码并退出现有会话" }}
+        </button>
+      </div>
+    </dialog>
     <dialog id="bulk-policy-editor" class="bulk-policy-dialog">
       <form method="dialog" class="dialog-head">
         <div>

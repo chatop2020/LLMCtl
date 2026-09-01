@@ -555,6 +555,60 @@ class PortalAdminControlMixin:
             raise
         self.sync_user(user_id)
 
+    def reset_user_password(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """由已认证管理员重置一个正式普通用户的门户登录密码。
+
+        参数：
+            payload: 包含目标 ``user_id``、精确的新 ``password`` 与
+                ``confirm``。密码不做去空格或大小写规范化，并复用注册入口的
+                统一强度和哈希规则。
+
+        返回：
+            目标用户 ID 与被撤销的门户会话数量；不返回密码、哈希或盐值。
+
+        异常：
+            ValueError: 用户不存在、仍待邮箱验证、两次密码不一致或密码不符合
+                当前普通用户规则。失败时密码和会话均保持不变。
+
+        密码哈希更新与会话撤销位于同一个数据库事务。API Key、余额、用户组和
+        模型权限不属于门户登录凭据，因此不会随密码重置而变化。
+        """
+
+        user_id = str(payload.get("user_id", "")).strip()
+        password = str(payload.get("password", ""))
+        confirmation = str(payload.get("confirm", ""))
+        if not user_id or len(user_id) > 200:
+            raise ValueError("用户 ID 无效")
+        if password != confirmation:
+            raise ValueError("两次输入的密码不一致")
+        with self.db.connect() as connection:
+            user = connection.execute(
+                "SELECT id,status FROM users WHERE id=? AND role='user'",
+                (user_id,),
+            ).fetchone()
+        if not user:
+            raise ValueError("用户不存在")
+        if str(user["status"]) == "pending":
+            raise ValueError("邮箱未验证用户不能重置密码，请先完成验证")
+
+        password_hash = hash_password(password)
+        with self.db.connect() as connection:
+            changed = connection.execute(
+                "UPDATE users SET password_hash=? WHERE id=? AND role='user' "
+                "AND status IN ('active','disabled')",
+                (password_hash, user_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("用户状态已经变化，请刷新页面后重试")
+            sessions_revoked = connection.execute(
+                "DELETE FROM sessions WHERE user_id=?", (user_id,)
+            ).rowcount
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "sessions_revoked": int(sessions_revoked),
+        }
+
     def save_group(self, payload: dict[str, Any]) -> str:
         group_id = str(payload.get("id", "")).strip() or str(uuid.uuid4())
         name = normalize_group_name(str(payload.get("name", "")))

@@ -671,6 +671,8 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/portal-api/admin/users/update":
                 self.app.control.update_user(payload, user_identity(user))
                 result = {"ok": True}
+            elif path == "/portal-api/admin/users/password/reset":
+                result = self.app.control.reset_user_password(payload)
             elif path == "/portal-api/admin/users/key/reveal":
                 result = self.app.control.reveal_user_api_key(
                     str(payload.get("user_id", ""))
@@ -800,6 +802,7 @@ class PortalHandler(http.server.BaseHTTPRequestHandler):
             "/portal-api/key/reveal",
             "/portal-api/key/rotate",
             "/portal-api/admin/users/key/reveal",
+            "/portal-api/admin/users/password/reset",
         }
         if path == "/portal-api/admin/users/key/reveal" and isinstance(result, dict):
             audit_result = {

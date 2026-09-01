@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import json
 import pathlib
+import re
 import unittest
 
 
@@ -22,6 +24,18 @@ MANIFEST = (ROOT / "upgrade-manifest.tsv").read_text(encoding="utf-8")
 
 
 class StaticDeploymentContracts(unittest.TestCase):
+    def test_control_plane_and_portal_versions_match(self):
+        """CLI、门户 API 与前端包必须发布同一个可核验版本。"""
+
+        manager_version = re.search(r'CTL_VERSION="([^"]+)"', MANAGER).group(1)
+        portal_version = re.search(r'APP_VERSION = "([^"]+)"', ACCOUNT).group(1)
+        package_version = json.loads(
+            (ROOT / "portal-ui" / "package.json").read_text(encoding="utf-8")
+        )["version"]
+
+        self.assertEqual(manager_version, portal_version)
+        self.assertEqual(manager_version, package_version)
+
     def test_shell_json_defaults_do_not_append_a_literal_closing_brace(self):
         """`${value:-{}}` 会在 Bash 中追加 `}`，所有受管脚本必须禁用该写法。"""
 
@@ -172,8 +186,11 @@ class StaticDeploymentContracts(unittest.TestCase):
         self.assertIn("wait_gateway_process", MANAGER)
         self.assertIn("GATEWAY_API_KEY", MANAGER)
         self.assertIn("-e ALLOW_API_KEY_REVEAL=true", MANAGER)
-        self.assertIn("active_worker_count \"${ACTIVE_WORKERS}\"", MANAGER)
-        self.assertIn("OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT", MANAGER)
+        self.assertIn("OMNIROUTE_UNBOUNDED_HEAVY_ADMISSION=2147483647", MANAGER)
+        self.assertIn(
+            "OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT=${OMNIROUTE_UNBOUNDED_HEAVY_ADMISSION}",
+            MANAGER,
+        )
 
     def test_router_can_reconcile_live_without_restarting_workers(self):
         router = MANAGER.split("cmd_router() {", 1)[1].split("cmd_database() {", 1)[0]

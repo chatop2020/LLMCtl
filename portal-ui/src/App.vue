@@ -31,6 +31,7 @@ import PortalDialogs from "./components/PortalDialogs.vue";
 import PortalUserPages from "./components/PortalUserPages.vue";
 import { PORTAL_WORKSPACE_KEY } from "./portalWorkspaceContext.js";
 import { useAdminApiKeys } from "./useAdminApiKeys.js";
+import { useAdminUserPasswordReset } from "./useAdminUserPasswordReset.js";
 import { useModelDeployments } from "./useModelDeployments.js";
 import { usePendingUserActions } from "./usePendingUserActions.js";
 
@@ -145,6 +146,8 @@ const {
   revealAdminUserApiKey,
   copyAdminUserApiKey,
 } = useAdminApiKeys({ api, copy, notify });
+const { userPasswordReset, openUserPasswordReset, resetUserPassword } =
+  useAdminUserPasswordReset({ api, action, notify });
 const {
   pendingUserApproval,
   pendingUserDelete,
@@ -2685,6 +2688,9 @@ provide(PORTAL_WORKSPACE_KEY, {
   hideAdminUserApiKey,
   revealAdminUserApiKey,
   copyAdminUserApiKey,
+  userPasswordReset,
+  openUserPasswordReset,
+  resetUserPassword,
   openPendingUserApproval,
   approvePendingUser,
   resendUserVerification,

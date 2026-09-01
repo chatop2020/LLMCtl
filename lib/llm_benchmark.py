@@ -234,12 +234,12 @@ def percentile(values: list[float], value: float) -> float | None:
 
 
 def meaningful_prompt(target_tokens: int, seed: str) -> str:
-    """生成长度接近目标且不会误触 Router 大请求门禁的可复现业务文本。
+    """生成长度接近目标且传输开销较低的可复现业务文本。
 
     当前受管 Qwen 系模型通常把一个中文字符编码为约一个 Token。使用紧凑中文
-    可以让 30K 档位保持在 OmniRoute 的 256 KiB 原始请求体门槛以内，同时仍让
-    Worker 承担约 30K Token 的真实预填充负载。最终统计继续以网关返回的
-    ``usage`` 为准，不把字符数当作实际 Token 数。
+    可以减少 Router 接收和解析文字压测的网络与内存开销，同时仍让 Worker 承担
+    约 30K Token 的真实预填充负载。最终统计继续以网关返回的 ``usage`` 为准，
+    不把字符数当作实际 Token 数，也不依赖请求体大小改变准入结果。
 
     参数：
         target_tokens: 页面选择的目标输入 Token 档位。

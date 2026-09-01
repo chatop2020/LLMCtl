@@ -1463,6 +1463,16 @@ export default {
                         <button v-else class="ghost" @click="editUser(user)">
                           管理
                         </button>
+                        <button
+                          v-if="user.status !== 'pending'"
+                          type="button"
+                          class="ghost"
+                          :disabled="busy"
+                          :aria-label="`重置 ${user.email} 的门户登录密码`"
+                          @click="openUserPasswordReset(user)"
+                        >
+                          改密码
+                        </button>
                       </div>
                     </td>
                   </tr>

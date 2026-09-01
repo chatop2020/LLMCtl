@@ -5,7 +5,10 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.21"
+readonly CTL_VERSION="3.6.22"
+# OmniRoute 3.8.49 没有关闭重请求快速拒绝的布尔开关，只接受正整数。
+# 使用其可安全解析的 32 位上界，使合法请求进入后端队列；50 MiB 硬上限仍生效。
+readonly OMNIROUTE_UNBOUNDED_HEAVY_ADMISSION=2147483647
 readonly CONFIG_DIR="${LLM_CLUSTER_CONFIG_DIR:-/etc/llm-cluster}"
 readonly STATE_DIR="${LLM_CLUSTER_STATE_DIR:-/var/lib/llm-cluster}"
 readonly CACHE_DIR="${STATE_DIR}/cache"
@@ -238,12 +241,9 @@ load_config() {
 cmd_gateway_start() {
   require_root
   load_config
-  local name omniroute_heavy_in_flight=1
+  local name
   local -a runtime_proxy_args=()
   name=$(gateway_display_name)
-  if [[ "${GATEWAY_KIND}" == omniroute ]]; then
-    omniroute_heavy_in_flight=$(active_worker_count "${ACTIVE_WORKERS}") || die "ACTIVE_WORKERS 无法生成 OmniRoute 重请求容量"
-  fi
   runtime_proxy_docker_args runtime_proxy_args
   export UI_USERNAME UI_PASSWORD
   log "启动 ${name}：镜像=${GATEWAY_IMAGE}，内部入口=127.0.0.1:${GATEWAY_INTERNAL_PORT}，公开入口由 Nginx ${API_BIND}:${API_PORT} 提供。"
@@ -295,7 +295,7 @@ cmd_gateway_start() {
         -e CALL_LOG_PIPELINE_CAPTURE_STREAM_CHUNKS=false \
         -e CALL_LOG_PIPELINE_MAX_SIZE_KB=4096 \
         -e CHAT_LOG_TEXT_LIMIT=1048576 \
-        -e "OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT=${omniroute_heavy_in_flight}" \
+        -e "OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT=${OMNIROUTE_UNBOUNDED_HEAVY_ADMISSION}" \
         -v "${STATE_DIR}/omniroute/gateway:/app/data" \
         "${GATEWAY_IMAGE}"
       ;;

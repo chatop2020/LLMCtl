@@ -58,8 +58,8 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("延迟、吞吐、成本、可靠性", prompt)
         self.assertEqual(len(prompt), 300)
 
-    def test_largest_prompt_stays_below_omniroute_heavy_admission_thresholds(self):
-        """30K 文字压测必须测到 Worker，不能被 Router 当成大文件拦截。"""
+    def test_largest_prompt_is_byte_compact(self):
+        """30K 文字压测应减少传输放大，但其准入不能依赖请求体大小。"""
 
         prompt = benchmark.meaningful_prompt(30_000, "largest-plan")
         payload = json.dumps(
@@ -70,11 +70,8 @@ class BenchmarkTests(unittest.TestCase):
             },
             ensure_ascii=False,
         ).encode()
-        admission_estimate = sum(0.25 if ord(character) < 128 else 1 for character in prompt)
-
         self.assertEqual(len(prompt), 30_000)
-        self.assertLess(len(payload), 256 * 1024)
-        self.assertLess(admission_estimate, 32_000)
+        self.assertLess(len(payload), 128 * 1024)
 
     def test_backend_runner_streams_and_writes_professional_metrics(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StreamingHandler)
