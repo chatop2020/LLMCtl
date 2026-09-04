@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="3.6.22"
+readonly CTL_VERSION="3.6.23"
 # OmniRoute 3.8.49 没有关闭重请求快速拒绝的布尔开关，只接受正整数。
 # 使用其可安全解析的 32 位上界，使合法请求进入后端队列；50 MiB 硬上限仍生效。
 readonly OMNIROUTE_UNBOUNDED_HEAVY_ADMISSION=2147483647
@@ -476,7 +476,7 @@ usage() {
   llmctl omniroute update [固定镜像] [--local-image] [--yes] 本地/在线升级并自动恢复
   llmctl omniroute rollback <备份ID> [--yes]       回滚前再备份，并恢复镜像与 SQLite
   llmctl omniroute sqlite assess [--deep]          评估完整性、WAL、空间和备份准备度
-  llmctl omniroute sqlite maintain online|compact  在线优化或维护窗 VACUUM
+  llmctl omniroute sqlite maintain online|compact|audit-cleanup  在线优化、压缩或清理重复审计
   llmctl database <start|stop|restart|status>  管理接入层 PostgreSQL
   llmctl database enable-mysql                激活门户 MySQL 驱动；连接配置与迁移在 WebUI 完成
   llmctl account <start|stop|restart|status|url> 管理 OmniRoute 账户门户

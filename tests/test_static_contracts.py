@@ -451,6 +451,7 @@ class StaticDeploymentContracts(unittest.TestCase):
             "omniroute sqlite assess",
             "MAINTAIN ONLINE",
             "COMPACT SQLITE",
+            "CLEAN AUDIT LOG",
             "UPDATE OMNIROUTE",
             "ROLLBACK ${backup_id}",
             "--local-image",
@@ -461,6 +462,7 @@ class StaticDeploymentContracts(unittest.TestCase):
             "source.backup",
             "PRAGMA quick_check",
             "PRAGMA wal_checkpoint(PASSIVE)",
+            "apiKey.activate",
             "VACUUM",
             "_restore_database",
             "_restart_and_smoke",
@@ -479,6 +481,7 @@ class StaticDeploymentContracts(unittest.TestCase):
             for command in (
                 "llmctl omniroute sqlite assess",
                 "llmctl omniroute sqlite maintain online",
+                "llmctl omniroute sqlite maintain audit-cleanup",
                 "llmctl omniroute update",
                 "llmctl omniroute rollback",
             ):

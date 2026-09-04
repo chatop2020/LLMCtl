@@ -991,6 +991,40 @@ class PortalModelControlMixin:
                 failed += 1
         return {"synced": success, "failed": failed}
 
+    def sync_due_users(self) -> dict[str, int]:
+        """仅重试尚未同步、同步失败或仍有旧限制待迁移的用户。
+
+        返回：
+            本轮成功和失败的用户数。已经同步且策略没有通过业务入口变更的用户
+            不会再次 PATCH OmniRoute，避免无状态变化的激活审计持续增长。
+
+        用户注册、计费余额耗尽、管理员修改、用户组和模型发布路径仍直接调用
+        ``sync_user`` 或 ``sync_all_users``；本方法只替代周期性无差别重写。
+        """
+
+        with self.db.connect() as connection:
+            ids = [
+                row["id"]
+                for row in connection.execute(
+                    """SELECT u.id FROM users u
+                       LEFT JOIN permission_sync p ON p.user_id=u.id
+                       WHERE u.role='user' AND u.api_key_id IS NOT NULL AND (
+                         u.token_limit_id IS NOT NULL OR
+                         p.user_id IS NULL OR
+                         p.status IN ('pending','failed')
+                       )
+                       ORDER BY u.created_at,u.id"""
+                )
+            ]
+        success = failed = 0
+        for user_id in ids:
+            try:
+                self.sync_user(str(user_id))
+                success += 1
+            except RuntimeError:
+                failed += 1
+        return {"synced": success, "failed": failed}
+
     def discover_free_resources(self) -> dict[str, int]:
         catalog = self.omni.free_models()
         rankings = self.omni.free_rankings()

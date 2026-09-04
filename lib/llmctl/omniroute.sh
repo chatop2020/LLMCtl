@@ -157,8 +157,9 @@ cmd_omniroute() {
           ;;
         maintain)
           subaction="${1:-online}"
-          [[ "${subaction}" == online || "${subaction}" == compact ]] || \
-            die "维护模式必须是 online 或 compact"
+          [[ "${subaction}" == online || "${subaction}" == compact || \
+             "${subaction}" == audit-cleanup ]] || \
+            die "维护模式必须是 online、compact 或 audit-cleanup"
           (($# == 0)) || shift
           while (($#)); do
             case "$1" in
@@ -172,11 +173,16 @@ cmd_omniroute() {
               "确认先备份，再在线执行 PRAGMA optimize 与 PASSIVE checkpoint？" \
               "${assume_yes}" || { log "已取消在线维护。"; return; }
             confirmation="MAINTAIN ONLINE"
-          else
+          elif [[ "${subaction}" == compact ]]; then
             omniroute_confirm \
               "确认先备份，短暂停止 Router 执行 VACUUM，失败时自动恢复？" \
               "${assume_yes}" || { log "已取消维护窗压缩。"; return; }
             confirmation="COMPACT SQLITE"
+          else
+            omniroute_confirm \
+              "确认先完整备份，短暂停止 Router，保留每个 Key 每日最后一条激活审计并回收空间？" \
+              "${assume_yes}" || { log "已取消重复审计清理。"; return; }
+            confirmation="CLEAN AUDIT LOG"
           fi
           payload=$(jq -cn --arg action "${subaction}" --arg confirmation "${confirmation}" \
             '{action:$action,confirmation:$confirmation}')

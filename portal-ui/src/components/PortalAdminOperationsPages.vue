@@ -227,6 +227,10 @@ export default {
                     </dd>
                   </dl>
                   <dl>
+                    <dt>Key 激活审计</dt>
+                    <dd>{{ formatTokens(omnirouteAssessment.sqlite?.api_key_activate_audit_rows || 0) }}</dd>
+                  </dl>
+                  <dl>
                     <dt>磁盘可用</dt>
                     <dd>{{ formatBytes(omnirouteAssessment.storage?.disk_free || 0) }}</dd>
                   </dl>
@@ -311,6 +315,35 @@ export default {
                     @click="compactOmniRouteSqlite"
                   >
                     备份并压缩 SQLite
+                  </button>
+                </section>
+
+                <section class="panel">
+                  <h2>清理重复审计</h2>
+                  <p>
+                    创建完整备份后，只把重复 <code>apiKey.activate</code> 压缩为
+                    每个 Key 每日最后一条；登录、停用、凭据和其它审计全部保留。
+                    随后回收表和索引空间，失败时自动恢复。
+                  </p>
+                  <label>
+                    输入 <code>CLEAN AUDIT LOG</code> 确认短暂中断 /v1
+                    <input
+                      v-model="omnirouteForm.audit_cleanup_confirmation"
+                      autocomplete="off"
+                      placeholder="CLEAN AUDIT LOG"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="danger wide-button"
+                    :disabled="
+                      omnirouteActionLoading ||
+                      omnirouteJobActive ||
+                      omnirouteForm.audit_cleanup_confirmation.trim() !== 'CLEAN AUDIT LOG'
+                    "
+                    @click="cleanOmniRouteAudit"
+                  >
+                    备份并清理重复审计
                   </button>
                 </section>
 

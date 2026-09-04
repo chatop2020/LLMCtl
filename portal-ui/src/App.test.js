@@ -203,6 +203,9 @@ describe("LLMCtl portal contracts", () => {
     expect(source).toContain("UPDATE OMNIROUTE");
     expect(source).toContain("MAINTAIN ONLINE");
     expect(source).toContain("COMPACT SQLITE");
+    expect(source).toContain("CLEAN AUDIT LOG");
+    expect(source).toContain("每个 Key 每日最后一条");
+    expect(source).toContain("备份并清理重复审计");
     expect(source).toContain("备份、升级并自动验收");
     expect(source).toContain("备份当前状态并执行回滚");
     expect(source).toContain("账户门户正在恢复，系统会自动重试");

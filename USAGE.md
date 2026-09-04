@@ -272,6 +272,8 @@ sudo llmctl logs account -f
 
 OmniRoute 暂时不可用时，门户的本地管理页仍保持可登录，显示降级告警，并允许查看用户、SMTP、账本和审计；依赖网关的模型、Key、权限和实时对账操作会明确失败，不会伪装成功。`llmctl startup status` 会把这种状态标为 `degraded`，而完整启动验收仍要求门户 `/ready` 与 OmniRoute 一起恢复。
 
+账户门户只在注册、余额耗尽或恢复、用户状态/用户组/模型授权/调用限额变化时即时发布相关 Key；每分钟维护仅重试失败或旧 Token 限制待迁移的用户，每 6 小时做一次全量漂移兜底。若旧版本曾产生大量重复 `apiKey.activate` 审计，升级后可在管理页输入 `CLEAN AUDIT LOG`，或执行 `sudo llmctl omniroute sqlite maintain audit-cleanup --yes`。该任务先创建完整可校验备份，再短暂停止 Router 和账户门户，只保留每个 Key 每日最后一条激活审计，随后 VACUUM、二次截断 WAL、恢复 Router 并执行完整冒烟；其它审计、GPU Worker 和模型权重不受影响。
+
 生产环境只需保护公开 `8000`，并在现有 Nginx/TLS 站点或上游负载均衡器终止 HTTPS；不要公开回环 `8001/18000/810x`。`--account-public-url` 可使用公开 origin 或其 `/ui` 路径，`--account-api-public-url` 使用无路径 origin。SMTP 密码、管理 key 和门户数据库连接配置位于 root-only 配置；SQLite 文件或 MySQL 备份同样应按敏感数据保护，不要把凭据写入命令历史。
 
 公网发布前执行以下安全清单：

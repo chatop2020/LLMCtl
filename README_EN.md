@@ -30,6 +30,7 @@ The project does not use Conda or modify the NVIDIA driver. Inference dependenci
 - Accept images, PDFs, and common text attachments in the playground. Images are sent as multimodal content, while PDFs are rendered to page images in the browser and are never uploaded to the portal backend. Streaming results label input, output, and total tokens explicitly and show reasoning content, TTFT, and output speed.
 - Run administration benchmarks on the server. The browser only submits and observes a job; a separate process generates meaningful prompts for the selected concurrency and target input size, then reports success rate, RPS, aggregate output tok/s, TTFT, end-to-end latency, and p50/p95/p99 in real time. It also records the Worker selected for every request and samples per-GPU utilization, memory, power, and peak simultaneous active-GPU count once per second to expose routing skew. High-load plans require explicit confirmation.
 - Provide an on-demand administrator system monitor for CPU, memory, swap, GPU/VRAM/temperature/power, network interfaces, disks, and a `top`-like process table. It samples every two seconds only while the monitor page is visible and uses a one-second shared backend cache across tabs. The monitor is read-only and administrator-only; common keys, tokens, passwords, and credential-bearing URLs are redacted from process arguments.
+- Publish user permissions immediately after registration, balance, group, model, or rate-limit changes. The minute maintenance loop retries only failed or pending migrations, while a six-hour full reconciliation remains as a drift backstop instead of reactivating every stable key repeatedly. The OmniRoute maintenance page can preserve a complete verified backup, collapse historical duplicate key-activation audits, reclaim their table/index space, and truncate the WAL again after VACUUM without restarting GPU workers.
 - Start automatically through systemd. Workers can load concurrently in batches, and an SSH disconnect does not terminate background startup.
 - Show aggregated startup and uninstall progress, including per-worker state, GPU memory, active systemd units, and containers. After reconnecting through SSH, continue observing with `llmctl startup watch`.
 - Manage partial or full start, stop, restart, activation, scaling, logs, health checks, OCR, benchmarks, proxies, and offline bundles.
@@ -304,6 +305,7 @@ sudo llmctl omniroute sqlite assess --deep
 sudo llmctl omniroute backup
 sudo llmctl omniroute sqlite maintain online
 sudo llmctl omniroute sqlite maintain compact
+sudo llmctl omniroute sqlite maintain audit-cleanup
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 --local-image
 sudo llmctl omniroute backups

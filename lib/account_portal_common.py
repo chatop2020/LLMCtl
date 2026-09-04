@@ -53,9 +53,10 @@ from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-APP_VERSION = "3.6.22"
+APP_VERSION = "3.6.23"
 SESSION_COOKIE = "llm_account_session"
 CSRF_COOKIE = "llm_account_csrf"
+PERMISSION_FULL_RECONCILE_INTERVAL_SECONDS = 6 * 60 * 60
 MAX_FORM_BYTES = 64 * 1024
 STRESS_CONCURRENCY_CHOICES = (1, 2, 4, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 100)
 STRESS_INPUT_TOKEN_CHOICES = (50, 100, 300, 800, 1500, 3000, 6000, 8000, 15000, 30000)

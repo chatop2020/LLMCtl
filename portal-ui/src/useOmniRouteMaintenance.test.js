@@ -88,6 +88,26 @@ describe("OmniRoute 生命周期维护", () => {
     });
   });
 
+  it("重复 Key 激活审计只能通过精确确认提交受管清理", async () => {
+    const api = vi.fn().mockResolvedValue({
+      id: "77777777-7777-4777-8777-777777777777",
+      state: "waiting",
+    });
+    const state = useOmniRouteMaintenance({ api, notify: vi.fn() });
+    state.omnirouteForm.audit_cleanup_confirmation = "CLEAN AUDIT LOG";
+
+    await state.cleanOmniRouteAudit();
+
+    expect(api).toHaveBeenCalledWith("admin/omniroute/submit", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "audit-cleanup",
+        confirmation: "CLEAN AUDIT LOG",
+      }),
+    });
+    expect(state.omnirouteForm.audit_cleanup_confirmation).toBe("");
+  });
+
   it("任务接口短暂失败时从总快照恢复，不误报任务失败", async () => {
     const activeJob = {
       id: "22222222-2222-4222-8222-222222222222",

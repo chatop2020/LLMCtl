@@ -33,6 +33,7 @@ export function useOmniRouteMaintenance({ api, notify }) {
     update_confirmation: "",
     online_confirmation: "",
     compact_confirmation: "",
+    audit_cleanup_confirmation: "",
     rollback_id: "",
     rollback_confirmation: "",
   });
@@ -253,7 +254,7 @@ export function useOmniRouteMaintenance({ api, notify }) {
   /**
    * 提交经过服务端再次校验的维护任务。
    *
-   * @param {string} action backup、online、compact、update 或 rollback。
+   * @param {string} action backup、online、compact、audit-cleanup、update 或 rollback。
    * @param {object} fields 镜像、备份 ID 和精确确认短语。
    * @returns {Promise<object|null>} 已提交任务；失败返回 null。
    */
@@ -298,6 +299,15 @@ export function useOmniRouteMaintenance({ api, notify }) {
       confirmation: omnirouteForm.compact_confirmation.trim(),
     });
     if (result) omnirouteForm.compact_confirmation = "";
+    return result;
+  }
+
+  /** 提交带完整备份、回滚和冒烟保护的重复 Key 激活审计清理。 */
+  async function cleanOmniRouteAudit() {
+    const result = await submitOmniRouteTask("audit-cleanup", {
+      confirmation: omnirouteForm.audit_cleanup_confirmation.trim(),
+    });
+    if (result) omnirouteForm.audit_cleanup_confirmation = "";
     return result;
   }
 
@@ -367,6 +377,7 @@ export function useOmniRouteMaintenance({ api, notify }) {
     backupOmniRouteSqlite,
     maintainOmniRouteOnline,
     compactOmniRouteSqlite,
+    cleanOmniRouteAudit,
     updateOmniRoute,
     selectOmniRouteBackup,
     rollbackOmniRoute,

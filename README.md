@@ -30,6 +30,7 @@ Qwen3.8 Flash Next NVFP4 在 8×RTX PRO 6000D 上的推荐拓扑、验收和回�
 - 在线测试支持图片、PDF 和常见文本附件；图片直接作为多模态内容发送，PDF 在浏览器内按页转为图片，不上传到门户后端。流式结果明确标注输入、输出和合计 Token，并展示思考内容、首 Token 延迟与输出速度。
 - 管理端提供服务器后台压测：浏览器只提交和观察任务，独立执行器按并发数与目标输入长度生成有意义的提示词，并实时汇总成功率、RPS、聚合输出 tok/s、TTFT、端到端延迟和 p50/p95/p99；同时记录每个请求命中的 Worker，并每秒采样各 GPU 的利用率、显存、功耗及峰值并行卡数，用于识别路由偏斜。高负载档位需要二次确认。
 - 管理端提供按需系统监控：在“系统监控”页面集中查看 CPU、内存、Swap、GPU/显存/温度/功耗、网络接口、磁盘和类似 `top` 的进程列表。页面打开时每 2 秒采样，离开或隐藏页面即停止；多标签页共用 1 秒后端缓存。监控只读、仅管理员可访问，进程参数中的常见 Key、Token、密码和连接串会自动脱敏。
+- 用户权限由注册、余额、用户组、模型和限流变更即时发布；后台每分钟只重试失败或待迁移用户，每 6 小时执行一次全量漂移兜底，不再无差别重复激活全部 Key。OmniRoute 维护页可在完整备份、自动回滚和冒烟保护下清理历史重复 Key 激活审计，并在 VACUUM 后再次截断 WAL。
 - systemd 开机自启；Worker 可分批并行加载，SSH 断开不影响后台启动。
 - 启动和卸载提供聚合进度：逐 Worker 状态、GPU 显存、活动 systemd 单元与容器；SSH 重连后可用 `llmctl startup watch` 继续观察。
 - 管理命令支持部分/全部启动、停止、重启、激活、缩容、日志、健康检查、OCR、压力测试、代理与离线包。
@@ -304,6 +305,7 @@ sudo llmctl omniroute sqlite assess --deep
 sudo llmctl omniroute backup
 sudo llmctl omniroute sqlite maintain online
 sudo llmctl omniroute sqlite maintain compact
+sudo llmctl omniroute sqlite maintain audit-cleanup
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49
 sudo llmctl omniroute update diegosouzapw/omniroute:3.8.49 --local-image
 sudo llmctl omniroute backups

@@ -166,6 +166,7 @@ class OmniRouteMaintenanceTests(unittest.TestCase):
         confirmations = {
             "online": "MAINTAIN ONLINE",
             "compact": "COMPACT SQLITE",
+            "audit-cleanup": "CLEAN AUDIT LOG",
             "update": "UPDATE OMNIROUTE",
         }
         payload = {"action": action, **values}
@@ -272,14 +273,95 @@ class OmniRouteMaintenanceTests(unittest.TestCase):
             )
             connection.execute("DELETE FROM sample WHERE id > 1")
 
-        job = self.wait_job(self.submit("compact"))
+        # 模拟控制进程仍持有空闲连接；旧实现会在 VACUUM 后留下接近整库大小
+        # 的 WAL，新的二次 TRUNCATE 必须仍能把它收为零。
+        keeper = sqlite3.connect(self.database)
+        keeper.execute("SELECT COUNT(*) FROM sample").fetchone()
+        try:
+            job = self.wait_job(self.submit("compact"))
+        finally:
+            keeper.close()
 
         self.assertEqual(job["state"], "succeeded")
         self.assertEqual(self.sample_value(), "original")
+        wal = self.database.with_name(self.database.name + "-wal")
+        self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0)
         commands = [" ".join(command) for command in self.runner.commands]
         self.assertTrue(any("systemctl stop llm-router.service" in item for item in commands))
         self.assertTrue(any("router restart" in item for item in commands))
         self.assertTrue(any("smoke --full" in item for item in commands))
+
+    def test_audit_cleanup_keeps_daily_last_activation_and_all_other_audits(self):
+        """显式审计清理必须备份原始历史并只删除重复激活记录。"""
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """CREATE TABLE audit_log(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     timestamp TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     target TEXT,
+                     details TEXT,
+                     metadata TEXT)"""
+            )
+            connection.execute("CREATE INDEX idx_audit_action ON audit_log(action)")
+            rows = [
+                ("2026-09-01T00:00:00Z", "apiKey.activate", "key-1"),
+                ("2026-09-01T01:00:00Z", "apiKey.activate", "key-1"),
+                ("2026-09-02T00:00:00Z", "apiKey.activate", "key-1"),
+                ("2026-09-02T01:00:00Z", "apiKey.activate", "key-1"),
+                ("2026-09-01T00:00:00Z", "apiKey.activate", "key-2"),
+                ("2026-09-01T01:00:00Z", "apiKey.activate", "key-2"),
+                ("2026-09-01T02:00:00Z", "auth.login.success", "admin"),
+            ]
+            connection.executemany(
+                "INSERT INTO audit_log(timestamp,action,target) VALUES(?,?,?)", rows
+            )
+
+        job = self.wait_job(self.submit("audit-cleanup"))
+
+        self.assertEqual(job["state"], "succeeded")
+        self.assertEqual(job["audit_rows_removed"], 3)
+        self.assertEqual(job["audit_rows_remaining"], 3)
+        with sqlite3.connect(self.database) as connection:
+            retained = connection.execute(
+                "SELECT action,target,timestamp FROM audit_log ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(retained), 4)
+        self.assertEqual(sum(row[0] == "auth.login.success" for row in retained), 1)
+        backup = self.paths.backup_root / job["backup_id"] / "database.sqlite"
+        with sqlite3.connect(backup) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0], 7)
+        wal = self.database.with_name(self.database.name + "-wal")
+        self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0)
+
+    def test_failed_audit_cleanup_restores_all_original_rows(self):
+        """审计删除后压缩失败必须自动恢复清理前的完整数据库。"""
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE audit_log(id INTEGER PRIMARY KEY,timestamp TEXT,action TEXT,target TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO audit_log VALUES(?,?,?,?)",
+                [
+                    (1, "2026-09-01T00:00:00Z", "apiKey.activate", "key-1"),
+                    (2, "2026-09-01T01:00:00Z", "apiKey.activate", "key-1"),
+                    (3, "2026-09-01T02:00:00Z", "auth.login.success", "admin"),
+                ],
+            )
+        original = self.manager._compact_database
+        self.manager._compact_database = lambda: (_ for _ in ()).throw(
+            RuntimeError("forced compact failure")
+        )
+        try:
+            job = self.wait_job(self.submit("audit-cleanup"))
+        finally:
+            self.manager._compact_database = original
+
+        self.assertEqual(job["state"], "rolled_back")
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0], 3)
 
     def test_update_switches_fixed_image_after_backup_and_full_smoke(self):
         job = self.wait_job(

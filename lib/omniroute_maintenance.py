@@ -487,6 +487,19 @@ class OmniRouteMaintenanceManager:
                     "AND name NOT LIKE 'sqlite_%'"
                 ).fetchone()[0]
             )
+            audit_log_rows = 0
+            api_key_activate_audit_rows = 0
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'"
+            ).fetchone():
+                audit_log_rows = int(
+                    connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+                )
+                api_key_activate_audit_rows = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM audit_log WHERE action='apiKey.activate'"
+                    ).fetchone()[0]
+                )
         integrity_ok = check_rows == ["ok"]
         foreign_key_ok = not foreign_rows
         free_ratio = freelist_count / max(1, page_count)
@@ -538,7 +551,10 @@ class OmniRouteMaintenanceManager:
                 {
                     "severity": "warning",
                     "code": "wal_large",
-                    "message": "WAL 文件偏大，建议执行在线维护的 PASSIVE checkpoint。",
+                    "message": (
+                        "WAL 物理文件偏大；PASSIVE checkpoint 只回写页面，不保证缩小文件。"
+                        "若在线维护后仍显示，请在低峰维护窗口执行压缩。"
+                    ),
                 }
             )
         if free_ratio >= 0.25 and file_size >= 64 * 1024 * 1024:
@@ -547,6 +563,17 @@ class OmniRouteMaintenanceManager:
                     "severity": "warning",
                     "code": "fragmented",
                     "message": "空闲页比例较高，可在维护窗口备份后执行压缩。",
+                }
+            )
+        if api_key_activate_audit_rows >= 100_000:
+            recommendations.append(
+                {
+                    "severity": "warning",
+                    "code": "duplicate_key_activation_audit",
+                    "message": (
+                        f"检测到 {api_key_activate_audit_rows:,} 条 Key 激活审计；"
+                        "可在升级到修复版本后使用受管审计清理保留每日最后状态。"
+                    ),
                 }
             )
         if backup_age_hours is None or backup_age_hours > 24 * 7:
@@ -580,6 +607,8 @@ class OmniRouteMaintenanceManager:
                 "wal_autocheckpoint": wal_autocheckpoint,
                 "user_version": user_version,
                 "table_count": table_count,
+                "audit_log_rows": audit_log_rows,
+                "api_key_activate_audit_rows": api_key_activate_audit_rows,
                 "page_size": page_size,
                 "page_count": page_count,
                 "freelist_count": freelist_count,
@@ -942,10 +971,20 @@ class OmniRouteMaintenanceManager:
         confirmations = {
             "online": "MAINTAIN ONLINE",
             "compact": "COMPACT SQLITE",
+            "audit-cleanup": "CLEAN AUDIT LOG",
             "update": "UPDATE OMNIROUTE",
         }
-        if action not in {"backup", "online", "compact", "update", "rollback"}:
-            raise ValueError("OmniRoute 操作必须是 backup|online|compact|update|rollback")
+        if action not in {
+            "backup",
+            "online",
+            "compact",
+            "audit-cleanup",
+            "update",
+            "rollback",
+        }:
+            raise ValueError(
+                "OmniRoute 操作必须是 backup|online|compact|audit-cleanup|update|rollback"
+            )
         self._cluster()
         request: dict[str, Any] = {"action": action}
         if action == "update":
@@ -1005,6 +1044,8 @@ class OmniRouteMaintenanceManager:
                 self._run_online_maintenance(job)
             elif action == "compact":
                 self._run_compact(job)
+            elif action == "audit-cleanup":
+                self._run_audit_cleanup(job)
             elif action == "update":
                 self._run_update(job)
             elif action == "rollback":
@@ -1086,16 +1127,58 @@ class OmniRouteMaintenanceManager:
         self._complete(job, "在线维护完成；Router 与 GPU Worker 未重启")
 
     def _compact_database(self) -> None:
-        """在 Router 停止后 checkpoint、VACUUM、optimize 并做完整检查。"""
+        """在 Router 停止后压缩数据库，并把 VACUUM 新产生的 WAL 截断。"""
 
-        with sqlite3.connect(self.paths.database, timeout=30) as connection:
+        with contextlib.closing(
+            sqlite3.connect(self.paths.database, timeout=30)
+        ) as connection:
             connection.execute("PRAGMA busy_timeout=30000")
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            before = tuple(connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+            if before[0] != 0:
+                raise RuntimeError(f"VACUUM 前 WAL 截断被占用：{before}")
             connection.execute("VACUUM")
             connection.execute("PRAGMA optimize")
+            # VACUUM 在 WAL 模式下会重写接近整库大小的页面；必须在它之后再次
+            # 截断，否则维护成功后仍会留下与主库等大的 WAL 并触发假告警。
+            after = tuple(connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+            if after[0] != 0 or after[1:] != (0, 0):
+                raise RuntimeError(f"VACUUM 后 WAL 截断未完成：{after}")
             checks = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
             if checks != ["ok"]:
                 raise RuntimeError(f"VACUUM 后完整性检查失败：{checks[:3]}")
+
+    def _deduplicate_key_activation_audit(self) -> tuple[int, int]:
+        """把重复 Key 激活审计压缩为每个 Key 每日最后一条。
+
+        返回：
+            删除行数与保留的 Key 激活审计行数。其它动作、状态、审计字段和表均
+            不修改；操作前的完整记录由受管一致性备份保留。
+        """
+
+        with contextlib.closing(
+            sqlite3.connect(self.paths.database, timeout=120)
+        ) as connection:
+            connection.execute("PRAGMA busy_timeout=120000")
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'"
+            ).fetchone()
+            if not table:
+                return 0, 0
+            removed = connection.execute(
+                """DELETE FROM audit_log
+                   WHERE action='apiKey.activate' AND id NOT IN (
+                     SELECT MAX(id) FROM audit_log
+                     WHERE action='apiKey.activate'
+                     GROUP BY COALESCE(target,''),SUBSTR(timestamp,1,10)
+                   )"""
+            ).rowcount
+            remaining = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_log WHERE action='apiKey.activate'"
+                ).fetchone()[0]
+            )
+            connection.commit()
+        return int(removed), remaining
 
     def _run_compact(self, job: dict[str, Any]) -> None:
         """在维护窗口压缩数据库，失败时自动恢复维护前快照。"""
@@ -1106,7 +1189,7 @@ class OmniRouteMaintenanceManager:
             raise RuntimeError("SQLite 存在严重异常，拒绝执行 VACUUM")
         database_size = int(assessment["storage"]["database_size"])
         if int(assessment["storage"]["disk_free"]) < max(
-            database_size * 2, 512 * 1024 * 1024
+            database_size * 3, 1024 * 1024 * 1024
         ):
             raise RuntimeError("磁盘余量不足以安全执行 VACUUM")
         self._set_job(job, "backing_up", 20, "压缩前创建一致性备份")
@@ -1155,6 +1238,86 @@ class OmniRouteMaintenanceManager:
                     "phase": "rolled_back",
                     "progress": 100,
                     "message": f"压缩失败，已恢复维护前数据库：{error}",
+                    "error": str(error)[:2000],
+                }
+            )
+            self.jobs.save(job)
+
+    def _run_audit_cleanup(self, job: dict[str, Any]) -> None:
+        """备份后清理重复 Key 激活审计，失败则恢复完整维护前快照。"""
+
+        self._set_job(job, "assessing", 5, "评估审计清理空间与数据库完整性")
+        assessment = self.assess(deep=True)
+        if assessment["health"] == "critical":
+            raise RuntimeError("SQLite 存在严重异常，拒绝清理审计")
+        database_size = int(assessment["storage"]["database_size"])
+        if int(assessment["storage"]["disk_free"]) < max(
+            database_size * 3, 1024 * 1024 * 1024
+        ):
+            raise RuntimeError("磁盘余量不足以安全清理审计并执行 VACUUM")
+        self._set_job(job, "backing_up", 20, "审计清理前创建一致性完整备份")
+        backup = self._create_backup("audit-cleanup", job_id=str(job["id"]))
+        job["backup_id"] = backup["id"]
+        directory, metadata = self._validated_backup(str(backup["id"]))
+        self._set_job(job, "stopping", 35, "停止 Router 与账户门户；GPU Worker 保持运行")
+        self._stop_router_stack()
+        try:
+            self._set_job(
+                job,
+                "cleaning_audit",
+                50,
+                "保留每个 Key 每日最后一条激活审计，其它审计不变",
+                cancellable=False,
+            )
+            removed, remaining = self._deduplicate_key_activation_audit()
+            job["audit_rows_removed"] = removed
+            job["audit_rows_remaining"] = remaining
+            self.jobs.save(job)
+            self._set_job(
+                job,
+                "compacting",
+                65,
+                "回收审计与索引空间并截断 VACUUM 产生的 WAL",
+                cancellable=False,
+            )
+            self._compact_database()
+            self._set_job(
+                job,
+                "starting",
+                82,
+                "恢复 Router 并执行完整模型冒烟",
+                cancellable=False,
+            )
+            self._restart_and_smoke(allow_legacy_gateway=True)
+            after = self.assess(deep=False)
+            if not after["integrity"]["ok"] or not after["foreign_keys"]["ok"]:
+                raise RuntimeError("审计清理后 SQLite 完整性检查失败")
+            self._complete(
+                job,
+                f"重复 Key 激活审计已清理 {removed:,} 条，保留 {remaining:,} 条；"
+                "Router 已恢复并通过完整冒烟",
+            )
+        except Exception as error:
+            try:
+                self._stop_router_stack()
+                self._restore_database(directory, metadata)
+            except Exception as restore_error:
+                raise RuntimeError(
+                    f"审计清理失败：{error}；自动恢复数据库失败：{restore_error}"
+                ) from restore_error
+            try:
+                self._restart_and_smoke(allow_legacy_gateway=True)
+            except Exception as verification_error:
+                raise RuntimeError(
+                    f"审计清理失败：{error}；已恢复维护前数据库文件，"
+                    f"但恢复后服务冒烟仍失败：{verification_error}"
+                ) from verification_error
+            job.update(
+                {
+                    "state": "rolled_back",
+                    "phase": "rolled_back",
+                    "progress": 100,
+                    "message": f"审计清理失败，已恢复维护前数据库：{error}",
                     "error": str(error)[:2000],
                 }
             )

@@ -643,9 +643,18 @@ class PortalAdminControlMixin:
         return group_id
 
     def background_tick(self) -> None:
-        # 同时迁移旧 OmniRoute Token 限制；该限制曾错误地把促销赠额与现金计费耦合。
+        # 业务变更路径会即时发布权限。周期任务每分钟只重试失败/待迁移用户，
+        # 每六小时再做一次完整漂移兜底，避免对所有已同步 Key 重复写入相同策略。
         try:
-            self.sync_all_users()
+            stamp = now()
+            last_full = int(getattr(self, "permission_full_reconciled_at", 0) or 0)
+            if stamp - last_full >= PERMISSION_FULL_RECONCILE_INTERVAL_SECONDS:
+                self.sync_all_users()
+                # 即使个别用户失败也推进全量窗口；失败状态会由下一分钟的定向
+                # 重试处理，不能退化成再次每分钟重写所有用户。
+                self.permission_full_reconciled_at = stamp
+            else:
+                self.sync_due_users()
         except Exception as error:
             print(
                 f"[account-portal] permission sync warning: {error}",

@@ -88,6 +88,9 @@ class PortalServer:
         self.route_migration_finished = False
         self.request_content_logging_due = time.monotonic()
         self.request_content_logging_ready = False
+        # 第一次维护 tick 做一次完整权限投影；之后只在六小时兜底窗口执行全量
+        # 对账，普通每分钟维护仅重试失败或待迁移用户。
+        self.control.permission_full_reconciled_at = 0
         try:
             self.control.prepare_public_combo_migration_backup()
             self.control.seed_managed_model()
